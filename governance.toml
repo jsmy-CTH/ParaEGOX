@@ -1,0 +1,187 @@
+schema_version = 1
+
+[repository]
+source_root = "src/paraegox"
+term_scan_roots = ["src", "crates", "configs"]
+exception_scan_roots = ["src", "crates", "tests", "scripts", ".github"]
+documentation_roots = ["README.md", "README_zh.md"]
+allowed_top_level_directories = [".github", "configs", "crates", "docs", "scripts", "src", "tests"]
+ignored_top_level_directories = [".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "build", "dist", "target"]
+
+[registry]
+# Do not add placeholders. Add rows only in the same change that creates the real surface.
+waivers = []
+deprecations = []
+feature_flags = []
+
+[[registry.packages]]
+path = "crates/paraegox-kernel"
+cargo_package = "paraegox-kernel"
+owner = "Kernel mechanisms"
+responsibility = "Canonical digest framing and identity values shared by admitted mechanism owners."
+status = "public"
+public_entrypoints = ["paraegox_kernel::digest", "paraegox_kernel::identity"]
+consumers = ["paraegox-runtime-contracts", "paraegox-runtime", "paraegox-deployment"]
+first_tests = ["crates/paraegox-kernel/src/digest.rs", "crates/paraegox-kernel/src/identity.rs"]
+removal_condition = "Removal requires migrating every registered mechanism consumer and its canonical digest or identity evidence."
+
+[[registry.packages]]
+path = "crates/paraegox-runtime-contracts"
+cargo_package = "paraegox-runtime-contracts"
+owner = "Runtime contract owner"
+responsibility = "Source-only plan provenance, target-slice commitments, writer tenure, and non-temporal apply-control contracts."
+status = "public"
+public_entrypoints = ["paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply"]
+consumers = ["paraegox-deployment", "paraegox-runtime"]
+first_tests = ["crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs"]
+removal_condition = "Removal requires replacing both the independent Deployment producer and Runtime consumer in one accepted contract migration."
+
+[[registry.packages]]
+path = "crates/paraegox-runtime"
+cargo_package = "paraegox-runtime"
+owner = "Runtime apply-state owner"
+responsibility = "Pure writer-fence, prepare, and activate control-state transitions for the B1 vertical slice."
+status = "enabler"
+public_entrypoints = []
+consumers = []
+first_tests = ["crates/paraegox-runtime/src/apply_state.rs"]
+removal_condition = "Remove this crate if P2a cannot reuse the reducer in the durable RuntimeHost apply path without a parallel state machine."
+
+[[registry.packages]]
+path = "crates/paraegox-deployment"
+cargo_package = "paraegox-deployment"
+owner = "Deployment projection owner"
+responsibility = "Pure projection from committed deployment identities into target-slice and apply-control commitments."
+status = "enabler"
+public_entrypoints = []
+consumers = []
+first_tests = ["crates/paraegox-deployment/src/projection.rs"]
+removal_condition = "Remove this crate if the P2a production fixture and P2e DeploymentController cannot reuse this projection path."
+
+[[registry.public_apis]]
+module = "paraegox_kernel::digest"
+symbols = ["Digest32", "DigestBuildError", "Digest32Builder"]
+owner = "Kernel mechanisms"
+consumers = ["paraegox-runtime-contracts", "paraegox-runtime", "paraegox-deployment"]
+compatibility = "The SHA-256-v1 framing and golden bytes are stable; semantic domains remain contract-owned and versioned."
+tests = ["crates/paraegox-kernel/src/digest.rs"]
+
+[[registry.public_apis]]
+module = "paraegox_kernel::identity"
+symbols = ["RuntimeHostId", "PrincipalRef"]
+owner = "Kernel identity values"
+consumers = ["paraegox-runtime-contracts", "paraegox-runtime", "paraegox-deployment"]
+compatibility = "Types stay opaque and non-interchangeable; byte encoding is not yet a published cross-language wire schema."
+tests = ["crates/paraegox-kernel/src/identity.rs"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime_contracts::provenance"
+symbols = ["PlanProvenance", "RuntimeSliceHeader", "RuntimeSliceCommitment", "SourceScopeRef", "SourcePlanRef", "SourcePlanRevision", "SourcePlanDigest", "TargetAssignmentDigest", "TargetSliceDigest"]
+owner = "Runtime contract owner"
+consumers = ["paraegox-deployment", "paraegox-runtime"]
+compatibility = "Header version 1 and target-slice digest coverage are stable for composition into P2a; no serializer or wire ABI is published in B1."
+tests = ["crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-runtime/src/apply_state.rs"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime_contracts::apply"
+symbols = ["RuntimeApplyControl", "RuntimeApplyControlCommitment", "PlanWriterContext", "WriterTenureProof", "ExpectedActive", "ApplyOperationId"]
+owner = "Runtime contract owner"
+consumers = ["paraegox-deployment", "paraegox-runtime"]
+compatibility = "B1 non-temporal controls and their canonical commitment remain reusable; P2a composes assignments, temporal constraints, and authentication without mutating this contract."
+tests = ["crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-runtime/src/apply_state.rs"]
+
+[cargo]
+manifest_path = "Cargo.toml"
+lockfile_path = "Cargo.lock"
+crate_root = "crates"
+
+[[cargo.rules]]
+id = "CARGO-ARCH-001"
+source = "paraegox-kernel"
+allow_workspace_dependencies = []
+allow_external_dependencies = ["sha2"]
+
+[[cargo.rules]]
+id = "CARGO-ARCH-002"
+source = "paraegox-runtime-contracts"
+allow_workspace_dependencies = ["paraegox-kernel"]
+allow_external_dependencies = []
+
+[[cargo.rules]]
+id = "CARGO-ARCH-003"
+source = "paraegox-runtime"
+allow_workspace_dependencies = ["paraegox-kernel", "paraegox-runtime-contracts"]
+allow_external_dependencies = []
+
+[[cargo.rules]]
+id = "CARGO-ARCH-004"
+source = "paraegox-deployment"
+allow_workspace_dependencies = ["paraegox-kernel", "paraegox-runtime-contracts"]
+allow_external_dependencies = []
+
+[[architecture.rules]]
+id = "ARCH-001"
+source = "paraegox.kernel"
+forbid = [
+  "paraegox.decks",
+  "paraegox.deployment",
+  "paraegox.drivers",
+  "paraegox.gateways",
+  "paraegox.runtime",
+  "paraegox.services",
+]
+reason = "Kernel mechanisms must not depend on product, deployment, runtime, gateway, driver, or service owners."
+
+[[architecture.rules]]
+id = "ARCH-002"
+source = "paraegox.runtime"
+forbid = ["paraegox.decks", "paraegox.deployment"]
+reason = "Runtime consumes runtime-owned apply contracts and must not import deployment or Deck implementation."
+
+[[terminology.rules]]
+id = "TERM-001"
+identifier = "ModuleSpec"
+replacement = "CardDefinition"
+reason = "ADR-0002 accepts CardDefinition as the reusable capability contract."
+
+[[terminology.rules]]
+id = "TERM-002"
+identifier = "ModuleRef"
+replacement = "CardDefinitionRef"
+reason = "ADR-0002 accepts CardDefinitionRef as the stable reference."
+
+[[terminology.rules]]
+id = "TERM-003"
+identifier = "ApplicationTopology"
+replacement = "DeckTopology"
+reason = "DeckTopology is the proposed workload topology term; Application is not a current identity."
+
+[[terminology.rules]]
+id = "TERM-004"
+identifier = "RemoteDomain"
+replacement = "target RuntimeHost placement"
+reason = "ExecutionDomain is local to RuntimeHost; remote placement is not a local domain."
+
+[[terminology.rules]]
+id = "TERM-005"
+identifier = "LocalBus"
+replacement = "PortBinding test fixture or Zenoh-backed PortBinding"
+reason = "There is one production Fabric and no parallel local production bus."
+
+[[terminology.rules]]
+id = "TERM-006"
+identifier = "MemoryBus"
+replacement = "PortBinding test fixture"
+reason = "A test fixture must not become a second public Bus product."
+
+[[terminology.rules]]
+id = "TERM-007"
+identifier = "MemoryPortBinding"
+replacement = "PortBinding test fixture"
+reason = "Test implementations do not create a second public live-binding term."
+
+[[terminology.rules]]
+id = "TERM-008"
+identifier = "ZenohBinding"
+replacement = "PortBinding"
+reason = "PortBinding is the only public live-binding term."

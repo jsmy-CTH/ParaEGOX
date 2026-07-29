@@ -1,0 +1,23 @@
+[workspace]
+members = [
+  "crates/paraegox-deployment",
+  "crates/paraegox-kernel",
+  "crates/paraegox-runtime",
+  "crates/paraegox-runtime-contracts",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "Apache-2.0"
+repository = "https://github.com/jsmy-CTH/ParaEGOX"
+
+[workspace.dependencies]
+sha2 = { version = "0.11.0", default-features = false }
+paraegox-kernel = { path = "crates/paraegox-kernel" }
+paraegox-runtime-contracts = { path = "crates/paraegox-runtime-contracts" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

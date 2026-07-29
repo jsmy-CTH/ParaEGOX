@@ -1,0 +1,28 @@
+[project]
+name = "paraegox-governance"
+version = "0.0.0"
+description = "Development governance and validation tooling for the ParaEGOX clean-slate rebuild"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest>=8,<10",
+  "ruff>=0.11,<1",
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+required-version = "==0.11.32"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
