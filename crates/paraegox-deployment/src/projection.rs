@@ -42,10 +42,6 @@ pub fn build_runtime_apply_control_commitment(
     let runtime_writer = PlanWriterRef::from_bytes(*deployment_writer.as_bytes());
     let runtime_epoch = PlanWriterEpoch::new(deployment_epoch.value());
 
-    if proof.claim().source_scope() != slice.header().provenance().source_scope() {
-        return Err(ProjectionError::WriterScopeMismatch);
-    }
-
     let writer_context = PlanWriterContext::try_new(runtime_writer, runtime_epoch, proof)?;
     let control = RuntimeApplyControl::new(writer_context, expected_active, operation_id);
     RuntimeApplyControlCommitment::try_new(slice, control).map_err(ProjectionError::Apply)
@@ -58,8 +54,6 @@ pub enum ProjectionError {
     Provenance(ProvenanceContractError),
     /// Runtime apply-control construction failed.
     Apply(ApplyContractError),
-    /// The authority proof is for a different desired-state scope.
-    WriterScopeMismatch,
 }
 
 impl From<ApplyContractError> for ProjectionError {
@@ -73,9 +67,6 @@ impl fmt::Display for ProjectionError {
         match self {
             Self::Provenance(error) => write!(formatter, "slice projection failed: {error}"),
             Self::Apply(error) => write!(formatter, "apply-control mapping failed: {error}"),
-            Self::WriterScopeMismatch => {
-                formatter.write_str("writer proof scope does not match slice provenance")
-            }
         }
     }
 }
@@ -196,6 +187,24 @@ mod tests {
     }
 
     #[test]
+    fn exact_active_expectation_is_preserved() {
+        let Ok(slice) = project_runtime_slice_commitment(&projection(9, 10)) else {
+            panic!("valid projection must succeed");
+        };
+        let expected_active = ExpectedActive::Exact(slice.target_slice_digest());
+        let Ok(commitment) = build_runtime_apply_control_commitment(
+            slice,
+            tenure(1, 13, 1),
+            expected_active,
+            ApplyOperationId::from_bytes([14; 16]),
+        ) else {
+            panic!("valid writer mapping must succeed");
+        };
+
+        assert_eq!(commitment.control().expected_active(), expected_active);
+    }
+
+    #[test]
     fn invalid_proof_scope_fails_closed() {
         let Ok(slice) = project_runtime_slice_commitment(&projection(9, 10)) else {
             panic!("valid projection must succeed");
@@ -207,6 +216,11 @@ mod tests {
             ApplyOperationId::from_bytes([14; 16]),
         );
 
-        assert_eq!(result.err(), Some(ProjectionError::WriterScopeMismatch));
+        assert_eq!(
+            result.err(),
+            Some(ProjectionError::Apply(
+                paraegox_runtime_contracts::apply::ApplyContractError::WriterScopeMismatch
+            ))
+        );
     }
 }

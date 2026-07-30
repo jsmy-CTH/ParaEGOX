@@ -33,6 +33,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-targets --locked
+      - name: Documentation tests
+        run: cargo test --workspace --doc --locked
 
   governance-and-tests:
     runs-on: ubuntu-24.04

@@ -297,17 +297,38 @@ mod tests {
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
     };
 
-    fn commitment(target: [u8; 16], revision: u64, assignment_byte: u8) -> RuntimeSliceCommitment {
+    #[derive(Clone, Copy)]
+    struct SliceFixture {
+        target_byte: u8,
+        scope_byte: u8,
+        plan_byte: u8,
+        revision: u64,
+        plan_digest_byte: u8,
+        assignment_byte: u8,
+    }
+
+    const fn fixture() -> SliceFixture {
+        SliceFixture {
+            target_byte: 5,
+            scope_byte: 1,
+            plan_byte: 2,
+            revision: 3,
+            plan_digest_byte: 4,
+            assignment_byte: 6,
+        }
+    }
+
+    fn commitment(fixture: SliceFixture) -> RuntimeSliceCommitment {
         let provenance = PlanProvenance::new(
-            SourceScopeRef::from_bytes([1; 16]),
-            SourcePlanRef::from_bytes([2; 16]),
-            SourcePlanRevision::new(revision),
-            SourcePlanDigest::new(Digest32::from_bytes([3; 32])),
+            SourceScopeRef::from_bytes([fixture.scope_byte; 16]),
+            SourcePlanRef::from_bytes([fixture.plan_byte; 16]),
+            SourcePlanRevision::new(fixture.revision),
+            SourcePlanDigest::new(Digest32::from_bytes([fixture.plan_digest_byte; 32])),
         );
         let header = RuntimeSliceHeader::new(
-            RuntimeHostId::from_bytes(target),
+            RuntimeHostId::from_bytes([fixture.target_byte; 16]),
             provenance,
-            TargetAssignmentDigest::new(Digest32::from_bytes([assignment_byte; 32])),
+            TargetAssignmentDigest::new(Digest32::from_bytes([fixture.assignment_byte; 32])),
         );
         let Ok(value) = RuntimeSliceCommitment::try_new(header) else {
             panic!("valid commitment fixture must build");
@@ -316,20 +337,45 @@ mod tests {
     }
 
     #[test]
-    fn commitment_is_stable_and_validates() {
-        let first = commitment([4; 16], 5, 6);
-        let second = commitment([4; 16], 5, 6);
+    fn target_slice_has_a_stable_golden_vector() {
+        let first = commitment(fixture());
+        let second = commitment(fixture());
+        let expected = [
+            0x78, 0x9d, 0x23, 0x48, 0x56, 0xf3, 0x17, 0x04, 0xa0, 0xa5, 0x8c, 0x49, 0x1c, 0xd3,
+            0x69, 0x34, 0x69, 0xd4, 0xa9, 0xe3, 0x80, 0xe3, 0x3e, 0x85, 0x3e, 0xc0, 0x4a, 0x16,
+            0xd5, 0x42, 0x29, 0x80,
+        ];
 
         assert_eq!(first, second);
+        assert_eq!(first.target_slice_digest().value().as_bytes(), &expected);
         assert_eq!(first.validate(), Ok(()));
     }
 
     #[test]
-    fn target_revision_and_assignment_are_all_committed() {
-        let baseline = commitment([4; 16], 5, 6);
+    fn every_slice_header_field_is_committed() {
+        let baseline = commitment(fixture());
+        let mut variations = [fixture(); 6];
+        variations[0].target_byte = 0x15;
+        variations[1].scope_byte = 0x11;
+        variations[2].plan_byte = 0x12;
+        variations[3].revision = 4;
+        variations[4].plan_digest_byte = 0x14;
+        variations[5].assignment_byte = 0x16;
 
-        assert_ne!(baseline, commitment([7; 16], 5, 6));
-        assert_ne!(baseline, commitment([4; 16], 8, 6));
-        assert_ne!(baseline, commitment([4; 16], 5, 9));
+        for changed in variations {
+            assert_ne!(baseline, commitment(changed));
+        }
+    }
+
+    #[test]
+    fn stored_slice_digest_is_revalidated() {
+        let mut corrupted = commitment(fixture());
+        corrupted.target_slice_digest =
+            super::TargetSliceDigest::new(Digest32::from_bytes([99; 32]));
+
+        assert_eq!(
+            corrupted.validate(),
+            Err(super::ProvenanceContractError::TargetSliceDigestMismatch)
+        );
     }
 }

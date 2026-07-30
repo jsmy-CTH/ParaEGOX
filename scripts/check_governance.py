@@ -70,6 +70,7 @@ def validate_repository(root: Path, config: dict[str, Any], *, today: dt.date) -
     findings: list[Finding] = []
     findings.extend(check_config(config, today=today))
     findings.extend(check_top_level_directories(root, config))
+    findings.extend(check_untracked_only_roots(root, config))
     findings.extend(check_package_registry(root, config))
     findings.extend(check_cargo_workspace(root, config))
     findings.extend(check_architecture_imports(root, config))
@@ -85,6 +86,48 @@ def check_config(config: dict[str, Any], *, today: dt.date) -> list[Finding]:
         findings.append(Finding("GOV-001", "governance.toml", "schema_version must be 1"))
 
     registry = _table(config, "registry")
+    repository = _table(config, "repository")
+    raw_local_only_roots = repository.get("untracked_only_roots")
+    if not isinstance(raw_local_only_roots, list) or not raw_local_only_roots:
+        findings.append(
+            Finding(
+                "VCS-003",
+                "governance.toml",
+                "repository.untracked_only_roots must be a non-empty array containing 'docs'",
+            )
+        )
+    else:
+        local_only_roots: list[str] = []
+        for value in raw_local_only_roots:
+            if not isinstance(value, str) or not value:
+                findings.append(
+                    Finding(
+                        "VCS-003",
+                        "governance.toml",
+                        "repository.untracked_only_roots entries must be non-empty strings",
+                    )
+                )
+                continue
+            path = Path(value)
+            if path.is_absolute() or ".." in path.parts or value == ".":
+                findings.append(
+                    Finding(
+                        "VCS-003",
+                        "governance.toml",
+                        f"local-only root must be a safe relative path: {value!r}",
+                    )
+                )
+                continue
+            local_only_roots.append(value)
+        if local_only_roots != ["docs"]:
+            findings.append(
+                Finding(
+                    "VCS-003",
+                    "governance.toml",
+                    "repository.untracked_only_roots must be exactly ['docs']",
+                )
+            )
+
     for name in ("packages", "public_apis", "waivers", "deprecations", "feature_flags"):
         if not isinstance(registry.get(name), list):
             findings.append(
@@ -164,6 +207,41 @@ def check_top_level_directories(root: Path, config: dict[str, Any]) -> list[Find
                     "top-level directory is not admitted in governance.toml",
                 )
             )
+    return findings
+
+
+def check_untracked_only_roots(root: Path, config: dict[str, Any]) -> list[Finding]:
+    repository = _table(config, "repository")
+    local_only_roots = _strings(repository.get("untracked_only_roots"))
+    if not local_only_roots:
+        return []
+
+    literal_pathspecs = [f":(top,literal){value}" for value in local_only_roots]
+    command = ["git", "-C", str(root), "ls-files", "-z", "--", *literal_pathspecs]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return [Finding("VCS-002", ".", f"cannot inspect tracked paths: {exc}")]
+
+    if completed.returncode != 0:
+        detail = _first_nonempty_line(completed.stderr) or "git ls-files failed"
+        return [Finding("VCS-002", ".", f"cannot inspect tracked paths: {detail}")]
+
+    findings: list[Finding] = []
+    for tracked in sorted(path for path in completed.stdout.split("\0") if path):
+        findings.append(
+            Finding(
+                "VCS-001",
+                tracked,
+                "path belongs to a local-only root and must not be tracked",
+            )
+        )
     return findings
 
 

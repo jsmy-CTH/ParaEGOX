@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,8 +23,9 @@ def base_config() -> dict:
             "term_scan_roots": ["src"],
             "exception_scan_roots": ["src", "tests", ".github"],
             "documentation_roots": ["docs"],
+            "untracked_only_roots": ["docs"],
             "allowed_top_level_directories": [".github", "docs", "src", "tests"],
-            "ignored_top_level_directories": [],
+            "ignored_top_level_directories": [".git"],
         },
         "registry": {
             "packages": [],
@@ -62,6 +64,10 @@ def rule_ids(findings: list) -> set[str]:
     return {finding.rule_id for finding in findings}
 
 
+def init_git_repository(root: Path) -> None:
+    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+
+
 def test_repository_configuration_passes_current_tree() -> None:
     config = governance.load_config(REPO_ROOT / "governance.toml")
     assert governance.validate_repository(REPO_ROOT, config, today=dt.date(2026, 7, 29)) == []
@@ -74,6 +80,79 @@ def test_unadmitted_top_level_directory_is_rejected(tmp_path: Path) -> None:
     findings = validate(tmp_path, config)
 
     assert "DIR-001" in rule_ids(findings)
+
+
+def test_local_only_root_allows_untracked_files(tmp_path: Path) -> None:
+    init_git_repository(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "local.md").write_text("local only\n", encoding="utf-8")
+    config = base_config()
+    config["repository"]["untracked_only_roots"] = ["docs"]
+
+    findings = governance.check_untracked_only_roots(tmp_path, config)
+
+    assert findings == []
+
+
+def test_local_only_root_rejects_tracked_files(tmp_path: Path) -> None:
+    init_git_repository(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    document = docs / "local.md"
+    document.write_text("must stay local\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-f", "docs/local.md"], cwd=tmp_path, check=True)
+    config = base_config()
+    config["repository"]["untracked_only_roots"] = ["docs"]
+
+    findings = validate(tmp_path, config)
+
+    assert rule_ids(findings) == {"VCS-001"}
+    assert findings[0].path == "docs/local.md"
+
+
+def test_local_only_root_check_fails_outside_git_repository(tmp_path: Path) -> None:
+    config = base_config()
+    config["repository"]["untracked_only_roots"] = ["docs"]
+
+    findings = governance.check_untracked_only_roots(tmp_path, config)
+
+    assert rule_ids(findings) == {"VCS-002"}
+
+
+def test_local_only_root_policy_is_required_and_well_formed() -> None:
+    invalid_values = [
+        None,
+        [],
+        "docs",
+        ["../docs"],
+        ["/docs"],
+        ["."],
+        ["docs", ":(exclude)docs"],
+    ]
+    for value in invalid_values:
+        config = base_config()
+        if value is None:
+            del config["repository"]["untracked_only_roots"]
+        else:
+            config["repository"]["untracked_only_roots"] = value
+
+        findings = governance.check_config(config, today=dt.date(2026, 7, 30))
+
+        assert "VCS-003" in rule_ids(findings)
+
+
+def test_missing_git_is_a_hard_local_only_root_failure(tmp_path: Path, monkeypatch) -> None:
+    config = base_config()
+
+    def missing_git(*_args, **_kwargs):
+        raise FileNotFoundError("git not found")
+
+    monkeypatch.setattr(governance.subprocess, "run", missing_git)
+
+    findings = governance.check_untracked_only_roots(tmp_path, config)
+
+    assert rule_ids(findings) == {"VCS-002"}
 
 
 def test_implementation_package_requires_registry_entry(tmp_path: Path) -> None:

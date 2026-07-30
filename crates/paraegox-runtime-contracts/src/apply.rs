@@ -4,10 +4,11 @@ use core::fmt;
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 
 use crate::provenance::{
-    ProvenanceContractError, RuntimeSliceCommitment, SourcePlanRevision, SourceScopeRef,
+    ProvenanceContractError, RuntimeSliceCommitment, SourceScopeRef, TargetSliceDigest,
 };
 
-const WRITER_TENURE_PROOF_DIGEST_DOMAIN: &[u8] = b"paraegox.runtime.writer-tenure-proof.sha256.v1";
+const WRITER_TENURE_PROOF_ENVELOPE_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.writer-tenure-proof.sha256.v1";
 const APPLY_CONTROL_COMMITMENT_DIGEST_DOMAIN: &[u8] = b"paraegox.runtime.apply-control.sha256.v1";
 const MAX_TENURE_NONCE_BYTES: usize = 64;
 const MAX_TENURE_SIGNATURE_BYTES: usize = 512;
@@ -259,11 +260,14 @@ impl WriterTenureProof {
         &self.signature
     }
 
-    /// Computes the digest durably retained by the Runtime writer fence.
-    pub fn digest(&self) -> Result<Digest32, DigestBuildError> {
+    /// Computes the canonical fingerprint of the complete proof envelope.
+    ///
+    /// The signature bytes are part of this fingerprint. It is therefore not a
+    /// signing transcript; the future verifier owns that separate contract.
+    pub fn envelope_digest(&self) -> Result<Digest32, DigestBuildError> {
         let authority = self.authority();
         let claim = self.claim();
-        let mut builder = Digest32Builder::try_new(WRITER_TENURE_PROOF_DIGEST_DOMAIN)?;
+        let mut builder = Digest32Builder::try_new(WRITER_TENURE_PROOF_ENVELOPE_DIGEST_DOMAIN)?;
         builder.field_bytes(authority.authority().as_bytes())?;
         builder.field_bytes(authority.key().as_bytes())?;
         builder.field_u16(authority.algorithm().value())?;
@@ -365,13 +369,13 @@ impl PlanWriterContext {
     }
 }
 
-/// Compare-and-swap expectation for the active source revision.
+/// Compare-and-swap expectation for the exact active target slice.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExpectedActive {
-    /// The target must not have an active revision for the source scope.
+    /// The target must not have an active slice for the source scope.
     None,
-    /// The target must have exactly this source revision active.
-    Revision(SourcePlanRevision),
+    /// The target must have exactly this target-slice commitment active.
+    Exact(TargetSliceDigest),
 }
 
 /// Runtime-owned controls that are deliberately excluded from slice identity.
@@ -403,7 +407,7 @@ impl RuntimeApplyControl {
         &self.writer_context
     }
 
-    /// Returns the expected active revision CAS input.
+    /// Returns the exact active-slice CAS input.
     #[must_use]
     pub const fn expected_active(&self) -> ExpectedActive {
         self.expected_active
@@ -431,6 +435,7 @@ impl RuntimeApplyControlCommitment {
         control: RuntimeApplyControl,
     ) -> Result<Self, ApplyContractError> {
         slice.validate()?;
+        ensure_writer_scope_matches(&slice, &control)?;
         let commitment_digest = control_commitment_digest(&slice, &control)?;
         Ok(Self {
             slice,
@@ -460,11 +465,24 @@ impl RuntimeApplyControlCommitment {
     /// Recomputes every B1 commitment before control-state admission.
     pub fn validate(&self) -> Result<(), ApplyContractError> {
         self.slice.validate()?;
+        ensure_writer_scope_matches(&self.slice, &self.control)?;
         if control_commitment_digest(&self.slice, &self.control)? != self.commitment_digest {
             return Err(ApplyContractError::ControlCommitmentDigestMismatch);
         }
         Ok(())
     }
+}
+
+fn ensure_writer_scope_matches(
+    slice: &RuntimeSliceCommitment,
+    control: &RuntimeApplyControl,
+) -> Result<(), ApplyContractError> {
+    let slice_scope = slice.header().provenance().source_scope();
+    let proof_scope = control.writer_context().proof().claim().source_scope();
+    if proof_scope != slice_scope {
+        return Err(ApplyContractError::WriterScopeMismatch);
+    }
+    Ok(())
 }
 
 fn control_commitment_digest(
@@ -474,10 +492,10 @@ fn control_commitment_digest(
     let header = slice.header();
     let provenance = header.provenance();
     let writer = control.writer_context();
-    let proof_digest = writer.proof().digest()?;
-    let (expected_tag, expected_revision) = match control.expected_active() {
-        ExpectedActive::None => (0_u16, 0_u64),
-        ExpectedActive::Revision(revision) => (1_u16, revision.value()),
+    let proof_envelope_digest = writer.proof().envelope_digest()?;
+    let (expected_tag, expected_slice_digest) = match control.expected_active() {
+        ExpectedActive::None => (0_u16, Digest32::from_bytes([0; 32])),
+        ExpectedActive::Exact(digest) => (1_u16, *digest.value()),
     };
 
     let mut builder = Digest32Builder::try_new(APPLY_CONTROL_COMMITMENT_DIGEST_DOMAIN)?;
@@ -491,9 +509,9 @@ fn control_commitment_digest(
     builder.field_digest(header.assignment_digest().value())?;
     builder.field_bytes(writer.writer().as_bytes())?;
     builder.field_u64(writer.epoch().value())?;
-    builder.field_digest(&proof_digest)?;
+    builder.field_digest(&proof_envelope_digest)?;
     builder.field_u16(expected_tag)?;
-    builder.field_u64(expected_revision)?;
+    builder.field_digest(&expected_slice_digest)?;
     builder.field_bytes(control.operation_id().as_bytes())?;
     Ok(builder.finish())
 }
@@ -509,6 +527,8 @@ pub enum ApplyContractError {
     WriterRefMismatch,
     /// Writer routing epoch does not match its authority proof.
     WriterEpochMismatch,
+    /// Writer proof scope does not match the slice provenance scope.
+    WriterScopeMismatch,
     /// Stored control commitment does not match slice and control fields.
     ControlCommitmentDigestMismatch,
 }
@@ -536,6 +556,9 @@ impl fmt::Display for ApplyContractError {
             Self::WriterEpochMismatch => {
                 formatter.write_str("writer epoch does not match tenure proof")
             }
+            Self::WriterScopeMismatch => {
+                formatter.write_str("writer proof scope does not match slice provenance")
+            }
             Self::ControlCommitmentDigestMismatch => {
                 formatter.write_str("apply control commitment does not match its fields")
             }
@@ -553,6 +576,7 @@ mod tests {
     use crate::provenance::{
         PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanDigest,
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
+        TargetSliceDigest,
     };
 
     use super::{
@@ -562,33 +586,77 @@ mod tests {
         WriterTenureProof,
     };
 
-    fn proof(scope: SourceScopeRef, writer: PlanWriterRef, epoch: u64) -> WriterTenureProof {
-        let Ok(algorithm) = TenureProofAlgorithm::try_new(1) else {
+    #[derive(Clone, Copy)]
+    struct ProofFixture {
+        authority_byte: u8,
+        key_byte: u8,
+        algorithm: u16,
+        algorithm_version: u16,
+        scope_byte: u8,
+        writer_byte: u8,
+        epoch: u64,
+        supersedes: u64,
+        nonce: &'static [u8],
+        signature: &'static [u8],
+    }
+
+    const fn proof_fixture() -> ProofFixture {
+        ProofFixture {
+            authority_byte: 7,
+            key_byte: 8,
+            algorithm: 1,
+            algorithm_version: 1,
+            scope_byte: 1,
+            writer_byte: 9,
+            epoch: 2,
+            supersedes: 1,
+            nonce: b"nonce",
+            signature: b"signature",
+        }
+    }
+
+    fn build_proof(fixture: ProofFixture) -> WriterTenureProof {
+        let Ok(algorithm) = TenureProofAlgorithm::try_new(fixture.algorithm) else {
             panic!("test algorithm must be valid");
         };
         let Ok(authority) = TenureProofAuthority::try_new(
-            TenureAuthorityRef::from_bytes([7; 16]),
-            TenureKeyRef::from_bytes([8; 16]),
+            TenureAuthorityRef::from_bytes([fixture.authority_byte; 16]),
+            TenureKeyRef::from_bytes([fixture.key_byte; 16]),
             algorithm,
-            1,
+            fixture.algorithm_version,
         ) else {
             panic!("test authority must be valid");
         };
         let Ok(claim) = WriterTenureClaim::try_new(
-            scope,
-            writer,
-            PlanWriterEpoch::new(epoch),
-            PlanWriterEpoch::new(epoch - 1),
+            SourceScopeRef::from_bytes([fixture.scope_byte; 16]),
+            PlanWriterRef::from_bytes([fixture.writer_byte; 16]),
+            PlanWriterEpoch::new(fixture.epoch),
+            PlanWriterEpoch::new(fixture.supersedes),
         ) else {
             panic!("test claim must be valid");
         };
-        let Ok(value) = WriterTenureProof::try_new(authority, claim, b"nonce", b"signature") else {
+        let Ok(proof) =
+            WriterTenureProof::try_new(authority, claim, fixture.nonce, fixture.signature)
+        else {
             panic!("test proof must be valid");
         };
-        value
+        proof
+    }
+
+    fn proof(scope: SourceScopeRef, writer: PlanWriterRef, epoch: u64) -> WriterTenureProof {
+        let mut fixture = proof_fixture();
+        fixture.scope_byte = scope.as_bytes()[0];
+        fixture.writer_byte = writer.as_bytes()[0];
+        fixture.epoch = epoch;
+        fixture.supersedes = epoch - 1;
+        build_proof(fixture)
     }
 
     fn slice(scope: SourceScopeRef) -> RuntimeSliceCommitment {
+        slice_with_assignment(scope, 6)
+    }
+
+    fn slice_with_assignment(scope: SourceScopeRef, assignment_byte: u8) -> RuntimeSliceCommitment {
         let provenance = PlanProvenance::new(
             scope,
             SourcePlanRef::from_bytes([2; 16]),
@@ -598,7 +666,7 @@ mod tests {
         let header = RuntimeSliceHeader::new(
             RuntimeHostId::from_bytes([5; 16]),
             provenance,
-            TargetAssignmentDigest::new(Digest32::from_bytes([6; 32])),
+            TargetAssignmentDigest::new(Digest32::from_bytes([assignment_byte; 32])),
         );
         let Ok(value) = RuntimeSliceCommitment::try_new(header) else {
             panic!("test slice must be valid");
@@ -606,25 +674,179 @@ mod tests {
         value
     }
 
-    fn payload(epoch: u64, operation: u8) -> RuntimeApplyControlCommitment {
+    fn payload_with_expected(
+        epoch: u64,
+        expected_active: ExpectedActive,
+        operation: u8,
+    ) -> RuntimeApplyControlCommitment {
         let scope = SourceScopeRef::from_bytes([1; 16]);
         let writer = PlanWriterRef::from_bytes([9; 16]);
-        let Ok(context) = PlanWriterContext::try_new(
-            writer,
-            PlanWriterEpoch::new(epoch),
+        commitment_from_parts(
+            slice(scope),
             proof(scope, writer, epoch),
-        ) else {
+            expected_active,
+            operation,
+        )
+    }
+
+    fn commitment_from_parts(
+        slice: RuntimeSliceCommitment,
+        proof: WriterTenureProof,
+        expected_active: ExpectedActive,
+        operation: u8,
+    ) -> RuntimeApplyControlCommitment {
+        let claim = proof.claim();
+        let Ok(context) = PlanWriterContext::try_new(claim.writer(), claim.epoch(), proof) else {
+            panic!("test writer context must be valid");
+        };
+        let control = RuntimeApplyControl::new(
+            context,
+            expected_active,
+            ApplyOperationId::from_bytes([operation; 16]),
+        );
+        let Ok(value) = RuntimeApplyControlCommitment::try_new(slice, control) else {
+            panic!("test control commitment must be valid");
+        };
+        value
+    }
+
+    fn payload(epoch: u64, operation: u8) -> RuntimeApplyControlCommitment {
+        payload_with_expected(epoch, ExpectedActive::None, operation)
+    }
+
+    #[test]
+    fn proof_envelope_has_a_stable_golden_vector() {
+        let Ok(digest) = build_proof(proof_fixture()).envelope_digest() else {
+            panic!("test proof fingerprint must build");
+        };
+        let expected = [
+            0x87, 0x59, 0xf9, 0x22, 0x1d, 0x37, 0xf3, 0x10, 0x8d, 0x6d, 0xf0, 0x43, 0x11, 0xc5,
+            0xbe, 0x90, 0x47, 0xa6, 0xee, 0x99, 0x41, 0x42, 0xc8, 0x4c, 0xe7, 0xcd, 0x27, 0x4a,
+            0xca, 0x19, 0xf5, 0x3f,
+        ];
+
+        assert_eq!(digest.as_bytes(), &expected);
+    }
+
+    #[test]
+    fn every_proof_envelope_field_is_committed() {
+        let Ok(baseline) = build_proof(proof_fixture()).envelope_digest() else {
+            panic!("baseline proof fingerprint must build");
+        };
+        let mut variations = [proof_fixture(); 10];
+        variations[0].authority_byte = 0x17;
+        variations[1].key_byte = 0x18;
+        variations[2].algorithm = 2;
+        variations[3].algorithm_version = 2;
+        variations[4].scope_byte = 0x11;
+        variations[5].writer_byte = 0x19;
+        variations[6].epoch = 3;
+        variations[7].supersedes = 0;
+        variations[8].nonce = b"noncf";
+        variations[9].signature = b"signaturf";
+
+        for changed in variations {
+            let Ok(changed_digest) = build_proof(changed).envelope_digest() else {
+                panic!("changed proof fingerprint must build");
+            };
+            assert_ne!(baseline, changed_digest);
+        }
+    }
+
+    #[test]
+    fn apply_control_has_stable_none_and_exact_vectors() {
+        let none = payload_with_expected(2, ExpectedActive::None, 0x0b);
+        let exact = payload_with_expected(
+            2,
+            ExpectedActive::Exact(TargetSliceDigest::new(Digest32::from_bytes([0x0a; 32]))),
+            0x0b,
+        );
+        let expected_none = [
+            0xc7, 0xf3, 0x4b, 0xed, 0xb0, 0x18, 0xae, 0xd6, 0x87, 0xf6, 0x13, 0xbf, 0xbc, 0x8e,
+            0x36, 0xbb, 0x13, 0xc6, 0xcc, 0x62, 0x18, 0x4d, 0x25, 0x66, 0xc7, 0x3d, 0x79, 0xe5,
+            0x41, 0x66, 0x51, 0x15,
+        ];
+        let expected_exact = [
+            0x1b, 0x91, 0x7b, 0xa6, 0x83, 0x27, 0x58, 0xd2, 0x72, 0x99, 0xd3, 0xaa, 0x32, 0x4f,
+            0x82, 0xb2, 0xca, 0xf3, 0x2c, 0x28, 0x41, 0x78, 0x10, 0x8e, 0x28, 0xd6, 0xaf, 0x97,
+            0xc5, 0x9b, 0x77, 0xd8,
+        ];
+
+        assert_eq!(none.commitment_digest().as_bytes(), &expected_none);
+        assert_eq!(exact.commitment_digest().as_bytes(), &expected_exact);
+        assert_ne!(none.commitment_digest(), exact.commitment_digest());
+    }
+
+    #[test]
+    fn apply_control_commits_exact_cas_proof_and_operation() {
+        let baseline = payload_with_expected(2, ExpectedActive::None, 0x0b);
+        let exact_zero = payload_with_expected(
+            2,
+            ExpectedActive::Exact(TargetSliceDigest::new(Digest32::from_bytes([0; 32]))),
+            0x0b,
+        );
+        let exact_value = payload_with_expected(
+            2,
+            ExpectedActive::Exact(TargetSliceDigest::new(Digest32::from_bytes([0x0a; 32]))),
+            0x0b,
+        );
+        let changed_operation = payload_with_expected(2, ExpectedActive::None, 0x1b);
+
+        let mut changed_proof_fixture = proof_fixture();
+        changed_proof_fixture.signature = b"signaturf";
+        let changed_proof = commitment_from_parts(
+            slice(SourceScopeRef::from_bytes([1; 16])),
+            build_proof(changed_proof_fixture),
+            ExpectedActive::None,
+            0x0b,
+        );
+
+        assert_ne!(baseline.commitment_digest(), exact_zero.commitment_digest());
+        assert_ne!(
+            exact_zero.commitment_digest(),
+            exact_value.commitment_digest()
+        );
+        assert_ne!(
+            baseline.commitment_digest(),
+            changed_operation.commitment_digest()
+        );
+        assert_ne!(
+            baseline.commitment_digest(),
+            changed_proof.commitment_digest()
+        );
+
+        let changed_slice = commitment_from_parts(
+            slice_with_assignment(SourceScopeRef::from_bytes([1; 16]), 0x16),
+            build_proof(proof_fixture()),
+            ExpectedActive::None,
+            0x0b,
+        );
+        assert_ne!(
+            baseline.commitment_digest(),
+            changed_slice.commitment_digest()
+        );
+    }
+
+    #[test]
+    fn apply_commitment_rejects_cross_scope_proof() {
+        let slice_scope = SourceScopeRef::from_bytes([1; 16]);
+        let proof_scope = SourceScopeRef::from_bytes([2; 16]);
+        let writer = PlanWriterRef::from_bytes([9; 16]);
+        let proof = proof(proof_scope, writer, 2);
+        let claim = proof.claim();
+        let Ok(context) = PlanWriterContext::try_new(claim.writer(), claim.epoch(), proof) else {
             panic!("test writer context must be valid");
         };
         let control = RuntimeApplyControl::new(
             context,
             ExpectedActive::None,
-            ApplyOperationId::from_bytes([operation; 16]),
+            ApplyOperationId::from_bytes([0x0b; 16]),
         );
-        let Ok(value) = RuntimeApplyControlCommitment::try_new(slice(scope), control) else {
-            panic!("test control commitment must be valid");
-        };
-        value
+
+        assert_eq!(
+            RuntimeApplyControlCommitment::try_new(slice(slice_scope), control).err(),
+            Some(super::ApplyContractError::WriterScopeMismatch)
+        );
     }
 
     #[test]

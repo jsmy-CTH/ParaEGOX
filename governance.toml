@@ -5,6 +5,7 @@ source_root = "src/paraegox"
 term_scan_roots = ["src", "crates", "configs"]
 exception_scan_roots = ["src", "crates", "tests", "scripts", ".github"]
 documentation_roots = ["README.md", "README_zh.md"]
+untracked_only_roots = ["docs"]
 allowed_top_level_directories = [".github", "configs", "crates", "docs", "scripts", "src", "tests"]
 ignored_top_level_directories = [".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "build", "dist", "target"]
 
@@ -76,7 +77,7 @@ tests = ["crates/paraegox-kernel/src/identity.rs"]
 
 [[registry.public_apis]]
 module = "paraegox_runtime_contracts::provenance"
-symbols = ["PlanProvenance", "RuntimeSliceHeader", "RuntimeSliceCommitment", "SourceScopeRef", "SourcePlanRef", "SourcePlanRevision", "SourcePlanDigest", "TargetAssignmentDigest", "TargetSliceDigest"]
+symbols = ["RUNTIME_SLICE_HEADER_VERSION", "PlanProvenance", "RuntimeSliceHeader", "RuntimeSliceCommitment", "SourceScopeRef", "SourcePlanRef", "SourcePlanRevision", "SourcePlanDigest", "TargetAssignmentDigest", "TargetSliceDigest", "ProvenanceContractError"]
 owner = "Runtime contract owner"
 consumers = ["paraegox-deployment", "paraegox-runtime"]
 compatibility = "Header version 1 and target-slice digest coverage are stable for composition into P2a; no serializer or wire ABI is published in B1."
@@ -84,10 +85,10 @@ tests = ["crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox
 
 [[registry.public_apis]]
 module = "paraegox_runtime_contracts::apply"
-symbols = ["RuntimeApplyControl", "RuntimeApplyControlCommitment", "PlanWriterContext", "WriterTenureProof", "ExpectedActive", "ApplyOperationId"]
+symbols = ["PlanWriterRef", "ApplyOperationId", "TenureAuthorityRef", "TenureKeyRef", "PlanWriterEpoch", "TenureProofAlgorithm", "TenureProofAuthority", "WriterTenureClaim", "WriterTenureProof", "TenureProofError", "PlanWriterContext", "ExpectedActive", "RuntimeApplyControl", "RuntimeApplyControlCommitment", "ApplyContractError"]
 owner = "Runtime contract owner"
 consumers = ["paraegox-deployment", "paraegox-runtime"]
-compatibility = "B1 non-temporal controls and their canonical commitment remain reusable; P2a composes assignments, temporal constraints, and authentication without mutating this contract."
+compatibility = "The B1 exact target-slice CAS, proof-envelope fingerprint, v1 digest framing, and golden outputs are stable; no signing transcript, serializer, or wire ABI is published."
 tests = ["crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-runtime/src/apply_state.rs"]
 
 [cargo]
