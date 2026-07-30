@@ -5,6 +5,7 @@ use paraegox_runtime_contracts::apply::WriterTenureProof;
 use paraegox_runtime_contracts::assignment::TargetAssignments;
 use paraegox_runtime_contracts::execution::TargetPlanAssignments;
 use paraegox_runtime_contracts::provenance::{SourcePlanDigest, TargetAssignmentDigest};
+use paraegox_runtime_contracts::thread_execution::TargetPlanAssignmentsV3;
 
 macro_rules! deployment_ref {
     ($name:ident, $documentation:literal) => {
@@ -222,6 +223,54 @@ impl CommittedTargetPlanProjection {
     /// Returns the complete PXTA and PXTE assignments projected for the target.
     #[must_use]
     pub const fn assignments(&self) -> &TargetPlanAssignments {
+        &self.assignments
+    }
+}
+
+/// One committed target projection carrying complete PXTA and additive Loop/Thread PXTE v2.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedTargetPlanProjectionV3 {
+    plan: CommittedPlanIdentity,
+    target: RuntimeHostId,
+    assignments: TargetPlanAssignmentsV3,
+}
+
+impl CommittedTargetPlanProjectionV3 {
+    /// Binds complete canonical binding and additive execution assignments to one target.
+    #[must_use]
+    pub fn new(
+        plan: CommittedPlanIdentity,
+        target: RuntimeHostId,
+        assignments: TargetPlanAssignmentsV3,
+    ) -> Self {
+        Self {
+            plan,
+            target,
+            assignments,
+        }
+    }
+
+    /// Returns committed source-plan identity.
+    #[must_use]
+    pub const fn plan(&self) -> CommittedPlanIdentity {
+        self.plan
+    }
+
+    /// Returns the target RuntimeHost.
+    #[must_use]
+    pub const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    /// Returns the v3 digest committing PXTA and additive PXTE v2.
+    #[must_use]
+    pub const fn assignment_digest(&self) -> TargetAssignmentDigest {
+        self.assignments.assignment_digest()
+    }
+
+    /// Returns complete PXTA and additive Loop/Thread execution assignments.
+    #[must_use]
+    pub const fn assignments(&self) -> &TargetPlanAssignmentsV3 {
         &self.assignments
     }
 }

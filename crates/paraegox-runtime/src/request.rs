@@ -8,6 +8,7 @@ use core::fmt;
 
 use paraegox_runtime_contracts::assignment::{RequestWireError, RuntimePlanSlice};
 use paraegox_runtime_contracts::execution::{RequestV2WireError, RuntimePlanSliceV2};
+use paraegox_runtime_contracts::thread_execution::{RequestV3WireError, RuntimePlanSliceV3};
 
 use crate::admission::{AdmissionDisposition, AdmissionError, AdmissionState, AdmissionTransition};
 use crate::apply_state::AdmittedApply;
@@ -95,11 +96,51 @@ impl RuntimeExecutionRequestAdmissionTransition {
     }
 }
 
+/// Pure admission result retaining the exact signed v3 Thread execution Slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeThreadExecutionRequestAdmissionTransition {
+    admission: AdmissionTransition,
+    slice: RuntimePlanSliceV3,
+}
+
+impl RuntimeThreadExecutionRequestAdmissionTransition {
+    pub(super) const fn new(admission: AdmissionTransition, slice: RuntimePlanSliceV3) -> Self {
+        Self { admission, slice }
+    }
+
+    #[must_use]
+    pub(crate) const fn next_state(&self) -> &AdmissionState {
+        self.admission.next_state()
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted(&self) -> &AdmittedApply {
+        self.admission.admitted()
+    }
+
+    #[must_use]
+    pub(crate) const fn slice(&self) -> &RuntimePlanSliceV3 {
+        &self.slice
+    }
+
+    #[must_use]
+    pub(crate) const fn disposition(&self) -> AdmissionDisposition {
+        self.admission.disposition()
+    }
+
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (AdmissionState, AdmittedApply, RuntimePlanSliceV3) {
+        let (state, admitted) = self.admission.into_parts();
+        (state, admitted, self.slice)
+    }
+}
+
 /// Fail-closed complete-request decoding or authenticated admission errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeRequestAdmissionError {
     RequestWire(RequestWireError),
     ExecutionRequestWire(RequestV2WireError),
+    ThreadExecutionRequestWire(RequestV3WireError),
     Admission(AdmissionError),
 }
 
@@ -112,6 +153,12 @@ impl From<RequestWireError> for RuntimeRequestAdmissionError {
 impl From<RequestV2WireError> for RuntimeRequestAdmissionError {
     fn from(value: RequestV2WireError) -> Self {
         Self::ExecutionRequestWire(value)
+    }
+}
+
+impl From<RequestV3WireError> for RuntimeRequestAdmissionError {
+    fn from(value: RequestV3WireError) -> Self {
+        Self::ThreadExecutionRequestWire(value)
     }
 }
 
@@ -129,6 +176,12 @@ impl fmt::Display for RuntimeRequestAdmissionError {
             }
             Self::ExecutionRequestWire(error) => {
                 write!(formatter, "execution apply request rejected: {error}")
+            }
+            Self::ThreadExecutionRequestWire(error) => {
+                write!(
+                    formatter,
+                    "thread execution apply request rejected: {error}"
+                )
             }
             Self::Admission(error) => write!(formatter, "signed apply admission rejected: {error}"),
         }

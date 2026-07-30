@@ -12,9 +12,11 @@ use paraegox_runtime_contracts::provenance::{
     PlanProvenance, ProvenanceContractError, RuntimeSliceHeader, SourcePlanRef, SourcePlanRevision,
     SourceScopeRef,
 };
+use paraegox_runtime_contracts::thread_execution::{RuntimePlanSliceV3, TargetPlanV3ContractError};
 
 use crate::plan::{
-    CommittedTargetPlanProjection, CommittedTargetProjection, DeploymentWriterTenure,
+    CommittedTargetPlanProjection, CommittedTargetPlanProjectionV3, CommittedTargetProjection,
+    DeploymentWriterTenure,
 };
 
 /// Projects a target-specific, tenure-neutral Runtime slice commitment.
@@ -69,6 +71,28 @@ pub fn project_runtime_plan_slice_v2(
         .map_err(ProjectionError::TargetPlan)
 }
 
+/// Projects a complete v3 target Slice from canonical PXTA and additive PXTE v2.
+pub fn project_runtime_plan_slice_v3(
+    projection: &CommittedTargetPlanProjectionV3,
+) -> Result<RuntimePlanSliceV3, ProjectionError> {
+    let plan = projection.plan();
+    let provenance = PlanProvenance::new(
+        SourceScopeRef::from_bytes(*plan.scope().as_bytes()),
+        SourcePlanRef::from_bytes(*plan.plan().as_bytes()),
+        SourcePlanRevision::new(plan.revision().value()),
+        plan.digest(),
+    );
+    let header = RuntimeSliceHeader::new(
+        projection.target(),
+        provenance,
+        projection.assignment_digest(),
+    );
+    let commitment =
+        RuntimeSliceCommitment::try_new(header).map_err(ProjectionError::Provenance)?;
+    RuntimePlanSliceV3::try_new(commitment, projection.assignments().clone())
+        .map_err(ProjectionError::TargetPlanV3)
+}
+
 /// Maps deployment writer ownership into a Runtime-owned apply-control commitment.
 pub fn build_runtime_apply_control_commitment(
     slice: RuntimeSliceCommitment,
@@ -94,6 +118,8 @@ pub enum ProjectionError {
     Assignment(AssignmentContractError),
     /// Composite binding/execution body did not match the projected commitment.
     TargetPlan(TargetPlanContractError),
+    /// Additive Loop/Thread target plan did not match the projected commitment.
+    TargetPlanV3(TargetPlanV3ContractError),
     /// Runtime apply-control construction failed.
     Apply(ApplyContractError),
 }
@@ -116,12 +142,21 @@ impl From<TargetPlanContractError> for ProjectionError {
     }
 }
 
+impl From<TargetPlanV3ContractError> for ProjectionError {
+    fn from(value: TargetPlanV3ContractError) -> Self {
+        Self::TargetPlanV3(value)
+    }
+}
+
 impl fmt::Display for ProjectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Provenance(error) => write!(formatter, "slice projection failed: {error}"),
             Self::Assignment(error) => write!(formatter, "assignment projection failed: {error}"),
             Self::TargetPlan(error) => write!(formatter, "target-plan projection failed: {error}"),
+            Self::TargetPlanV3(error) => {
+                write!(formatter, "v3 target-plan projection failed: {error}")
+            }
             Self::Apply(error) => write!(formatter, "apply-control mapping failed: {error}"),
         }
     }

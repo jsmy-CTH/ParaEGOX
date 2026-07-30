@@ -20,6 +20,7 @@ use paraegox_runtime_contracts::assignment::RuntimeApplyRequest;
 use paraegox_runtime_contracts::execution::RuntimeApplyRequestV2;
 use paraegox_runtime_contracts::provenance::SourceScopeRef;
 use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
+use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
 use paraegox_runtime_contracts::wire::{
     ApplyAuthAlgorithm, ApplyAuthKeyRef, EnvelopeContractError, RuntimeApplyEnvelope, WireError,
 };
@@ -27,7 +28,7 @@ use paraegox_runtime_contracts::wire::{
 use crate::apply_state::{AdmittedApply, VerifiedWriterTenure};
 use crate::request::{
     RuntimeExecutionRequestAdmissionTransition, RuntimeRequestAdmissionError,
-    RuntimeRequestAdmissionTransition,
+    RuntimeRequestAdmissionTransition, RuntimeThreadExecutionRequestAdmissionTransition,
 };
 
 /// Registry value for pure Ed25519 request and tenure signatures.
@@ -533,6 +534,23 @@ impl ApplyAdmission {
         ))
     }
 
+    /// Decodes and admits one v3 request whose signed Slice commits the exact
+    /// Loop and Thread execution plan. There is no older-version fallback.
+    pub(crate) fn admit_thread_execution_request(
+        &self,
+        frame: &[u8],
+        state: &AdmissionState,
+        reading: ClockReading,
+    ) -> Result<RuntimeThreadExecutionRequestAdmissionTransition, RuntimeRequestAdmissionError>
+    {
+        let request = RuntimeApplyRequestV3::decode(frame)?;
+        let slice = request.slice().clone();
+        let admission = self.admit_envelope(request.envelope().clone(), state, reading)?;
+        Ok(RuntimeThreadExecutionRequestAdmissionTransition::new(
+            admission, slice,
+        ))
+    }
+
     fn admit_envelope(
         &self,
         envelope: RuntimeApplyEnvelope,
@@ -950,6 +968,12 @@ impl std::error::Error for AdmissionError {}
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::time::Duration;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Instant;
+
     use ed25519_dalek::{Signer, SigningKey};
     use paraegox_kernel::digest::Digest32;
     use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
@@ -975,6 +999,7 @@ mod tests {
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
     };
     use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
+    use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
     use paraegox_runtime_contracts::wire::{
         ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
         MAX_RUNTIME_APPLY_ENVELOPE_BYTES, RuntimeApplyEnvelope, RuntimeApplyEnvelopeDraft,
@@ -996,10 +1021,18 @@ mod tests {
         ComponentCallbackOutcome, ComponentDispatchOutcome, ComponentRuntimeEpochs,
         SingleSubjectComponentRuntime,
     };
-    use crate::mailbox::{EnqueueOutcome, Mailbox, MessageId, PayloadHandle, ValidatedMessage};
+    use crate::mailbox::{
+        EnqueueOutcome, Mailbox, MessageId, PayloadHandle, TerminalReason, ValidatedMessage,
+    };
     use crate::port_binding::PortBinding;
     use crate::runtime_clock::RuntimeClock;
     use crate::task_registry::CancellationSource;
+    use crate::thread_component_runtime::{
+        PreparedThreadComponentRuntime, SynchronousThreadCard, ThreadCardFailure,
+        ThreadCardInputView, ThreadComponentDispatchOutcome, ThreadComponentPollOutcome,
+        TrustedSynchronousThreadCard, TrustedThreadCardImplementation,
+    };
+    use crate::thread_registry::RuntimeThreadRegistry;
 
     use super::{
         AdmissionConfigurationError, AdmissionDisposition, AdmissionError, AdmissionState,
@@ -1025,6 +1058,8 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/s3_runtime_apply_request_v1.json");
     const PYTHON_EXECUTION_REQUEST_FIXTURE_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s4_runtime_apply_request_v2.json");
+    const PYTHON_THREAD_EXECUTION_REQUEST_FIXTURE_JSON: &str =
+        include_str!("../../../tests/fixtures/wire/s5_runtime_apply_request_v3.json");
     // TEST-ONLY keys matching the independently encoded Python contract fixture.
     const PYTHON_FIXTURE_TENURE_SEED: [u8; 32] = [0x11; 32];
     const PYTHON_FIXTURE_REQUEST_SEED: [u8; 32] = [0x22; 32];
@@ -1061,6 +1096,35 @@ mod tests {
             CardImplementationRef::from_bytes([0xa2; 16]);
         const BOUND_DEFINITION_DIGEST: Digest32 = Digest32::from_bytes([0xa3; 32]);
         const BOUND_ARTIFACT_DIGEST: Digest32 = Digest32::from_bytes([0xa4; 32]);
+    }
+
+    struct AdmittedThreadFixtureCard {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SynchronousThreadCard for AdmittedThreadFixtureCard {
+        fn on_input(
+            &mut self,
+            cancellation: &crate::thread_domain::ThreadCancellation,
+            input: ThreadCardInputView<'_>,
+        ) -> Result<(), ThreadCardFailure> {
+            assert!(!cancellation.is_cancellation_requested());
+            assert_eq!(input.binding(), BindingId::from_bytes([0x32; 16]));
+            assert_eq!(input.mailbox(), MailboxRef::from_bytes([0x82; 16]));
+            assert_eq!(input.target_port(), PortRef::from_bytes([0x72; 16]));
+            assert_eq!(input.message_id(), MessageId::from_bytes([0xb4; 16]));
+            assert_eq!(input.payload(), &[0xb4]);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl TrustedSynchronousThreadCard for AdmittedThreadFixtureCard {
+        const BOUND_CARD_DEFINITION: CardDefinitionRef = CardDefinitionRef::from_bytes([0xb1; 16]);
+        const BOUND_CARD_IMPLEMENTATION: CardImplementationRef =
+            CardImplementationRef::from_bytes([0xb2; 16]);
+        const BOUND_DEFINITION_DIGEST: Digest32 = Digest32::from_bytes([0xb3; 32]);
+        const BOUND_ARTIFACT_DIGEST: Digest32 = Digest32::from_bytes([0xb4; 32]);
     }
 
     #[derive(Clone, Debug)]
@@ -1453,6 +1517,10 @@ mod tests {
 
     fn execution_request_fixture_hex_bytes(field: &str) -> Vec<u8> {
         fixture_document_hex_bytes(PYTHON_EXECUTION_REQUEST_FIXTURE_JSON, field)
+    }
+
+    fn thread_execution_request_fixture_hex_bytes(field: &str) -> Vec<u8> {
+        fixture_document_hex_bytes(PYTHON_THREAD_EXECUTION_REQUEST_FIXTURE_JSON, field)
     }
 
     fn fixture_document_hex_bytes(document: &str, field: &str) -> Vec<u8> {
@@ -2118,6 +2186,234 @@ mod tests {
                 .admit_execution_request(&v1, &AdmissionState::for_new_boundary(), reading)
                 .is_err(),
             "the v2 entry must never fall back to PXAR v1"
+        );
+    }
+
+    #[test]
+    fn python_thread_request_fixture_reaches_v3_admission_and_thread_component() {
+        let wire = thread_execution_request_fixture_hex_bytes("outer_wire_hex");
+        let expected_bindings = thread_execution_request_fixture_hex_bytes("pxta_body_hex");
+        let expected_execution = thread_execution_request_fixture_hex_bytes("pxte_v2_body_hex");
+        let expected_composite =
+            thread_execution_request_fixture_hex_bytes("composite_v3_digest_hex");
+        let expected_request_digest =
+            thread_execution_request_fixture_hex_bytes("request_digest_hex");
+        let s4_loop = execution_request_fixture_hex_bytes("pxte_body_hex");
+        let (admission, reading) = python_fixture_admission_and_reading();
+
+        let decoded = RuntimeApplyRequestV3::decode(&wire)
+            .unwrap_or_else(|error| panic!("independent v3 request must decode: {error}"));
+        assert_eq!(decoded.canonical_wire(), wire);
+        assert_eq!(
+            decoded.slice().assignments().bindings().canonical_wire(),
+            expected_bindings
+        );
+        let execution = decoded.slice().assignments().execution();
+        assert_eq!(execution.canonical_wire(), expected_execution);
+        assert_eq!(
+            execution
+                .loop_plan()
+                .unwrap_or_else(|| panic!("v3 fixture must retain the S4 Loop plan"))
+                .canonical_wire(),
+            s4_loop
+        );
+        assert_eq!(execution.executor_budget().max_total_threads(), 3);
+        assert_eq!(execution.executor_budget().framework_threads(), 2);
+        assert_eq!(execution.thread_domains().len(), 1);
+        assert_eq!(execution.thread_domains()[0].worker_count(), 1);
+        assert_eq!(execution.thread_mailbox_executions().len(), 1);
+        assert_eq!(
+            execution.thread_mailbox_executions()[0]
+                .requirements()
+                .native_thread_reservation(),
+            0
+        );
+
+        let transition = admission
+            .admit_thread_execution_request(&wire, &AdmissionState::for_new_boundary(), reading)
+            .unwrap_or_else(|error| panic!("independent v3 request must admit: {error}"));
+        assert_eq!(transition.disposition(), AdmissionDisposition::Fresh);
+        assert_eq!(transition.slice(), decoded.slice());
+        assert_eq!(
+            transition
+                .slice()
+                .assignments()
+                .assignment_digest()
+                .value()
+                .as_bytes()
+                .as_slice(),
+            expected_composite.as_slice()
+        );
+        assert_eq!(
+            transition.admitted().request_digest().as_bytes().as_slice(),
+            expected_request_digest.as_slice()
+        );
+        assert_eq!(transition.admitted().deadline().deadline().value(), 60);
+        assert_eq!(transition.next_state().tenure_nonce_count(), 1);
+        assert_eq!(transition.next_state().request_nonce_count(), 1);
+        assert_eq!(transition.next_state().temporal_lineage_count(), 1);
+
+        let thread_execution = transition
+            .slice()
+            .assignments()
+            .execution()
+            .thread_mailbox_executions()[0];
+        let binding = transition
+            .slice()
+            .assignments()
+            .bindings()
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|assignment| assignment.binding_id() == thread_execution.binding_id())
+            .unwrap_or_else(|| panic!("admitted Thread execution binding must exist"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let card_calls = Arc::clone(&calls);
+        let selected =
+            TrustedThreadCardImplementation::try_resolve::<AdmittedThreadFixtureCard, _>(
+                thread_execution,
+                move || AdmittedThreadFixtureCard { calls: card_calls },
+            )
+            .unwrap_or_else(|error| {
+                panic!("admitted Thread fixture implementation must resolve: {error}")
+            });
+        let runtime_clock = RuntimeClock::new(
+            reading.domain(),
+            reading.generation(),
+            reading.now().value(),
+        );
+        let prepared =
+            PreparedThreadComponentRuntime::try_new(transition.slice(), selected, runtime_clock)
+                .unwrap_or_else(|error| panic!("admitted Thread component must prepare: {error}"));
+        let executor_budget = transition
+            .slice()
+            .assignments()
+            .execution()
+            .executor_budget();
+        let mut registry = RuntimeThreadRegistry::try_new(executor_budget)
+            .unwrap_or_else(|error| panic!("signed executor registry must build: {error}"));
+        let domain_epoch = DomainEpoch::try_new(2)
+            .unwrap_or_else(|error| panic!("Thread fixture domain epoch must build: {error}"));
+        let handle = prepared
+            .install(&mut registry, domain_epoch)
+            .unwrap_or_else(|error| panic!("admitted Thread component must install: {error}"));
+
+        let dispatch = registry
+            .with_owner_mut(&handle, |component| {
+                let ingress = component.active_ingress().unwrap_or_else(|| {
+                    panic!("admitted Thread binding must activate in the registry")
+                });
+                let deadline = runtime_clock
+                    .deadline_after(BoundedDuration::from_nanos(1_000_000_000))
+                    .unwrap_or_else(|error| {
+                        panic!("Thread fixture message deadline must build: {error}")
+                    });
+                let payload = PayloadHandle::try_from_vec(vec![0xb4])
+                    .unwrap_or_else(|error| panic!("Thread fixture payload must build: {error}"));
+                let message = ValidatedMessage::new(
+                    MessageId::from_bytes([0xb4; 16]),
+                    binding.target_spec().schema(),
+                    binding.target_spec().interaction(),
+                    None,
+                    deadline,
+                    payload,
+                );
+                let offer = component
+                    .try_offer(ingress, message)
+                    .unwrap_or_else(|failure| {
+                        panic!("admitted Thread fixture offer failed: {}", failure.error())
+                    });
+                assert!(matches!(offer.outcome(), EnqueueOutcome::Admitted));
+                component.try_dispatch_once()
+            })
+            .unwrap_or_else(|error| panic!("Thread component registry visit failed: {error}"))
+            .unwrap_or_else(|error| panic!("admitted Thread dispatch failed: {error}"));
+        assert_eq!(dispatch, ThreadComponentDispatchOutcome::Started);
+
+        let completion_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let outcome = registry
+                .with_owner_mut(&handle, |component| component.poll_pending())
+                .unwrap_or_else(|error| panic!("Thread completion registry visit failed: {error}"))
+                .unwrap_or_else(|error| panic!("admitted Thread completion failed: {error}"));
+            match outcome {
+                ThreadComponentPollOutcome::Pending(_) => {
+                    assert!(
+                        Instant::now() < completion_deadline,
+                        "admitted Thread fixture did not complete"
+                    );
+                    thread::yield_now();
+                }
+                ThreadComponentPollOutcome::Completed {
+                    callback,
+                    terminal,
+                    expired,
+                } => {
+                    assert_eq!(callback, Ok(()));
+                    assert_eq!(terminal.reason(), TerminalReason::Completed);
+                    assert!(expired.is_empty());
+                    break;
+                }
+                ThreadComponentPollOutcome::NoInvocation { .. }
+                | ThreadComponentPollOutcome::LateRejected { .. }
+                | ThreadComponentPollOutcome::Panicked { .. } => {
+                    panic!("admitted Thread fixture must complete normally")
+                }
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        registry
+            .shutdown()
+            .unwrap_or_else(|error| panic!("admitted Thread registry shutdown failed: {error}"));
+        assert_eq!(registry.domain_count(), 0);
+        let zero = registry
+            .budget_snapshot()
+            .unwrap_or_else(|error| panic!("Thread registry zero snapshot failed: {error}"));
+        assert_eq!(zero.active_reservations(), 0);
+        assert_eq!(zero.managed_workers(), 0);
+        assert_eq!(zero.native_threads(), 0);
+
+        let v2 = execution_request_fixture_hex_bytes("outer_wire_hex");
+        assert!(
+            admission
+                .admit_thread_execution_request(&v2, &AdmissionState::for_new_boundary(), reading,)
+                .is_err(),
+            "the v3 entry must never fall back to PXAR v2"
+        );
+
+        let mut execution_tamper = wire.clone();
+        let last = execution_tamper
+            .last_mut()
+            .unwrap_or_else(|| panic!("v3 fixture must be nonempty"));
+        *last ^= 1;
+        assert!(
+            admission
+                .admit_thread_execution_request(
+                    &execution_tamper,
+                    &AdmissionState::for_new_boundary(),
+                    reading,
+                )
+                .is_err(),
+            "tampered PXTE v2 must fail before admission state changes"
+        );
+
+        let mut signature_tamper = wire;
+        let envelope_len = u32::from_be_bytes([
+            signature_tamper[6],
+            signature_tamper[7],
+            signature_tamper[8],
+            signature_tamper[9],
+        ]) as usize;
+        mutate_tlv(&mut signature_tamper[18..18 + envelope_len], 0x25);
+        assert!(
+            admission
+                .admit_thread_execution_request(
+                    &signature_tamper,
+                    &AdmissionState::for_new_boundary(),
+                    reading,
+                )
+                .is_err(),
+            "v3 outer framing must not bypass the existing request signature"
         );
     }
 

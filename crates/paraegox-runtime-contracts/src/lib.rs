@@ -5,4 +5,5 @@ pub mod assignment;
 pub mod execution;
 pub mod provenance;
 pub mod temporal;
+pub mod thread_execution;
 pub mod wire;

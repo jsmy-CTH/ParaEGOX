@@ -10,17 +10,21 @@ use paraegox_runtime_contracts::execution::{
     RuntimeApplyRequestV2, RuntimePlanSliceV2, TargetPlanContractError,
 };
 use paraegox_runtime_contracts::temporal::ApplyTemporalConstraint;
+use paraegox_runtime_contracts::thread_execution::{
+    RuntimeApplyRequestV3, RuntimePlanSliceV3, TargetPlanV3ContractError,
+};
 use paraegox_runtime_contracts::wire::{
     ApplyRequestAuthClaim, ApplyRequestSigningTranscript, EnvelopeContractError,
     RuntimeApplyEnvelopeDraft,
 };
 
 use crate::plan::{
-    CommittedTargetPlanProjection, CommittedTargetProjection, DeploymentWriterTenure,
+    CommittedTargetPlanProjection, CommittedTargetPlanProjectionV3, CommittedTargetProjection,
+    DeploymentWriterTenure,
 };
 use crate::projection::{
     ProjectionError, build_runtime_apply_control_commitment, project_runtime_plan_slice,
-    project_runtime_plan_slice_v2,
+    project_runtime_plan_slice_v2, project_runtime_plan_slice_v3,
 };
 
 /// Signature-independent complete request paired with its canonical Slice body.
@@ -74,6 +78,32 @@ impl RuntimeApplyRequestV2Draft {
     }
 }
 
+/// Signature-independent PXAR v3 request paired with complete PXTA and additive PXTE v2.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeApplyRequestV3Draft {
+    slice: RuntimePlanSliceV3,
+    envelope: RuntimeApplyEnvelopeDraft,
+}
+
+impl RuntimeApplyRequestV3Draft {
+    /// Returns the exact unchanged envelope transcript the external writer signs.
+    pub fn signing_transcript(&self) -> Result<ApplyRequestSigningTranscript, EnvelopeBuildError> {
+        self.envelope
+            .signing_transcript()
+            .map_err(EnvelopeBuildError::Envelope)
+    }
+
+    /// Finalizes the envelope and binds it to complete PXTA and additive PXTE v2.
+    pub fn finalize(self, signature: &[u8]) -> Result<RuntimeApplyRequestV3, EnvelopeBuildError> {
+        let envelope = self
+            .envelope
+            .finalize(signature)
+            .map_err(EnvelopeBuildError::Envelope)?;
+        RuntimeApplyRequestV3::try_new(envelope, self.slice)
+            .map_err(EnvelopeBuildError::TargetPlanV3Request)
+    }
+}
+
 /// Builds the complete signature-independent Runtime apply request.
 pub fn build_runtime_apply_request_draft(
     projection: &CommittedTargetProjection,
@@ -116,6 +146,27 @@ pub fn build_runtime_apply_request_v2_draft(
     Ok(RuntimeApplyRequestV2Draft { slice, envelope })
 }
 
+/// Builds the complete signature-independent PXAR v3 Runtime apply request.
+pub fn build_runtime_apply_request_v3_draft(
+    projection: &CommittedTargetPlanProjectionV3,
+    tenure: DeploymentWriterTenure,
+    expected_active: ExpectedActive,
+    operation_id: ApplyOperationId,
+    temporal: ApplyTemporalConstraint,
+    auth_claim: ApplyRequestAuthClaim,
+) -> Result<RuntimeApplyRequestV3Draft, EnvelopeBuildError> {
+    let slice = project_runtime_plan_slice_v3(projection)?;
+    let control_commitment = build_runtime_apply_control_commitment(
+        slice.commitment(),
+        tenure,
+        expected_active,
+        operation_id,
+    )?;
+    let envelope = RuntimeApplyEnvelopeDraft::try_new(control_commitment, temporal, auth_claim)
+        .map_err(EnvelopeBuildError::Envelope)?;
+    Ok(RuntimeApplyRequestV3Draft { slice, envelope })
+}
+
 /// Builds the signature-independent form of one canonical B2 apply envelope.
 ///
 /// The returned draft exposes the complete request-authentication transcript.
@@ -153,6 +204,8 @@ pub enum EnvelopeBuildError {
     Request(AssignmentContractError),
     /// PXAR v2 and its complete composite target plan failed validation.
     TargetPlanRequest(TargetPlanContractError),
+    /// PXAR v3 and its additive Loop/Thread target plan failed validation.
+    TargetPlanV3Request(TargetPlanV3ContractError),
 }
 
 impl From<ProjectionError> for EnvelopeBuildError {
@@ -169,6 +222,9 @@ impl fmt::Display for EnvelopeBuildError {
             Self::Request(error) => write!(formatter, "complete apply request failed: {error}"),
             Self::TargetPlanRequest(error) => {
                 write!(formatter, "complete v2 apply request failed: {error}")
+            }
+            Self::TargetPlanV3Request(error) => {
+                write!(formatter, "complete v3 apply request failed: {error}")
             }
         }
     }
@@ -206,22 +262,28 @@ mod tests {
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
     };
     use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
+    use paraegox_runtime_contracts::thread_execution::{
+        ExecutorBudgetSpec, RuntimeApplyRequestV3, TargetExecutionPlanV2, TargetPlanAssignmentsV3,
+        ThreadDispatchPolicy, ThreadDomainRef, ThreadDomainSpec, ThreadExecutionRequirements,
+        ThreadInvocationBudgets, ThreadMailboxExecutionSpec,
+    };
     use paraegox_runtime_contracts::wire::{
         ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim, RuntimeApplyEnvelope,
         RuntimeApplyEnvelopeDraft, WireErrorCode,
     };
 
     use crate::plan::{
-        CommittedPlanIdentity, CommittedTargetPlanProjection, CommittedTargetProjection,
-        DeploymentId, DeploymentRevision, DeploymentScopeId, DeploymentWriterEpoch,
-        DeploymentWriterRef, DeploymentWriterTenure,
+        CommittedPlanIdentity, CommittedTargetPlanProjection, CommittedTargetPlanProjectionV3,
+        CommittedTargetProjection, DeploymentId, DeploymentRevision, DeploymentScopeId,
+        DeploymentWriterEpoch, DeploymentWriterRef, DeploymentWriterTenure,
     };
     use crate::projection::{ProjectionError, build_runtime_apply_control_commitment};
 
     use super::{
         EnvelopeBuildError, RuntimeApplyRequestDraft, RuntimeApplyRequestV2Draft,
-        build_runtime_apply_envelope_draft, build_runtime_apply_request_draft,
-        build_runtime_apply_request_v2_draft,
+        RuntimeApplyRequestV3Draft, build_runtime_apply_envelope_draft,
+        build_runtime_apply_request_draft, build_runtime_apply_request_v2_draft,
+        build_runtime_apply_request_v3_draft,
     };
 
     // TEST-ONLY fixed seed. Production code never holds a tenure-authority signing key.
@@ -234,6 +296,8 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/s3_runtime_apply_request_v1.json");
     const S4_APPLY_VECTOR_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s4_runtime_apply_request_v2.json");
+    const S5_APPLY_VECTOR_JSON: &str =
+        include_str!("../../../tests/fixtures/wire/s5_runtime_apply_request_v3.json");
     const APPLY_ENVELOPE_MAGIC: &[u8] = b"ParaEGOX\0runtime-apply-envelope";
 
     struct TlvLocation {
@@ -252,6 +316,10 @@ mod tests {
 
     fn s4_fixture_hex(name: &str) -> Vec<u8> {
         fixture_document_hex(S4_APPLY_VECTOR_JSON, name)
+    }
+
+    fn s5_fixture_hex(name: &str) -> Vec<u8> {
+        fixture_document_hex(S5_APPLY_VECTOR_JSON, name)
     }
 
     fn assert_v2_rejection(
@@ -595,6 +663,81 @@ mod tests {
         )
     }
 
+    fn s5_projection(
+        drain_budget_nanos: u64,
+        native_threads: u32,
+        max_total_threads: u32,
+    ) -> CommittedTargetPlanProjectionV3 {
+        let s4_projection = s4_fixture_projection();
+        let Ok(domain) = ThreadDomainSpec::try_new(
+            ThreadDomainRef::from_bytes([0x92; 16]),
+            1,
+            BoundedDuration::from_nanos(2_000_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(drain_budget_nanos),
+        ) else {
+            panic!("S5 ThreadDomain fixture must be valid");
+        };
+        let subject = CardSubjectSpec::new(
+            CardDefinitionRef::from_bytes([0xb1; 16]),
+            CardImplementationRef::from_bytes([0xb2; 16]),
+            Digest32::from_bytes([0xb3; 32]),
+            Digest32::from_bytes([0xb4; 32]),
+            Digest32::from_bytes([0xb5; 32]),
+        );
+        let Ok(invocation_budgets) = ThreadInvocationBudgets::try_new(
+            BoundedDuration::from_nanos(500_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(500_000_000),
+            native_threads,
+        ) else {
+            panic!("S5 Thread invocation budgets must be valid");
+        };
+        let Ok(requirements) = ThreadExecutionRequirements::try_new(
+            CallModel::Synchronous,
+            WorkloadKind::Native,
+            BlockingRisk::Bounded,
+            RunBoundProvenance::Certified,
+            invocation_budgets,
+        ) else {
+            panic!("S5 Thread execution requirements must be valid");
+        };
+        let Ok(dispatch) = ThreadDispatchPolicy::try_new(DispatchClass::Stream, 3, 5, 2, 1) else {
+            panic!("S5 Thread dispatch policy must be valid");
+        };
+        let thread_mailbox = ThreadMailboxExecutionSpec::new(
+            BindingId::from_bytes([0x32; 16]),
+            MailboxRef::from_bytes([0x82; 16]),
+            InstanceRef::from_bytes([0x62; 16]),
+            ThreadDomainRef::from_bytes([0x92; 16]),
+            subject,
+            requirements,
+            dispatch,
+        );
+        let Ok(executor_budget) = ExecutorBudgetSpec::try_new(max_total_threads, 2) else {
+            panic!("S5 executor budget must be valid");
+        };
+        let Ok(execution) = TargetExecutionPlanV2::try_new(
+            Some(s4_projection.assignments().execution().clone()),
+            executor_budget,
+            vec![domain],
+            vec![thread_mailbox],
+        ) else {
+            panic!("S5 additive execution plan must be valid");
+        };
+        let Ok(assignments) = TargetPlanAssignmentsV3::try_new(
+            s4_projection.assignments().bindings().clone(),
+            execution,
+        ) else {
+            panic!("S5 composite target assignments must be valid");
+        };
+        CommittedTargetPlanProjectionV3::new(
+            s4_projection.plan(),
+            s4_projection.target(),
+            assignments,
+        )
+    }
+
     fn tenure(scope_byte: u8, epoch: u64) -> DeploymentWriterTenure {
         let writer = PlanWriterRef::from_bytes([9; 16]);
         let Ok(algorithm) = TenureProofAlgorithm::try_new(1) else {
@@ -769,6 +912,24 @@ mod tests {
         draft
     }
 
+    fn s5_complete_draft(
+        drain_budget_nanos: u64,
+        native_threads: u32,
+        max_total_threads: u32,
+    ) -> RuntimeApplyRequestV3Draft {
+        let Ok(draft) = build_runtime_apply_request_v3_draft(
+            &s5_projection(drain_budget_nanos, native_threads, max_total_threads),
+            tenure(0x01, 1),
+            ExpectedActive::None,
+            ApplyOperationId::from_bytes([0x0d; 16]),
+            temporal(60),
+            auth_claim(b"test-only-request-nonce"),
+        ) else {
+            panic!("production producer must build the S5 v3 request");
+        };
+        draft
+    }
+
     fn sign_and_finalize(draft: RuntimeApplyEnvelopeDraft) -> RuntimeApplyEnvelope {
         let Ok(transcript) = draft.signing_transcript() else {
             panic!("test request transcript must be valid");
@@ -805,6 +966,24 @@ mod tests {
         let signature = SigningKey::from_bytes(&TEST_ONLY_WRITER_SEED).sign(transcript.as_bytes());
         let Ok(request) = draft.finalize(&signature.to_bytes()) else {
             panic!("complete signed v2 request must finalize");
+        };
+        request
+    }
+
+    fn sign_complete_v3(draft: RuntimeApplyRequestV3Draft) -> RuntimeApplyRequestV3 {
+        let Ok(transcript) = draft.signing_transcript() else {
+            panic!("complete v3 request transcript must be valid");
+        };
+        let writer_signing_key = SigningKey::from_bytes(&TEST_ONLY_WRITER_SEED);
+        let signature = writer_signing_key.sign(transcript.as_bytes());
+        assert!(
+            writer_signing_key
+                .verifying_key()
+                .verify_strict(transcript.as_bytes(), &signature)
+                .is_ok()
+        );
+        let Ok(request) = draft.finalize(&signature.to_bytes()) else {
+            panic!("complete signed v3 request must finalize");
         };
         request
     }
@@ -984,6 +1163,127 @@ mod tests {
             panic!("independent canonical S4 fixture must decode through Rust");
         };
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn production_v3_producer_exactly_matches_independent_s5_fixture() {
+        let expected_outer = s5_fixture_hex("outer_wire_hex");
+        let expected_bindings = s5_fixture_hex("pxta_body_hex");
+        let expected_loop = s5_fixture_hex("embedded_pxte_v1_body_hex");
+        let expected_execution = s5_fixture_hex("pxte_v2_body_hex");
+        let expected_execution_digest = s5_fixture_hex("pxte_v2_digest_hex");
+        let expected_composite_digest = s5_fixture_hex("composite_v3_digest_hex");
+        let expected_request_digest = s5_fixture_hex("request_digest_hex");
+        let first = sign_complete_v3(s5_complete_draft(1_000_000_000, 0, 3));
+        let second = sign_complete_v3(s5_complete_draft(1_000_000_000, 0, 3));
+
+        assert_eq!(first, second);
+        assert_eq!(first.canonical_wire(), expected_outer);
+        assert_eq!(
+            first.slice().assignments().bindings().canonical_wire(),
+            expected_bindings
+        );
+        assert_eq!(first.slice().assignments().bindings().len(), 2);
+        let Some(loop_plan) = first.slice().assignments().execution().loop_plan() else {
+            panic!("S5 additive execution must retain the unchanged Loop plan");
+        };
+        assert_eq!(loop_plan.canonical_wire(), expected_loop);
+        assert_eq!(loop_plan.mailbox_executions().len(), 1);
+        assert_eq!(
+            first.slice().assignments().execution().canonical_wire(),
+            expected_execution
+        );
+        assert_eq!(
+            first
+                .slice()
+                .assignments()
+                .execution()
+                .execution_digest()
+                .value()
+                .as_bytes()
+                .as_slice(),
+            expected_execution_digest.as_slice()
+        );
+        assert_eq!(
+            first
+                .slice()
+                .assignments()
+                .execution()
+                .thread_domains()
+                .len(),
+            1
+        );
+        assert_eq!(
+            first
+                .slice()
+                .assignments()
+                .execution()
+                .thread_mailbox_executions()
+                .len(),
+            1
+        );
+        assert_eq!(
+            first.slice().assignments().assignment_digest(),
+            first
+                .envelope()
+                .control_commitment()
+                .slice()
+                .header()
+                .assignment_digest()
+        );
+        assert_eq!(
+            first
+                .slice()
+                .assignments()
+                .assignment_digest()
+                .value()
+                .as_bytes()
+                .as_slice(),
+            expected_composite_digest.as_slice()
+        );
+        assert_eq!(
+            first.request_digest().as_bytes().as_slice(),
+            expected_request_digest.as_slice()
+        );
+        let Ok(decoded) = RuntimeApplyRequestV3::decode(first.canonical_wire()) else {
+            panic!("production v3 canonical request must decode");
+        };
+        assert_eq!(decoded, first);
+        assert_eq!(
+            decoded.request_digest(),
+            decoded.envelope().request_digest()
+        );
+    }
+
+    #[test]
+    fn v3_thread_plan_field_changes_rebind_digest_transcript_and_signature() {
+        let baseline = sign_complete_v3(s5_complete_draft(1_000_000_000, 0, 4));
+        let drain_changed = sign_complete_v3(s5_complete_draft(2_000_000_000, 0, 4));
+        let native_changed = sign_complete_v3(s5_complete_draft(1_000_000_000, 1, 4));
+
+        for changed in [&drain_changed, &native_changed] {
+            assert_ne!(
+                baseline
+                    .slice()
+                    .assignments()
+                    .execution()
+                    .execution_digest(),
+                changed.slice().assignments().execution().execution_digest()
+            );
+            assert_ne!(
+                baseline.slice().assignments().assignment_digest(),
+                changed.slice().assignments().assignment_digest()
+            );
+            assert_ne!(
+                baseline.slice().commitment().target_slice_digest(),
+                changed.slice().commitment().target_slice_digest()
+            );
+            assert_ne!(baseline.request_digest(), changed.request_digest());
+            assert_ne!(
+                baseline.envelope().authentication().signature(),
+                changed.envelope().authentication().signature()
+            );
+        }
     }
 
     #[test]

@@ -54,7 +54,10 @@ local_epoch!(
     RuntimeHostEpoch,
     "One RuntimeHost process-incarnation epoch."
 );
-local_epoch!(DomainEpoch, "One RuntimeHost-owned LoopDomain generation.");
+local_epoch!(
+    DomainEpoch,
+    "One RuntimeHost-owned execution-domain generation."
+);
 local_epoch!(
     InstanceGeneration,
     "One generation of a planned Card instance."

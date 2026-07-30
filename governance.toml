@@ -19,7 +19,7 @@ id = "GOV-WAIVER-0001"
 rule_id = "rust:expect"
 scope = "crates/paraegox-runtime/src/lib.rs"
 owner = "Runtime apply admission and state owner"
-reason = "Keep the admitted B2/P2a state mechanisms, S4/P2b single-subject component composition, and fixed two-CoreService lifecycle evidence private until the P2e Runtime apply endpoint and assembly owner become their executable consumer. The S4 binary consumes only the reactor/task/clock bootstrap, while canonical component and fixed lifecycle composition remain L2 evidence; remove or narrow this expectation in P2e."
+reason = "Keep the admitted B2/P2a state mechanisms, S4/P2b Loop composition, S5/P2c ThreadDomain/ExecutorBudget composition, and fixed two-CoreService lifecycle evidence private until the P2e Runtime apply endpoint and assembly owner become their executable consumer. The binary consumes only the reactor/task/clock bootstrap, while canonical component and fixed lifecycle composition remain L2 evidence; remove or narrow this expectation in P2e."
 expires_at = "2026-09-30"
 
 [[registry.waivers]]
@@ -45,29 +45,29 @@ removal_condition = "Removal requires migrating every registered mechanism consu
 path = "crates/paraegox-runtime-contracts"
 cargo_package = "paraegox-runtime-contracts"
 owner = "Runtime contract owner"
-responsibility = "Source-plan provenance, canonical PXTA binding assignments, canonical PXTE inbound-Mailbox-driven Loop-subset assignments and their v2 composite target digest, complete PXAR v1/v2 Runtime apply requests, B1 apply-control commitments, writer-tenure signing and fingerprints, temporal constraints, and the canonical B2 signed apply-envelope wire contract; this package does not model a general execution plan or source-only Cards with no input Mailbox."
+responsibility = "Source-plan provenance, canonical PXTA binding assignments, canonical PXTE v1 Loop and additive PXTE v2 Loop+Thread inbound-Mailbox assignments, v2/v3 composite target digests, complete PXAR v1/v2/v3 Runtime apply requests, B1 apply-control commitments, writer-tenure signing and fingerprints, temporal constraints, and the canonical B2 signed apply-envelope wire contract; this package does not model a general execution plan or source-only Cards with no input Mailbox."
 status = "public"
-public_entrypoints = ["paraegox_runtime_contracts::assignment", "paraegox_runtime_contracts::execution", "paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply", "paraegox_runtime_contracts::temporal", "paraegox_runtime_contracts::wire"]
+public_entrypoints = ["paraegox_runtime_contracts::assignment", "paraegox_runtime_contracts::execution", "paraegox_runtime_contracts::thread_execution", "paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply", "paraegox_runtime_contracts::temporal", "paraegox_runtime_contracts::wire"]
 consumers = ["paraegox-deployment", "paraegox-runtime"]
-first_tests = ["crates/paraegox-runtime-contracts/src/assignment.rs", "crates/paraegox-runtime-contracts/src/execution.rs", "crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs"]
+first_tests = ["crates/paraegox-runtime-contracts/src/assignment.rs", "crates/paraegox-runtime-contracts/src/execution.rs", "crates/paraegox-runtime-contracts/src/thread_execution.rs", "crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs", "tests/contract/test_s5_runtime_thread_execution_request.py"]
 removal_condition = "Removal requires replacing both the independent Deployment producer and Runtime consumer in one accepted contract migration."
 
 [[registry.packages]]
 path = "crates/paraegox-runtime"
 cargo_package = "paraegox-runtime"
 owner = "Runtime apply admission and state owner"
-responsibility = "Signed-request admission and apply-control transitions, bounded Mailbox and PortBinding, plus the S4 current-thread RuntimeHost reactor, structured task owner, LoopDomain dispatch, trusted internal Card callback seam, private single-subject L2 component composition, and a private fixed provider-consumer two-CoreService lifecycle owner with bounded readiness and cleanup facts; these L2 paths are not yet consumed by an apply endpoint, do not implement a general ServiceDependencyGraph, and this package has no ThreadDomain, ProcessDomain, durable journal, Fabric, Controller, or full RuntimeAssemblyEngine."
+responsibility = "Signed-request admission and apply-control transitions, bounded Mailbox and PortBinding, the current-thread RuntimeHost reactor and structured task owner, S4 LoopDomain dispatch, and S5 RuntimeHost-owned ExecutorBudget/ThreadDomain with fixed workers, permit-before-dequeue, signed timeout fencing, wedged capacity retention, joined-worker proof, and private single-subject trusted synchronous Card composition; it also contains a private fixed provider-consumer two-CoreService lifecycle owner. These L2 paths are not yet consumed by an apply endpoint, native-pool adapters remain fail-closed, and the trusted Card factory plus pre-install failure Drop remain finite same-build synchronous assumptions until P2e. This package has no ProcessDomain, durable journal, Fabric, Controller, or full RuntimeAssemblyEngine."
 status = "experimental"
 public_entrypoints = ["paraegox_runtime::run_runtime_host_process"]
 consumers = ["paraegox-runtime-host"]
-first_tests = ["crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs", "crates/paraegox-runtime/src/request.rs", "crates/paraegox-runtime/src/mailbox.rs", "crates/paraegox-runtime/src/port_binding.rs", "crates/paraegox-runtime/src/runtime_clock.rs", "crates/paraegox-runtime/src/task_registry.rs", "crates/paraegox-runtime/src/dispatcher.rs", "crates/paraegox-runtime/src/loop_domain.rs", "crates/paraegox-runtime/src/card_instance.rs", "crates/paraegox-runtime/src/card_executor.rs", "crates/paraegox-runtime/src/component_runtime.rs", "crates/paraegox-runtime/src/core_service.rs", "crates/paraegox-runtime/src/runtime_host.rs"]
+first_tests = ["crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs", "crates/paraegox-runtime/src/request.rs", "crates/paraegox-runtime/src/mailbox.rs", "crates/paraegox-runtime/src/port_binding.rs", "crates/paraegox-runtime/src/runtime_clock.rs", "crates/paraegox-runtime/src/task_registry.rs", "crates/paraegox-runtime/src/dispatcher.rs", "crates/paraegox-runtime/src/loop_domain.rs", "crates/paraegox-runtime/src/card_instance.rs", "crates/paraegox-runtime/src/card_executor.rs", "crates/paraegox-runtime/src/component_runtime.rs", "crates/paraegox-runtime/src/thread_component_runtime.rs", "crates/paraegox-runtime/src/executor_budget.rs", "crates/paraegox-runtime/src/thread_domain.rs", "crates/paraegox-runtime/src/thread_registry.rs", "crates/paraegox-runtime/src/core_service.rs", "crates/paraegox-runtime/src/runtime_host.rs"]
 removal_condition = "Removal requires replacing the executable consumer and the proven canonical-request to bounded LoopDomain ownership path without adding a second desired-state, task, or payload-queue owner."
 
 [[registry.packages]]
 path = "crates/paraegox-runtime-host"
 cargo_package = "paraegox-runtime-host"
 owner = "RuntimeHost process owner"
-responsibility = "Minimal executable composition root for the single S4 RuntimeHost reactor and process shutdown signal; it does not own Deployment planning, a second apply input, Card configuration, Fabric, or persistence."
+responsibility = "Minimal executable composition root for the single RuntimeHost reactor and process shutdown signal; S5 adds only crate-private root ownership and cleanup evidence for planned ThreadDomains, while the public process remains idle and owns no Deployment planning, apply input, Card configuration, Fabric, or persistence."
 status = "internal"
 public_entrypoints = []
 consumers = []
@@ -78,7 +78,7 @@ removal_condition = "Remove only when another admitted OS-managed executable bec
 path = "crates/paraegox-deployment"
 cargo_package = "paraegox-deployment"
 owner = "Deployment projection and apply-envelope owner"
-responsibility = "Pure projection from committed deployment identities and canonical target assignments into complete Runtime slices and signature-independent apply-request drafts; signing keys and I/O remain caller-owned."
+responsibility = "Pure projection from committed deployment identities and canonical target assignments plus Loop/Thread execution plans into complete Runtime slices and signature-independent PXAR v1/v2/v3 apply-request drafts; signing keys and I/O remain caller-owned."
 status = "enabler"
 public_entrypoints = []
 consumers = []
@@ -156,6 +156,14 @@ owner = "Runtime execution contract owner"
 consumers = ["paraegox-deployment", "paraegox-runtime"]
 compatibility = "PXTE v1 fixes bounded big-endian 64-byte LoopDomain and 236-byte Mailbox execution records, canonical ordering, enum values, digest framing, bounds, and stable rejection codes for the inbound-Mailbox-driven Loop-eligible subset. PXAR v2 strictly frames one unchanged signed envelope, one PXTA v1 body, and one PXTE v1 body with three explicit lengths and no v1/v2 fallback; its explicit v2 composite digest commits the PXTA and PXTE digests through the existing Slice assignment-digest field. PXTA may be a superset, but records absent from PXTE remain execution-inert and grant no CardInstance, LoopDomain, callback, dispatcher, or Task authority. Loop admission requires cooperative async I/O or routing, no blocking risk, measured or certified run bounds, CooperativeCancel or Escalate overrun handling, total arrivals-times-(run-plus-cleanup) utilization within the common capacity window, control utilization within reserved capacity, and a strict scheduler-independent Control start bound derived across the signed PXTA/PXTE plan. MailboxExecutionSpec introduces subjects only for this inbound-Mailbox-driven subset: source-only Cards with no input Mailbox are not expressible, so these types are not a general or complete execution-plan contract. Incompatible framing, digest, eligibility, or scope changes require new explicit versions and domains."
 tests = ["crates/paraegox-runtime-contracts/src/execution.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-deployment/src/envelope.rs", "crates/paraegox-runtime/src/admission.rs", "tests/contract/test_s4_runtime_execution_request.py", "tests/fixtures/wire/s4_runtime_apply_request_v2.json"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime_contracts::thread_execution"
+symbols = ["TARGET_EXECUTION_PLAN_V2_VERSION", "RUNTIME_APPLY_REQUEST_V3_VERSION", "MAX_THREAD_DOMAINS", "MAX_THREAD_MAILBOX_EXECUTIONS", "MAX_EXECUTOR_THREADS", "MAX_TARGET_EXECUTION_PLAN_V2_BYTES", "MAX_RUNTIME_APPLY_REQUEST_V3_BYTES", "ThreadDomainRef", "TargetExecutionDigestV2", "ExecutorBudgetSpec", "ThreadDomainSpec", "ThreadInvocationBudgets", "ThreadExecutionRequirements", "ThreadDispatchPolicy", "ThreadMailboxExecutionSpec", "TargetExecutionPlanV2", "TargetPlanAssignmentsV3", "RuntimePlanSliceV3", "RuntimeApplyRequestV3", "ThreadExecutionContractError", "TargetPlanV3ContractError", "ThreadExecutionRecordSection", "ThreadExecutionWireErrorCode", "ThreadExecutionWireError", "TargetPlanV3WireErrorCode", "RequestV3WireErrorCode", "RequestV3WireError"]
+owner = "Runtime Thread execution contract owner"
+consumers = ["paraegox-deployment", "paraegox-runtime"]
+compatibility = "PXTE v2 additively embeds one byte-exact optional PXTE v1 Loop body and fixes bounded big-endian ThreadDomain and Thread Mailbox records, global framework/worker/distinct-instance-native budgeting, utilization, exact PXTA references, Loop/Thread identity separation, canonical ordering, digest framing, and stable rejection codes. PXAR v3 strictly frames one unchanged signed envelope, PXTA v1, and PXTE v2 with no older-version fallback; its v3 composite digest commits both canonical bodies through the existing signed Slice field. Runtime execution currently admits only the trusted single-subject one-worker zero-native profile; wider workers and nonzero native pools remain valid desired-state contracts but fail closed until an admitted Runtime owner exists. Incompatible framing, digest, eligibility, or scope changes require new explicit versions and domains."
+tests = ["crates/paraegox-runtime-contracts/src/thread_execution.rs", "crates/paraegox-deployment/src/envelope.rs", "crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/thread_component_runtime.rs", "tests/contract/test_s5_runtime_thread_execution_request.py", "tests/fixtures/wire/s5_runtime_apply_request_v3.json"]
 
 [[registry.public_apis]]
 module = "paraegox_runtime"

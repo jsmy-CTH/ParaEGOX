@@ -1,8 +1,8 @@
 //! Controlled current-thread reactor process owned by RuntimeHost.
 //!
-//! S4 exposes only the executable bootstrap substrate and internal component
-//! harness. It does not expose an apply endpoint, claim an active Deployment
-//! revision, or create a public standalone Card runner.
+//! The executable exposes only the bootstrap substrate; S4 Loop and S5 Thread
+//! component paths remain crate-private Harnesses. It does not expose an apply
+//! endpoint, claim an active Deployment revision, or create a public Card runner.
 
 use core::fmt;
 use core::future::Future;
@@ -27,6 +27,7 @@ use crate::task_registry::{
     CancellationSource, RuntimeTaskKind, TaskCompletion, TaskOutcome, TaskRegistry,
     TaskRegistryError,
 };
+use crate::thread_registry::{RuntimeThreadRegistry, ThreadRegistryError};
 
 const RUNTIME_CLOCK_DOMAIN: ClockDomainRef = ClockDomainRef::from_bytes(*b"PX-runtime-clock");
 const RUNTIME_CLOCK_GENERATION: u64 = 1;
@@ -155,7 +156,7 @@ type CoreServiceLifecycleFactory = Box<
         + 'static,
 >;
 
-/// Starts the S4 RuntimeHost reactor and waits for the process shutdown signal.
+/// Starts the RuntimeHost reactor and waits for the process shutdown signal.
 ///
 /// This process is intentionally idle until a later admitted control adapter
 /// supplies canonical apply requests. Starting it proves the single owned
@@ -241,6 +242,7 @@ where
 struct RuntimeHostScope {
     clock: RuntimeClock,
     tasks: TaskRegistry<RuntimeOwnedTaskResult>,
+    thread_domains: Option<RuntimeThreadRegistry>,
 }
 
 impl RuntimeHostScope {
@@ -253,6 +255,7 @@ impl RuntimeHostScope {
         Ok(Self {
             clock: RuntimeClock::new(RUNTIME_CLOCK_DOMAIN, generation, 0),
             tasks: TaskRegistry::new(maximum),
+            thread_domains: None,
         })
     }
 
@@ -394,7 +397,16 @@ impl RuntimeHostScope {
 
     async fn shutdown(&mut self) -> Result<(), RuntimeHostProcessError> {
         let report = self.tasks.shutdown(ROOT_CLEANUP_BUDGET).await;
-        if !self.tasks.is_empty() {
+        let task_leak = !self.tasks.is_empty();
+        let thread_cleanup = self
+            .thread_domains
+            .as_mut()
+            .map(RuntimeThreadRegistry::shutdown)
+            .transpose();
+        if let Err(error) = thread_cleanup {
+            return Err(thread_cleanup_error(error));
+        }
+        if task_leak {
             return Err(RuntimeHostProcessError::OwnedTaskLeak);
         }
         let forced = report.forced();
@@ -553,6 +565,8 @@ pub enum RuntimeHostProcessError {
     OwnedComponentNonZeroCleanup,
     OwnedCoreServiceTaskFailed,
     OwnedCoreServiceNonZeroCleanup,
+    OwnedThreadDomainFailed,
+    OwnedThreadDomainNonZeroCleanup,
     OwnedTaskExitedEarly,
     OwnedTaskForcedAbort,
     OwnedTaskLeak,
@@ -589,6 +603,12 @@ impl fmt::Display for RuntimeHostProcessError {
             Self::OwnedCoreServiceNonZeroCleanup => formatter.write_str(
                 "the owned fixed CoreService lifecycle returned nonzero cleanup evidence",
             ),
+            Self::OwnedThreadDomainFailed => {
+                formatter.write_str("an owned ThreadDomain lifecycle failed")
+            }
+            Self::OwnedThreadDomainNonZeroCleanup => {
+                formatter.write_str("an owned ThreadDomain retained live or unjoined OS workers")
+            }
             Self::OwnedTaskExitedEarly => {
                 formatter.write_str("an owned RuntimeHost task exited before external shutdown")
             }
@@ -615,9 +635,36 @@ impl std::error::Error for RuntimeHostProcessError {
             | Self::OwnedComponentNonZeroCleanup
             | Self::OwnedCoreServiceTaskFailed
             | Self::OwnedCoreServiceNonZeroCleanup
+            | Self::OwnedThreadDomainFailed
+            | Self::OwnedThreadDomainNonZeroCleanup
             | Self::OwnedTaskExitedEarly
             | Self::OwnedTaskForcedAbort
             | Self::OwnedTaskLeak => None,
+        }
+    }
+}
+
+fn thread_cleanup_error(error: ThreadRegistryError) -> RuntimeHostProcessError {
+    match error {
+        ThreadRegistryError::DrainIncomplete => {
+            RuntimeHostProcessError::OwnedThreadDomainNonZeroCleanup
+        }
+        ThreadRegistryError::Budget(_)
+        | ThreadRegistryError::Observation(_)
+        | ThreadRegistryError::DomainBuild(_)
+        | ThreadRegistryError::Domain(_)
+        | ThreadRegistryError::InvalidDomainConfiguration
+        | ThreadRegistryError::ExecutorPlanMismatch
+        | ThreadRegistryError::NativeOwnerUnavailable
+        | ThreadRegistryError::DomainCapacityExhausted
+        | ThreadRegistryError::DomainAlreadyOwned
+        | ThreadRegistryError::DomainNotOwned
+        | ThreadRegistryError::HandleOwnerMismatch
+        | ThreadRegistryError::HandleTypeMismatch
+        | ThreadRegistryError::ObservedCounterOverflow
+        | ThreadRegistryError::OwnerCleanupFailed
+        | ThreadRegistryError::StateInconsistent => {
+            RuntimeHostProcessError::OwnedThreadDomainFailed
         }
     }
 }
@@ -628,6 +675,7 @@ mod tests {
     use core::time::Duration;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Instant;
 
     use ed25519_dalek::SigningKey;
     use paraegox_kernel::digest::Digest32;
@@ -643,6 +691,9 @@ mod tests {
         CardDefinitionRef, CardImplementationRef, MailboxExecutionSpec, RuntimePlanSliceV2,
     };
     use paraegox_runtime_contracts::provenance::SourceScopeRef;
+    use paraegox_runtime_contracts::thread_execution::{
+        ExecutorBudgetSpec, ThreadDomainRef, ThreadDomainSpec,
+    };
     use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
     use super::{
@@ -673,6 +724,8 @@ mod tests {
     };
     use crate::mailbox::{EnqueueOutcome, MessageId, PayloadHandle, ValidatedMessage};
     use crate::task_registry::RuntimeTaskKind;
+    use crate::thread_domain::{ThreadCompletion, ThreadDomainLifecycle};
+    use crate::thread_registry::RuntimeThreadRegistry;
 
     const PYTHON_EXECUTION_REQUEST_FIXTURE_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s4_runtime_apply_request_v2.json");
@@ -1520,6 +1573,90 @@ mod tests {
             },)
             .is_ok()
         );
+    }
+
+    #[test]
+    fn root_scope_directly_owns_and_joins_the_planned_thread_inventory() {
+        let caller = thread::current().id();
+        let observed_worker = Arc::new(Mutex::new(None));
+        let worker_fact = Arc::clone(&observed_worker);
+
+        let result = run_reactor_until_with_setup(async { Ok(()) }, move |scope| {
+            let budget = ExecutorBudgetSpec::try_new(2, 1)
+                .unwrap_or_else(|error| panic!("fixture executor budget failed: {error}"));
+            scope.thread_domains = Some(
+                RuntimeThreadRegistry::try_new(budget)
+                    .unwrap_or_else(|error| panic!("fixture registry failed: {error}")),
+            );
+            let registry = scope
+                .thread_domains
+                .as_mut()
+                .unwrap_or_else(|| panic!("thread registry must remain root-owned"));
+            let domain_spec = ThreadDomainSpec::try_new(
+                ThreadDomainRef::from_bytes([0xf1; 16]),
+                1,
+                BoundedDuration::from_nanos(1_000_000_000),
+                BoundedDuration::from_nanos(1_000_000_000),
+                BoundedDuration::from_nanos(1_000_000_000),
+            )
+            .unwrap_or_else(|error| panic!("fixture ThreadDomain plan failed: {error}"));
+            let domain_epoch = DomainEpoch::try_new(91)
+                .unwrap_or_else(|error| panic!("fixture domain epoch failed: {error}"));
+            let handle = registry
+                .try_create::<u8>(domain_epoch, domain_spec, 0)
+                .unwrap_or_else(|error| panic!("root ThreadDomain build failed: {error}"));
+            let mut invocation = registry
+                .with_domain_mut(&handle, |domain| {
+                    domain.try_submit(|| {
+                        move |_| {
+                            *worker_fact
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) =
+                                Some(thread::current().id());
+                            73
+                        }
+                    })
+                })
+                .unwrap_or_else(|error| panic!("root domain visit failed: {error}"))
+                .unwrap_or_else(|error| panic!("root domain submission failed: {error}"));
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let completion = registry
+                    .with_domain_mut(&handle, |domain| {
+                        domain.try_take_completion(&mut invocation)
+                    })
+                    .unwrap_or_else(|error| panic!("root domain visit failed: {error}"))
+                    .unwrap_or_else(|error| panic!("root completion failed: {error}"));
+                match completion {
+                    ThreadCompletion::Pending(_) => {}
+                    ThreadCompletion::Returned(73) => break,
+                    ThreadCompletion::Returned(value) => {
+                        panic!("unexpected ThreadDomain value: {value}")
+                    }
+                    ThreadCompletion::Panicked | ThreadCompletion::LateRejected(_) => {
+                        panic!("root-owned invocation did not complete normally")
+                    }
+                }
+                assert!(Instant::now() < deadline, "root invocation timed out");
+                thread::yield_now();
+            }
+            let snapshot = registry
+                .with_domain_mut(&handle, |domain| domain.snapshot())
+                .unwrap_or_else(|error| panic!("root domain census failed: {error}"));
+            assert_eq!(snapshot.lifecycle(), ThreadDomainLifecycle::Accepting);
+            assert_eq!(snapshot.live_workers(), 1);
+            Ok(())
+        });
+
+        assert!(
+            result.is_ok(),
+            "root ThreadDomain cleanup failed: {result:?}"
+        );
+        let worker = observed_worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(|| panic!("worker thread fact must be recorded"));
+        assert_ne!(worker, caller);
     }
 
     #[test]
