@@ -6,13 +6,16 @@ use paraegox_runtime_contracts::apply::{
     PlanWriterRef, RuntimeApplyControl, RuntimeApplyControlCommitment,
 };
 use paraegox_runtime_contracts::assignment::{AssignmentContractError, RuntimePlanSlice};
+use paraegox_runtime_contracts::execution::{RuntimePlanSliceV2, TargetPlanContractError};
 use paraegox_runtime_contracts::provenance::RuntimeSliceCommitment;
 use paraegox_runtime_contracts::provenance::{
     PlanProvenance, ProvenanceContractError, RuntimeSliceHeader, SourcePlanRef, SourcePlanRevision,
     SourceScopeRef,
 };
 
-use crate::plan::{CommittedTargetProjection, DeploymentWriterTenure};
+use crate::plan::{
+    CommittedTargetPlanProjection, CommittedTargetProjection, DeploymentWriterTenure,
+};
 
 /// Projects a target-specific, tenure-neutral Runtime slice commitment.
 #[cfg(test)]
@@ -44,6 +47,28 @@ pub fn project_runtime_plan_slice(
         .map_err(ProjectionError::Assignment)
 }
 
+/// Projects a complete v2 target Slice from canonical binding and execution bodies.
+pub fn project_runtime_plan_slice_v2(
+    projection: &CommittedTargetPlanProjection,
+) -> Result<RuntimePlanSliceV2, ProjectionError> {
+    let plan = projection.plan();
+    let provenance = PlanProvenance::new(
+        SourceScopeRef::from_bytes(*plan.scope().as_bytes()),
+        SourcePlanRef::from_bytes(*plan.plan().as_bytes()),
+        SourcePlanRevision::new(plan.revision().value()),
+        plan.digest(),
+    );
+    let header = RuntimeSliceHeader::new(
+        projection.target(),
+        provenance,
+        projection.assignment_digest(),
+    );
+    let commitment =
+        RuntimeSliceCommitment::try_new(header).map_err(ProjectionError::Provenance)?;
+    RuntimePlanSliceV2::try_new(commitment, projection.assignments().clone())
+        .map_err(ProjectionError::TargetPlan)
+}
+
 /// Maps deployment writer ownership into a Runtime-owned apply-control commitment.
 pub fn build_runtime_apply_control_commitment(
     slice: RuntimeSliceCommitment,
@@ -67,6 +92,8 @@ pub enum ProjectionError {
     Provenance(ProvenanceContractError),
     /// Canonical assignment body did not match the projected commitment.
     Assignment(AssignmentContractError),
+    /// Composite binding/execution body did not match the projected commitment.
+    TargetPlan(TargetPlanContractError),
     /// Runtime apply-control construction failed.
     Apply(ApplyContractError),
 }
@@ -83,11 +110,18 @@ impl From<AssignmentContractError> for ProjectionError {
     }
 }
 
+impl From<TargetPlanContractError> for ProjectionError {
+    fn from(value: TargetPlanContractError) -> Self {
+        Self::TargetPlan(value)
+    }
+}
+
 impl fmt::Display for ProjectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Provenance(error) => write!(formatter, "slice projection failed: {error}"),
             Self::Assignment(error) => write!(formatter, "assignment projection failed: {error}"),
+            Self::TargetPlan(error) => write!(formatter, "target-plan projection failed: {error}"),
             Self::Apply(error) => write!(formatter, "apply-control mapping failed: {error}"),
         }
     }

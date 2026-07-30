@@ -3,6 +3,7 @@
 use paraegox_kernel::identity::RuntimeHostId;
 use paraegox_runtime_contracts::apply::WriterTenureProof;
 use paraegox_runtime_contracts::assignment::TargetAssignments;
+use paraegox_runtime_contracts::execution::TargetPlanAssignments;
 use paraegox_runtime_contracts::provenance::{SourcePlanDigest, TargetAssignmentDigest};
 
 macro_rules! deployment_ref {
@@ -173,6 +174,54 @@ impl CommittedTargetProjection {
     /// Returns the complete canonical assignment body projected for the target.
     #[must_use]
     pub const fn assignments(&self) -> &TargetAssignments {
+        &self.assignments
+    }
+}
+
+/// One committed target projection carrying complete PXTA and a Loop-authorized PXTE subset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedTargetPlanProjection {
+    plan: CommittedPlanIdentity,
+    target: RuntimeHostId,
+    assignments: TargetPlanAssignments,
+}
+
+impl CommittedTargetPlanProjection {
+    /// Binds complete canonical binding and execution assignments to one target.
+    #[must_use]
+    pub fn new(
+        plan: CommittedPlanIdentity,
+        target: RuntimeHostId,
+        assignments: TargetPlanAssignments,
+    ) -> Self {
+        Self {
+            plan,
+            target,
+            assignments,
+        }
+    }
+
+    /// Returns committed source-plan identity.
+    #[must_use]
+    pub const fn plan(&self) -> CommittedPlanIdentity {
+        self.plan
+    }
+
+    /// Returns the target RuntimeHost.
+    #[must_use]
+    pub const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    /// Returns the v2 digest committing both canonical assignment bodies.
+    #[must_use]
+    pub const fn assignment_digest(&self) -> TargetAssignmentDigest {
+        self.assignments.assignment_digest()
+    }
+
+    /// Returns the complete PXTA and PXTE assignments projected for the target.
+    #[must_use]
+    pub const fn assignments(&self) -> &TargetPlanAssignments {
         &self.assignments
     }
 }

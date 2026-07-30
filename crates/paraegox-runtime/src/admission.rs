@@ -17,6 +17,7 @@ use paraegox_runtime_contracts::apply::{
     TenureProofError,
 };
 use paraegox_runtime_contracts::assignment::RuntimeApplyRequest;
+use paraegox_runtime_contracts::execution::RuntimeApplyRequestV2;
 use paraegox_runtime_contracts::provenance::SourceScopeRef;
 use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
 use paraegox_runtime_contracts::wire::{
@@ -24,7 +25,10 @@ use paraegox_runtime_contracts::wire::{
 };
 
 use crate::apply_state::{AdmittedApply, VerifiedWriterTenure};
-use crate::request::{RuntimeRequestAdmissionError, RuntimeRequestAdmissionTransition};
+use crate::request::{
+    RuntimeExecutionRequestAdmissionTransition, RuntimeRequestAdmissionError,
+    RuntimeRequestAdmissionTransition,
+};
 
 /// Registry value for pure Ed25519 request and tenure signatures.
 pub const ED25519_ALGORITHM: u16 = 1;
@@ -513,6 +517,22 @@ impl ApplyAdmission {
         Ok(RuntimeRequestAdmissionTransition::new(admission, slice))
     }
 
+    /// Decodes and admits one v2 request whose signed Slice commits both
+    /// binding and execution bodies. There is no v1 fallback on this path.
+    pub(crate) fn admit_execution_request(
+        &self,
+        frame: &[u8],
+        state: &AdmissionState,
+        reading: ClockReading,
+    ) -> Result<RuntimeExecutionRequestAdmissionTransition, RuntimeRequestAdmissionError> {
+        let request = RuntimeApplyRequestV2::decode(frame)?;
+        let slice = request.slice().clone();
+        let admission = self.admit_envelope(request.envelope().clone(), state, reading)?;
+        Ok(RuntimeExecutionRequestAdmissionTransition::new(
+            admission, slice,
+        ))
+    }
+
     fn admit_envelope(
         &self,
         envelope: RuntimeApplyEnvelope,
@@ -947,6 +967,9 @@ mod tests {
         MailboxSpec, OverflowPolicy, PortCardinality, PortDirection, PortEndpoint, PortRef,
         PortSpec, RuntimeApplyRequest, RuntimePlanSlice, SchemaRef, TargetAssignments,
     };
+    use paraegox_runtime_contracts::execution::{
+        CardDefinitionRef, CardImplementationRef, RuntimeApplyRequestV2,
+    };
     use paraegox_runtime_contracts::provenance::{
         PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanDigest,
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
@@ -962,8 +985,21 @@ mod tests {
         ApplyControlState, ApplyRejection, FenceDisposition, OperationPhase, PrepareDisposition,
         evaluate_prepare, evaluate_writer_fence,
     };
+    use crate::card_executor::{
+        CardStartOutcome, CardStopOutcome, CooperativeLoopImplementation, TrustedCardImplementation,
+    };
+    use crate::card_instance::{
+        CallbackFailure, CardContext, CardFuture, CardImplementation, DomainEpoch, InputView,
+        InstanceGeneration, OutputProposal, RuntimeHostEpoch,
+    };
+    use crate::component_runtime::{
+        ComponentCallbackOutcome, ComponentDispatchOutcome, ComponentRuntimeEpochs,
+        SingleSubjectComponentRuntime,
+    };
     use crate::mailbox::{EnqueueOutcome, Mailbox, MessageId, PayloadHandle, ValidatedMessage};
     use crate::port_binding::PortBinding;
+    use crate::runtime_clock::RuntimeClock;
+    use crate::task_registry::CancellationSource;
 
     use super::{
         AdmissionConfigurationError, AdmissionDisposition, AdmissionError, AdmissionState,
@@ -987,9 +1023,45 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/s2_apply_envelope_v1.json");
     const PYTHON_COMPLETE_REQUEST_FIXTURE_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s3_runtime_apply_request_v1.json");
+    const PYTHON_EXECUTION_REQUEST_FIXTURE_JSON: &str =
+        include_str!("../../../tests/fixtures/wire/s4_runtime_apply_request_v2.json");
     // TEST-ONLY keys matching the independently encoded Python contract fixture.
     const PYTHON_FIXTURE_TENURE_SEED: [u8; 32] = [0x11; 32];
     const PYTHON_FIXTURE_REQUEST_SEED: [u8; 32] = [0x22; 32];
+
+    struct AdmittedFixtureCard;
+
+    impl CardImplementation for AdmittedFixtureCard {
+        fn on_start<'a>(
+            &'a mut self,
+            _context: &'a CardContext,
+        ) -> CardFuture<'a, Result<(), CallbackFailure>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn on_input<'a>(
+            &'a mut self,
+            _context: &'a CardContext,
+            _input: InputView<'a>,
+        ) -> CardFuture<'a, Result<Option<OutputProposal>, CallbackFailure>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn on_stop<'a>(
+            &'a mut self,
+            _context: &'a CardContext,
+        ) -> CardFuture<'a, Result<(), CallbackFailure>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl CooperativeLoopImplementation for AdmittedFixtureCard {
+        const BOUND_CARD_DEFINITION: CardDefinitionRef = CardDefinitionRef::from_bytes([0xa1; 16]);
+        const BOUND_CARD_IMPLEMENTATION: CardImplementationRef =
+            CardImplementationRef::from_bytes([0xa2; 16]);
+        const BOUND_DEFINITION_DIGEST: Digest32 = Digest32::from_bytes([0xa3; 32]);
+        const BOUND_ARTIFACT_DIGEST: Digest32 = Digest32::from_bytes([0xa4; 32]);
+    }
 
     #[derive(Clone, Debug)]
     struct Fixture {
@@ -1377,6 +1449,10 @@ mod tests {
 
     fn complete_request_fixture_hex_bytes(field: &str) -> Vec<u8> {
         fixture_document_hex_bytes(PYTHON_COMPLETE_REQUEST_FIXTURE_JSON, field)
+    }
+
+    fn execution_request_fixture_hex_bytes(field: &str) -> Vec<u8> {
+        fixture_document_hex_bytes(PYTHON_EXECUTION_REQUEST_FIXTURE_JSON, field)
     }
 
     fn fixture_document_hex_bytes(document: &str, field: &str) -> Vec<u8> {
@@ -1900,6 +1976,149 @@ mod tests {
             assert_eq!(snapshot.queued_items(), 1);
             assert_eq!(snapshot.retained_bytes(), index as u64 + 1);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn python_execution_request_fixture_reaches_strict_v2_crypto_admission_and_component() {
+        let wire = execution_request_fixture_hex_bytes("outer_wire_hex");
+        let expected_bindings = execution_request_fixture_hex_bytes("pxta_body_hex");
+        let expected_execution = execution_request_fixture_hex_bytes("pxte_body_hex");
+        let expected_composite = execution_request_fixture_hex_bytes("composite_digest_hex");
+        let expected_request_digest = execution_request_fixture_hex_bytes("request_digest_hex");
+        let (admission, reading) = python_fixture_admission_and_reading();
+
+        let decoded = RuntimeApplyRequestV2::decode(&wire)
+            .unwrap_or_else(|error| panic!("independent v2 request must decode: {error}"));
+        assert_eq!(decoded.canonical_wire(), wire);
+        assert_eq!(
+            decoded.slice().assignments().bindings().canonical_wire(),
+            expected_bindings
+        );
+        assert_eq!(
+            decoded.slice().assignments().execution().canonical_wire(),
+            expected_execution
+        );
+
+        let transition = admission
+            .admit_execution_request(&wire, &AdmissionState::for_new_boundary(), reading)
+            .unwrap_or_else(|error| panic!("independent v2 request must admit: {error}"));
+        assert_eq!(transition.disposition(), AdmissionDisposition::Fresh);
+        assert_eq!(transition.slice().assignments().bindings().len(), 2);
+        assert_eq!(
+            transition
+                .slice()
+                .assignments()
+                .execution()
+                .mailbox_executions()
+                .len(),
+            1
+        );
+        assert_eq!(
+            transition
+                .slice()
+                .assignments()
+                .assignment_digest()
+                .value()
+                .as_bytes()
+                .as_slice(),
+            expected_composite.as_slice()
+        );
+        assert_eq!(
+            transition.admitted().request_digest().as_bytes().as_slice(),
+            expected_request_digest.as_slice()
+        );
+        assert_eq!(transition.admitted().deadline().deadline().value(), 60);
+        assert_eq!(transition.next_state().tenure_nonce_count(), 1);
+        assert_eq!(transition.next_state().request_nonce_count(), 1);
+        assert_eq!(transition.next_state().temporal_lineage_count(), 1);
+
+        let execution = transition
+            .slice()
+            .assignments()
+            .execution()
+            .mailbox_executions()[0];
+        let binding = transition
+            .slice()
+            .assignments()
+            .bindings()
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|assignment| assignment.binding_id() == execution.binding_id())
+            .unwrap_or_else(|| panic!("admitted execution binding must exist"));
+        let selected =
+            TrustedCardImplementation::try_resolve_loop(&[execution], || AdmittedFixtureCard)
+                .unwrap_or_else(|error| {
+                    panic!("admitted fixture implementation must resolve: {error}")
+                });
+        let host_epoch = RuntimeHostEpoch::try_new(1)
+            .unwrap_or_else(|error| panic!("fixture host epoch must build: {error}"));
+        let domain_epoch = DomainEpoch::try_new(1)
+            .unwrap_or_else(|error| panic!("fixture domain epoch must build: {error}"));
+        let instance_generation = InstanceGeneration::try_new(1)
+            .unwrap_or_else(|error| panic!("fixture instance generation must build: {error}"));
+        let runtime_clock = RuntimeClock::new(
+            reading.domain(),
+            reading.generation(),
+            reading.now().value(),
+        );
+        let root = CancellationSource::root();
+        let mut component = SingleSubjectComponentRuntime::try_new(
+            transition.slice(),
+            selected,
+            ComponentRuntimeEpochs::new(host_epoch, domain_epoch, instance_generation),
+            runtime_clock,
+            &root,
+        )
+        .unwrap_or_else(|error| panic!("admitted fixture must compose: {error}"));
+        assert_eq!(component.start().await, Ok(CardStartOutcome::Started));
+        let ingress = component
+            .active_ingress(binding.binding_id())
+            .unwrap_or_else(|| panic!("admitted execution binding must activate in the harness"));
+        let message_deadline = runtime_clock
+            .deadline_after(BoundedDuration::from_nanos(20))
+            .unwrap_or_else(|error| panic!("fixture message deadline must build: {error}"));
+        let payload = PayloadHandle::try_from_vec(vec![0xA4])
+            .unwrap_or_else(|error| panic!("fixture payload must build: {error}"));
+        let message = ValidatedMessage::new(
+            MessageId::from_bytes([0xA4; 16]),
+            binding.target_spec().schema(),
+            binding.target_spec().interaction(),
+            None,
+            message_deadline,
+            payload,
+        );
+        let offer = component
+            .try_offer(&ingress, message)
+            .unwrap_or_else(|failure| panic!("admitted fixture offer failed: {}", failure.error()));
+        assert!(matches!(offer.outcome(), EnqueueOutcome::Admitted));
+        let dispatch = component
+            .dispatch_once()
+            .await
+            .unwrap_or_else(|error| panic!("admitted fixture dispatch failed: {error}"));
+        assert!(matches!(
+            dispatch.outcome(),
+            ComponentDispatchOutcome::Invoked {
+                callback: ComponentCallbackOutcome::Completed {
+                    output_discarded: false
+                },
+                terminal,
+            } if terminal.reason() == crate::mailbox::TerminalReason::Completed
+        ));
+        let shutdown = component
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("admitted fixture shutdown failed: {error}"));
+        assert_eq!(shutdown.card(), CardStopOutcome::Stopped);
+        assert!(shutdown.is_zero_cleanup());
+
+        let v1 = complete_request_fixture_hex_bytes("outer_wire_hex");
+        assert!(
+            admission
+                .admit_execution_request(&v1, &AdmissionState::for_new_boundary(), reading)
+                .is_err(),
+            "the v2 entry must never fall back to PXAR v1"
+        );
     }
 
     #[test]

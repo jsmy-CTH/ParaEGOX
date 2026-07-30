@@ -6,15 +6,21 @@ use paraegox_runtime_contracts::apply::{ApplyOperationId, ExpectedActive};
 use paraegox_runtime_contracts::assignment::{
     AssignmentContractError, RuntimeApplyRequest, RuntimePlanSlice,
 };
+use paraegox_runtime_contracts::execution::{
+    RuntimeApplyRequestV2, RuntimePlanSliceV2, TargetPlanContractError,
+};
 use paraegox_runtime_contracts::temporal::ApplyTemporalConstraint;
 use paraegox_runtime_contracts::wire::{
     ApplyRequestAuthClaim, ApplyRequestSigningTranscript, EnvelopeContractError,
     RuntimeApplyEnvelopeDraft,
 };
 
-use crate::plan::{CommittedTargetProjection, DeploymentWriterTenure};
+use crate::plan::{
+    CommittedTargetPlanProjection, CommittedTargetProjection, DeploymentWriterTenure,
+};
 use crate::projection::{
     ProjectionError, build_runtime_apply_control_commitment, project_runtime_plan_slice,
+    project_runtime_plan_slice_v2,
 };
 
 /// Signature-independent complete request paired with its canonical Slice body.
@@ -42,6 +48,32 @@ impl RuntimeApplyRequestDraft {
     }
 }
 
+/// Signature-independent PXAR v2 request paired with complete PXTA and PXTE bodies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeApplyRequestV2Draft {
+    slice: RuntimePlanSliceV2,
+    envelope: RuntimeApplyEnvelopeDraft,
+}
+
+impl RuntimeApplyRequestV2Draft {
+    /// Returns the exact unchanged envelope transcript the external writer signs.
+    pub fn signing_transcript(&self) -> Result<ApplyRequestSigningTranscript, EnvelopeBuildError> {
+        self.envelope
+            .signing_transcript()
+            .map_err(EnvelopeBuildError::Envelope)
+    }
+
+    /// Finalizes the envelope and binds it to both canonical v2 plan bodies.
+    pub fn finalize(self, signature: &[u8]) -> Result<RuntimeApplyRequestV2, EnvelopeBuildError> {
+        let envelope = self
+            .envelope
+            .finalize(signature)
+            .map_err(EnvelopeBuildError::Envelope)?;
+        RuntimeApplyRequestV2::try_new(envelope, self.slice)
+            .map_err(EnvelopeBuildError::TargetPlanRequest)
+    }
+}
+
 /// Builds the complete signature-independent Runtime apply request.
 pub fn build_runtime_apply_request_draft(
     projection: &CommittedTargetProjection,
@@ -61,6 +93,27 @@ pub fn build_runtime_apply_request_draft(
     let envelope = RuntimeApplyEnvelopeDraft::try_new(control_commitment, temporal, auth_claim)
         .map_err(EnvelopeBuildError::Envelope)?;
     Ok(RuntimeApplyRequestDraft { slice, envelope })
+}
+
+/// Builds the complete signature-independent PXAR v2 Runtime apply request.
+pub fn build_runtime_apply_request_v2_draft(
+    projection: &CommittedTargetPlanProjection,
+    tenure: DeploymentWriterTenure,
+    expected_active: ExpectedActive,
+    operation_id: ApplyOperationId,
+    temporal: ApplyTemporalConstraint,
+    auth_claim: ApplyRequestAuthClaim,
+) -> Result<RuntimeApplyRequestV2Draft, EnvelopeBuildError> {
+    let slice = project_runtime_plan_slice_v2(projection)?;
+    let control_commitment = build_runtime_apply_control_commitment(
+        slice.commitment(),
+        tenure,
+        expected_active,
+        operation_id,
+    )?;
+    let envelope = RuntimeApplyEnvelopeDraft::try_new(control_commitment, temporal, auth_claim)
+        .map_err(EnvelopeBuildError::Envelope)?;
+    Ok(RuntimeApplyRequestV2Draft { slice, envelope })
 }
 
 /// Builds the signature-independent form of one canonical B2 apply envelope.
@@ -98,6 +151,8 @@ pub enum EnvelopeBuildError {
     Envelope(EnvelopeContractError),
     /// Complete request and canonical assignment binding failed validation.
     Request(AssignmentContractError),
+    /// PXAR v2 and its complete composite target plan failed validation.
+    TargetPlanRequest(TargetPlanContractError),
 }
 
 impl From<ProjectionError> for EnvelopeBuildError {
@@ -112,6 +167,9 @@ impl fmt::Display for EnvelopeBuildError {
             Self::Projection(error) => write!(formatter, "apply projection failed: {error}"),
             Self::Envelope(error) => write!(formatter, "apply envelope draft failed: {error}"),
             Self::Request(error) => write!(formatter, "complete apply request failed: {error}"),
+            Self::TargetPlanRequest(error) => {
+                write!(formatter, "complete v2 apply request failed: {error}")
+            }
         }
     }
 }
@@ -136,6 +194,13 @@ mod tests {
         MailboxSpec, OverflowPolicy, PortCardinality, PortDirection, PortEndpoint, PortRef,
         PortSpec, RuntimeApplyRequest, SchemaRef, TargetAssignments,
     };
+    use paraegox_runtime_contracts::execution::{
+        BlockingRisk, CallModel, CallbackBudgets, CardDefinitionRef, CardImplementationRef,
+        CardSubjectSpec, DispatchClass, DomainRef, LoopDomainCapacity, LoopDomainSpec,
+        LoopExecutionRequirements, LoopLifecycleBudgets, MailboxDispatchPolicy,
+        MailboxExecutionSpec, OverrunAction, RequestV2WireErrorCode, RunBoundProvenance,
+        RuntimeApplyRequestV2, TargetExecutionPlan, TargetPlanAssignments, WorkloadKind,
+    };
     use paraegox_runtime_contracts::provenance::{
         PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanDigest,
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
@@ -147,14 +212,16 @@ mod tests {
     };
 
     use crate::plan::{
-        CommittedPlanIdentity, CommittedTargetProjection, DeploymentId, DeploymentRevision,
-        DeploymentScopeId, DeploymentWriterEpoch, DeploymentWriterRef, DeploymentWriterTenure,
+        CommittedPlanIdentity, CommittedTargetPlanProjection, CommittedTargetProjection,
+        DeploymentId, DeploymentRevision, DeploymentScopeId, DeploymentWriterEpoch,
+        DeploymentWriterRef, DeploymentWriterTenure,
     };
     use crate::projection::{ProjectionError, build_runtime_apply_control_commitment};
 
     use super::{
-        EnvelopeBuildError, RuntimeApplyRequestDraft, build_runtime_apply_envelope_draft,
-        build_runtime_apply_request_draft,
+        EnvelopeBuildError, RuntimeApplyRequestDraft, RuntimeApplyRequestV2Draft,
+        build_runtime_apply_envelope_draft, build_runtime_apply_request_draft,
+        build_runtime_apply_request_v2_draft,
     };
 
     // TEST-ONLY fixed seed. Production code never holds a tenure-authority signing key.
@@ -165,6 +232,8 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/s2_apply_envelope_v1.json");
     const S3_APPLY_VECTOR_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s3_runtime_apply_request_v1.json");
+    const S4_APPLY_VECTOR_JSON: &str =
+        include_str!("../../../tests/fixtures/wire/s4_runtime_apply_request_v2.json");
     const APPLY_ENVELOPE_MAGIC: &[u8] = b"ParaEGOX\0runtime-apply-envelope";
 
     struct TlvLocation {
@@ -179,6 +248,22 @@ mod tests {
 
     fn s3_fixture_hex(name: &str) -> Vec<u8> {
         fixture_document_hex(S3_APPLY_VECTOR_JSON, name)
+    }
+
+    fn s4_fixture_hex(name: &str) -> Vec<u8> {
+        fixture_document_hex(S4_APPLY_VECTOR_JSON, name)
+    }
+
+    fn assert_v2_rejection(
+        frame: &[u8],
+        expected_code: RequestV2WireErrorCode,
+        expected_detail: Option<u16>,
+    ) {
+        let Err(error) = RuntimeApplyRequestV2::decode(frame) else {
+            panic!("mutated S4 fixture must be rejected");
+        };
+        assert_eq!(error.code(), expected_code);
+        assert_eq!(error.detail_code(), expected_detail);
     }
 
     fn fixture_document_hex(document: &str, name: &str) -> Vec<u8> {
@@ -391,6 +476,125 @@ mod tests {
         CommittedTargetProjection::new(plan, RuntimeHostId::from_bytes([0x05; 16]), assignments)
     }
 
+    fn s4_fixture_projection() -> CommittedTargetPlanProjection {
+        let s3_projection = s3_fixture_projection();
+        let Ok(delivery) = DeliveryProfile::try_new(
+            128,
+            BoundedDuration::from_nanos(5_000_000_000),
+            OverflowPolicy::Latest,
+        ) else {
+            panic!("S4 fixture delivery profile must be valid");
+        };
+        let Ok(mailbox) = MailboxSpec::try_new(
+            2,
+            256,
+            BoundedDuration::from_nanos(5_000_000_000),
+            1,
+            256,
+            OverflowPolicy::Latest,
+        ) else {
+            panic!("S4 fixture mailbox must be valid");
+        };
+        let mut bindings = Vec::new();
+        for assignment in s3_projection.assignments().as_slice().iter().copied() {
+            let source = PortEndpoint::new(
+                assignment.source_instance(),
+                assignment.source_port(),
+                assignment.source_spec(),
+            );
+            let target = PortEndpoint::new(
+                assignment.target_instance(),
+                assignment.target_port(),
+                assignment.target_spec(),
+            );
+            let Ok(binding) = BindingAssignment::try_new(
+                assignment.binding_id(),
+                source,
+                target,
+                assignment.mailbox(),
+                delivery,
+                mailbox,
+            ) else {
+                panic!("S4 fixture binding must be valid");
+            };
+            bindings.push(binding);
+        }
+        let Ok(bindings) = TargetAssignments::try_new(bindings) else {
+            panic!("S4 fixture assignments must be valid");
+        };
+        let binding_projection =
+            CommittedTargetProjection::new(s3_projection.plan(), s3_projection.target(), bindings);
+        let Ok(capacity) = LoopDomainCapacity::try_new(
+            2,
+            1,
+            BoundedDuration::from_nanos(4_000_000_000),
+            BoundedDuration::from_nanos(4_000_000_000),
+        ) else {
+            panic!("S4 fixture LoopDomain capacity must be valid");
+        };
+        let Ok(lifecycle) = LoopLifecycleBudgets::try_new(
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+        ) else {
+            panic!("S4 fixture LoopDomain lifecycle must be valid");
+        };
+        let domain = LoopDomainSpec::new(DomainRef::from_bytes([0x91; 16]), capacity, lifecycle);
+        let subject = CardSubjectSpec::new(
+            CardDefinitionRef::from_bytes([0xa1; 16]),
+            CardImplementationRef::from_bytes([0xa2; 16]),
+            Digest32::from_bytes([0xa3; 32]),
+            Digest32::from_bytes([0xa4; 32]),
+            Digest32::from_bytes([0xa5; 32]),
+        );
+        let Ok(requirements) = LoopExecutionRequirements::try_new(
+            CallModel::CooperativeAsync,
+            WorkloadKind::Io,
+            BlockingRisk::None,
+            RunBoundProvenance::Measured,
+            BoundedDuration::from_nanos(1_000_000_000),
+        ) else {
+            panic!("S4 fixture execution requirements must be valid");
+        };
+        let Ok(budgets) = CallbackBudgets::try_new(
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+            OverrunAction::CooperativeCancel,
+        ) else {
+            panic!("S4 fixture callback budgets must be valid");
+        };
+        let Ok(dispatch) =
+            MailboxDispatchPolicy::try_new(DispatchClass::Control, 2, 4, 2, 2, budgets)
+        else {
+            panic!("S4 fixture dispatch policy must be valid");
+        };
+        let Ok(mailbox_execution) = MailboxExecutionSpec::try_new(
+            BindingId::from_bytes([0x31; 16]),
+            MailboxRef::from_bytes([0x81; 16]),
+            InstanceRef::from_bytes([0x61; 16]),
+            DomainRef::from_bytes([0x91; 16]),
+            subject,
+            requirements,
+            dispatch,
+        ) else {
+            panic!("S4 fixture Mailbox execution must be valid");
+        };
+        let Ok(execution) = TargetExecutionPlan::try_new(vec![domain], vec![mailbox_execution])
+        else {
+            panic!("S4 fixture PXTE body must be valid");
+        };
+        let Ok(assignments) =
+            TargetPlanAssignments::try_new(binding_projection.assignments().clone(), execution)
+        else {
+            panic!("S4 fixture composite assignments must be valid");
+        };
+        CommittedTargetPlanProjection::new(
+            binding_projection.plan(),
+            binding_projection.target(),
+            assignments,
+        )
+    }
+
     fn tenure(scope_byte: u8, epoch: u64) -> DeploymentWriterTenure {
         let writer = PlanWriterRef::from_bytes([9; 16]);
         let Ok(algorithm) = TenureProofAlgorithm::try_new(1) else {
@@ -551,6 +755,20 @@ mod tests {
         draft
     }
 
+    fn s4_fixture_complete_draft() -> RuntimeApplyRequestV2Draft {
+        let Ok(draft) = build_runtime_apply_request_v2_draft(
+            &s4_fixture_projection(),
+            tenure(0x01, 1),
+            ExpectedActive::None,
+            ApplyOperationId::from_bytes([0x0d; 16]),
+            temporal(60),
+            auth_claim(b"test-only-request-nonce"),
+        ) else {
+            panic!("production producer must build the independent S4 fixture request");
+        };
+        draft
+    }
+
     fn sign_and_finalize(draft: RuntimeApplyEnvelopeDraft) -> RuntimeApplyEnvelope {
         let Ok(transcript) = draft.signing_transcript() else {
             panic!("test request transcript must be valid");
@@ -576,6 +794,17 @@ mod tests {
         let signature = SigningKey::from_bytes(&TEST_ONLY_WRITER_SEED).sign(transcript.as_bytes());
         let Ok(request) = draft.finalize(&signature.to_bytes()) else {
             panic!("complete signed request must finalize");
+        };
+        request
+    }
+
+    fn sign_complete_v2(draft: RuntimeApplyRequestV2Draft) -> RuntimeApplyRequestV2 {
+        let Ok(transcript) = draft.signing_transcript() else {
+            panic!("complete v2 request transcript must be valid");
+        };
+        let signature = SigningKey::from_bytes(&TEST_ONLY_WRITER_SEED).sign(transcript.as_bytes());
+        let Ok(request) = draft.finalize(&signature.to_bytes()) else {
+            panic!("complete signed v2 request must finalize");
         };
         request
     }
@@ -691,6 +920,138 @@ mod tests {
         assert_eq!(
             request.request_digest().as_bytes().as_slice(),
             expected_request_digest.as_slice()
+        );
+    }
+
+    #[test]
+    fn production_v2_producer_exactly_matches_independent_s4_fixture() {
+        let expected_outer = s4_fixture_hex("outer_wire_hex");
+        let expected_bindings = s4_fixture_hex("pxta_body_hex");
+        let expected_execution = s4_fixture_hex("pxte_body_hex");
+        let expected_execution_digest = s4_fixture_hex("pxte_digest_hex");
+        let expected_composite_digest = s4_fixture_hex("composite_digest_hex");
+        let expected_request_digest = s4_fixture_hex("request_digest_hex");
+
+        let request = sign_complete_v2(s4_fixture_complete_draft());
+        // PXTA is the complete binding body; PXTE authorizes only the one Card
+        // Mailbox that may enter this LoopDomain. Binding 0x32 remains a passive
+        // L2 source/sink boundary and grants no callback, dispatcher, or Task authority.
+        assert_eq!(request.slice().assignments().bindings().len(), 2);
+        assert_eq!(
+            request
+                .slice()
+                .assignments()
+                .execution()
+                .mailbox_executions()
+                .len(),
+            1
+        );
+        assert_eq!(request.canonical_wire(), expected_outer);
+        assert_eq!(
+            request.slice().assignments().bindings().canonical_wire(),
+            expected_bindings
+        );
+        assert_eq!(
+            request.slice().assignments().execution().canonical_wire(),
+            expected_execution
+        );
+        assert_eq!(
+            request
+                .slice()
+                .assignments()
+                .execution()
+                .execution_digest()
+                .value()
+                .as_bytes()
+                .as_slice(),
+            expected_execution_digest.as_slice()
+        );
+        assert_eq!(
+            request
+                .slice()
+                .assignments()
+                .assignment_digest()
+                .value()
+                .as_bytes()
+                .as_slice(),
+            expected_composite_digest.as_slice()
+        );
+        assert_eq!(
+            request.request_digest().as_bytes().as_slice(),
+            expected_request_digest.as_slice()
+        );
+        let Ok(decoded) = RuntimeApplyRequestV2::decode(request.canonical_wire()) else {
+            panic!("independent canonical S4 fixture must decode through Rust");
+        };
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn rust_v2_decoder_reports_nested_rejections_and_body_tamper() {
+        let wire = s4_fixture_hex("outer_wire_hex");
+        let envelope_length = u32::from_be_bytes([wire[6], wire[7], wire[8], wire[9]]) as usize;
+        let bindings_length = u32::from_be_bytes([wire[10], wire[11], wire[12], wire[13]]) as usize;
+        let envelope_start = 18;
+        let bindings_start = envelope_start + envelope_length;
+        let execution_start = bindings_start + bindings_length;
+
+        let mut invalid_envelope = wire.clone();
+        invalid_envelope[envelope_start] ^= 0xff;
+        assert_v2_rejection(
+            &invalid_envelope,
+            RequestV2WireErrorCode::EnvelopeRejected,
+            Some(3),
+        );
+
+        let mut invalid_bindings = wire.clone();
+        invalid_bindings[bindings_start] ^= 0xff;
+        assert_v2_rejection(
+            &invalid_bindings,
+            RequestV2WireErrorCode::BindingsRejected,
+            Some(3),
+        );
+
+        let mut invalid_execution = wire.clone();
+        invalid_execution[execution_start] ^= 0xff;
+        assert_v2_rejection(
+            &invalid_execution,
+            RequestV2WireErrorCode::ExecutionRejected,
+            Some(3),
+        );
+
+        let mut unsafe_overrun = wire.clone();
+        let mailbox_record = execution_start + 14 + 64;
+        unsafe_overrun[mailbox_record + 235] = 1;
+        assert_v2_rejection(
+            &unsafe_overrun,
+            RequestV2WireErrorCode::ExecutionRejected,
+            Some(22),
+        );
+
+        let mut target_mismatch = wire.clone();
+        let first_binding_record = bindings_start + 10;
+        target_mismatch[first_binding_record + 103] ^= 0xff;
+        assert_v2_rejection(
+            &target_mismatch,
+            RequestV2WireErrorCode::TargetPlanRejected,
+            Some(3),
+        );
+
+        let mut forbidden_block = wire.clone();
+        forbidden_block[first_binding_record + 222] = 5;
+        forbidden_block[first_binding_record + 255] = 5;
+        assert_v2_rejection(
+            &forbidden_block,
+            RequestV2WireErrorCode::TargetPlanRejected,
+            Some(4),
+        );
+
+        let mut body_tamper = wire;
+        body_tamper[mailbox_record + 160] ^= 0xff;
+        assert_v2_rejection(
+            &body_tamper,
+            RequestV2WireErrorCode::CommitmentMismatch,
+            None,
         );
     }
 

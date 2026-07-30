@@ -11,6 +11,10 @@ publish = false
 ed25519-dalek.workspace = true
 paraegox-kernel.workspace = true
 paraegox-runtime-contracts.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }
 
 [lints]
 workspace = true

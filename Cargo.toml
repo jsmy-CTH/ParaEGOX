@@ -4,6 +4,7 @@ members = [
   "crates/paraegox-kernel",
   "crates/paraegox-runtime",
   "crates/paraegox-runtime-contracts",
+  "crates/paraegox-runtime-host",
 ]
 resolver = "3"
 
@@ -17,6 +18,7 @@ repository = "https://github.com/jsmy-CTH/ParaEGOX"
 [workspace.dependencies]
 ed25519-dalek = { version = "=3.0.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "signal", "sync", "time"] }
 paraegox-kernel = { path = "crates/paraegox-kernel" }
 paraegox-runtime-contracts = { path = "crates/paraegox-runtime-contracts" }
 

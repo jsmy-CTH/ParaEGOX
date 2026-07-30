@@ -19,7 +19,7 @@ id = "GOV-WAIVER-0001"
 rule_id = "rust:expect"
 scope = "crates/paraegox-runtime/src/lib.rs"
 owner = "Runtime apply admission and state owner"
-reason = "Keep the tested B2/P2a Runtime enabler private until the S4 RuntimeHost reactor becomes its admitted executable consumer; remove the expectation in that bounded batch."
+reason = "Keep the admitted B2/P2a state mechanisms, S4/P2b single-subject component composition, and fixed two-CoreService lifecycle evidence private until the P2e Runtime apply endpoint and assembly owner become their executable consumer. The S4 binary consumes only the reactor/task/clock bootstrap, while canonical component and fixed lifecycle composition remain L2 evidence; remove or narrow this expectation in P2e."
 expires_at = "2026-09-30"
 
 [[registry.waivers]]
@@ -45,23 +45,34 @@ removal_condition = "Removal requires migrating every registered mechanism consu
 path = "crates/paraegox-runtime-contracts"
 cargo_package = "paraegox-runtime-contracts"
 owner = "Runtime contract owner"
-responsibility = "Source-plan provenance, canonical target assignments and complete Runtime apply requests, B1 apply-control commitments, writer-tenure signing and fingerprints, temporal constraints, and the canonical B2 signed apply-envelope wire contract."
+responsibility = "Source-plan provenance, canonical PXTA binding assignments, canonical PXTE inbound-Mailbox-driven Loop-subset assignments and their v2 composite target digest, complete PXAR v1/v2 Runtime apply requests, B1 apply-control commitments, writer-tenure signing and fingerprints, temporal constraints, and the canonical B2 signed apply-envelope wire contract; this package does not model a general execution plan or source-only Cards with no input Mailbox."
 status = "public"
-public_entrypoints = ["paraegox_runtime_contracts::assignment", "paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply", "paraegox_runtime_contracts::temporal", "paraegox_runtime_contracts::wire"]
+public_entrypoints = ["paraegox_runtime_contracts::assignment", "paraegox_runtime_contracts::execution", "paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply", "paraegox_runtime_contracts::temporal", "paraegox_runtime_contracts::wire"]
 consumers = ["paraegox-deployment", "paraegox-runtime"]
-first_tests = ["crates/paraegox-runtime-contracts/src/assignment.rs", "crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs"]
+first_tests = ["crates/paraegox-runtime-contracts/src/assignment.rs", "crates/paraegox-runtime-contracts/src/execution.rs", "crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs"]
 removal_condition = "Removal requires replacing both the independent Deployment producer and Runtime consumer in one accepted contract migration."
 
 [[registry.packages]]
 path = "crates/paraegox-runtime"
 cargo_package = "paraegox-runtime"
 owner = "Runtime apply admission and state owner"
-responsibility = "Pure signed-request admission and apply-control transitions plus the bounded P2a Mailbox and deterministic single-route PortBinding fixture; no RuntimeHost, callback execution, I/O, or durable persistence."
-status = "enabler"
+responsibility = "Signed-request admission and apply-control transitions, bounded Mailbox and PortBinding, plus the S4 current-thread RuntimeHost reactor, structured task owner, LoopDomain dispatch, trusted internal Card callback seam, private single-subject L2 component composition, and a private fixed provider-consumer two-CoreService lifecycle owner with bounded readiness and cleanup facts; these L2 paths are not yet consumed by an apply endpoint, do not implement a general ServiceDependencyGraph, and this package has no ThreadDomain, ProcessDomain, durable journal, Fabric, Controller, or full RuntimeAssemblyEngine."
+status = "experimental"
+public_entrypoints = ["paraegox_runtime::run_runtime_host_process"]
+consumers = ["paraegox-runtime-host"]
+first_tests = ["crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs", "crates/paraegox-runtime/src/request.rs", "crates/paraegox-runtime/src/mailbox.rs", "crates/paraegox-runtime/src/port_binding.rs", "crates/paraegox-runtime/src/runtime_clock.rs", "crates/paraegox-runtime/src/task_registry.rs", "crates/paraegox-runtime/src/dispatcher.rs", "crates/paraegox-runtime/src/loop_domain.rs", "crates/paraegox-runtime/src/card_instance.rs", "crates/paraegox-runtime/src/card_executor.rs", "crates/paraegox-runtime/src/component_runtime.rs", "crates/paraegox-runtime/src/core_service.rs", "crates/paraegox-runtime/src/runtime_host.rs"]
+removal_condition = "Removal requires replacing the executable consumer and the proven canonical-request to bounded LoopDomain ownership path without adding a second desired-state, task, or payload-queue owner."
+
+[[registry.packages]]
+path = "crates/paraegox-runtime-host"
+cargo_package = "paraegox-runtime-host"
+owner = "RuntimeHost process owner"
+responsibility = "Minimal executable composition root for the single S4 RuntimeHost reactor and process shutdown signal; it does not own Deployment planning, a second apply input, Card configuration, Fabric, or persistence."
+status = "internal"
 public_entrypoints = []
 consumers = []
-first_tests = ["crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs", "crates/paraegox-runtime/src/request.rs", "crates/paraegox-runtime/src/mailbox.rs", "crates/paraegox-runtime/src/port_binding.rs"]
-removal_condition = "Remove or restructure this enabler if the S4 RuntimeHost cannot consume its complete-request admission, reducer, Mailbox, and PortBinding without a parallel state machine or second semantic queue."
+first_tests = ["crates/paraegox-runtime/src/runtime_host.rs"]
+removal_condition = "Remove only when another admitted OS-managed executable becomes the sole RuntimeHost reactor composition root."
 
 [[registry.packages]]
 path = "crates/paraegox-deployment"
@@ -138,6 +149,22 @@ consumers = ["paraegox-deployment", "paraegox-runtime"]
 compatibility = "Version 1 fixes the magic, 37 ordered TLVs, big-endian scalar and length encoding, frame, nonce, and signature bounds, the 36-field request-signing transcript excluding only the request signature, request-digest framing, and stable WireErrorCode values; incompatible changes require a new protocol version."
 tests = ["crates/paraegox-runtime-contracts/src/wire.rs", "crates/paraegox-deployment/src/envelope.rs", "crates/paraegox-runtime/src/admission.rs", "tests/contract/test_s2_apply_vectors.py"]
 
+[[registry.public_apis]]
+module = "paraegox_runtime_contracts::execution"
+symbols = ["TARGET_EXECUTION_PLAN_VERSION", "RUNTIME_APPLY_REQUEST_V2_VERSION", "MAX_LOOP_DOMAINS", "MAX_MAILBOX_EXECUTIONS", "MAX_DOMAIN_OUTSTANDING", "MAX_SERVICE_COST_TOKENS", "MAX_MINIMUM_SERVICE_WEIGHT", "MAX_ARRIVALS_PER_WINDOW", "MAX_EXECUTION_DURATION_NANOS", "MAX_TARGET_EXECUTION_PLAN_BYTES", "MAX_RUNTIME_APPLY_REQUEST_V2_BYTES", "DomainRef", "CardDefinitionRef", "CardImplementationRef", "TargetExecutionDigest", "CallModel", "WorkloadKind", "BlockingRisk", "RunBoundProvenance", "DispatchClass", "OverrunAction", "LoopDomainCapacity", "LoopLifecycleBudgets", "LoopDomainSpec", "CardSubjectSpec", "LoopExecutionRequirements", "CallbackBudgets", "MailboxDispatchPolicy", "MailboxExecutionSpec", "TargetExecutionPlan", "TargetPlanAssignments", "RuntimePlanSliceV2", "RuntimeApplyRequestV2", "ExecutionContractError", "TargetPlanContractError", "ExecutionRecordSection", "ExecutionWireErrorCode", "ExecutionWireError", "TargetPlanWireErrorCode", "RequestV2WireErrorCode", "RequestV2WireError"]
+owner = "Runtime execution contract owner"
+consumers = ["paraegox-deployment", "paraegox-runtime"]
+compatibility = "PXTE v1 fixes bounded big-endian 64-byte LoopDomain and 236-byte Mailbox execution records, canonical ordering, enum values, digest framing, bounds, and stable rejection codes for the inbound-Mailbox-driven Loop-eligible subset. PXAR v2 strictly frames one unchanged signed envelope, one PXTA v1 body, and one PXTE v1 body with three explicit lengths and no v1/v2 fallback; its explicit v2 composite digest commits the PXTA and PXTE digests through the existing Slice assignment-digest field. PXTA may be a superset, but records absent from PXTE remain execution-inert and grant no CardInstance, LoopDomain, callback, dispatcher, or Task authority. Loop admission requires cooperative async I/O or routing, no blocking risk, measured or certified run bounds, CooperativeCancel or Escalate overrun handling, total arrivals-times-(run-plus-cleanup) utilization within the common capacity window, control utilization within reserved capacity, and a strict scheduler-independent Control start bound derived across the signed PXTA/PXTE plan. MailboxExecutionSpec introduces subjects only for this inbound-Mailbox-driven subset: source-only Cards with no input Mailbox are not expressible, so these types are not a general or complete execution-plan contract. Incompatible framing, digest, eligibility, or scope changes require new explicit versions and domains."
+tests = ["crates/paraegox-runtime-contracts/src/execution.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-deployment/src/envelope.rs", "crates/paraegox-runtime/src/admission.rs", "tests/contract/test_s4_runtime_execution_request.py", "tests/fixtures/wire/s4_runtime_apply_request_v2.json"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime"
+symbols = ["run_runtime_host_process", "RuntimeHostProcessError"]
+owner = "RuntimeHost process owner"
+consumers = ["paraegox-runtime-host"]
+compatibility = "This pre-1.0 executable bootstrap surface owns one current-thread reactor and Ctrl-C shutdown only; it deliberately exposes no Tokio type, apply endpoint, Card runner, readiness claim, or durable state."
+tests = ["crates/paraegox-runtime/src/runtime_host.rs"]
+
 [cargo]
 manifest_path = "Cargo.toml"
 lockfile_path = "Cargo.lock"
@@ -159,13 +186,19 @@ allow_external_dependencies = []
 id = "CARGO-ARCH-003"
 source = "paraegox-runtime"
 allow_workspace_dependencies = ["paraegox-kernel", "paraegox-runtime-contracts"]
-allow_external_dependencies = ["ed25519-dalek"]
+allow_external_dependencies = ["ed25519-dalek", "tokio"]
 
 [[cargo.rules]]
 id = "CARGO-ARCH-004"
 source = "paraegox-deployment"
 allow_workspace_dependencies = ["paraegox-kernel", "paraegox-runtime-contracts"]
 allow_external_dependencies = ["ed25519-dalek"]
+
+[[cargo.rules]]
+id = "CARGO-ARCH-005"
+source = "paraegox-runtime-host"
+allow_workspace_dependencies = ["paraegox-runtime"]
+allow_external_dependencies = []
 
 [[architecture.rules]]
 id = "ARCH-001"

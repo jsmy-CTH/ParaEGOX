@@ -79,20 +79,22 @@ impl PayloadHandle {
 /// A fully validated logical Message ready for target-mailbox admission.
 ///
 /// Constructing this value does not authenticate transport bytes. Its caller
-/// is the validation owner and supplies a deadline already installed in the
-/// target clock domain and generation.
+/// is the validation owner and supplies temporal bounds already installed in
+/// the target clock domain and generation.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ValidatedMessage {
     id: MessageId,
     schema: SchemaRef,
     class: MessageClass,
     coalesce_key: Option<CoalesceKey>,
-    deadline: MonotonicDeadline,
+    fresh_until: MonotonicDeadline,
+    run_deadline: MonotonicDeadline,
     payload: PayloadHandle,
 }
 
 impl ValidatedMessage {
-    /// Creates one immutable, target-local validated Message.
+    /// Creates one immutable, target-local validated Message using the legacy
+    /// single deadline for both freshness and latest-run-start enforcement.
     #[must_use]
     pub(crate) const fn new(
         id: MessageId,
@@ -107,7 +109,30 @@ impl ValidatedMessage {
             schema,
             class: MessageClass::from_interaction(interaction),
             coalesce_key,
-            deadline,
+            fresh_until: deadline,
+            run_deadline: deadline,
+            payload,
+        }
+    }
+
+    /// Creates one immutable Message with independent freshness and run bounds.
+    #[must_use]
+    pub(crate) const fn new_with_deadlines(
+        id: MessageId,
+        schema: SchemaRef,
+        interaction: InteractionKind,
+        coalesce_key: Option<CoalesceKey>,
+        fresh_until: MonotonicDeadline,
+        run_deadline: MonotonicDeadline,
+        payload: PayloadHandle,
+    ) -> Self {
+        Self {
+            id,
+            schema,
+            class: MessageClass::from_interaction(interaction),
+            coalesce_key,
+            fresh_until,
+            run_deadline,
             payload,
         }
     }
@@ -136,10 +161,22 @@ impl ValidatedMessage {
         self.coalesce_key
     }
 
-    /// Returns the target-local Message deadline.
+    /// Returns the target-local freshness boundary.
+    #[must_use]
+    pub(crate) const fn fresh_until(&self) -> MonotonicDeadline {
+        self.fresh_until
+    }
+
+    /// Returns the target-local latest run-start boundary.
+    #[must_use]
+    pub(crate) const fn run_deadline(&self) -> MonotonicDeadline {
+        self.run_deadline
+    }
+
+    /// Returns the legacy Message deadline alias (the run deadline).
     #[must_use]
     pub(crate) const fn deadline(&self) -> MonotonicDeadline {
-        self.deadline
+        self.run_deadline
     }
 
     /// Returns the immutable payload.
@@ -189,7 +226,8 @@ impl ValidatedMessage {
             schema,
             class: MessageClass::Command,
             coalesce_key: None,
-            deadline,
+            fresh_until: deadline,
+            run_deadline: deadline,
             payload,
         }
     }
@@ -214,6 +252,9 @@ pub(crate) enum TerminalReason {
     Failed,
     Cancelled,
     ExpiredAfterAdmission,
+    StaleBeforeRun,
+    RunDeadlineExpired,
+    QueueAgeExpired,
     Evicted,
     Coalesced,
     Uncertain,
@@ -227,6 +268,8 @@ impl TerminalReason {
                 | Self::Failed
                 | Self::Cancelled
                 | Self::ExpiredAfterAdmission
+                | Self::StaleBeforeRun
+                | Self::RunDeadlineExpired
                 | Self::Uncertain
         )
     }
@@ -460,6 +503,9 @@ pub(crate) struct TerminalCounters {
     failed: u64,
     cancelled: u64,
     expired_after_admission: u64,
+    stale_before_run: u64,
+    run_deadline_expired: u64,
+    queue_age_expired: u64,
     evicted: u64,
     coalesced: u64,
     uncertain: u64,
@@ -487,6 +533,21 @@ impl TerminalCounters {
     }
 
     #[must_use]
+    pub(crate) const fn stale_before_run(self) -> u64 {
+        self.stale_before_run
+    }
+
+    #[must_use]
+    pub(crate) const fn run_deadline_expired(self) -> u64 {
+        self.run_deadline_expired
+    }
+
+    #[must_use]
+    pub(crate) const fn queue_age_expired(self) -> u64 {
+        self.queue_age_expired
+    }
+
+    #[must_use]
     pub(crate) const fn evicted(self) -> u64 {
         self.evicted
     }
@@ -508,6 +569,9 @@ impl TerminalCounters {
             TerminalReason::Failed => &mut next.failed,
             TerminalReason::Cancelled => &mut next.cancelled,
             TerminalReason::ExpiredAfterAdmission => &mut next.expired_after_admission,
+            TerminalReason::StaleBeforeRun => &mut next.stale_before_run,
+            TerminalReason::RunDeadlineExpired => &mut next.run_deadline_expired,
+            TerminalReason::QueueAgeExpired => &mut next.queue_age_expired,
             TerminalReason::Evicted => &mut next.evicted,
             TerminalReason::Coalesced => &mut next.coalesced,
             TerminalReason::Uncertain => &mut next.uncertain,
@@ -529,6 +593,9 @@ impl TerminalCounters {
             .checked_add(self.failed)
             .and_then(|value| value.checked_add(self.cancelled))
             .and_then(|value| value.checked_add(self.expired_after_admission))
+            .and_then(|value| value.checked_add(self.stale_before_run))
+            .and_then(|value| value.checked_add(self.run_deadline_expired))
+            .and_then(|value| value.checked_add(self.queue_age_expired))
             .and_then(|value| value.checked_add(self.evicted))
             .and_then(|value| value.checked_add(self.coalesced))
             .and_then(|value| value.checked_add(self.uncertain))
@@ -593,7 +660,78 @@ impl MailboxSnapshot {
 
 struct QueuedMessage {
     message: ValidatedMessage,
-    queue_deadline: MonotonicDeadline,
+    queue_age_deadline: MonotonicDeadline,
+}
+
+/// A fixed-size, payload-free view of the current FIFO head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MailboxHeadHint {
+    mailbox: MailboxRef,
+    message_id: MessageId,
+    charged_bytes: u64,
+    fresh_until: MonotonicDeadline,
+    run_deadline: MonotonicDeadline,
+    queue_age_deadline: MonotonicDeadline,
+}
+
+impl MailboxHeadHint {
+    #[must_use]
+    pub(crate) const fn mailbox(self) -> MailboxRef {
+        self.mailbox
+    }
+
+    #[must_use]
+    pub(crate) const fn message_id(self) -> MessageId {
+        self.message_id
+    }
+
+    #[must_use]
+    pub(crate) const fn charged_bytes(self) -> u64 {
+        self.charged_bytes
+    }
+
+    #[must_use]
+    pub(crate) const fn fresh_until(self) -> MonotonicDeadline {
+        self.fresh_until
+    }
+
+    #[must_use]
+    pub(crate) const fn run_deadline(self) -> MonotonicDeadline {
+        self.run_deadline
+    }
+
+    #[must_use]
+    pub(crate) const fn queue_age_deadline(self) -> MonotonicDeadline {
+        self.queue_age_deadline
+    }
+}
+
+/// Read-only bounded readiness for the single-owner dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailboxHeadReadiness {
+    Ready(MailboxHeadHint),
+    Expired {
+        hint: MailboxHeadHint,
+        reason: TerminalReason,
+    },
+    Empty,
+    NoPermit(MailboxHeadHint),
+    Closed,
+}
+
+impl MailboxHeadReadiness {
+    #[must_use]
+    pub(crate) const fn is_dispatchable(self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    #[must_use]
+    pub(crate) const fn hint(self) -> Option<MailboxHeadHint> {
+        match self {
+            Self::Ready(hint) | Self::Expired { hint, .. } | Self::NoPermit(hint) => Some(hint),
+            Self::Empty | Self::Closed => None,
+        }
+    }
 }
 
 struct InflightAccounting {
@@ -856,31 +994,37 @@ impl Mailbox {
         if let Err(error) = self.ensure_reading(reading) {
             return Err(OfferFailure::new(error, message));
         }
-        let incoming_expired = match message.deadline.is_expired_at(reading) {
+        let freshness_expired = match message.fresh_until.is_expired_at(reading) {
             Ok(expired) => expired,
             Err(error) => {
                 return Err(OfferFailure::new(mailbox_time_error(error), message));
             }
         };
-        let queue_deadline = match reading.try_deadline_after(self.limits.max_queue_age) {
-            Ok(deadline) => earlier_deadline(deadline, message.deadline),
+        let run_deadline_expired = match message.run_deadline.is_expired_at(reading) {
+            Ok(expired) => expired,
             Err(error) => {
                 return Err(OfferFailure::new(mailbox_time_error(error), message));
             }
         };
-        let queue_age_immediately_expired = match queue_deadline.is_expired_at(reading) {
+        let queue_age_deadline = match reading.try_deadline_after(self.limits.max_queue_age) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                return Err(OfferFailure::new(mailbox_time_error(error), message));
+            }
+        };
+        let queue_age_immediately_expired = match queue_age_deadline.is_expired_at(reading) {
             Ok(expired) => expired,
             Err(error) => {
                 return Err(OfferFailure::new(mailbox_time_error(error), message));
             }
         };
 
-        let expired_indices = match self.expired_indices(reading) {
-            Ok(indices) => indices,
+        let expired_items = match self.expired_items(reading) {
+            Ok(items) => items,
             Err(error) => return Err(OfferFailure::new(error, message)),
         };
-        let expired_records =
-            self.records_for_indices(&expired_indices, TerminalReason::ExpiredAfterAdmission);
+        let expired_indices = Self::indices_for_expired_items(&expired_items);
+        let expired_records = self.records_for_expired_items(&expired_items);
         let mut next_terminals = match self.terminals.checked_increment_records(&expired_records) {
             Ok(counters) => counters,
             Err(error) => return Err(OfferFailure::new(error, message)),
@@ -894,25 +1038,26 @@ impl Mailbox {
 
         let mut displaced_indices = Vec::new();
         let mut displaced_reason = TerminalReason::Evicted;
-        let mut decision = if incoming_expired || queue_age_immediately_expired {
-            PlannedOffer::ExpiredBeforeAdmission
-        } else if message.schema != self.schema {
-            PlannedOffer::Rejected(RejectionReason::SchemaMismatch)
-        } else if message.class != self.message_class {
-            PlannedOffer::Rejected(RejectionReason::InteractionMismatch)
-        } else if duplicate {
-            PlannedOffer::Rejected(RejectionReason::DuplicateActiveMessage)
-        } else if message.payload.charged_bytes > self.limits.capacity_bytes
-            || message.payload.charged_bytes > self.limits.max_retained_bytes
-        {
-            PlannedOffer::Rejected(RejectionReason::PayloadTooLarge)
-        } else if self.limits.overflow == OverflowPolicy::CoalesceByKey
-            && message.coalesce_key.is_none()
-        {
-            PlannedOffer::Rejected(RejectionReason::MissingCoalesceKey)
-        } else {
-            PlannedOffer::Admit
-        };
+        let mut decision =
+            if freshness_expired || run_deadline_expired || queue_age_immediately_expired {
+                PlannedOffer::ExpiredBeforeAdmission
+            } else if message.schema != self.schema {
+                PlannedOffer::Rejected(RejectionReason::SchemaMismatch)
+            } else if message.class != self.message_class {
+                PlannedOffer::Rejected(RejectionReason::InteractionMismatch)
+            } else if duplicate {
+                PlannedOffer::Rejected(RejectionReason::DuplicateActiveMessage)
+            } else if message.payload.charged_bytes > self.limits.capacity_bytes
+                || message.payload.charged_bytes > self.limits.max_retained_bytes
+            {
+                PlannedOffer::Rejected(RejectionReason::PayloadTooLarge)
+            } else if self.limits.overflow == OverflowPolicy::CoalesceByKey
+                && message.coalesce_key.is_none()
+            {
+                PlannedOffer::Rejected(RejectionReason::MissingCoalesceKey)
+            } else {
+                PlannedOffer::Admit
+            };
 
         if decision == PlannedOffer::Admit {
             match self.limits.overflow {
@@ -1040,7 +1185,7 @@ impl Mailbox {
             PlannedOffer::Admit => {
                 self.queue.push_back(QueuedMessage {
                     message,
-                    queue_deadline,
+                    queue_age_deadline,
                 });
                 EnqueueOutcome::Admitted
             }
@@ -1048,13 +1193,51 @@ impl Mailbox {
             PlannedOffer::ExpiredBeforeAdmission => {
                 EnqueueOutcome::ExpiredBeforeAdmission { message }
             }
-            PlannedOffer::WouldBlock => EnqueueOutcome::WouldBlock {
-                deadline: message.deadline,
-                message,
-            },
+            PlannedOffer::WouldBlock => {
+                let deadline = if message.fresh_until.deadline().value()
+                    <= message.run_deadline.deadline().value()
+                {
+                    message.fresh_until
+                } else {
+                    message.run_deadline
+                };
+                EnqueueOutcome::WouldBlock { message, deadline }
+            }
         };
 
         Ok(OfferReport { outcome, terminals })
+    }
+
+    /// Returns a payload-free view of the FIFO head without changing ownership.
+    pub(crate) fn head_readiness(
+        &self,
+        reading: ClockReading,
+    ) -> Result<MailboxHeadReadiness, MailboxError> {
+        self.validate_state()?;
+        if self.lifecycle == MailboxLifecycle::Closed {
+            return Ok(MailboxHeadReadiness::Closed);
+        }
+        self.ensure_reading(reading)?;
+        let Some(item) = self.queue.front() else {
+            return Ok(MailboxHeadReadiness::Empty);
+        };
+        let hint = MailboxHeadHint {
+            mailbox: self.reference,
+            message_id: item.message.id,
+            charged_bytes: item.message.payload.charged_bytes,
+            fresh_until: item.message.fresh_until,
+            run_deadline: item.message.run_deadline,
+            queue_age_deadline: item.queue_age_deadline,
+        };
+        if let Some(reason) = Self::expiration_reason(item, reading)? {
+            return Ok(MailboxHeadReadiness::Expired { hint, reason });
+        }
+        let inflight_items =
+            u32::try_from(self.inflight.len()).map_err(|_| MailboxError::StateInconsistent)?;
+        if inflight_items >= self.limits.max_inflight {
+            return Ok(MailboxHeadReadiness::NoPermit(hint));
+        }
+        Ok(MailboxHeadReadiness::Ready(hint))
     }
 
     /// Moves the FIFO head to in-flight only when a permit is available.
@@ -1071,9 +1254,9 @@ impl Mailbox {
         }
         self.ensure_reading(reading)?;
 
-        let expired_indices = self.expired_indices(reading)?;
-        let expired_records =
-            self.records_for_indices(&expired_indices, TerminalReason::ExpiredAfterAdmission);
+        let expired_items = self.expired_items(reading)?;
+        let expired_indices = Self::indices_for_expired_items(&expired_items);
+        let expired_records = self.records_for_expired_items(&expired_items);
         let next_terminals = self.terminals.checked_increment_records(&expired_records)?;
         let removed_bytes = self.bytes_for_indices(&expired_indices)?;
         let mut next_queued_bytes = self
@@ -1255,6 +1438,32 @@ impl Mailbox {
         Ok(())
     }
 
+    /// Cancels every queued Message after admission has stopped.
+    ///
+    /// A closed mailbox is already empty, so repeated calls are idempotent.
+    /// In-flight ownership and its explicit abandonment preconditions are not
+    /// changed by this queue-only transition.
+    pub(crate) fn cancel_all_queued(&mut self) -> Result<Vec<TerminalRecord>, MailboxError> {
+        self.validate_state()?;
+        if self.lifecycle == MailboxLifecycle::Accepting {
+            return Err(MailboxError::CancelRequiresDraining);
+        }
+        if self.queue.is_empty() {
+            self.close_if_drained_internal();
+            return Ok(Vec::new());
+        }
+
+        let indices = (0..self.queue.len()).collect::<Vec<_>>();
+        let records = self.records_for_indices(&indices, TerminalReason::Cancelled);
+        let next_terminals = self.terminals.checked_increment_records(&records)?;
+
+        self.queue.clear();
+        self.queued_bytes = 0;
+        self.terminals = next_terminals;
+        self.close_if_drained_internal();
+        Ok(records)
+    }
+
     /// Expires queued Messages at one caller-supplied target-local reading.
     pub(crate) fn expire_queued(
         &mut self,
@@ -1265,9 +1474,9 @@ impl Mailbox {
             return Ok(Vec::new());
         }
         self.ensure_reading(reading)?;
-        let expired_indices = self.expired_indices(reading)?;
-        let records =
-            self.records_for_indices(&expired_indices, TerminalReason::ExpiredAfterAdmission);
+        let expired_items = self.expired_items(reading)?;
+        let expired_indices = Self::indices_for_expired_items(&expired_items);
+        let records = self.records_for_expired_items(&expired_items);
         let next_terminals = self.terminals.checked_increment_records(&records)?;
         let removed_bytes = self.bytes_for_indices(&expired_indices)?;
         let next_queued_bytes = self
@@ -1331,20 +1540,57 @@ impl Mailbox {
         Ok(())
     }
 
-    fn expired_indices(&self, reading: ClockReading) -> Result<Vec<usize>, MailboxError> {
+    fn expired_items(
+        &self,
+        reading: ClockReading,
+    ) -> Result<Vec<(usize, TerminalReason)>, MailboxError> {
         self.queue
             .iter()
             .enumerate()
-            .try_fold(Vec::new(), |mut indices, (index, item)| {
-                if item
-                    .queue_deadline
-                    .is_expired_at(reading)
-                    .map_err(mailbox_time_error)?
-                {
-                    indices.push(index);
+            .try_fold(Vec::new(), |mut items, (index, item)| {
+                if let Some(reason) = Self::expiration_reason(item, reading)? {
+                    items.push((index, reason));
                 }
-                Ok(indices)
+                Ok(items)
             })
+    }
+
+    fn expiration_reason(
+        item: &QueuedMessage,
+        reading: ClockReading,
+    ) -> Result<Option<TerminalReason>, MailboxError> {
+        let run = item.message.run_deadline.deadline().value();
+        let fresh = item.message.fresh_until.deadline().value();
+        let queue_age = item.queue_age_deadline.deadline().value();
+        let (deadline, reason) = if run <= fresh && run <= queue_age {
+            // Latest-run-start is the stronger reason at an equal boundary.
+            (
+                item.message.run_deadline,
+                TerminalReason::RunDeadlineExpired,
+            )
+        } else if fresh <= queue_age {
+            (item.message.fresh_until, TerminalReason::StaleBeforeRun)
+        } else {
+            (item.queue_age_deadline, TerminalReason::QueueAgeExpired)
+        };
+        deadline
+            .is_expired_at(reading)
+            .map(|expired| expired.then_some(reason))
+            .map_err(mailbox_time_error)
+    }
+
+    fn indices_for_expired_items(items: &[(usize, TerminalReason)]) -> Vec<usize> {
+        items.iter().map(|(index, _)| *index).collect()
+    }
+
+    fn records_for_expired_items(&self, items: &[(usize, TerminalReason)]) -> Vec<TerminalRecord> {
+        items
+            .iter()
+            .map(|(index, reason)| {
+                let item = &self.queue[*index];
+                TerminalRecord::new(item.message.id, *reason, item.message.payload.charged_bytes)
+            })
+            .collect()
     }
 
     fn live_indices_excluding(&self, excluded: &[usize]) -> Vec<usize> {
@@ -1463,8 +1709,12 @@ impl Mailbox {
 
         let mut active = BTreeSet::new();
         for item in &self.queue {
-            if item.queue_deadline.domain() != self.clock_domain
-                || item.queue_deadline.generation() != self.clock_generation
+            if item.queue_age_deadline.domain() != self.clock_domain
+                || item.queue_age_deadline.generation() != self.clock_generation
+                || item.message.fresh_until.domain() != self.clock_domain
+                || item.message.fresh_until.generation() != self.clock_generation
+                || item.message.run_deadline.domain() != self.clock_domain
+                || item.message.run_deadline.generation() != self.clock_generation
                 || !active.insert(item.message.id)
             {
                 return Err(MailboxError::StateInconsistent);
@@ -1532,14 +1782,6 @@ impl CapacityFit {
     }
 }
 
-fn earlier_deadline(first: MonotonicDeadline, second: MonotonicDeadline) -> MonotonicDeadline {
-    if first.deadline().value() <= second.deadline().value() {
-        first
-    } else {
-        second
-    }
-}
-
 const fn mailbox_time_error(error: TimeError) -> MailboxError {
     match error {
         TimeError::ClockDomainMismatch => MailboxError::ClockDomainMismatch,
@@ -1563,6 +1805,7 @@ pub(crate) enum MailboxError {
     InvalidTerminalReason,
     InflightTokenMismatch,
     AbandonRequiresDraining,
+    CancelRequiresDraining,
 }
 
 impl fmt::Display for MailboxError {
@@ -1581,6 +1824,7 @@ impl fmt::Display for MailboxError {
             Self::AbandonRequiresDraining => {
                 "in-flight abandonment requires a non-accepting mailbox"
             }
+            Self::CancelRequiresDraining => "queued cancellation requires a non-accepting mailbox",
         };
         formatter.write_str(message)
     }
@@ -1719,6 +1963,23 @@ mod tests {
             schema(0x41),
             InteractionKind::Signal,
             None,
+        )
+    }
+
+    fn message_with_deadlines(
+        id: u8,
+        size: usize,
+        fresh_until: u64,
+        run_deadline: u64,
+    ) -> ValidatedMessage {
+        ValidatedMessage::new_with_deadlines(
+            MessageId::from_bytes([id; 16]),
+            schema(0x41),
+            InteractionKind::Signal,
+            None,
+            deadline_at(fresh_until),
+            deadline_at(run_deadline),
+            payload(size, id),
         )
     }
 
@@ -1953,12 +2214,12 @@ mod tests {
         );
         let before = snapshot(&mailbox);
 
-        let report = offer(&mut mailbox, message(2, 1, 50), 0);
+        let report = offer(&mut mailbox, message_with_deadlines(2, 1, 20, 50), 0);
         let EnqueueOutcome::WouldBlock { message, deadline } = report.outcome() else {
             panic!("full block policy must return a pure would-block decision");
         };
         assert_eq!(message.id(), MessageId::from_bytes([2; 16]));
-        assert_eq!(*deadline, deadline_at(50));
+        assert_eq!(*deadline, deadline_at(20));
         assert!(report.terminals().is_empty());
         let after = snapshot(&mailbox);
         assert_eq!(after.queued_items(), before.queued_items());
@@ -1989,10 +2250,7 @@ mod tests {
             panic!("compatible expiry must succeed");
         };
         assert_eq!(at_deadline.len(), 1);
-        assert_eq!(
-            at_deadline[0].reason(),
-            TerminalReason::ExpiredAfterAdmission
-        );
+        assert_eq!(at_deadline[0].reason(), TerminalReason::QueueAgeExpired);
 
         let already_expired = offer(&mut mailbox, message(2, 2, 10), 10);
         assert!(matches!(
@@ -2002,8 +2260,109 @@ mod tests {
         let state = snapshot(&mailbox);
         assert_eq!(state.offers().admitted(), 1);
         assert_eq!(state.offers().expired_before_admission(), 1);
-        assert_eq!(state.terminals().expired_after_admission(), 1);
+        assert_eq!(state.terminals().queue_age_expired(), 1);
         assert_eq!(state.queued_items(), 0);
+    }
+
+    #[test]
+    fn dispatch_distinguishes_all_three_exact_pre_run_boundaries() {
+        let bounds = [
+            (5, 50, 50, TerminalReason::StaleBeforeRun),
+            (50, 5, 50, TerminalReason::RunDeadlineExpired),
+            (50, 50, 5, TerminalReason::QueueAgeExpired),
+        ];
+
+        for (offset, (fresh_until, run_deadline, queue_age, expected)) in
+            bounds.into_iter().enumerate()
+        {
+            let mut mailbox = mailbox_with(
+                u8::try_from(0x60 + offset).expect("test mailbox identity must fit"),
+                InteractionKind::Signal,
+                spec(1, 4, queue_age, 1, 4, OverflowPolicy::RejectNew),
+            );
+            assert!(
+                offer(
+                    &mut mailbox,
+                    message_with_deadlines(1, 2, fresh_until, run_deadline),
+                    0,
+                )
+                .outcome()
+                .is_admitted()
+            );
+
+            let before = mailbox
+                .head_readiness(reading(4))
+                .expect("compatible readiness must succeed");
+            let super::MailboxHeadReadiness::Ready(hint) = before else {
+                panic!("head must be ready one tick before its first boundary");
+            };
+            assert_eq!(hint.mailbox(), mailbox.reference());
+            assert_eq!(hint.message_id(), MessageId::from_bytes([1; 16]));
+            assert_eq!(hint.charged_bytes(), 2);
+            assert_eq!(hint.fresh_until(), deadline_at(fresh_until));
+            assert_eq!(hint.run_deadline(), deadline_at(run_deadline));
+            assert_eq!(hint.queue_age_deadline(), deadline_at(queue_age));
+
+            let at_boundary = mailbox
+                .head_readiness(reading(5))
+                .expect("compatible readiness must succeed");
+            assert!(matches!(
+                at_boundary,
+                super::MailboxHeadReadiness::Expired { reason, .. } if reason == expected
+            ));
+            let state_before_dispatch = snapshot(&mailbox);
+            let report = begin(&mut mailbox, 5);
+            assert_eq!(report.expired().len(), 1);
+            assert_eq!(report.expired()[0].reason(), expected);
+            assert!(matches!(report.outcome(), DispatchOutcome::NoQueuedMessage));
+            let after = snapshot(&mailbox);
+            assert_eq!(after.queued_items(), 0);
+            assert_eq!(after.retained_bytes(), 0);
+            assert_eq!(after.offers(), state_before_dispatch.offers());
+        }
+    }
+
+    #[test]
+    fn delayed_dispatch_reports_the_first_expired_boundary_with_stable_ties() {
+        let cases = [
+            (5, 10, 20, TerminalReason::StaleBeforeRun),
+            (10, 20, 5, TerminalReason::QueueAgeExpired),
+            (10, 5, 20, TerminalReason::RunDeadlineExpired),
+            (5, 5, 5, TerminalReason::RunDeadlineExpired),
+            (5, 10, 5, TerminalReason::StaleBeforeRun),
+        ];
+
+        for (offset, (fresh_until, run_deadline, queue_age, expected)) in
+            cases.into_iter().enumerate()
+        {
+            let mut mailbox = mailbox_with(
+                u8::try_from(0x70 + offset).expect("test mailbox identity must fit"),
+                InteractionKind::Signal,
+                spec(1, 4, queue_age, 1, 4, OverflowPolicy::RejectNew),
+            );
+            assert!(
+                offer(
+                    &mut mailbox,
+                    message_with_deadlines(1, 2, fresh_until, run_deadline),
+                    0,
+                )
+                .outcome()
+                .is_admitted()
+            );
+
+            let observed = mailbox
+                .head_readiness(reading(30))
+                .expect("delayed readiness must remain structurally valid");
+            assert!(matches!(
+                observed,
+                super::MailboxHeadReadiness::Expired { reason, .. } if reason == expected
+            ));
+            let report = begin(&mut mailbox, 30);
+            assert_eq!(report.expired().len(), 1);
+            assert_eq!(report.expired()[0].reason(), expected);
+            assert!(matches!(report.outcome(), DispatchOutcome::NoQueuedMessage));
+            assert_eq!(snapshot(&mailbox).retained_bytes(), 0);
+        }
     }
 
     #[test]
@@ -2178,6 +2537,73 @@ mod tests {
         assert_eq!(closed.retained_bytes(), 0);
         assert_eq!(closed.inflight_items(), 0);
         assert_eq!(closed.queued_items(), 0);
+    }
+
+    #[test]
+    fn draining_queue_cancellation_is_atomic_idempotent_and_queue_only() {
+        let mut mailbox = mailbox_with(
+            0x51,
+            InteractionKind::Signal,
+            spec(3, 9, 50, 1, 9, OverflowPolicy::RejectNew),
+        );
+        for id in 1..=3 {
+            assert!(
+                offer(&mut mailbox, message(id, 3, 100), 0)
+                    .outcome()
+                    .is_admitted()
+            );
+        }
+        let token = started_token(begin(&mut mailbox, 0));
+        let accepting = snapshot(&mailbox);
+        assert_eq!(
+            mailbox.cancel_all_queued().err(),
+            Some(MailboxError::CancelRequiresDraining)
+        );
+        assert_eq!(snapshot(&mailbox), accepting);
+
+        assert!(mailbox.stop_accepting().is_ok());
+        let records = mailbox
+            .cancel_all_queued()
+            .unwrap_or_else(|error| panic!("draining cancellation failed: {error}"));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].message_id(), MessageId::from_bytes([2; 16]));
+        assert_eq!(records[1].message_id(), MessageId::from_bytes([3; 16]));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.reason() == TerminalReason::Cancelled)
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.released_bytes())
+                .sum::<u64>(),
+            6
+        );
+        let draining = snapshot(&mailbox);
+        assert_eq!(draining.lifecycle(), MailboxLifecycle::Draining);
+        assert_eq!(draining.queued_items(), 0);
+        assert_eq!(draining.queued_bytes(), 0);
+        assert_eq!(draining.inflight_items(), 1);
+        assert_eq!(draining.retained_bytes(), 3);
+        assert_eq!(draining.terminals().cancelled(), 2);
+
+        assert!(
+            mailbox
+                .cancel_all_queued()
+                .unwrap_or_else(|error| panic!("repeated cancellation failed: {error}"))
+                .is_empty()
+        );
+        assert_eq!(snapshot(&mailbox), draining);
+
+        assert!(mailbox.finish(token, TerminalReason::Completed).is_ok());
+        assert_eq!(snapshot(&mailbox).lifecycle(), MailboxLifecycle::Closed);
+        assert!(
+            mailbox
+                .cancel_all_queued()
+                .unwrap_or_else(|error| panic!("closed cancellation failed: {error}"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2466,7 +2892,14 @@ mod tests {
             Some(CoalesceKey::from_bytes([8; 16]))
         );
         assert_eq!(message.deadline(), deadline_at(50));
+        assert_eq!(message.fresh_until(), deadline_at(50));
+        assert_eq!(message.run_deadline(), deadline_at(50));
         assert_eq!(message.payload().charged_bytes(), 4);
+
+        let explicit = message_with_deadlines(10, 1, 20, 40);
+        assert_eq!(explicit.fresh_until(), deadline_at(20));
+        assert_eq!(explicit.run_deadline(), deadline_at(40));
+        assert_eq!(explicit.deadline(), deadline_at(40));
     }
 
     #[test]
