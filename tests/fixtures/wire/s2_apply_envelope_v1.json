@@ -1,0 +1,317 @@
+{
+  "fixture_version": 1,
+  "source": "crates/paraegox-deployment/src/envelope.rs TEST-ONLY signed fixture literals",
+  "test_only_notice": "TEST-ONLY deterministic keys; never production",
+  "test_only_keys": {
+    "tenure_authority_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "request_writer_seed_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "semantic": {
+    "slice_contract_version": 1,
+    "target_hex": "05050505050505050505050505050505",
+    "source_scope_hex": "01010101010101010101010101010101",
+    "source_plan_hex": "02020202020202020202020202020202",
+    "source_revision": 3,
+    "source_plan_digest_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+    "assignment_digest_hex": "0606060606060606060606060606060606060606060606060606060606060606",
+    "writer_hex": "09090909090909090909090909090909",
+    "writer_epoch": 1,
+    "tenure_authority_hex": "07070707070707070707070707070707",
+    "tenure_key_hex": "08080808080808080808080808080808",
+    "tenure_algorithm": 1,
+    "tenure_algorithm_version": 1,
+    "supersedes_through_epoch": 0,
+    "tenure_nonce_hex": "746573742d6f6e6c792d74656e7572652d6e6f6e6365",
+    "expected_active_tag": 0,
+    "expected_active_digest_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "operation_id_hex": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+    "temporal_version": 1,
+    "temporal_constraint_id_hex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "clock_domain_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+    "clock_generation": 3,
+    "original_budget_nanos": 100,
+    "remaining_budget_nanos": 60,
+    "auth_principal_hex": "09090909090909090909090909090909",
+    "auth_key_hex": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+    "auth_algorithm": 1,
+    "auth_algorithm_version": 1,
+    "auth_nonce_hex": "746573742d6f6e6c792d726571756573742d6e6f6e6365"
+  },
+  "protocol": {
+    "frame_magic_hex": "5061726145474f580072756e74696d652d6170706c792d656e76656c6f7065",
+    "frame_version": 1,
+    "frame_field_count": 37,
+    "max_frame_bytes": 4096,
+    "tlv_header": "tag:u16-be,length:u32-be",
+    "digest_magic_hex": "5061726145474f580063616e6f6e6963616c2d646967657374",
+    "digest_version": 1,
+    "digest_field_framing": "marker:u8=1,ordinal:u32-be,length:u64-be",
+    "digest_terminator": "marker:u8=255,field_count:u32-be",
+    "target_slice_digest_domain_hex": "7061726165676f782e72756e74696d652e7461726765742d736c6963652e7368613235362e7631",
+    "tenure_proof_digest_domain_hex": "7061726165676f782e72756e74696d652e7772697465722d74656e7572652d70726f6f662e7368613235362e7631",
+    "apply_control_digest_domain_hex": "7061726165676f782e72756e74696d652e6170706c792d636f6e74726f6c2e7368613235362e7631",
+    "signing_magic_hex": "5061726145474f580063616e6f6e6963616c2d7369676e696e672d7472616e736372697074",
+    "tenure_signing_version": 1,
+    "tenure_signing_domain_hex": "7061726165676f782e72756e74696d652e7772697465722d74656e7572652e7369676e696e672e7631",
+    "tenure_signing_field_count": 9,
+    "request_signing_version": 1,
+    "request_signing_domain_hex": "7061726165676f782e72756e74696d652e6170706c792d656e76656c6f70652d617574682e7369676e696e672e7631",
+    "request_signing_field_count": 36,
+    "request_digest_domain_hex": "7061726165676f782e72756e74696d652e6170706c792d656e76656c6f70652e726571756573742e7368613235362e7631"
+  },
+  "error_codes": {
+    "frame_too_large": 1,
+    "truncated": 2,
+    "invalid_magic": 3,
+    "unsupported_version": 4,
+    "unknown_field": 5,
+    "missing_field": 6,
+    "duplicate_field": 7,
+    "out_of_order_field": 8,
+    "invalid_field_length": 9,
+    "invalid_field_value": 10,
+    "derived_digest_mismatch": 11,
+    "non_canonical_frame": 12,
+    "trailing_bytes": 13
+  },
+  "wire_fields": [
+    {
+      "tag": 1,
+      "name": "slice_contract_version",
+      "length": 2,
+      "value_hex": "0001"
+    },
+    {
+      "tag": 2,
+      "name": "target",
+      "length": 16,
+      "value_hex": "05050505050505050505050505050505"
+    },
+    {
+      "tag": 3,
+      "name": "source_scope",
+      "length": 16,
+      "value_hex": "01010101010101010101010101010101"
+    },
+    {
+      "tag": 4,
+      "name": "source_plan",
+      "length": 16,
+      "value_hex": "02020202020202020202020202020202"
+    },
+    {
+      "tag": 5,
+      "name": "source_revision",
+      "length": 8,
+      "value_hex": "0000000000000003"
+    },
+    {
+      "tag": 6,
+      "name": "source_plan_digest",
+      "length": 32,
+      "value_hex": "0404040404040404040404040404040404040404040404040404040404040404"
+    },
+    {
+      "tag": 7,
+      "name": "assignment_digest",
+      "length": 32,
+      "value_hex": "0606060606060606060606060606060606060606060606060606060606060606"
+    },
+    {
+      "tag": 8,
+      "name": "target_slice_digest",
+      "length": 32,
+      "value_hex": "789d234856f31704a0a58c491cd3693469d4a9e380e33e853ec04a16d5422980"
+    },
+    {
+      "tag": 9,
+      "name": "writer",
+      "length": 16,
+      "value_hex": "09090909090909090909090909090909"
+    },
+    {
+      "tag": 10,
+      "name": "writer_epoch",
+      "length": 8,
+      "value_hex": "0000000000000001"
+    },
+    {
+      "tag": 11,
+      "name": "tenure_authority",
+      "length": 16,
+      "value_hex": "07070707070707070707070707070707"
+    },
+    {
+      "tag": 12,
+      "name": "tenure_key",
+      "length": 16,
+      "value_hex": "08080808080808080808080808080808"
+    },
+    {
+      "tag": 13,
+      "name": "tenure_algorithm",
+      "length": 2,
+      "value_hex": "0001"
+    },
+    {
+      "tag": 14,
+      "name": "tenure_algorithm_version",
+      "length": 2,
+      "value_hex": "0001"
+    },
+    {
+      "tag": 15,
+      "name": "tenure_claim_scope",
+      "length": 16,
+      "value_hex": "01010101010101010101010101010101"
+    },
+    {
+      "tag": 16,
+      "name": "tenure_claim_writer",
+      "length": 16,
+      "value_hex": "09090909090909090909090909090909"
+    },
+    {
+      "tag": 17,
+      "name": "tenure_claim_epoch",
+      "length": 8,
+      "value_hex": "0000000000000001"
+    },
+    {
+      "tag": 18,
+      "name": "supersedes_through_epoch",
+      "length": 8,
+      "value_hex": "0000000000000000"
+    },
+    {
+      "tag": 19,
+      "name": "tenure_nonce",
+      "length": 22,
+      "value_hex": "746573742d6f6e6c792d74656e7572652d6e6f6e6365"
+    },
+    {
+      "tag": 20,
+      "name": "tenure_signature",
+      "length": 64,
+      "value_hex": "d584783b69b8cdcfd4d915cf46cfe703e12c508573570074bdca6f7e32fdd69fff98fc9d08fa97d659a1ea822771eebc4a3779fbbbe8d19b5449354be6963c08"
+    },
+    {
+      "tag": 21,
+      "name": "tenure_proof_envelope_digest",
+      "length": 32,
+      "value_hex": "b5ea3606213f6e502dd1376f8343f8c18b6a6c1374e177661dc84b149f4bb80d"
+    },
+    {
+      "tag": 22,
+      "name": "expected_active_tag",
+      "length": 2,
+      "value_hex": "0000"
+    },
+    {
+      "tag": 23,
+      "name": "expected_active_digest",
+      "length": 32,
+      "value_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "tag": 24,
+      "name": "operation_id",
+      "length": 16,
+      "value_hex": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+    },
+    {
+      "tag": 25,
+      "name": "apply_control_commitment_digest",
+      "length": 32,
+      "value_hex": "8890a30dbe1ff772eee90a5e6173d6f94c568c5fb269604a135af13e5c5c5db4"
+    },
+    {
+      "tag": 26,
+      "name": "temporal_version",
+      "length": 2,
+      "value_hex": "0001"
+    },
+    {
+      "tag": 27,
+      "name": "temporal_constraint_id",
+      "length": 16,
+      "value_hex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+    },
+    {
+      "tag": 28,
+      "name": "clock_domain",
+      "length": 16,
+      "value_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+    },
+    {
+      "tag": 29,
+      "name": "clock_generation",
+      "length": 8,
+      "value_hex": "0000000000000003"
+    },
+    {
+      "tag": 30,
+      "name": "original_budget_nanos",
+      "length": 8,
+      "value_hex": "0000000000000064"
+    },
+    {
+      "tag": 31,
+      "name": "remaining_budget_nanos",
+      "length": 8,
+      "value_hex": "000000000000003c"
+    },
+    {
+      "tag": 32,
+      "name": "auth_principal",
+      "length": 16,
+      "value_hex": "09090909090909090909090909090909"
+    },
+    {
+      "tag": 33,
+      "name": "auth_key",
+      "length": 16,
+      "value_hex": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+    },
+    {
+      "tag": 34,
+      "name": "auth_algorithm",
+      "length": 2,
+      "value_hex": "0001"
+    },
+    {
+      "tag": 35,
+      "name": "auth_algorithm_version",
+      "length": 2,
+      "value_hex": "0001"
+    },
+    {
+      "tag": 36,
+      "name": "auth_nonce",
+      "length": 23,
+      "value_hex": "746573742d6f6e6c792d726571756573742d6e6f6e6365"
+    },
+    {
+      "tag": 37,
+      "name": "auth_signature",
+      "length": 64,
+      "value_hex": "e9a7daa5aaf45e9e9acee3cb6ab4714ece5867d5ff8f9120683e9c4e76a95cf070dcbcecadeeb223b6d6f88ba4880e52913ac20bb57402243a305a51ab871d0a"
+    }
+  ],
+  "expected": {
+    "target_slice_digest_hex": "789d234856f31704a0a58c491cd3693469d4a9e380e33e853ec04a16d5422980",
+    "tenure_public_key_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "tenure_transcript_hex": "5061726145474f580063616e6f6e6963616c2d7369676e696e672d7472616e736372697074000100297061726165676f782e72756e74696d652e7772697465722d74656e7572652e7369676e696e672e76310009000100000010070707070707070707070707070707070002000000100808080808080808080808080808080800030000000200010004000000020001000500000010010101010101010101010101010101010006000000100909090909090909090909090909090900070000000800000000000000010008000000080000000000000000000900000016746573742d6f6e6c792d74656e7572652d6e6f6e6365",
+    "tenure_signature_hex": "d584783b69b8cdcfd4d915cf46cfe703e12c508573570074bdca6f7e32fdd69fff98fc9d08fa97d659a1ea822771eebc4a3779fbbbe8d19b5449354be6963c08",
+    "tenure_proof_digest_hex": "b5ea3606213f6e502dd1376f8343f8c18b6a6c1374e177661dc84b149f4bb80d",
+    "control_digest_hex": "8890a30dbe1ff772eee90a5e6173d6f94c568c5fb269604a135af13e5c5c5db4",
+    "request_public_key_hex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+    "request_transcript_hex": "5061726145474f580063616e6f6e6963616c2d7369676e696e672d7472616e7363726970740001002f7061726165676f782e72756e74696d652e6170706c792d656e76656c6f70652d617574682e7369676e696e672e763100240001000000020001000200000010050505050505050505050505050505050003000000100101010101010101010101010101010100040000001002020202020202020202020202020202000500000008000000000000000300060000002004040404040404040404040404040404040404040404040404040404040404040007000000200606060606060606060606060606060606060606060606060606060606060606000800000020789d234856f31704a0a58c491cd3693469d4a9e380e33e853ec04a16d542298000090000001009090909090909090909090909090909000a000000080000000000000001000b0000001007070707070707070707070707070707000c0000001008080808080808080808080808080808000d000000020001000e000000020001000f00000010010101010101010101010101010101010010000000100909090909090909090909090909090900110000000800000000000000010012000000080000000000000000001300000016746573742d6f6e6c792d74656e7572652d6e6f6e6365001400000040d584783b69b8cdcfd4d915cf46cfe703e12c508573570074bdca6f7e32fdd69fff98fc9d08fa97d659a1ea822771eebc4a3779fbbbe8d19b5449354be6963c08001500000020b5ea3606213f6e502dd1376f8343f8c18b6a6c1374e177661dc84b149f4bb80d001600000002000000170000002000000000000000000000000000000000000000000000000000000000000000000018000000100d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0019000000208890a30dbe1ff772eee90a5e6173d6f94c568c5fb269604a135af13e5c5c5db4001a000000020001001b000000100a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a001c000000100b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b001d000000080000000000000003001e000000080000000000000064001f00000008000000000000003c002000000010090909090909090909090909090909090021000000100c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c00220000000200010023000000020001002400000017746573742d6f6e6c792d726571756573742d6e6f6e6365",
+    "request_signature_hex": "e9a7daa5aaf45e9e9acee3cb6ab4714ece5867d5ff8f9120683e9c4e76a95cf070dcbcecadeeb223b6d6f88ba4880e52913ac20bb57402243a305a51ab871d0a",
+    "canonical_wire_hex": "5061726145474f580072756e74696d652d6170706c792d656e76656c6f7065000100250001000000020001000200000010050505050505050505050505050505050003000000100101010101010101010101010101010100040000001002020202020202020202020202020202000500000008000000000000000300060000002004040404040404040404040404040404040404040404040404040404040404040007000000200606060606060606060606060606060606060606060606060606060606060606000800000020789d234856f31704a0a58c491cd3693469d4a9e380e33e853ec04a16d542298000090000001009090909090909090909090909090909000a000000080000000000000001000b0000001007070707070707070707070707070707000c0000001008080808080808080808080808080808000d000000020001000e000000020001000f00000010010101010101010101010101010101010010000000100909090909090909090909090909090900110000000800000000000000010012000000080000000000000000001300000016746573742d6f6e6c792d74656e7572652d6e6f6e6365001400000040d584783b69b8cdcfd4d915cf46cfe703e12c508573570074bdca6f7e32fdd69fff98fc9d08fa97d659a1ea822771eebc4a3779fbbbe8d19b5449354be6963c08001500000020b5ea3606213f6e502dd1376f8343f8c18b6a6c1374e177661dc84b149f4bb80d001600000002000000170000002000000000000000000000000000000000000000000000000000000000000000000018000000100d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0019000000208890a30dbe1ff772eee90a5e6173d6f94c568c5fb269604a135af13e5c5c5db4001a000000020001001b000000100a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a001c000000100b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b001d000000080000000000000003001e000000080000000000000064001f00000008000000000000003c002000000010090909090909090909090909090909090021000000100c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c00220000000200010023000000020001002400000017746573742d6f6e6c792d726571756573742d6e6f6e6365002500000040e9a7daa5aaf45e9e9acee3cb6ab4714ece5867d5ff8f9120683e9c4e76a95cf070dcbcecadeeb223b6d6f88ba4880e52913ac20bb57402243a305a51ab871d0a",
+    "request_digest_hex": "e706c1cc22b436aa3dc75924cbcd60860688bd9dd65f87de3de53b428590a7bf",
+    "tenure_transcript_length": 244,
+    "request_transcript_length": 885,
+    "canonical_wire_length": 900
+  }
+}

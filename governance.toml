@@ -11,52 +11,67 @@ ignored_top_level_directories = [".git", ".mypy_cache", ".pytest_cache", ".ruff_
 
 [registry]
 # Do not add placeholders. Add rows only in the same change that creates the real surface.
-waivers = []
 deprecations = []
 feature_flags = []
+
+[[registry.waivers]]
+id = "GOV-WAIVER-0001"
+rule_id = "rust:expect"
+scope = "crates/paraegox-runtime/src/lib.rs"
+owner = "Runtime apply admission and state owner"
+reason = "Keep the tested B2 runtime enabler private until an admitted executable Runtime consumer exists; remove the expectation when that internal consumer lands."
+expires_at = "2026-09-30"
+
+[[registry.waivers]]
+id = "GOV-WAIVER-0002"
+rule_id = "rust:expect"
+scope = "crates/paraegox-deployment/src/lib.rs"
+owner = "Deployment projection and apply-envelope owner"
+reason = "Keep the tested deployment producer private until an admitted executable integration consumer exists; remove the expectation when that internal consumer lands."
+expires_at = "2026-09-30"
 
 [[registry.packages]]
 path = "crates/paraegox-kernel"
 cargo_package = "paraegox-kernel"
 owner = "Kernel mechanisms"
-responsibility = "Canonical digest framing and identity values shared by admitted mechanism owners."
+responsibility = "Canonical digest framing, identity values, and owner-local monotonic time values shared by admitted mechanism owners."
 status = "public"
-public_entrypoints = ["paraegox_kernel::digest", "paraegox_kernel::identity"]
+public_entrypoints = ["paraegox_kernel::digest", "paraegox_kernel::identity", "paraegox_kernel::time"]
 consumers = ["paraegox-runtime-contracts", "paraegox-runtime", "paraegox-deployment"]
-first_tests = ["crates/paraegox-kernel/src/digest.rs", "crates/paraegox-kernel/src/identity.rs"]
-removal_condition = "Removal requires migrating every registered mechanism consumer and its canonical digest or identity evidence."
+first_tests = ["crates/paraegox-kernel/src/digest.rs", "crates/paraegox-kernel/src/identity.rs", "crates/paraegox-kernel/src/time.rs"]
+removal_condition = "Removal requires migrating every registered mechanism consumer and its canonical digest, identity, or time evidence."
 
 [[registry.packages]]
 path = "crates/paraegox-runtime-contracts"
 cargo_package = "paraegox-runtime-contracts"
 owner = "Runtime contract owner"
-responsibility = "Source-only plan provenance, target-slice commitments, writer tenure, and non-temporal apply-control contracts."
+responsibility = "Source-plan provenance, target-slice and B1 apply-control commitments, writer-tenure signing and fingerprints, temporal constraints, and the canonical B2 signed apply-envelope wire contract."
 status = "public"
-public_entrypoints = ["paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply"]
+public_entrypoints = ["paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply", "paraegox_runtime_contracts::temporal", "paraegox_runtime_contracts::wire"]
 consumers = ["paraegox-deployment", "paraegox-runtime"]
-first_tests = ["crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs"]
+first_tests = ["crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs"]
 removal_condition = "Removal requires replacing both the independent Deployment producer and Runtime consumer in one accepted contract migration."
 
 [[registry.packages]]
 path = "crates/paraegox-runtime"
 cargo_package = "paraegox-runtime"
-owner = "Runtime apply-state owner"
-responsibility = "Pure writer-fence, prepare, and activate control-state transitions for the B1 vertical slice."
+owner = "Runtime apply admission and state owner"
+responsibility = "Pure B2 signature and temporal admission plus writer-fence, prepare, and activate control-state transitions; no RuntimeHost, I/O, or durable persistence."
 status = "enabler"
 public_entrypoints = []
 consumers = []
-first_tests = ["crates/paraegox-runtime/src/apply_state.rs"]
+first_tests = ["crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs"]
 removal_condition = "Remove this crate if P2a cannot reuse the reducer in the durable RuntimeHost apply path without a parallel state machine."
 
 [[registry.packages]]
 path = "crates/paraegox-deployment"
 cargo_package = "paraegox-deployment"
-owner = "Deployment projection owner"
-responsibility = "Pure projection from committed deployment identities into target-slice and apply-control commitments."
+owner = "Deployment projection and apply-envelope owner"
+responsibility = "Pure projection from committed deployment identities into target-slice and apply-control commitments, plus signature-independent B2 envelope drafts; signing keys and I/O remain caller-owned."
 status = "enabler"
 public_entrypoints = []
 consumers = []
-first_tests = ["crates/paraegox-deployment/src/projection.rs"]
+first_tests = ["crates/paraegox-deployment/src/projection.rs", "crates/paraegox-deployment/src/envelope.rs"]
 removal_condition = "Remove this crate if the P2a production fixture and P2e DeploymentController cannot reuse this projection path."
 
 [[registry.public_apis]]
@@ -72,24 +87,48 @@ module = "paraegox_kernel::identity"
 symbols = ["RuntimeHostId", "PrincipalRef"]
 owner = "Kernel identity values"
 consumers = ["paraegox-runtime-contracts", "paraegox-runtime", "paraegox-deployment"]
-compatibility = "Types stay opaque and non-interchangeable; byte encoding is not yet a published cross-language wire schema."
+compatibility = "Types stay opaque and non-interchangeable; their 16-byte values are stable in explicitly registered B2 envelope fields without defining a global serializer beyond those fields."
 tests = ["crates/paraegox-kernel/src/identity.rs"]
+
+[[registry.public_apis]]
+module = "paraegox_kernel::time"
+symbols = ["ClockDomainRef", "ClockGeneration", "BoundedDuration", "MonotonicInstant", "ClockReading", "MonotonicDeadline", "TimeError"]
+owner = "Kernel time values"
+consumers = ["paraegox-runtime-contracts", "paraegox-runtime", "paraegox-deployment"]
+compatibility = "ClockDomainRef's 16-byte value, nonzero ClockGeneration, and nanosecond BoundedDuration are stable where embedded by B2 wire v1; MonotonicInstant, ClockReading, and MonotonicDeadline remain owner-local and are not serialized as protocol time."
+tests = ["crates/paraegox-kernel/src/time.rs"]
 
 [[registry.public_apis]]
 module = "paraegox_runtime_contracts::provenance"
 symbols = ["RUNTIME_SLICE_HEADER_VERSION", "PlanProvenance", "RuntimeSliceHeader", "RuntimeSliceCommitment", "SourceScopeRef", "SourcePlanRef", "SourcePlanRevision", "SourcePlanDigest", "TargetAssignmentDigest", "TargetSliceDigest", "ProvenanceContractError"]
 owner = "Runtime contract owner"
 consumers = ["paraegox-deployment", "paraegox-runtime"]
-compatibility = "Header version 1 and target-slice digest coverage are stable for composition into P2a; no serializer or wire ABI is published in B1."
+compatibility = "The B1 header version, target-slice digest framing, and golden outputs remain stable; B2 envelope v1 canonically carries their semantic fields and derived digests, while Rust layout remains non-ABI."
 tests = ["crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-runtime/src/apply_state.rs"]
 
 [[registry.public_apis]]
 module = "paraegox_runtime_contracts::apply"
-symbols = ["PlanWriterRef", "ApplyOperationId", "TenureAuthorityRef", "TenureKeyRef", "PlanWriterEpoch", "TenureProofAlgorithm", "TenureProofAuthority", "WriterTenureClaim", "WriterTenureProof", "TenureProofError", "PlanWriterContext", "ExpectedActive", "RuntimeApplyControl", "RuntimeApplyControlCommitment", "ApplyContractError"]
+symbols = ["WRITER_TENURE_SIGNING_TRANSCRIPT_VERSION", "MAX_TENURE_NONCE_BYTES", "MAX_TENURE_SIGNATURE_BYTES", "MAX_TENURE_SIGNING_TRANSCRIPT_BYTES", "PlanWriterRef", "ApplyOperationId", "TenureAuthorityRef", "TenureKeyRef", "PlanWriterEpoch", "TenureProofAlgorithm", "TenureProofAuthority", "WriterTenureClaim", "WriterTenureSigningTranscript", "WriterTenureProof", "TenureProofError", "PlanWriterContext", "ExpectedActive", "RuntimeApplyControl", "RuntimeApplyControlCommitment", "ApplyContractError"]
 owner = "Runtime contract owner"
 consumers = ["paraegox-deployment", "paraegox-runtime"]
-compatibility = "The B1 exact target-slice CAS, proof-envelope fingerprint, v1 digest framing, and golden outputs are stable; no signing transcript, serializer, or wire ABI is published."
-tests = ["crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-runtime/src/apply_state.rs"]
+compatibility = "The B1 exact target-slice CAS, proof-envelope fingerprint including its signature, apply-control v1 digest framing, and golden outputs remain stable; writer-tenure signing-transcript v1 and its bounds are published and exclude the signature, while B2 envelope compatibility is governed by the wire module."
+tests = ["crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-deployment/src/envelope.rs", "crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs", "tests/contract/test_s2_apply_vectors.py"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime_contracts::temporal"
+symbols = ["APPLY_TEMPORAL_CONSTRAINT_VERSION", "TemporalConstraintId", "ApplyTemporalConstraint", "TemporalContractError"]
+owner = "Runtime contract owner"
+consumers = ["paraegox-deployment", "paraegox-runtime"]
+compatibility = "Version 1 fixes the constraint identity, target clock domain and generation, and original and remaining nanosecond budgets; remaining budget may only attenuate, while local monotonic instants and deadlines are never transported."
+tests = ["crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs", "crates/paraegox-runtime/src/admission.rs", "tests/contract/test_s2_apply_vectors.py"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime_contracts::wire"
+symbols = ["RUNTIME_APPLY_ENVELOPE_VERSION", "APPLY_REQUEST_SIGNING_TRANSCRIPT_VERSION", "MAX_RUNTIME_APPLY_ENVELOPE_BYTES", "MAX_APPLY_AUTH_NONCE_BYTES", "MAX_APPLY_AUTH_SIGNATURE_BYTES", "ApplyAuthKeyRef", "ApplyAuthAlgorithm", "ApplyRequestAuthClaim", "ApplyRequestAuthentication", "ApplyRequestSigningTranscript", "RuntimeApplyEnvelopeDraft", "RuntimeApplyEnvelope", "ApplyAuthError", "EnvelopeContractError", "WireErrorCode", "WireError"]
+owner = "Runtime contract owner"
+consumers = ["paraegox-deployment", "paraegox-runtime"]
+compatibility = "Version 1 fixes the magic, 37 ordered TLVs, big-endian scalar and length encoding, frame, nonce, and signature bounds, the 36-field request-signing transcript excluding only the request signature, request-digest framing, and stable WireErrorCode values; incompatible changes require a new protocol version."
+tests = ["crates/paraegox-runtime-contracts/src/wire.rs", "crates/paraegox-deployment/src/envelope.rs", "crates/paraegox-runtime/src/admission.rs", "tests/contract/test_s2_apply_vectors.py"]
 
 [cargo]
 manifest_path = "Cargo.toml"
@@ -112,13 +151,13 @@ allow_external_dependencies = []
 id = "CARGO-ARCH-003"
 source = "paraegox-runtime"
 allow_workspace_dependencies = ["paraegox-kernel", "paraegox-runtime-contracts"]
-allow_external_dependencies = []
+allow_external_dependencies = ["ed25519-dalek"]
 
 [[cargo.rules]]
 id = "CARGO-ARCH-004"
 source = "paraegox-deployment"
 allow_workspace_dependencies = ["paraegox-kernel", "paraegox-runtime-contracts"]
-allow_external_dependencies = []
+allow_external_dependencies = ["ed25519-dalek"]
 
 [[architecture.rules]]
 id = "ARCH-001"

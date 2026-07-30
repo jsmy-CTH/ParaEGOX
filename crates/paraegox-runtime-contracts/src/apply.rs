@@ -10,8 +10,25 @@ use crate::provenance::{
 const WRITER_TENURE_PROOF_ENVELOPE_DIGEST_DOMAIN: &[u8] =
     b"paraegox.runtime.writer-tenure-proof.sha256.v1";
 const APPLY_CONTROL_COMMITMENT_DIGEST_DOMAIN: &[u8] = b"paraegox.runtime.apply-control.sha256.v1";
-const MAX_TENURE_NONCE_BYTES: usize = 64;
-const MAX_TENURE_SIGNATURE_BYTES: usize = 512;
+const SIGNING_TRANSCRIPT_MAGIC: &[u8] = b"ParaEGOX\0canonical-signing-transcript";
+const WRITER_TENURE_SIGNING_DOMAIN: &[u8] = b"paraegox.runtime.writer-tenure.signing.v1";
+const WRITER_TENURE_SIGNING_FIELD_COUNT: u16 = 9;
+const TRANSCRIPT_TLV_HEADER_BYTES: usize = 6;
+
+/// Canonical version of the writer-tenure signing transcript.
+pub const WRITER_TENURE_SIGNING_TRANSCRIPT_VERSION: u16 = 1;
+/// Maximum anti-replay nonce size admitted by a writer-tenure proof.
+pub const MAX_TENURE_NONCE_BYTES: usize = 64;
+/// Maximum opaque signature size admitted by a writer-tenure proof.
+pub const MAX_TENURE_SIGNATURE_BYTES: usize = 512;
+/// Maximum encoded size of a canonical writer-tenure signing transcript.
+pub const MAX_TENURE_SIGNING_TRANSCRIPT_BYTES: usize = SIGNING_TRANSCRIPT_MAGIC.len()
+    + 2
+    + 2
+    + WRITER_TENURE_SIGNING_DOMAIN.len()
+    + 2
+    + ((WRITER_TENURE_SIGNING_FIELD_COUNT as usize) * TRANSCRIPT_TLV_HEADER_BYTES)
+    + (16 + 16 + 2 + 2 + 16 + 16 + 8 + 8 + MAX_TENURE_NONCE_BYTES);
 
 macro_rules! opaque_ref {
     ($name:ident, $documentation:literal) => {
@@ -199,6 +216,82 @@ impl WriterTenureClaim {
     }
 }
 
+/// Canonical bytes signed by a writer-tenure authority.
+///
+/// The transcript is independent from [`WriterTenureProof::envelope_digest`]. It
+/// starts with a fixed magic value, a big-endian transcript version, a
+/// length-prefixed domain, and a big-endian field count. Nine ordered TLV fields
+/// then cover authority, key, algorithm, algorithm version, source scope,
+/// writer, epoch, supersedes-through epoch, and nonce. TLV tags are consecutive
+/// big-endian `u16` values starting at one; lengths are big-endian `u32` values.
+/// The signature value is deliberately absent.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WriterTenureSigningTranscript(Box<[u8]>);
+
+impl WriterTenureSigningTranscript {
+    /// Builds the bounded canonical transcript for an authority, claim, and nonce.
+    pub fn try_new(
+        authority: TenureProofAuthority,
+        claim: WriterTenureClaim,
+        nonce: &[u8],
+    ) -> Result<Self, TenureProofError> {
+        validate_tenure_nonce(nonce)?;
+
+        let mut encoded = Vec::with_capacity(MAX_TENURE_SIGNING_TRANSCRIPT_BYTES);
+        encoded.extend_from_slice(SIGNING_TRANSCRIPT_MAGIC);
+        encoded.extend_from_slice(&WRITER_TENURE_SIGNING_TRANSCRIPT_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&(WRITER_TENURE_SIGNING_DOMAIN.len() as u16).to_be_bytes());
+        encoded.extend_from_slice(WRITER_TENURE_SIGNING_DOMAIN);
+        encoded.extend_from_slice(&WRITER_TENURE_SIGNING_FIELD_COUNT.to_be_bytes());
+        append_transcript_tlv(&mut encoded, 1, authority.authority().as_bytes());
+        append_transcript_tlv(&mut encoded, 2, authority.key().as_bytes());
+        append_transcript_tlv(
+            &mut encoded,
+            3,
+            &authority.algorithm().value().to_be_bytes(),
+        );
+        append_transcript_tlv(
+            &mut encoded,
+            4,
+            &authority.algorithm_version().to_be_bytes(),
+        );
+        append_transcript_tlv(&mut encoded, 5, claim.source_scope().as_bytes());
+        append_transcript_tlv(&mut encoded, 6, claim.writer().as_bytes());
+        append_transcript_tlv(&mut encoded, 7, &claim.epoch().value().to_be_bytes());
+        append_transcript_tlv(
+            &mut encoded,
+            8,
+            &claim.supersedes_through_epoch().value().to_be_bytes(),
+        );
+        append_transcript_tlv(&mut encoded, 9, nonce);
+
+        debug_assert!(encoded.len() <= MAX_TENURE_SIGNING_TRANSCRIPT_BYTES);
+        Ok(Self(encoded.into_boxed_slice()))
+    }
+
+    /// Returns the exact bytes supplied to the signature algorithm.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn append_transcript_tlv(encoded: &mut Vec<u8>, tag: u16, value: &[u8]) {
+    encoded.extend_from_slice(&tag.to_be_bytes());
+    encoded.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(value);
+}
+
+fn validate_tenure_nonce(nonce: &[u8]) -> Result<(), TenureProofError> {
+    if nonce.is_empty() {
+        return Err(TenureProofError::EmptyNonce);
+    }
+    if nonce.len() > MAX_TENURE_NONCE_BYTES {
+        return Err(TenureProofError::NonceTooLong);
+    }
+    Ok(())
+}
+
 /// Bounded authority proof carried with writer context.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct WriterTenureProof {
@@ -216,12 +309,7 @@ impl WriterTenureProof {
         nonce: &[u8],
         signature: &[u8],
     ) -> Result<Self, TenureProofError> {
-        if nonce.is_empty() {
-            return Err(TenureProofError::EmptyNonce);
-        }
-        if nonce.len() > MAX_TENURE_NONCE_BYTES {
-            return Err(TenureProofError::NonceTooLong);
-        }
+        validate_tenure_nonce(nonce)?;
         if signature.is_empty() {
             return Err(TenureProofError::EmptySignature);
         }
@@ -260,10 +348,15 @@ impl WriterTenureProof {
         &self.signature
     }
 
+    /// Returns the canonical signing transcript, excluding the signature value.
+    pub fn signing_transcript(&self) -> Result<WriterTenureSigningTranscript, TenureProofError> {
+        WriterTenureSigningTranscript::try_new(self.authority, self.claim, self.nonce())
+    }
+
     /// Computes the canonical fingerprint of the complete proof envelope.
     ///
     /// The signature bytes are part of this fingerprint. It is therefore not a
-    /// signing transcript; the future verifier owns that separate contract.
+    /// signing transcript; the owning verifier uses that separate contract.
     pub fn envelope_digest(&self) -> Result<Digest32, DigestBuildError> {
         let authority = self.authority();
         let claim = self.claim();
@@ -580,10 +673,11 @@ mod tests {
     };
 
     use super::{
-        ApplyOperationId, ExpectedActive, PlanWriterContext, PlanWriterEpoch, PlanWriterRef,
+        ApplyOperationId, ExpectedActive, MAX_TENURE_NONCE_BYTES, MAX_TENURE_SIGNATURE_BYTES,
+        MAX_TENURE_SIGNING_TRANSCRIPT_BYTES, PlanWriterContext, PlanWriterEpoch, PlanWriterRef,
         RuntimeApplyControl, RuntimeApplyControlCommitment, TenureAuthorityRef, TenureKeyRef,
         TenureProofAlgorithm, TenureProofAuthority, TenureProofError, WriterTenureClaim,
-        WriterTenureProof,
+        WriterTenureProof, WriterTenureSigningTranscript,
     };
 
     #[derive(Clone, Copy)]
@@ -726,6 +820,73 @@ mod tests {
         ];
 
         assert_eq!(digest.as_bytes(), &expected);
+    }
+
+    #[test]
+    fn tenure_signing_transcript_has_a_stable_golden_vector() {
+        let proof = build_proof(proof_fixture());
+        let Ok(from_proof) = proof.signing_transcript() else {
+            panic!("test signing transcript must build");
+        };
+        let Ok(direct) =
+            WriterTenureSigningTranscript::try_new(proof.authority(), proof.claim(), proof.nonce())
+        else {
+            panic!("direct test signing transcript must build");
+        };
+        let expected = [
+            0x50, 0x61, 0x72, 0x61, 0x45, 0x47, 0x4f, 0x58, 0x00, 0x63, 0x61, 0x6e, 0x6f, 0x6e,
+            0x69, 0x63, 0x61, 0x6c, 0x2d, 0x73, 0x69, 0x67, 0x6e, 0x69, 0x6e, 0x67, 0x2d, 0x74,
+            0x72, 0x61, 0x6e, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x00, 0x01, 0x00, 0x29, 0x70,
+            0x61, 0x72, 0x61, 0x65, 0x67, 0x6f, 0x78, 0x2e, 0x72, 0x75, 0x6e, 0x74, 0x69, 0x6d,
+            0x65, 0x2e, 0x77, 0x72, 0x69, 0x74, 0x65, 0x72, 0x2d, 0x74, 0x65, 0x6e, 0x75, 0x72,
+            0x65, 0x2e, 0x73, 0x69, 0x67, 0x6e, 0x69, 0x6e, 0x67, 0x2e, 0x76, 0x31, 0x00, 0x09,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+            0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x00, 0x02, 0x00, 0x00, 0x00, 0x10,
+            0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+            0x08, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x10, 0x01, 0x01, 0x01, 0x01,
+            0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x06,
+            0x00, 0x00, 0x00, 0x10, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09,
+            0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x00, 0x07, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00, 0x05, 0x6e, 0x6f,
+            0x6e, 0x63, 0x65,
+        ];
+
+        assert_eq!(from_proof, direct);
+        assert_eq!(from_proof.as_bytes(), &expected);
+    }
+
+    #[test]
+    fn every_tenure_signing_field_is_committed_but_signature_is_not() {
+        let Ok(baseline) = build_proof(proof_fixture()).signing_transcript() else {
+            panic!("baseline signing transcript must build");
+        };
+        let mut variations = [proof_fixture(); 9];
+        variations[0].authority_byte = 0x17;
+        variations[1].key_byte = 0x18;
+        variations[2].algorithm = 2;
+        variations[3].algorithm_version = 2;
+        variations[4].scope_byte = 0x11;
+        variations[5].writer_byte = 0x19;
+        variations[6].epoch = 3;
+        variations[7].supersedes = 0;
+        variations[8].nonce = b"noncf";
+
+        for changed in variations {
+            let Ok(changed_transcript) = build_proof(changed).signing_transcript() else {
+                panic!("changed signing transcript must build");
+            };
+            assert_ne!(baseline, changed_transcript);
+        }
+
+        let mut changed_signature = proof_fixture();
+        changed_signature.signature = b"signaturf";
+        let Ok(changed_signature_transcript) = build_proof(changed_signature).signing_transcript()
+        else {
+            panic!("changed-signature transcript must build");
+        };
+        assert_eq!(baseline, changed_signature_transcript);
     }
 
     #[test]
@@ -880,6 +1041,35 @@ mod tests {
         assert_eq!(
             WriterTenureProof::try_new(authority, claim, b"nonce", b"").err(),
             Some(TenureProofError::EmptySignature)
+        );
+        assert_eq!(
+            WriterTenureProof::try_new(authority, claim, &[0; 65], b"signature").err(),
+            Some(TenureProofError::NonceTooLong)
+        );
+        assert_eq!(
+            WriterTenureProof::try_new(authority, claim, b"nonce", &[0; 513]).err(),
+            Some(TenureProofError::SignatureTooLong)
+        );
+        assert_eq!(
+            WriterTenureSigningTranscript::try_new(authority, claim, &[0; 65]).err(),
+            Some(TenureProofError::NonceTooLong)
+        );
+
+        let max_nonce = [0; MAX_TENURE_NONCE_BYTES];
+        let max_signature = [0; MAX_TENURE_SIGNATURE_BYTES];
+        let Ok(max_proof) =
+            WriterTenureProof::try_new(authority, claim, &max_nonce, &max_signature)
+        else {
+            panic!("exact-limit tenure proof must be admitted");
+        };
+        let Ok(max_transcript) = max_proof.signing_transcript() else {
+            panic!("exact-limit tenure transcript must build");
+        };
+        assert_eq!(max_proof.nonce().len(), MAX_TENURE_NONCE_BYTES);
+        assert_eq!(max_proof.signature().len(), MAX_TENURE_SIGNATURE_BYTES);
+        assert_eq!(
+            max_transcript.as_bytes().len(),
+            MAX_TENURE_SIGNING_TRANSCRIPT_BYTES
         );
     }
 

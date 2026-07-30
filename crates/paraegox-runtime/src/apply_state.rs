@@ -1,8 +1,11 @@
-//! Pure writer-fence and apply-control state transitions.
+//! Pure writer-fence and apply-control transitions for admitted requests.
 
 use core::fmt;
 use paraegox_kernel::digest::{Digest32, DigestBuildError};
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
+#[cfg(test)]
+use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration, MonotonicInstant};
+use paraegox_kernel::time::{ClockReading, MonotonicDeadline, TimeError};
 use paraegox_runtime_contracts::apply::{
     ApplyContractError, ApplyOperationId, ExpectedActive, PlanWriterEpoch, PlanWriterRef,
     RuntimeApplyControlCommitment,
@@ -98,9 +101,9 @@ impl ApplyControlState {
     }
 }
 
-/// Verified tenure facts produced by a future owning admission implementation.
+/// Verified tenure facts produced only by this crate's concrete admission path.
 ///
-/// The owning verifier must establish proof validity and authentication. When no
+/// Admission establishes proof validity and authentication. When no
 /// durable fence exists, it must additionally establish authoritative freshness;
 /// recovery must not turn lost fence state into a fresh bootstrap. For an existing
 /// fence, this reducer owns stale/newer ordering so exact historical replays remain
@@ -116,6 +119,24 @@ pub struct VerifiedWriterTenure {
 }
 
 impl VerifiedWriterTenure {
+    pub(crate) const fn new(
+        source_scope: SourceScopeRef,
+        writer: PlanWriterRef,
+        epoch: PlanWriterEpoch,
+        supersedes_through_epoch: PlanWriterEpoch,
+        proof_envelope_digest: Digest32,
+        principal: PrincipalRef,
+    ) -> Self {
+        Self {
+            source_scope,
+            writer,
+            epoch,
+            supersedes_through_epoch,
+            proof_envelope_digest,
+            principal,
+        }
+    }
+
     #[cfg(test)]
     fn from_payload_for_test(
         payload: &RuntimeApplyControlCommitment,
@@ -125,14 +146,14 @@ impl VerifiedWriterTenure {
         let context = payload.control().writer_context();
         let claim = context.proof().claim();
         let proof_envelope_digest = context.proof().envelope_digest()?;
-        Ok(Self {
-            source_scope: claim.source_scope(),
-            writer: context.writer(),
-            epoch: context.epoch(),
-            supersedes_through_epoch: claim.supersedes_through_epoch(),
+        Ok(Self::new(
+            claim.source_scope(),
+            context.writer(),
+            context.epoch(),
+            claim.supersedes_through_epoch(),
             proof_envelope_digest,
             principal,
-        })
+        ))
     }
 }
 
@@ -141,16 +162,45 @@ impl VerifiedWriterTenure {
 pub struct AdmittedApply {
     payload: RuntimeApplyControlCommitment,
     tenure: VerifiedWriterTenure,
+    request_digest: Digest32,
+    deadline: MonotonicDeadline,
+    exact_replay: bool,
 }
 
 impl AdmittedApply {
+    pub(crate) const fn new(
+        payload: RuntimeApplyControlCommitment,
+        tenure: VerifiedWriterTenure,
+        request_digest: Digest32,
+        deadline: MonotonicDeadline,
+        exact_replay: bool,
+    ) -> Self {
+        Self {
+            payload,
+            tenure,
+            request_digest,
+            deadline,
+            exact_replay,
+        }
+    }
+
     #[cfg(test)]
     fn from_payload_for_test(
         payload: RuntimeApplyControlCommitment,
         principal: PrincipalRef,
     ) -> Result<Self, ApplyRejection> {
         let tenure = VerifiedWriterTenure::from_payload_for_test(&payload, principal)?;
-        Ok(Self { payload, tenure })
+        let request_digest = *payload.commitment_digest();
+        let generation = ClockGeneration::try_new(1).map_err(ApplyRejection::Time)?;
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0; 16]),
+            generation,
+            MonotonicInstant::from_ticks(0),
+        );
+        let deadline = reading
+            .try_deadline_after(BoundedDuration::from_nanos(u64::MAX))
+            .map_err(ApplyRejection::Time)?;
+        Ok(Self::new(payload, tenure, request_digest, deadline, false))
     }
 
     /// Returns canonical slice and controls admitted by the owning verifier.
@@ -163,6 +213,24 @@ impl AdmittedApply {
     #[must_use]
     pub const fn tenure(&self) -> &VerifiedWriterTenure {
         &self.tenure
+    }
+
+    /// Returns the digest of the complete authenticated S2 request.
+    #[must_use]
+    pub const fn request_digest(&self) -> &Digest32 {
+        &self.request_digest
+    }
+
+    /// Returns the target-local monotonic deadline installed by admission.
+    #[must_use]
+    pub const fn deadline(&self) -> MonotonicDeadline {
+        self.deadline
+    }
+
+    /// Reports whether admission found the identical complete request in its snapshot.
+    #[must_use]
+    pub const fn is_exact_replay(&self) -> bool {
+        self.exact_replay
     }
 }
 
@@ -213,11 +281,13 @@ impl FenceTransition {
     }
 }
 
-/// Evaluates a verified writer tenure independently of plan CAS.
+/// Evaluates an admitted writer tenure independently of plan CAS.
 pub fn evaluate_writer_fence(
     state: &ApplyControlState,
-    verified: &VerifiedWriterTenure,
+    admitted: &AdmittedApply,
+    reading: ClockReading,
 ) -> Result<FenceTransition, ApplyRejection> {
+    let verified = admitted.tenure();
     if verified.source_scope != state.source_scope {
         return Err(ApplyRejection::SourceScopeMismatch);
     }
@@ -232,6 +302,7 @@ pub fn evaluate_writer_fence(
 
     match state.writer_fence {
         None => {
+            ensure_deadline_live(admitted.deadline, reading)?;
             let mut next_state = state.clone();
             next_state.writer_fence = Some(next_fence);
             Ok(FenceTransition {
@@ -245,6 +316,9 @@ pub fn evaluate_writer_fence(
             if current != next_fence {
                 return Err(ApplyRejection::WriterFenceConflict);
             }
+            if !admitted.is_exact_replay() {
+                ensure_deadline_live(admitted.deadline, reading)?;
+            }
             Ok(FenceTransition {
                 next_state: state.clone(),
                 disposition: FenceDisposition::Kept,
@@ -255,6 +329,7 @@ pub fn evaluate_writer_fence(
             if verified.supersedes_through_epoch < current.epoch {
                 return Err(ApplyRejection::TenureDoesNotSupersedeFence);
             }
+            ensure_deadline_live(admitted.deadline, reading)?;
             let mut next_state = state.clone();
             next_state.writer_fence = Some(next_fence);
             let superseded_operation = next_state.prepared.take().map(|prepared| OperationRecord {
@@ -288,6 +363,7 @@ pub struct PreparedControl {
     incoming: RuntimeSliceCommitment,
     expected_active: ExpectedActive,
     writer_fence: WriterFence,
+    deadline: MonotonicDeadline,
     stage: PrepareStage,
 }
 
@@ -320,6 +396,12 @@ impl PreparedControl {
     #[must_use]
     pub const fn writer_fence(&self) -> WriterFence {
         self.writer_fence
+    }
+
+    /// Returns the target-local deadline that bounds remaining side effects.
+    #[must_use]
+    pub const fn deadline(&self) -> MonotonicDeadline {
+        self.deadline
     }
 
     /// Returns the durable prepare stage.
@@ -444,6 +526,7 @@ pub fn evaluate_prepare(
     state: &ApplyControlState,
     admitted: &AdmittedApply,
     prior_operation: Option<&OperationRecord>,
+    reading: ClockReading,
 ) -> Result<PrepareTransition, ApplyRejection> {
     admitted.payload.validate()?;
     let payload = admitted.payload();
@@ -463,7 +546,7 @@ pub fn evaluate_prepare(
         if existing.operation_id != control.operation_id() {
             return Err(ApplyRejection::OperationLookupMismatch);
         }
-        if existing.request_digest != *payload.commitment_digest() {
+        if existing.request_digest != admitted.request_digest {
             return Err(ApplyRejection::OperationConflict);
         }
         ensure_replayed_operation_consistent(state, existing)?;
@@ -474,6 +557,7 @@ pub fn evaluate_prepare(
         });
     }
 
+    ensure_deadline_live(admitted.deadline, reading)?;
     let writer_fence = matching_writer_fence(state, admitted.tenure())?;
     ensure_expected_active(state, control.expected_active())?;
     ensure_revision_advances(state, slice)?;
@@ -483,10 +567,11 @@ pub fn evaluate_prepare(
 
     let prepared = PreparedControl {
         operation_id: control.operation_id(),
-        request_digest: *payload.commitment_digest(),
+        request_digest: admitted.request_digest,
         incoming: slice,
         expected_active: control.expected_active(),
         writer_fence,
+        deadline: admitted.deadline,
         stage: PrepareStage::ControlAccepted,
     };
     let operation = OperationRecord {
@@ -703,6 +788,7 @@ pub fn evaluate_activate(
     state: &ApplyControlState,
     operation: &OperationRecord,
     ready: &PreparationReadyFact,
+    reading: ClockReading,
 ) -> Result<ActivateTransition, ApplyRejection> {
     ensure_operation_belongs_to_state(state, operation)?;
     ensure_control_state_consistent(state)?;
@@ -722,6 +808,7 @@ pub fn evaluate_activate(
     let Some(prepared) = state.prepared.as_ref() else {
         return Err(ApplyRejection::OperationStateMismatch);
     };
+    ensure_deadline_live(prepared.deadline, reading)?;
     if prepared.operation_id != operation.operation_id
         || prepared.request_digest != operation.request_digest
     {
@@ -752,6 +839,19 @@ pub fn evaluate_activate(
     })
 }
 
+fn ensure_deadline_live(
+    deadline: MonotonicDeadline,
+    reading: ClockReading,
+) -> Result<(), ApplyRejection> {
+    if deadline
+        .is_expired_at(reading)
+        .map_err(ApplyRejection::Time)?
+    {
+        return Err(ApplyRejection::DeadlineExpired);
+    }
+    Ok(())
+}
+
 /// Stable, fail-closed reasons returned before any Runtime execution side effect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyRejection {
@@ -759,6 +859,10 @@ pub enum ApplyRejection {
     Contract(ApplyContractError),
     /// Canonical proof-envelope fingerprint construction failed.
     Digest(DigestBuildError),
+    /// A local monotonic-clock value was incompatible with the admitted request.
+    Time(TimeError),
+    /// The installed local budget expired before a state-changing transition.
+    DeadlineExpired,
     /// The request is for another RuntimeHost.
     TargetMismatch,
     /// The request is for another source desired-state scope.
@@ -801,11 +905,19 @@ impl From<DigestBuildError> for ApplyRejection {
     }
 }
 
+impl From<TimeError> for ApplyRejection {
+    fn from(value: TimeError) -> Self {
+        Self::Time(value)
+    }
+}
+
 impl fmt::Display for ApplyRejection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Contract(error) => write!(formatter, "apply contract rejected: {error}"),
             Self::Digest(error) => write!(formatter, "proof envelope rejected: {error}"),
+            Self::Time(error) => write!(formatter, "apply deadline rejected: {error}"),
+            Self::DeadlineExpired => formatter.write_str("apply deadline expired"),
             Self::TargetMismatch => formatter.write_str("runtime target mismatch"),
             Self::SourceScopeMismatch => formatter.write_str("source scope mismatch"),
             Self::StaleWriterEpoch => formatter.write_str("stale writer epoch"),
@@ -842,6 +954,9 @@ impl std::error::Error for ApplyRejection {}
 mod tests {
     use paraegox_kernel::digest::Digest32;
     use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
+    use paraegox_kernel::time::{
+        BoundedDuration, ClockDomainRef, ClockGeneration, ClockReading, MonotonicInstant, TimeError,
+    };
     use paraegox_runtime_contracts::apply::{
         ApplyOperationId, ExpectedActive, PlanWriterContext, PlanWriterEpoch, PlanWriterRef,
         RuntimeApplyControl, RuntimeApplyControlCommitment, TenureAuthorityRef, TenureKeyRef,
@@ -853,14 +968,49 @@ mod tests {
     };
 
     use super::{
-        ActivateDisposition, AdmittedApply, ApplyControlState, ApplyRejection, FenceDisposition,
-        OperationPhase, OperationRecord, PreparationReadyFact, PrepareDisposition,
-        evaluate_activate, evaluate_prepare, evaluate_writer_fence,
+        ActivateDisposition, ActivateTransition, AdmittedApply, ApplyControlState, ApplyRejection,
+        FenceDisposition, FenceTransition, OperationPhase, OperationRecord, PreparationReadyFact,
+        PrepareDisposition, PrepareTransition, evaluate_activate as evaluate_activate_at,
+        evaluate_prepare as evaluate_prepare_at, evaluate_writer_fence as evaluate_writer_fence_at,
     };
 
     const SCOPE_BYTES: [u8; 16] = [1; 16];
     const TARGET_BYTES: [u8; 16] = [2; 16];
     const WRITER_BYTES: [u8; 16] = [4; 16];
+
+    fn reading(now: u64) -> ClockReading {
+        let Ok(generation) = ClockGeneration::try_new(1) else {
+            panic!("test clock generation must be valid");
+        };
+        ClockReading::new(
+            ClockDomainRef::from_bytes([0; 16]),
+            generation,
+            MonotonicInstant::from_ticks(now),
+        )
+    }
+
+    fn evaluate_writer_fence(
+        state: &ApplyControlState,
+        admitted: &AdmittedApply,
+    ) -> Result<FenceTransition, ApplyRejection> {
+        evaluate_writer_fence_at(state, admitted, reading(0))
+    }
+
+    fn evaluate_prepare(
+        state: &ApplyControlState,
+        admitted: &AdmittedApply,
+        prior_operation: Option<&OperationRecord>,
+    ) -> Result<PrepareTransition, ApplyRejection> {
+        evaluate_prepare_at(state, admitted, prior_operation, reading(0))
+    }
+
+    fn evaluate_activate(
+        state: &ApplyControlState,
+        operation: &OperationRecord,
+        ready: &PreparationReadyFact,
+    ) -> Result<ActivateTransition, ApplyRejection> {
+        evaluate_activate_at(state, operation, ready, reading(0))
+    }
 
     #[derive(Clone, Copy)]
     struct Fixture {
@@ -976,7 +1126,7 @@ mod tests {
     }
 
     fn fence(state: &ApplyControlState, apply: &AdmittedApply) -> ApplyControlState {
-        let Ok(transition) = evaluate_writer_fence(state, apply.tenure()) else {
+        let Ok(transition) = evaluate_writer_fence(state, apply) else {
             panic!("test writer tenure must be admitted");
         };
         let (next_state, superseded) = transition.into_parts();
@@ -1012,7 +1162,7 @@ mod tests {
         let old_active = state.active().copied();
 
         let second = fixture(2, 2, ExpectedActive::None, 11).admitted();
-        let Ok(fence_transition) = evaluate_writer_fence(&state, second.tenure()) else {
+        let Ok(fence_transition) = evaluate_writer_fence(&state, &second) else {
             panic!("new tenure must advance the fence");
         };
         assert_eq!(fence_transition.disposition(), FenceDisposition::Advanced);
@@ -1177,7 +1327,7 @@ mod tests {
 
         let stale = fixture(1, 1, ExpectedActive::None, 11).admitted();
         assert_eq!(
-            evaluate_writer_fence(&state, stale.tenure()).err(),
+            evaluate_writer_fence(&state, &stale).err(),
             Some(ApplyRejection::StaleWriterEpoch)
         );
 
@@ -1185,7 +1335,7 @@ mod tests {
         conflicting_fixture.principal_byte = 44;
         let conflicting = conflicting_fixture.admitted();
         assert_eq!(
-            evaluate_writer_fence(&state, conflicting.tenure()).err(),
+            evaluate_writer_fence(&state, &conflicting).err(),
             Some(ApplyRejection::WriterFenceConflict)
         );
 
@@ -1193,7 +1343,7 @@ mod tests {
         insufficient_fixture.supersedes = 1;
         let insufficient = insufficient_fixture.admitted();
         assert_eq!(
-            evaluate_writer_fence(&state, insufficient.tenure()).err(),
+            evaluate_writer_fence(&state, &insufficient).err(),
             Some(ApplyRejection::TenureDoesNotSupersedeFence)
         );
 
@@ -1217,7 +1367,7 @@ mod tests {
         wrong_scope_fixture.scope_byte = 99;
         let wrong_scope = wrong_scope_fixture.admitted();
         assert_eq!(
-            evaluate_writer_fence(&state(), wrong_scope.tenure()).err(),
+            evaluate_writer_fence(&state(), &wrong_scope).err(),
             Some(ApplyRejection::SourceScopeMismatch)
         );
 
@@ -1242,7 +1392,7 @@ mod tests {
         next_fixture.writer_byte = 44;
         next_fixture.principal_byte = 44;
         let next = next_fixture.admitted();
-        let Ok(transition) = evaluate_writer_fence(&prepared_state, next.tenure()) else {
+        let Ok(transition) = evaluate_writer_fence(&prepared_state, &next) else {
             panic!("new writer tenure must advance");
         };
         assert_eq!(transition.disposition(), FenceDisposition::Advanced);
@@ -1307,13 +1457,15 @@ mod tests {
             panic!("first operation must activate");
         };
         let (active_state, active_operation) = activation.into_parts();
-        let active_digest = active_state
+        let Some(active_digest) = active_state
             .active()
             .map(|active| active.slice().target_slice_digest())
-            .expect("test active slice must exist");
+        else {
+            panic!("test active slice must exist");
+        };
 
         let next = fixture(2, 2, ExpectedActive::Exact(active_digest), 11).admitted();
-        let Ok(turnover) = evaluate_writer_fence(&active_state, next.tenure()) else {
+        let Ok(turnover) = evaluate_writer_fence(&active_state, &next) else {
             panic!("new writer tenure must advance");
         };
         let (state, superseded) = turnover.into_parts();
@@ -1449,7 +1601,7 @@ mod tests {
         wrong_target_fixture.target_byte = 99;
         prepared.incoming = wrong_target_fixture.slice();
         assert_eq!(
-            evaluate_writer_fence(&corrupted_prepared_target, apply.tenure()).err(),
+            evaluate_writer_fence(&corrupted_prepared_target, &apply).err(),
             Some(ApplyRejection::OperationStateMismatch)
         );
         assert_eq!(
@@ -1469,7 +1621,7 @@ mod tests {
         let mut missing_active_fence = active_state.clone();
         missing_active_fence.writer_fence = None;
         assert_eq!(
-            evaluate_writer_fence(&missing_active_fence, apply.tenure()).err(),
+            evaluate_writer_fence(&missing_active_fence, &apply).err(),
             Some(ApplyRejection::OperationStateMismatch)
         );
         assert_eq!(
@@ -1489,7 +1641,7 @@ mod tests {
         wrong_scope_fixture.scope_byte = 99;
         active.slice = wrong_scope_fixture.slice();
         assert_eq!(
-            evaluate_writer_fence(&corrupted_active_scope, apply.tenure()).err(),
+            evaluate_writer_fence(&corrupted_active_scope, &apply).err(),
             Some(ApplyRejection::OperationStateMismatch)
         );
         assert_eq!(
@@ -1546,6 +1698,124 @@ mod tests {
         assert_eq!(
             evaluate_activate(&active_state, &wrong_target, &ready).err(),
             Some(ApplyRejection::TargetMismatch)
+        );
+    }
+
+    #[test]
+    fn full_request_digest_not_b1_commitment_owns_operation_identity() {
+        let mut first = fixture(1, 1, ExpectedActive::None, 10).admitted();
+        first.request_digest = Digest32::from_bytes([41; 32]);
+        let state = fence(&state(), &first);
+        let Ok(preparation) = evaluate_prepare(&state, &first, None) else {
+            panic!("first full request digest must prepare");
+        };
+        let record = preparation.operation();
+        assert_eq!(record.request_digest().as_bytes(), &[41; 32]);
+
+        let mut changed_auth_or_temporal = first.clone();
+        changed_auth_or_temporal.request_digest = Digest32::from_bytes([42; 32]);
+        assert_eq!(
+            changed_auth_or_temporal.payload().commitment_digest(),
+            first.payload().commitment_digest()
+        );
+        assert_eq!(
+            evaluate_prepare(
+                preparation.next_state(),
+                &changed_auth_or_temporal,
+                Some(&record),
+            )
+            .err(),
+            Some(ApplyRejection::OperationConflict)
+        );
+    }
+
+    #[test]
+    fn state_changing_paths_expire_but_terminal_replay_remains_queryable() {
+        let mut apply = fixture(1, 1, ExpectedActive::None, 10).admitted();
+        let Ok(deadline) = reading(5).try_deadline_after(BoundedDuration::from_nanos(5)) else {
+            panic!("test deadline must install");
+        };
+        apply.deadline = deadline;
+
+        assert_eq!(
+            evaluate_writer_fence_at(&state(), &apply, reading(10)).err(),
+            Some(ApplyRejection::DeadlineExpired)
+        );
+
+        let Ok(fence_transition) = evaluate_writer_fence_at(&state(), &apply, reading(9)) else {
+            panic!("live request must fence");
+        };
+        assert_eq!(
+            evaluate_writer_fence_at(fence_transition.next_state(), &apply, reading(10)).err(),
+            Some(ApplyRejection::DeadlineExpired)
+        );
+        let mut replay = apply.clone();
+        replay.exact_replay = true;
+        assert_eq!(
+            evaluate_writer_fence_at(fence_transition.next_state(), &replay, reading(10))
+                .map(|transition| transition.disposition()),
+            Ok(FenceDisposition::Kept)
+        );
+        assert_eq!(
+            evaluate_prepare_at(fence_transition.next_state(), &apply, None, reading(10)).err(),
+            Some(ApplyRejection::DeadlineExpired)
+        );
+
+        let Ok(preparation) =
+            evaluate_prepare_at(fence_transition.next_state(), &apply, None, reading(9))
+        else {
+            panic!("live request must prepare");
+        };
+        let operation = preparation.operation();
+        let ready =
+            PreparationReadyFact::for_test(operation.operation_id(), *operation.request_digest());
+        assert_eq!(
+            evaluate_activate_at(preparation.next_state(), &operation, &ready, reading(10)).err(),
+            Some(ApplyRejection::DeadlineExpired)
+        );
+
+        let Ok(activation) =
+            evaluate_activate_at(preparation.next_state(), &operation, &ready, reading(9))
+        else {
+            panic!("live prepared operation must activate");
+        };
+        let active_operation = activation.operation();
+        assert_eq!(
+            evaluate_activate_at(
+                activation.next_state(),
+                &active_operation,
+                &ready,
+                reading(100),
+            )
+            .map(|transition| transition.disposition()),
+            Ok(ActivateDisposition::Replayed)
+        );
+    }
+
+    #[test]
+    fn state_changes_reject_incompatible_clock_domain_and_generation() {
+        let apply = fixture(1, 1, ExpectedActive::None, 10).admitted();
+        let Ok(other_generation) = ClockGeneration::try_new(2) else {
+            panic!("test generation must be valid");
+        };
+        let wrong_domain = ClockReading::new(
+            ClockDomainRef::from_bytes([1; 16]),
+            apply.deadline().generation(),
+            MonotonicInstant::from_ticks(0),
+        );
+        let wrong_generation = ClockReading::new(
+            apply.deadline().domain(),
+            other_generation,
+            MonotonicInstant::from_ticks(0),
+        );
+
+        assert_eq!(
+            evaluate_writer_fence_at(&state(), &apply, wrong_domain).err(),
+            Some(ApplyRejection::Time(TimeError::ClockDomainMismatch))
+        );
+        assert_eq!(
+            evaluate_writer_fence_at(&state(), &apply, wrong_generation).err(),
+            Some(ApplyRejection::Time(TimeError::ClockGenerationMismatch))
         );
     }
 }

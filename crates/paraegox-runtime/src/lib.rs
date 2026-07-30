@@ -1,4 +1,6 @@
-//! Internal pure apply-control reducer for the B1 foundation slice.
+//! Runtime-owned canonical apply admission and pure control-state transitions.
 
-#[doc(hidden)]
-pub mod apply_state;
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod admission;
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod apply_state;

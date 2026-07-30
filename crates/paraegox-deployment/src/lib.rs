@@ -1,6 +1,8 @@
-//! Internal deployment-side producer for the B1 apply-control spine.
+//! Internal deployment-side producer for Runtime apply commitments and envelope drafts.
 
-#[doc(hidden)]
-pub mod plan;
-#[doc(hidden)]
-pub mod projection;
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0002
+mod envelope;
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0002
+mod plan;
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0002
+mod projection;

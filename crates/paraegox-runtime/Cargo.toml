@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+ed25519-dalek.workspace = true
 paraegox-kernel.workspace = true
 paraegox-runtime-contracts.workspace = true
 
