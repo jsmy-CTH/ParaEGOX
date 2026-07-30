@@ -16,6 +16,7 @@ use paraegox_runtime_contracts::apply::{
     ApplyContractError, PlanWriterRef, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm,
     TenureProofError,
 };
+use paraegox_runtime_contracts::assignment::RuntimeApplyRequest;
 use paraegox_runtime_contracts::provenance::SourceScopeRef;
 use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
 use paraegox_runtime_contracts::wire::{
@@ -23,6 +24,7 @@ use paraegox_runtime_contracts::wire::{
 };
 
 use crate::apply_state::{AdmittedApply, VerifiedWriterTenure};
+use crate::request::{RuntimeRequestAdmissionError, RuntimeRequestAdmissionTransition};
 
 /// Registry value for pure Ed25519 request and tenure signatures.
 pub const ED25519_ALGORITHM: u16 = 1;
@@ -486,8 +488,9 @@ impl ApplyAdmission {
         Self { policy }
     }
 
-    /// Decodes, authenticates, and installs one canonical frame without side effects.
-    pub fn admit(
+    /// Decodes one historical S2-only test frame without side effects.
+    #[cfg(test)]
+    fn admit(
         &self,
         frame: &[u8],
         state: &AdmissionState,
@@ -495,6 +498,19 @@ impl ApplyAdmission {
     ) -> Result<AdmissionTransition, AdmissionError> {
         let envelope = RuntimeApplyEnvelope::decode(frame)?;
         self.admit_envelope(envelope, state, reading)
+    }
+
+    /// Decodes and admits one complete request before any assignment is installed.
+    pub(crate) fn admit_request(
+        &self,
+        frame: &[u8],
+        state: &AdmissionState,
+        reading: ClockReading,
+    ) -> Result<RuntimeRequestAdmissionTransition, RuntimeRequestAdmissionError> {
+        let request = RuntimeApplyRequest::decode(frame)?;
+        let slice = request.slice().clone();
+        let admission = self.admit_envelope(request.envelope().clone(), state, reading)?;
+        Ok(RuntimeRequestAdmissionTransition::new(admission, slice))
     }
 
     fn admit_envelope(
@@ -926,6 +942,11 @@ mod tests {
         TenureProofAlgorithm, TenureProofAuthority, WriterTenureClaim, WriterTenureProof,
         WriterTenureSigningTranscript,
     };
+    use paraegox_runtime_contracts::assignment::{
+        BindingAssignment, BindingId, DeliveryProfile, InstanceRef, InteractionKind, MailboxRef,
+        MailboxSpec, OverflowPolicy, PortCardinality, PortDirection, PortEndpoint, PortRef,
+        PortSpec, RuntimeApplyRequest, RuntimePlanSlice, SchemaRef, TargetAssignments,
+    };
     use paraegox_runtime_contracts::provenance::{
         PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanDigest,
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
@@ -941,6 +962,8 @@ mod tests {
         ApplyControlState, ApplyRejection, FenceDisposition, OperationPhase, PrepareDisposition,
         evaluate_prepare, evaluate_writer_fence,
     };
+    use crate::mailbox::{EnqueueOutcome, Mailbox, MessageId, PayloadHandle, ValidatedMessage};
+    use crate::port_binding::PortBinding;
 
     use super::{
         AdmissionConfigurationError, AdmissionDisposition, AdmissionError, AdmissionState,
@@ -962,6 +985,8 @@ mod tests {
     const DEFAULT_STATE_CAPACITY: usize = 64;
     const PYTHON_SIGNED_FIXTURE_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s2_apply_envelope_v1.json");
+    const PYTHON_COMPLETE_REQUEST_FIXTURE_JSON: &str =
+        include_str!("../../../tests/fixtures/wire/s3_runtime_apply_request_v1.json");
     // TEST-ONLY keys matching the independently encoded Python contract fixture.
     const PYTHON_FIXTURE_TENURE_SEED: [u8; 32] = [0x11; 32];
     const PYTHON_FIXTURE_REQUEST_SEED: [u8; 32] = [0x22; 32];
@@ -1029,6 +1054,15 @@ mod tests {
 
     impl Fixture {
         fn envelope(&self) -> RuntimeApplyEnvelope {
+            self.envelope_with_assignment_digest(TargetAssignmentDigest::new(Digest32::from_bytes(
+                [22; 32],
+            )))
+        }
+
+        fn envelope_with_assignment_digest(
+            &self,
+            assignment_digest: TargetAssignmentDigest,
+        ) -> RuntimeApplyEnvelope {
             let scope = SourceScopeRef::from_bytes([self.scope; 16]);
             let target = RuntimeHostId::from_bytes([self.target; 16]);
             let writer = PlanWriterRef::from_bytes([self.writer; 16]);
@@ -1079,11 +1113,7 @@ mod tests {
                 SourcePlanRevision::new(1),
                 SourcePlanDigest::new(Digest32::from_bytes([21; 32])),
             );
-            let header = RuntimeSliceHeader::new(
-                target,
-                provenance,
-                TargetAssignmentDigest::new(Digest32::from_bytes([22; 32])),
-            );
+            let header = RuntimeSliceHeader::new(target, provenance, assignment_digest);
             let Ok(slice) = RuntimeSliceCommitment::try_new(header) else {
                 panic!("fixture slice must be valid");
             };
@@ -1256,6 +1286,71 @@ mod tests {
         admission.admit(envelope.canonical_wire(), state, fixture.reading(now))
     }
 
+    fn complete_request(fixture: &Fixture) -> RuntimeApplyRequest {
+        let Ok(schema) = SchemaRef::try_new([31; 16], 1, Digest32::from_bytes([32; 32])) else {
+            panic!("test schema must be valid");
+        };
+        let source = PortEndpoint::new(
+            InstanceRef::from_bytes([33; 16]),
+            PortRef::from_bytes([34; 16]),
+            PortSpec::new(
+                PortDirection::Out,
+                schema,
+                InteractionKind::Signal,
+                PortCardinality::One,
+            ),
+        );
+        let target = PortEndpoint::new(
+            InstanceRef::from_bytes([35; 16]),
+            PortRef::from_bytes([36; 16]),
+            PortSpec::new(
+                PortDirection::In,
+                schema,
+                InteractionKind::Signal,
+                PortCardinality::One,
+            ),
+        );
+        let Ok(delivery) = DeliveryProfile::try_new(
+            64,
+            BoundedDuration::from_nanos(100),
+            OverflowPolicy::RejectNew,
+        ) else {
+            panic!("test delivery must be valid");
+        };
+        let Ok(mailbox) = MailboxSpec::try_new(
+            4,
+            256,
+            BoundedDuration::from_nanos(80),
+            2,
+            384,
+            OverflowPolicy::RejectNew,
+        ) else {
+            panic!("test mailbox must be valid");
+        };
+        let Ok(binding) = BindingAssignment::try_new(
+            BindingId::from_bytes([37; 16]),
+            source,
+            target,
+            MailboxRef::from_bytes([38; 16]),
+            delivery,
+            mailbox,
+        ) else {
+            panic!("test binding must be valid");
+        };
+        let Ok(assignments) = TargetAssignments::try_new(vec![binding]) else {
+            panic!("test assignments must be valid");
+        };
+        let envelope = fixture.envelope_with_assignment_digest(assignments.assignment_digest());
+        let commitment = envelope.control_commitment().slice();
+        let Ok(slice) = RuntimePlanSlice::try_new(commitment, assignments) else {
+            panic!("test complete slice must be valid");
+        };
+        let Ok(request) = RuntimeApplyRequest::try_new(envelope, slice) else {
+            panic!("test complete request must be valid");
+        };
+        request
+    }
+
     fn mutate_tlv(frame: &mut [u8], target_tag: u16) {
         let mut cursor = b"ParaEGOX\0runtime-apply-envelope".len() + 4;
         while cursor < frame.len() {
@@ -1277,8 +1372,16 @@ mod tests {
     }
 
     fn fixture_hex_bytes(field: &str) -> Vec<u8> {
+        fixture_document_hex_bytes(PYTHON_SIGNED_FIXTURE_JSON, field)
+    }
+
+    fn complete_request_fixture_hex_bytes(field: &str) -> Vec<u8> {
+        fixture_document_hex_bytes(PYTHON_COMPLETE_REQUEST_FIXTURE_JSON, field)
+    }
+
+    fn fixture_document_hex_bytes(document: &str, field: &str) -> Vec<u8> {
         let marker = format!("\"{field}\": \"");
-        let Some((_, tail)) = PYTHON_SIGNED_FIXTURE_JSON.split_once(marker.as_str()) else {
+        let Some((_, tail)) = document.split_once(marker.as_str()) else {
             panic!("Python fixture field must exist");
         };
         let Some((hex, _)) = tail.split_once('"') else {
@@ -1291,6 +1394,56 @@ mod tests {
             decoded.push((hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]));
         }
         decoded
+    }
+
+    fn python_fixture_admission_and_reading() -> (ApplyAdmission, ClockReading) {
+        let scope = SourceScopeRef::from_bytes([0x01; 16]);
+        let target = RuntimeHostId::from_bytes([0x05; 16]);
+        let writer = PlanWriterRef::from_bytes([0x09; 16]);
+        let principal = PrincipalRef::from_bytes([0x09; 16]);
+
+        let tenure_verifying_key = SigningKey::from_bytes(&PYTHON_FIXTURE_TENURE_SEED)
+            .verifying_key()
+            .to_bytes();
+        let Ok(tenure_trust) = TrustedTenureKey::try_new(
+            scope,
+            TenureAuthorityRef::from_bytes([0x07; 16]),
+            TenureKeyRef::from_bytes([0x08; 16]),
+            tenure_algorithm(ED25519_ALGORITHM),
+            ED25519_ALGORITHM_VERSION,
+            tenure_verifying_key,
+        ) else {
+            panic!("Python fixture tenure trust must be valid");
+        };
+        let request_verifying_key = SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
+            .verifying_key()
+            .to_bytes();
+        let Ok(request_trust) = TrustedApplyKey::try_new(
+            TrustedApplyIdentity::new(scope, target, principal, writer),
+            ApplyAuthKeyRef::from_bytes([0x0c; 16]),
+            apply_algorithm(ED25519_ALGORITHM),
+            ED25519_ALGORITHM_VERSION,
+            request_verifying_key,
+        ) else {
+            panic!("Python fixture request trust must be valid");
+        };
+        let Ok(policy) = ApplyAdmissionPolicy::try_new(
+            BoundedDuration::from_nanos(100),
+            state_limits(4, 4, 4),
+            [tenure_trust],
+            [request_trust],
+        ) else {
+            panic!("Python fixture admission policy must be valid");
+        };
+        let Ok(generation) = ClockGeneration::try_new(3) else {
+            panic!("Python fixture clock generation must be valid");
+        };
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0b; 16]),
+            generation,
+            MonotonicInstant::from_ticks(0),
+        );
+        (ApplyAdmission::new(policy), reading)
     }
 
     fn hex_nibble(value: u8) -> u8 {
@@ -1438,6 +1591,116 @@ mod tests {
     }
 
     #[test]
+    fn complete_request_validates_assignment_body_before_prepare() {
+        let fixture = Fixture::default();
+        let admission = admission(100);
+        let request = complete_request(&fixture);
+        let empty_admission = AdmissionState::for_new_boundary();
+
+        let mut corrupted = request.canonical_wire().to_vec();
+        let Some(last) = corrupted.last_mut() else {
+            panic!("complete request wire must not be empty");
+        };
+        *last ^= 1;
+        assert!(
+            admission
+                .admit_request(&corrupted, &empty_admission, fixture.reading(0))
+                .is_err()
+        );
+        assert_eq!(empty_admission, AdmissionState::for_new_boundary());
+
+        let Ok(transition) = admission.admit_request(
+            request.canonical_wire(),
+            &empty_admission,
+            fixture.reading(0),
+        ) else {
+            panic!("complete signed request must admit");
+        };
+        assert_eq!(transition.disposition(), AdmissionDisposition::Fresh);
+        assert_eq!(transition.slice().assignments().len(), 1);
+        assert_eq!(
+            transition.slice().assignments().assignment_digest(),
+            transition
+                .admitted()
+                .payload()
+                .slice()
+                .header()
+                .assignment_digest()
+        );
+
+        let control = ApplyControlState::new(
+            SourceScopeRef::from_bytes([SCOPE; 16]),
+            RuntimeHostId::from_bytes([TARGET; 16]),
+        );
+        let Ok(fenced) = evaluate_writer_fence(&control, transition.admitted(), fixture.reading(0))
+        else {
+            panic!("authenticated complete request must pass writer fencing");
+        };
+        let Ok(prepared) = evaluate_prepare(
+            fenced.next_state(),
+            transition.admitted(),
+            None,
+            fixture.reading(0),
+        ) else {
+            panic!("authenticated complete request must reach prepare");
+        };
+        assert_eq!(prepared.disposition(), PrepareDisposition::Prepared);
+
+        let Some(&assignment) = transition.slice().assignments().as_slice().first() else {
+            panic!("admitted complete request must retain its assignment");
+        };
+        let reading = fixture.reading(0);
+        let Ok(mut mailbox) = Mailbox::try_new(
+            assignment.mailbox(),
+            assignment.target_spec().schema(),
+            assignment.target_spec().interaction(),
+            assignment.mailbox_spec(),
+            reading.domain(),
+            reading.generation(),
+        ) else {
+            panic!("admitted assignment must construct its exact target mailbox");
+        };
+        let mut binding = PortBinding::new(assignment.binding_id());
+        let Ok(epoch) = binding.prepare(assignment, &mailbox, None) else {
+            panic!("admitted assignment must prepare against its exact mailbox");
+        };
+        let Ok(active) = binding.activate(epoch, &mailbox, None) else {
+            panic!("prepared admitted assignment must activate");
+        };
+        assert_eq!(active.assignment(), assignment);
+
+        let Ok(deadline) = reading.try_deadline_after(BoundedDuration::from_nanos(40)) else {
+            panic!("test message deadline must be representable");
+        };
+        let Ok(payload) = PayloadHandle::try_from_vec(vec![41; 8]) else {
+            panic!("test payload must be representable");
+        };
+        let message = ValidatedMessage::new(
+            MessageId::from_bytes([42; 16]),
+            assignment.target_spec().schema(),
+            assignment.target_spec().interaction(),
+            None,
+            deadline,
+            payload,
+        );
+        let Ok(report) = binding.offer(
+            assignment.binding_id(),
+            epoch,
+            message,
+            &mut mailbox,
+            reading,
+        ) else {
+            panic!("active binding must offer directly to the assigned mailbox");
+        };
+        assert!(matches!(report.outcome(), EnqueueOutcome::Admitted));
+        let Ok(snapshot) = mailbox.snapshot() else {
+            panic!("mailbox state must remain internally consistent");
+        };
+        assert_eq!(snapshot.queued_items(), 1);
+        assert_eq!(snapshot.retained_bytes(), 8);
+    }
+
+    #[test]
     fn first_seen_request_installs_full_budget_at_target_ingress() {
         let fixture = Fixture::default();
         let admission = admission(100);
@@ -1495,54 +1758,7 @@ mod tests {
     fn python_signed_fixture_reaches_rust_cryptographic_admission() {
         let wire = fixture_hex_bytes("canonical_wire_hex");
         let expected_request_digest = fixture_hex_bytes("request_digest_hex");
-        let scope = SourceScopeRef::from_bytes([0x01; 16]);
-        let target = RuntimeHostId::from_bytes([0x05; 16]);
-        let writer = PlanWriterRef::from_bytes([0x09; 16]);
-        let principal = PrincipalRef::from_bytes([0x09; 16]);
-
-        let tenure_verifying_key = SigningKey::from_bytes(&PYTHON_FIXTURE_TENURE_SEED)
-            .verifying_key()
-            .to_bytes();
-        let Ok(tenure_trust) = TrustedTenureKey::try_new(
-            scope,
-            TenureAuthorityRef::from_bytes([0x07; 16]),
-            TenureKeyRef::from_bytes([0x08; 16]),
-            tenure_algorithm(ED25519_ALGORITHM),
-            ED25519_ALGORITHM_VERSION,
-            tenure_verifying_key,
-        ) else {
-            panic!("Python fixture tenure trust must be valid");
-        };
-        let request_verifying_key = SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
-            .verifying_key()
-            .to_bytes();
-        let Ok(request_trust) = TrustedApplyKey::try_new(
-            TrustedApplyIdentity::new(scope, target, principal, writer),
-            ApplyAuthKeyRef::from_bytes([0x0c; 16]),
-            apply_algorithm(ED25519_ALGORITHM),
-            ED25519_ALGORITHM_VERSION,
-            request_verifying_key,
-        ) else {
-            panic!("Python fixture request trust must be valid");
-        };
-        let Ok(policy) = ApplyAdmissionPolicy::try_new(
-            BoundedDuration::from_nanos(100),
-            state_limits(4, 4, 4),
-            [tenure_trust],
-            [request_trust],
-        ) else {
-            panic!("Python fixture admission policy must be valid");
-        };
-        let Ok(generation) = ClockGeneration::try_new(3) else {
-            panic!("Python fixture clock generation must be valid");
-        };
-        let reading = ClockReading::new(
-            ClockDomainRef::from_bytes([0x0b; 16]),
-            generation,
-            MonotonicInstant::from_ticks(0),
-        );
-
-        let admission = ApplyAdmission::new(policy);
+        let (admission, reading) = python_fixture_admission_and_reading();
         let Ok(transition) = admission.admit(&wire, &AdmissionState::for_new_boundary(), reading)
         else {
             panic!("Python-produced canonical fixture must reach Rust admission");
@@ -1556,6 +1772,134 @@ mod tests {
         assert_eq!(transition.next_state().tenure_nonce_count(), 1);
         assert_eq!(transition.next_state().request_nonce_count(), 1);
         assert_eq!(transition.next_state().temporal_lineage_count(), 1);
+    }
+
+    #[test]
+    fn python_complete_request_fixture_reaches_rust_assignment_and_crypto_admission() {
+        let wire = complete_request_fixture_hex_bytes("outer_wire_hex");
+        let expected_assignment_body = complete_request_fixture_hex_bytes("assignment_body_hex");
+        let expected_request_digest = complete_request_fixture_hex_bytes("request_digest_hex");
+        let expected_assignment_digest =
+            complete_request_fixture_hex_bytes("assignment_digest_hex");
+        let (admission, reading) = python_fixture_admission_and_reading();
+
+        let Ok(decoded) = RuntimeApplyRequest::decode(&wire) else {
+            panic!("Python-produced complete request must decode in the Rust contract owner");
+        };
+        assert_eq!(decoded.canonical_wire(), wire);
+        assert_eq!(
+            decoded.slice().assignments().canonical_wire(),
+            expected_assignment_body
+        );
+
+        let Ok(transition) =
+            admission.admit_request(&wire, &AdmissionState::for_new_boundary(), reading)
+        else {
+            panic!(
+                "Python-produced complete request must reach Rust assignment and crypto admission"
+            );
+        };
+        assert_eq!(transition.disposition(), AdmissionDisposition::Fresh);
+        assert_eq!(transition.slice().assignments().len(), 2);
+        assert_eq!(
+            transition.slice().assignments().as_slice()[0]
+                .binding_id()
+                .as_bytes(),
+            &[0x31; 16]
+        );
+        assert_eq!(
+            transition.slice().assignments().as_slice()[1]
+                .binding_id()
+                .as_bytes(),
+            &[0x32; 16]
+        );
+        assert_eq!(
+            transition
+                .slice()
+                .assignments()
+                .assignment_digest()
+                .value()
+                .as_bytes()
+                .as_slice(),
+            expected_assignment_digest.as_slice()
+        );
+        assert_eq!(
+            transition.admitted().request_digest().as_bytes().as_slice(),
+            expected_request_digest.as_slice()
+        );
+        assert_eq!(transition.admitted().deadline().deadline().value(), 60);
+        assert_eq!(transition.next_state().tenure_nonce_count(), 1);
+        assert_eq!(transition.next_state().request_nonce_count(), 1);
+        assert_eq!(transition.next_state().temporal_lineage_count(), 1);
+
+        let control = ApplyControlState::new(
+            SourceScopeRef::from_bytes([0x01; 16]),
+            RuntimeHostId::from_bytes([0x05; 16]),
+        );
+        let Ok(fenced) = evaluate_writer_fence(&control, transition.admitted(), reading) else {
+            panic!("independent complete fixture must pass the writer fence");
+        };
+        let Ok(prepared) =
+            evaluate_prepare(fenced.next_state(), transition.admitted(), None, reading)
+        else {
+            panic!("independent complete fixture must reach prepare before installation");
+        };
+        assert_eq!(prepared.disposition(), PrepareDisposition::Prepared);
+
+        for (index, &assignment) in transition
+            .slice()
+            .assignments()
+            .as_slice()
+            .iter()
+            .enumerate()
+        {
+            let Ok(mut mailbox) = Mailbox::try_new(
+                assignment.mailbox(),
+                assignment.target_spec().schema(),
+                assignment.target_spec().interaction(),
+                assignment.mailbox_spec(),
+                reading.domain(),
+                reading.generation(),
+            ) else {
+                panic!("independent fixture assignment must construct its exact mailbox");
+            };
+            let mut binding = PortBinding::new(assignment.binding_id());
+            let Ok(epoch) = binding.prepare(assignment, &mailbox, None) else {
+                panic!("independent fixture assignment must prepare");
+            };
+            let Ok(_) = binding.activate(epoch, &mailbox, None) else {
+                panic!("independent fixture assignment must activate");
+            };
+            let Ok(deadline) = reading.try_deadline_after(BoundedDuration::from_nanos(40)) else {
+                panic!("fixture message deadline must be representable");
+            };
+            let Ok(payload) = PayloadHandle::try_from_vec(vec![index as u8 + 1; index + 1]) else {
+                panic!("fixture payload must be representable");
+            };
+            let message = ValidatedMessage::new(
+                MessageId::from_bytes([index as u8 + 1; 16]),
+                assignment.target_spec().schema(),
+                assignment.target_spec().interaction(),
+                None,
+                deadline,
+                payload,
+            );
+            let Ok(report) = binding.offer(
+                assignment.binding_id(),
+                epoch,
+                message,
+                &mut mailbox,
+                reading,
+            ) else {
+                panic!("independent fixture route must offer to its sole mailbox");
+            };
+            assert!(matches!(report.outcome(), EnqueueOutcome::Admitted));
+            let Ok(snapshot) = mailbox.snapshot() else {
+                panic!("fixture mailbox must remain internally consistent");
+            };
+            assert_eq!(snapshot.queued_items(), 1);
+            assert_eq!(snapshot.retained_bytes(), index as u64 + 1);
+        }
     }
 
     #[test]

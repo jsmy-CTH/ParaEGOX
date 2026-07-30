@@ -19,7 +19,7 @@ id = "GOV-WAIVER-0001"
 rule_id = "rust:expect"
 scope = "crates/paraegox-runtime/src/lib.rs"
 owner = "Runtime apply admission and state owner"
-reason = "Keep the tested B2 runtime enabler private until an admitted executable Runtime consumer exists; remove the expectation when that internal consumer lands."
+reason = "Keep the tested B2/P2a Runtime enabler private until the S4 RuntimeHost reactor becomes its admitted executable consumer; remove the expectation in that bounded batch."
 expires_at = "2026-09-30"
 
 [[registry.waivers]]
@@ -27,7 +27,7 @@ id = "GOV-WAIVER-0002"
 rule_id = "rust:expect"
 scope = "crates/paraegox-deployment/src/lib.rs"
 owner = "Deployment projection and apply-envelope owner"
-reason = "Keep the tested deployment producer private until an admitted executable integration consumer exists; remove the expectation when that internal consumer lands."
+reason = "Keep the tested canonical request producer private until the P2e DeploymentController becomes its admitted executable owner; remove the expectation in that bounded batch."
 expires_at = "2026-09-30"
 
 [[registry.packages]]
@@ -45,34 +45,34 @@ removal_condition = "Removal requires migrating every registered mechanism consu
 path = "crates/paraegox-runtime-contracts"
 cargo_package = "paraegox-runtime-contracts"
 owner = "Runtime contract owner"
-responsibility = "Source-plan provenance, target-slice and B1 apply-control commitments, writer-tenure signing and fingerprints, temporal constraints, and the canonical B2 signed apply-envelope wire contract."
+responsibility = "Source-plan provenance, canonical target assignments and complete Runtime apply requests, B1 apply-control commitments, writer-tenure signing and fingerprints, temporal constraints, and the canonical B2 signed apply-envelope wire contract."
 status = "public"
-public_entrypoints = ["paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply", "paraegox_runtime_contracts::temporal", "paraegox_runtime_contracts::wire"]
+public_entrypoints = ["paraegox_runtime_contracts::assignment", "paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply", "paraegox_runtime_contracts::temporal", "paraegox_runtime_contracts::wire"]
 consumers = ["paraegox-deployment", "paraegox-runtime"]
-first_tests = ["crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs"]
+first_tests = ["crates/paraegox-runtime-contracts/src/assignment.rs", "crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs"]
 removal_condition = "Removal requires replacing both the independent Deployment producer and Runtime consumer in one accepted contract migration."
 
 [[registry.packages]]
 path = "crates/paraegox-runtime"
 cargo_package = "paraegox-runtime"
 owner = "Runtime apply admission and state owner"
-responsibility = "Pure B2 signature and temporal admission plus writer-fence, prepare, and activate control-state transitions; no RuntimeHost, I/O, or durable persistence."
+responsibility = "Pure signed-request admission and apply-control transitions plus the bounded P2a Mailbox and deterministic single-route PortBinding fixture; no RuntimeHost, callback execution, I/O, or durable persistence."
 status = "enabler"
 public_entrypoints = []
 consumers = []
-first_tests = ["crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs"]
-removal_condition = "Remove this crate if P2a cannot reuse the reducer in the durable RuntimeHost apply path without a parallel state machine."
+first_tests = ["crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs", "crates/paraegox-runtime/src/request.rs", "crates/paraegox-runtime/src/mailbox.rs", "crates/paraegox-runtime/src/port_binding.rs"]
+removal_condition = "Remove or restructure this enabler if the S4 RuntimeHost cannot consume its complete-request admission, reducer, Mailbox, and PortBinding without a parallel state machine or second semantic queue."
 
 [[registry.packages]]
 path = "crates/paraegox-deployment"
 cargo_package = "paraegox-deployment"
 owner = "Deployment projection and apply-envelope owner"
-responsibility = "Pure projection from committed deployment identities into target-slice and apply-control commitments, plus signature-independent B2 envelope drafts; signing keys and I/O remain caller-owned."
+responsibility = "Pure projection from committed deployment identities and canonical target assignments into complete Runtime slices and signature-independent apply-request drafts; signing keys and I/O remain caller-owned."
 status = "enabler"
 public_entrypoints = []
 consumers = []
 first_tests = ["crates/paraegox-deployment/src/projection.rs", "crates/paraegox-deployment/src/envelope.rs"]
-removal_condition = "Remove this crate if the P2a production fixture and P2e DeploymentController cannot reuse this projection path."
+removal_condition = "Remove or restructure this enabler if the P2e DeploymentController cannot reuse the P2a-proven canonical projection/request path without a parallel producer."
 
 [[registry.public_apis]]
 module = "paraegox_kernel::digest"
@@ -97,6 +97,14 @@ owner = "Kernel time values"
 consumers = ["paraegox-runtime-contracts", "paraegox-runtime", "paraegox-deployment"]
 compatibility = "ClockDomainRef's 16-byte value, nonzero ClockGeneration, and nanosecond BoundedDuration are stable where embedded by B2 wire v1; MonotonicInstant, ClockReading, and MonotonicDeadline remain owner-local and are not serialized as protocol time."
 tests = ["crates/paraegox-kernel/src/time.rs"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime_contracts::assignment"
+symbols = ["TARGET_ASSIGNMENTS_VERSION", "MAX_TARGET_ASSIGNMENTS", "MAX_TARGET_ASSIGNMENTS_BYTES", "RUNTIME_APPLY_REQUEST_VERSION", "MAX_RUNTIME_APPLY_REQUEST_BYTES", "BindingId", "InstanceRef", "PortRef", "MailboxRef", "SchemaRef", "PortDirection", "InteractionKind", "PortCardinality", "PortSpec", "OverflowPolicy", "DeliveryProfile", "MailboxSpec", "PortEndpoint", "BindingAssignment", "TargetAssignments", "RuntimePlanSlice", "RuntimeApplyRequest", "AssignmentContractError", "AssignmentWireErrorCode", "AssignmentWireError", "RequestWireErrorCode", "RequestWireError"]
+owner = "Runtime canonical assignment and complete-request contract owner"
+consumers = ["paraegox-deployment", "paraegox-runtime"]
+compatibility = "PXTA v1 fixes the big-endian 256-byte static 1:1 binding record, BindingId ordering, exact schema identity/version/digest, duplicate rejection, bounds, enum values, assignment digest domain, and stable error codes; PXAR v1 fixes the bounded outer framing of one unchanged B2 envelope plus its canonical assignment body, without creating a second signature or request digest. Incompatible changes require a new protocol version."
+tests = ["crates/paraegox-runtime-contracts/src/assignment.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-deployment/src/envelope.rs", "crates/paraegox-runtime/src/admission.rs", "tests/contract/test_s3_runtime_apply_request.py"]
 
 [[registry.public_apis]]
 module = "paraegox_runtime_contracts::provenance"

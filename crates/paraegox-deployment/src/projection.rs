@@ -5,17 +5,27 @@ use paraegox_runtime_contracts::apply::{
     ApplyContractError, ApplyOperationId, ExpectedActive, PlanWriterContext, PlanWriterEpoch,
     PlanWriterRef, RuntimeApplyControl, RuntimeApplyControlCommitment,
 };
+use paraegox_runtime_contracts::assignment::{AssignmentContractError, RuntimePlanSlice};
+use paraegox_runtime_contracts::provenance::RuntimeSliceCommitment;
 use paraegox_runtime_contracts::provenance::{
-    PlanProvenance, ProvenanceContractError, RuntimeSliceCommitment, RuntimeSliceHeader,
-    SourcePlanRef, SourcePlanRevision, SourceScopeRef,
+    PlanProvenance, ProvenanceContractError, RuntimeSliceHeader, SourcePlanRef, SourcePlanRevision,
+    SourceScopeRef,
 };
 
 use crate::plan::{CommittedTargetProjection, DeploymentWriterTenure};
 
 /// Projects a target-specific, tenure-neutral Runtime slice commitment.
+#[cfg(test)]
 pub fn project_runtime_slice_commitment(
     projection: &CommittedTargetProjection,
 ) -> Result<RuntimeSliceCommitment, ProjectionError> {
+    Ok(project_runtime_plan_slice(projection)?.commitment())
+}
+
+/// Projects the complete target-specific Runtime slice from canonical assignments.
+pub fn project_runtime_plan_slice(
+    projection: &CommittedTargetProjection,
+) -> Result<RuntimePlanSlice, ProjectionError> {
     let plan = projection.plan();
     let provenance = PlanProvenance::new(
         SourceScopeRef::from_bytes(*plan.scope().as_bytes()),
@@ -28,7 +38,10 @@ pub fn project_runtime_slice_commitment(
         provenance,
         projection.assignment_digest(),
     );
-    RuntimeSliceCommitment::try_new(header).map_err(ProjectionError::Provenance)
+    let commitment =
+        RuntimeSliceCommitment::try_new(header).map_err(ProjectionError::Provenance)?;
+    RuntimePlanSlice::try_new(commitment, projection.assignments().clone())
+        .map_err(ProjectionError::Assignment)
 }
 
 /// Maps deployment writer ownership into a Runtime-owned apply-control commitment.
@@ -52,6 +65,8 @@ pub fn build_runtime_apply_control_commitment(
 pub enum ProjectionError {
     /// Slice commitment construction failed.
     Provenance(ProvenanceContractError),
+    /// Canonical assignment body did not match the projected commitment.
+    Assignment(AssignmentContractError),
     /// Runtime apply-control construction failed.
     Apply(ApplyContractError),
 }
@@ -62,10 +77,17 @@ impl From<ApplyContractError> for ProjectionError {
     }
 }
 
+impl From<AssignmentContractError> for ProjectionError {
+    fn from(value: AssignmentContractError) -> Self {
+        Self::Assignment(value)
+    }
+}
+
 impl fmt::Display for ProjectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Provenance(error) => write!(formatter, "slice projection failed: {error}"),
+            Self::Assignment(error) => write!(formatter, "assignment projection failed: {error}"),
             Self::Apply(error) => write!(formatter, "apply-control mapping failed: {error}"),
         }
     }
@@ -77,14 +99,18 @@ impl std::error::Error for ProjectionError {}
 mod tests {
     use paraegox_kernel::digest::Digest32;
     use paraegox_kernel::identity::RuntimeHostId;
+    use paraegox_kernel::time::BoundedDuration;
     use paraegox_runtime_contracts::apply::{
         ApplyOperationId, ExpectedActive, PlanWriterEpoch, PlanWriterRef, TenureAuthorityRef,
         TenureKeyRef, TenureProofAlgorithm, TenureProofAuthority, WriterTenureClaim,
         WriterTenureProof,
     };
-    use paraegox_runtime_contracts::provenance::{
-        SourcePlanDigest, SourceScopeRef, TargetAssignmentDigest,
+    use paraegox_runtime_contracts::assignment::{
+        BindingAssignment, BindingId, DeliveryProfile, InstanceRef, InteractionKind, MailboxRef,
+        MailboxSpec, OverflowPolicy, PortCardinality, PortDirection, PortEndpoint, PortRef,
+        PortSpec, SchemaRef, TargetAssignments,
     };
+    use paraegox_runtime_contracts::provenance::{SourcePlanDigest, SourceScopeRef};
 
     use crate::plan::{
         CommittedPlanIdentity, CommittedTargetProjection, DeploymentId, DeploymentRevision,
@@ -92,8 +118,70 @@ mod tests {
     };
 
     use super::{
-        ProjectionError, build_runtime_apply_control_commitment, project_runtime_slice_commitment,
+        ProjectionError, build_runtime_apply_control_commitment, project_runtime_plan_slice,
+        project_runtime_slice_commitment,
     };
+
+    fn assignments(seed: u8) -> TargetAssignments {
+        let Ok(schema) = SchemaRef::try_new(
+            [seed; 16],
+            1,
+            Digest32::from_bytes([seed.wrapping_add(1); 32]),
+        ) else {
+            panic!("fixture schema must be valid");
+        };
+        let source = PortEndpoint::new(
+            InstanceRef::from_bytes([seed.wrapping_add(2); 16]),
+            PortRef::from_bytes([seed.wrapping_add(3); 16]),
+            PortSpec::new(
+                PortDirection::Out,
+                schema,
+                InteractionKind::Signal,
+                PortCardinality::One,
+            ),
+        );
+        let target = PortEndpoint::new(
+            InstanceRef::from_bytes([seed.wrapping_add(4); 16]),
+            PortRef::from_bytes([seed.wrapping_add(5); 16]),
+            PortSpec::new(
+                PortDirection::In,
+                schema,
+                InteractionKind::Signal,
+                PortCardinality::One,
+            ),
+        );
+        let Ok(delivery) = DeliveryProfile::try_new(
+            64,
+            BoundedDuration::from_nanos(100),
+            OverflowPolicy::RejectNew,
+        ) else {
+            panic!("fixture delivery profile must be valid");
+        };
+        let Ok(mailbox) = MailboxSpec::try_new(
+            4,
+            256,
+            BoundedDuration::from_nanos(80),
+            2,
+            384,
+            OverflowPolicy::RejectNew,
+        ) else {
+            panic!("fixture mailbox spec must be valid");
+        };
+        let Ok(assignment) = BindingAssignment::try_new(
+            BindingId::from_bytes([seed.wrapping_add(6); 16]),
+            source,
+            target,
+            MailboxRef::from_bytes([seed.wrapping_add(7); 16]),
+            delivery,
+            mailbox,
+        ) else {
+            panic!("fixture binding assignment must be valid");
+        };
+        let Ok(assignments) = TargetAssignments::try_new(vec![assignment]) else {
+            panic!("fixture target assignments must be valid");
+        };
+        assignments
+    }
 
     fn projection(target_byte: u8, assignment_byte: u8) -> CommittedTargetProjection {
         let plan = CommittedPlanIdentity::new(
@@ -105,7 +193,7 @@ mod tests {
         CommittedTargetProjection::new(
             plan,
             RuntimeHostId::from_bytes([target_byte; 16]),
-            TargetAssignmentDigest::new(Digest32::from_bytes([assignment_byte; 32])),
+            assignments(assignment_byte),
         )
     }
 
@@ -142,6 +230,9 @@ mod tests {
 
     #[test]
     fn projection_is_stable_target_specific_and_tenure_neutral() {
+        let Ok(complete) = project_runtime_plan_slice(&projection(9, 10)) else {
+            panic!("valid complete projection must succeed");
+        };
         let Ok(first) = project_runtime_slice_commitment(&projection(9, 10)) else {
             panic!("valid projection must succeed");
         };
@@ -155,6 +246,11 @@ mod tests {
             panic!("valid projection must succeed");
         };
 
+        assert_eq!(complete.commitment(), first);
+        assert_eq!(
+            complete.assignments().assignment_digest(),
+            first.header().assignment_digest()
+        );
         assert_eq!(first, second);
         assert_ne!(first, changed_target);
         assert_ne!(first, changed_assignment);

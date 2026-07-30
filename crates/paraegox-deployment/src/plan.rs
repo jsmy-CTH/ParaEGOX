@@ -2,6 +2,7 @@
 
 use paraegox_kernel::identity::RuntimeHostId;
 use paraegox_runtime_contracts::apply::WriterTenureProof;
+use paraegox_runtime_contracts::assignment::TargetAssignments;
 use paraegox_runtime_contracts::provenance::{SourcePlanDigest, TargetAssignmentDigest};
 
 macro_rules! deployment_ref {
@@ -128,26 +129,26 @@ impl CommittedPlanIdentity {
     }
 }
 
-/// One committed target projection, represented without fabricating assignments.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// One committed target projection carrying the exact canonical assignment body.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedTargetProjection {
     plan: CommittedPlanIdentity,
     target: RuntimeHostId,
-    assignment_digest: TargetAssignmentDigest,
+    assignments: TargetAssignments,
 }
 
 impl CommittedTargetProjection {
-    /// Binds a complete assignment commitment to a committed plan and target.
+    /// Binds complete canonical assignments to a committed plan and target.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         plan: CommittedPlanIdentity,
         target: RuntimeHostId,
-        assignment_digest: TargetAssignmentDigest,
+        assignments: TargetAssignments,
     ) -> Self {
         Self {
             plan,
             target,
-            assignment_digest,
+            assignments,
         }
     }
 
@@ -166,7 +167,13 @@ impl CommittedTargetProjection {
     /// Returns the digest of the target's complete canonical assignment.
     #[must_use]
     pub const fn assignment_digest(&self) -> TargetAssignmentDigest {
-        self.assignment_digest
+        self.assignments.assignment_digest()
+    }
+
+    /// Returns the complete canonical assignment body projected for the target.
+    #[must_use]
+    pub const fn assignments(&self) -> &TargetAssignments {
+        &self.assignments
     }
 }
 
