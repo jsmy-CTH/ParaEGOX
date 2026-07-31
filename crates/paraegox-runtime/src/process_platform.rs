@@ -39,6 +39,12 @@ const DROP_RETRY_DELAY: Duration = Duration::from_millis(1);
 const MAX_PROCFS_HOST_ENTRIES_SCANNED: u32 = 4_096;
 #[cfg(any(target_os = "linux", test))]
 const MAX_PROCFS_FD_ENTRIES_SCANNED: u32 = 16_384;
+// An owned process can transiently deny procfs inspection while Linux commits
+// an exec. Retry the complete observation a fixed number of times; disappearance
+// becomes `None`, successful inspection is counted, and persistent denial still
+// fails closed without an unbounded reactor stall.
+#[cfg(any(target_os = "linux", test))]
+const MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES: u8 = 32;
 
 /// Trusted resolution of an immutable executable profile before a generation
 /// specific workspace is allocated.
@@ -584,7 +590,7 @@ fn observe_group_in(
             continue;
         }
         let path = entry.path();
-        let Some(group) = read_process_group(&path)? else {
+        let Some(group) = retry_transient_procfs_permission(|| read_process_group(&path))? else {
             continue;
         };
         if group != process_group.as_raw() {
@@ -595,7 +601,10 @@ fn observe_group_in(
         let Some(limits) = limits else {
             continue;
         };
-        let Some(member) = observe_member(&path, observation.open_fds, limits, work)? else {
+        let Some(member) = retry_transient_procfs_permission(|| {
+            observe_member(&path, observation.open_fds, limits, work)
+        })?
+        else {
             continue;
         };
         observation.memory_bytes = observation
@@ -805,6 +814,25 @@ fn read_optional(path: PathBuf) -> Result<Option<Vec<u8>>, ProcessPlatformError>
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(ProcessPlatformError::Io(error)),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn retry_transient_procfs_permission<T>(
+    mut operation: impl FnMut() -> Result<T, ProcessPlatformError>,
+) -> Result<T, ProcessPlatformError> {
+    let mut retries = 0;
+    loop {
+        match operation() {
+            Err(ProcessPlatformError::Io(error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && retries < MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES =>
+            {
+                retries += 1;
+                thread::yield_now();
+            }
+            result => return result,
+        }
     }
 }
 
@@ -1222,6 +1250,41 @@ mod tests {
             observe_open_fds(&synthetic_member, 0, 1, &mut signed_fd_limited),
             Err(ProcessPlatformError::OpenFileLimitExceeded)
         ));
+    }
+
+    #[test]
+    fn transient_procfs_permission_is_retried_but_persistent_denial_fails_closed() {
+        let mut transient_attempts = 0_u8;
+        let observed = retry_transient_procfs_permission(|| {
+            transient_attempts += 1;
+            if transient_attempts <= 3 {
+                Err(ProcessPlatformError::Io(io::Error::from(
+                    io::ErrorKind::PermissionDenied,
+                )))
+            } else {
+                Ok(17_u8)
+            }
+        })
+        .expect("a bounded transient exec window should be retried");
+        assert_eq!(observed, 17);
+        assert_eq!(transient_attempts, 4);
+
+        let mut persistent_attempts = 0_u8;
+        let denied = retry_transient_procfs_permission(|| {
+            persistent_attempts += 1;
+            Err::<(), _>(ProcessPlatformError::Io(io::Error::from(
+                io::ErrorKind::PermissionDenied,
+            )))
+        });
+        assert!(matches!(
+            denied,
+            Err(ProcessPlatformError::Io(error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(
+            persistent_attempts,
+            MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES + 1
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

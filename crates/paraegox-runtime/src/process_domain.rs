@@ -575,7 +575,7 @@ impl ProcessDomain {
             return Err(ProcessDomainError::AlreadyStopped);
         }
         self.refresh_retained_terminal()?;
-        let expected_loss = *self.shutdown_expected_loss.get_or_insert(
+        self.shutdown_expected_loss.get_or_insert(
             self.phase == ProcessDomainPhase::Running && self.active_invocation.is_none(),
         );
         self.fence_admission()?;
@@ -608,6 +608,11 @@ impl ProcessDomain {
             self.fail_owner_invariant(ProcessOwnerInvariantFailure::StateInconsistent)?;
             return Err(ProcessDomainError::CleanupTimedOut);
         }
+        // A cooperative stop can still return a non-clean outcome after shutdown
+        // began. `begin_unexpected_recovery` makes that failure sticky by
+        // clearing `shutdown_expected_loss`; consume the current value here
+        // rather than the optimistic value captured before the stop dialogue.
+        let expected_loss = self.shutdown_expected_loss.unwrap_or(false);
         if let Err(error) = self.observe_process_loss(&transport, expected_loss) {
             self.transport = Some(transport);
             self.fail_owner_invariant(ProcessOwnerInvariantFailure::StateInconsistent)?;
