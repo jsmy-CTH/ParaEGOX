@@ -21,7 +21,7 @@ use paraegox_runtime_contracts::process_protocol::{
     ProcessFrameKind, ProcessProtocolPhase, ProcessSessionGenerations, ProcessSessionIdentity,
     ProcessWorkerState, StopReason, StoppedOutcome,
 };
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 use crate::card_instance::{InstanceGeneration, InvocationId};
 use crate::liveness::{LivenessError, LivenessFailure, LivenessPhase, ProcessLivenessState};
@@ -585,15 +585,24 @@ impl ProcessDomain {
                 self.phase = ProcessDomainPhase::Draining;
                 if let Err(error) = self.graceful_stop(reason).await {
                     self.phase = ProcessDomainPhase::Recovering;
-                    // Once the worker fails any part of the signed stop
-                    // dialogue, its eventual loss is no longer a clean planned
-                    // exit. Record that fact before either reducer-driven or
-                    // direct signal escalation so cleanup cannot relabel it.
-                    self.begin_unexpected_recovery(RuntimeFailureFactKind::ShutdownFailed)?;
-                    if matches!(error, ProcessDomainError::WorkerStopFailed) {
-                        self.drive_recovery_stop(reason).await?;
-                    } else {
-                        self.escalate_termination().await?;
+                    match error {
+                        ProcessDomainError::CleanStopExitTimedOut => {
+                            // The worker issued an authoritative clean Stopped
+                            // acknowledgement. Remaining same-group descendants
+                            // are still reclaimed under the signed escalation
+                            // budget without relabelling that planned outcome.
+                            self.escalate_termination().await?;
+                        }
+                        ProcessDomainError::WorkerStopFailed => {
+                            self.begin_unexpected_recovery(RuntimeFailureFactKind::ShutdownFailed)?;
+                            self.drive_recovery_stop(reason).await?;
+                        }
+                        _ => {
+                            // Failure before a clean Stopped acknowledgement
+                            // makes eventual process loss unexpected.
+                            self.begin_unexpected_recovery(RuntimeFailureFactKind::ShutdownFailed)?;
+                            self.escalate_termination().await?;
+                        }
                     }
                 }
             } else {
@@ -827,18 +836,23 @@ impl ProcessDomain {
             )
             .await?;
         self.transport_mut()?.process_mut().close_stdin();
-        timeout(
-            bounded(self.desired.lifecycle().cooperative_stop()),
-            async {
-                let stopped = self.receive_until(ProcessFrameKind::Stopped).await?;
-                if stopped.stopped_outcome() != Some(StoppedOutcome::Clean) {
-                    return Err(ProcessDomainError::WorkerStopFailed);
-                }
-                wait_for_process_exit(self.transport_mut()?).await
-            },
+        let cooperative_deadline =
+            Instant::now() + bounded(self.desired.lifecycle().cooperative_stop());
+        let stopped = timeout_at(
+            cooperative_deadline,
+            self.receive_until(ProcessFrameKind::Stopped),
         )
         .await
         .map_err(|_| ProcessDomainError::CooperativeStopTimedOut)??;
+        if stopped.stopped_outcome() != Some(StoppedOutcome::Clean) {
+            return Err(ProcessDomainError::WorkerStopFailed);
+        }
+        timeout_at(
+            cooperative_deadline,
+            wait_for_process_exit(self.transport_mut()?),
+        )
+        .await
+        .map_err(|_| ProcessDomainError::CleanStopExitTimedOut)??;
         Ok(())
     }
 
@@ -1861,6 +1875,7 @@ pub(crate) enum ProcessDomainError {
     StartupTimedOut,
     DrainTimedOut,
     CooperativeStopTimedOut,
+    CleanStopExitTimedOut,
     WorkerStopFailed,
     KillTimedOut,
     CleanupTimedOut,
@@ -1948,6 +1963,9 @@ impl fmt::Display for ProcessDomainError {
             Self::StartupTimedOut => formatter.write_str("process startup timed out"),
             Self::DrainTimedOut => formatter.write_str("process drain timed out"),
             Self::CooperativeStopTimedOut => formatter.write_str("cooperative stop timed out"),
+            Self::CleanStopExitTimedOut => {
+                formatter.write_str("clean-stopped process group did not exit cooperatively")
+            }
             Self::WorkerStopFailed => {
                 formatter.write_str("worker reported a non-clean stop outcome")
             }
@@ -2059,7 +2077,7 @@ mod tests {
         FailedStop,
         MissingStopAck,
         BlockAfterInvoked,
-        HeartbeatThenExit,
+        HeartbeatThenKilled,
     }
 
     struct DomainFixture {
@@ -2222,28 +2240,29 @@ mod tests {
         }
 
         fn start(&self, area: &TestArea, dialogue: WorkerDialogue) -> ProcessDomainStart {
-            let response = area.write("worker.pxwp", &self.worker_wire(dialogue));
-            let script = match dialogue {
+            let worker_mode = match dialogue {
+                WorkerDialogue::BlockAfterInvoked => "block",
                 WorkerDialogue::Complete
                 | WorkerDialogue::Uncertain
                 | WorkerDialogue::FailedStop
-                | WorkerDialogue::MissingStopAck => "/bin/cat \"$RESPONSE\"; /bin/cat >/dev/null",
-                WorkerDialogue::BlockAfterInvoked => {
-                    "/bin/cat \"$RESPONSE\"; trap '' TERM; while :; do :; done"
-                }
-                WorkerDialogue::HeartbeatThenExit => {
-                    "/bin/cat \"$RESPONSE\"; /bin/dd bs=1 count=\"$READ_BYTES\" of=/dev/null 2>/dev/null"
-                }
+                | WorkerDialogue::MissingStopAck
+                | WorkerDialogue::HeartbeatThenKilled => "cooperative",
             };
+            let response = area.write(
+                "worker.pxwp.sh",
+                &shell_wire_assignment(&self.worker_wire(dialogue), worker_mode),
+            );
+            let script = ". \"$RESPONSE\"; printf '%b' \"$RESPONSE_WIRE\"; \
+                          case \"$WORKER_MODE\" in \
+                          block) trap '' TERM; while :; do :; done ;; \
+                          *) while IFS= read -r _; do :; done ;; \
+                          esac";
             let program = ResolvedProcessProgram::try_resolve_for_test(
                 self.desired.launch(),
                 self.worker_digest,
                 PathBuf::from("/bin/sh"),
                 vec![OsString::from("-c"), OsString::from(script)],
-                vec![
-                    (OsString::from("RESPONSE"), response.into_os_string()),
-                    (OsString::from("READ_BYTES"), OsString::from("416")),
-                ],
+                vec![(OsString::from("RESPONSE"), response.into_os_string())],
             )
             .expect("resolved worker");
             self.start_with_program(area, program)
@@ -2356,7 +2375,7 @@ mod tests {
                     },
                 ),
             ];
-            if !matches!(dialogue, WorkerDialogue::HeartbeatThenExit) {
+            if !matches!(dialogue, WorkerDialogue::HeartbeatThenKilled) {
                 frames.push(worker_frame(
                     identity,
                     3,
@@ -2420,7 +2439,7 @@ mod tests {
                         payload: Box::from(&b"output"[..]),
                     },
                 ));
-            } else if matches!(dialogue, WorkerDialogue::HeartbeatThenExit) {
+            } else if matches!(dialogue, WorkerDialogue::HeartbeatThenKilled) {
                 frames.push(worker_frame(
                     identity,
                     3,
@@ -2496,6 +2515,22 @@ mod tests {
             body,
         )
         .expect("worker frame")
+    }
+
+    fn shell_wire_assignment(wire: &[u8], worker_mode: &str) -> Vec<u8> {
+        const OCTAL: &[u8; 8] = b"01234567";
+        let mut assignment = Vec::with_capacity(32 + wire.len() * 5 + worker_mode.len());
+        assignment.extend_from_slice(b"RESPONSE_WIRE='");
+        for byte in wire {
+            assignment.extend_from_slice(b"\\0");
+            assignment.push(OCTAL[usize::from(byte >> 6)]);
+            assignment.push(OCTAL[usize::from((byte >> 3) & 0x07)]);
+            assignment.push(OCTAL[usize::from(byte & 0x07)]);
+        }
+        assignment.extend_from_slice(b"'\nWORKER_MODE='");
+        assignment.extend_from_slice(worker_mode.as_bytes());
+        assignment.extend_from_slice(b"'\n");
+        assignment
     }
 
     fn assert_group_and_workspace_reclaimed(process_group: nix::unistd::Pid, workspace: &Path) {
@@ -2770,11 +2805,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn idle_exit_is_detected_and_effect_free_domain_restarts_fresh() {
+    async fn idle_process_loss_is_detected_and_effect_free_domain_restarts_fresh() {
         let area = TestArea::create();
         let fixture = DomainFixture::new(SideEffectClass::EffectFree);
         let mut domain =
-            ProcessDomain::start(fixture.start(&area, WorkerDialogue::HeartbeatThenExit))
+            ProcessDomain::start(fixture.start(&area, WorkerDialogue::HeartbeatThenKilled))
                 .await
                 .expect("domain should start");
 
@@ -2785,11 +2820,21 @@ mod tests {
                 .expect("heartbeat should validate"),
             ProcessDomainMonitorEvent::Heartbeat
         );
+        assert!(
+            domain
+                .transport
+                .as_ref()
+                .expect("running domain owns its transport")
+                .process()
+                .kill_group()
+                .expect("idle worker group KILL should be observable"),
+            "idle worker group should exist before the injected process loss"
+        );
         assert_eq!(
             domain
                 .monitor_once()
                 .await
-                .expect("exit should be isolated"),
+                .expect("injected process loss should be isolated"),
             ProcessDomainMonitorEvent::RecoveryRequired
         );
         assert_eq!(domain.phase(), ProcessDomainPhase::Recovering);
@@ -2813,8 +2858,11 @@ mod tests {
         );
         let next_instance = InstanceGeneration::try_new(2).expect("next instance generation");
         area.write(
-            "worker.pxwp",
-            &fixture.worker_wire_for(next_identity, next_instance, WorkerDialogue::Complete),
+            "worker.pxwp.sh",
+            &shell_wire_assignment(
+                &fixture.worker_wire_for(next_identity, next_instance, WorkerDialogue::Complete),
+                "cooperative",
+            ),
         );
 
         domain

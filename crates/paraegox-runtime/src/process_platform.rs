@@ -593,14 +593,14 @@ fn observe_group_in(
             continue;
         }
         let path = entry.path();
-        let Some(group) =
+        let Some(identity) =
             retry_transient_procfs_permission(&mut transient_permission_retries, || {
-                read_process_group(&path)
+                read_process_identity(&path)
             })?
         else {
             continue;
         };
-        if group != process_group.as_raw() {
+        if identity.process_group != process_group.as_raw() {
             continue;
         }
         observation.process_tree_members =
@@ -610,9 +610,20 @@ fn observe_group_in(
         };
         let Some(member) =
             retry_transient_procfs_permission(&mut transient_permission_retries, || {
+                let Some(current) = read_process_identity(&path)? else {
+                    return Ok(None);
+                };
+                if current.process_group != process_group.as_raw() {
+                    return Ok(None);
+                }
                 let mut attempted_work = *work;
-                let member =
-                    observe_member(&path, observation.open_fds, limits, &mut attempted_work)?;
+                let member = observe_member(
+                    &path,
+                    current.has_live_resources(),
+                    observation.open_fds,
+                    limits,
+                    &mut attempted_work,
+                )?;
                 *work = attempted_work;
                 Ok(member)
             })?
@@ -713,7 +724,21 @@ fn enforce_observation(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn read_process_group(path: &Path) -> Result<Option<i32>, ProcessPlatformError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcProcessIdentity {
+    process_group: i32,
+    state: u8,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ProcProcessIdentity {
+    const fn has_live_resources(self) -> bool {
+        !matches!(self.state, b'Z' | b'X' | b'x')
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_process_identity(path: &Path) -> Result<Option<ProcProcessIdentity>, ProcessPlatformError> {
     let Some(stat) = read_optional(path.join("stat"))? else {
         return Ok(None);
     };
@@ -725,13 +750,20 @@ fn read_process_group(path: &Path) -> Result<Option<i32>, ProcessPlatformError> 
         .get(command_end.saturating_add(2)..)
         .ok_or(ProcessPlatformError::InvalidProcessCensus)?;
     let mut fields = fields.split(|byte| *byte == b' ');
-    let _state = fields.next();
+    let state = fields
+        .next()
+        .and_then(|field| <&[u8; 1]>::try_from(field).ok())
+        .map(|field| field[0])
+        .ok_or(ProcessPlatformError::InvalidProcessCensus)?;
     let _parent = fields.next();
-    let group = fields
+    let process_group = fields
         .next()
         .and_then(parse_ascii_i32)
         .ok_or(ProcessPlatformError::InvalidProcessCensus)?;
-    Ok(Some(group))
+    Ok(Some(ProcProcessIdentity {
+        process_group,
+        state,
+    }))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -745,14 +777,11 @@ struct ProcessMemberObservation {
 #[cfg(any(target_os = "linux", test))]
 fn observe_member(
     path: &Path,
+    has_live_resources: bool,
     observed_open_fds: u32,
     limits: ProcessResourceLimits,
     work: &mut ProcessCensusWork,
 ) -> Result<Option<ProcessMemberObservation>, ProcessPlatformError> {
-    let Some(status) = read_optional(path.join("status"))? else {
-        return Ok(None);
-    };
-    let memory_bytes = resident_bytes(&status)?;
     let Some(schedstat) = read_optional(path.join("schedstat"))? else {
         return Ok(None);
     };
@@ -761,10 +790,23 @@ fn observe_member(
         .find(|field| !field.is_empty())
         .and_then(parse_ascii_u64)
         .ok_or(ProcessPlatformError::InvalidProcessCensus)?;
-    let Some(aggregate_open_fds) =
-        observe_open_fds(path, observed_open_fds, limits.max_open_fds(), work)?
-    else {
-        return Ok(None);
+    let (memory_bytes, aggregate_open_fds) = if has_live_resources {
+        let Some(status) = read_optional(path.join("status"))? else {
+            return Ok(None);
+        };
+        let memory_bytes = resident_bytes(&status)?;
+        let Some(aggregate_open_fds) =
+            observe_open_fds(path, observed_open_fds, limits.max_open_fds(), work)?
+        else {
+            return Ok(None);
+        };
+        (memory_bytes, aggregate_open_fds)
+    } else {
+        // Linux releases a zombie/dead task's address space and descriptors
+        // before removing its `/proc` entry. Keep charging the process-tree
+        // member and final schedstat CPU, but do not probe unavailable live
+        // resource files during that terminal visibility window.
+        (0, observed_open_fds)
     };
     Ok(Some(ProcessMemberObservation {
         memory_bytes,
@@ -1288,6 +1330,34 @@ mod tests {
             observe_open_fds(&synthetic_member, 0, 1, &mut signed_fd_limited),
             Err(ProcessPlatformError::OpenFileLimitExceeded)
         ));
+    }
+
+    #[test]
+    fn procfs_census_charges_terminal_members_without_live_resource_files() {
+        let workspace = TestWorkspace::create();
+        let proc_root = workspace.0.join("proc");
+        let member = proc_root.join("101");
+        fs::create_dir_all(&member).expect("synthetic terminal proc member");
+        fs::write(member.join("stat"), b"101 (worker) Z 1 42 0\n")
+            .expect("synthetic terminal stat");
+        fs::write(member.join("schedstat"), b"17 0 0\n").expect("synthetic terminal schedstat");
+        let limits = ProcessResourceLimits::try_new(
+            1,
+            1,
+            1,
+            paraegox_kernel::time::BoundedDuration::from_nanos(100),
+        )
+        .expect("synthetic resource limits");
+        let mut work = ProcessCensusWork::for_test(2, 0);
+
+        let observation =
+            observe_group_in(&proc_root, Pid::from_raw(42), 1, Some(limits), &mut work)
+                .expect("terminal member should not require live RSS or fd files");
+
+        assert_eq!(observation.process_tree_members(), 1);
+        assert_eq!(observation.memory_bytes(), 0);
+        assert_eq!(observation.open_fds(), 0);
+        assert_eq!(observation.cpu_time_nanos(), 17);
     }
 
     #[test]
