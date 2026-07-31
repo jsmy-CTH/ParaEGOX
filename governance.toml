@@ -26,8 +26,8 @@ expires_at = "2026-09-30"
 id = "GOV-WAIVER-0002"
 rule_id = "rust:expect"
 scope = "crates/paraegox-deployment/src/lib.rs"
-owner = "Deployment projection and apply-envelope owner"
-reason = "Keep the tested canonical request producer private until the P2e DeploymentController becomes its admitted executable owner; remove the expectation in that bounded batch."
+owner = "Deployment pure-compile, projection, and apply-envelope owner"
+reason = "Keep the tested S7-C DeckCompiler/Planner enabler and canonical request producer private until the P2e operator ingress and DeploymentController become their admitted executable consumers. The opaque manifest seam has no production constructor and does not prove installer provenance; remove or narrow this expectation when S7-E connects the unique installer artifact and executable control-plane path."
 expires_at = "2026-09-30"
 
 [[registry.waivers]]
@@ -101,13 +101,13 @@ removal_condition = "Remove only when another admitted OS-managed executable bec
 [[registry.packages]]
 path = "crates/paraegox-deployment"
 cargo_package = "paraegox-deployment"
-owner = "Deployment projection and apply-envelope owner"
-responsibility = "Pure projection from committed deployment identities and canonical target assignments plus Loop/Thread/Process execution plans into complete Runtime slices and signature-independent PXAR v1/v2/v3/v4 apply-request drafts; signing keys, clocks, process construction, and I/O remain caller-owned."
+owner = "Deployment pure-compile, projection, and apply-envelope owner"
+responsibility = "Pure projection from committed deployment identities and canonical target assignments plus Loop/Thread/Process execution plans into complete Runtime slices and signature-independent PXAR v1/v2/v3/v4 apply-request drafts, together with the internal S7-C deterministic DeckSpec-to-DeckLock compiler, typed Deck and ServiceDependency validation, reference-profile Planner candidate, stable allocation delta, and opaque manifest-projection selection seam. The S7-C seam does not parse, generate, or prove installer provenance for the crate-private S7-B manifest; that unique artifact connection remains gated on the S7-E producer/consumer vertical. Signing keys, clocks, process construction, persistence, network access, and I/O remain caller-owned."
 status = "enabler"
 public_entrypoints = []
 consumers = []
-first_tests = ["crates/paraegox-deployment/src/projection.rs", "crates/paraegox-deployment/src/envelope.rs"]
-removal_condition = "Remove or restructure this enabler if the P2e DeploymentController cannot reuse the P2a-proven canonical projection/request path without a parallel producer."
+first_tests = ["crates/paraegox-deployment/src/deck.rs", "crates/paraegox-deployment/src/planner.rs", "crates/paraegox-deployment/src/projection.rs", "crates/paraegox-deployment/src/envelope.rs", "tests/governance/test_s7_pure_compile_boundary.py"]
+removal_condition = "Remove or restructure this enabler if the P2e DeploymentController cannot reuse the P2a-proven canonical projection/request path and S7-C pure compile path without a parallel producer; remove the opaque S7-C manifest seam when S7-E connects the one runtime-contract-owned strict manifest artifact."
 
 [[registry.public_apis]]
 module = "paraegox_kernel::digest"
