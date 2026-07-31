@@ -1,5 +1,9 @@
 //! Runtime-consumer-owned contracts shared with deployment producers.
 
+mod reference_assembly;
+
+const _: fn() = reference_assembly::compile_time_anchor;
+
 pub mod apply;
 pub mod assignment;
 pub mod execution;
