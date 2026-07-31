@@ -40,11 +40,13 @@ const MAX_PROCFS_HOST_ENTRIES_SCANNED: u32 = 4_096;
 #[cfg(any(target_os = "linux", test))]
 const MAX_PROCFS_FD_ENTRIES_SCANNED: u32 = 16_384;
 // An owned process can transiently deny procfs inspection while Linux commits
-// an exec. Retry the complete observation a fixed number of times; disappearance
-// becomes `None`, successful inspection is counted, and persistent denial still
-// fails closed without an unbounded reactor stall.
+// an exec. One complete census shares a fixed retry count and delay;
+// disappearance becomes `None`, successful inspection is counted, and
+// persistent denial still fails closed after at most eight delayed retries.
 #[cfg(any(target_os = "linux", test))]
-const MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES: u8 = 32;
+const MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES: u8 = 8;
+#[cfg(any(target_os = "linux", test))]
+const TRANSIENT_PROCFS_PERMISSION_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 /// Trusted resolution of an immutable executable profile before a generation
 /// specific workspace is allocated.
@@ -578,6 +580,7 @@ fn observe_group_in(
         open_fds: 0,
         cpu_time_nanos: 0,
     };
+    let mut transient_permission_retries = 0;
     for entry in fs::read_dir(proc_root).map_err(ProcessPlatformError::Io)? {
         let entry = entry.map_err(ProcessPlatformError::Io)?;
         work.observe_host_entry()?;
@@ -590,7 +593,11 @@ fn observe_group_in(
             continue;
         }
         let path = entry.path();
-        let Some(group) = retry_transient_procfs_permission(|| read_process_group(&path))? else {
+        let Some(group) =
+            retry_transient_procfs_permission(&mut transient_permission_retries, || {
+                read_process_group(&path)
+            })?
+        else {
             continue;
         };
         if group != process_group.as_raw() {
@@ -601,9 +608,14 @@ fn observe_group_in(
         let Some(limits) = limits else {
             continue;
         };
-        let Some(member) = retry_transient_procfs_permission(|| {
-            observe_member(&path, observation.open_fds, limits, work)
-        })?
+        let Some(member) =
+            retry_transient_procfs_permission(&mut transient_permission_retries, || {
+                let mut attempted_work = *work;
+                let member =
+                    observe_member(&path, observation.open_fds, limits, &mut attempted_work)?;
+                *work = attempted_work;
+                Ok(member)
+            })?
         else {
             continue;
         };
@@ -819,17 +831,17 @@ fn read_optional(path: PathBuf) -> Result<Option<Vec<u8>>, ProcessPlatformError>
 
 #[cfg(any(target_os = "linux", test))]
 fn retry_transient_procfs_permission<T>(
+    retries: &mut u8,
     mut operation: impl FnMut() -> Result<T, ProcessPlatformError>,
 ) -> Result<T, ProcessPlatformError> {
-    let mut retries = 0;
     loop {
         match operation() {
             Err(ProcessPlatformError::Io(error))
                 if error.kind() == io::ErrorKind::PermissionDenied
-                    && retries < MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES =>
+                    && *retries < MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES =>
             {
-                retries += 1;
-                thread::yield_now();
+                *retries += 1;
+                thread::sleep(TRANSIENT_PROCFS_PERMISSION_RETRY_DELAY);
             }
             result => return result,
         }
@@ -1184,6 +1196,32 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn linux_group_census_tolerates_bounded_exec_visibility_windows() {
+        let workspace = TestWorkspace::create();
+        let profile = shell_profile(&workspace.0, "while :; do /bin/true; done");
+        let process = UnixChildProcess::spawn(&profile).expect("worker should launch");
+        let limits = ProcessResourceLimits::try_new(
+            256 * 1_024 * 1_024,
+            128,
+            8,
+            paraegox_kernel::time::BoundedDuration::from_nanos(10_000_000_000),
+        )
+        .expect("resource limits");
+        let mut observed_member = false;
+
+        for _ in 0..128 {
+            let observation = process
+                .enforce_resource_limits(limits)
+                .expect("bounded exec churn must not create a false census failure");
+            observed_member |= observation.process_tree_members() != 0;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(observed_member);
+    }
+
     #[test]
     fn procfs_census_caps_fail_closed_without_partial_observations() {
         let workspace = TestWorkspace::create();
@@ -1254,8 +1292,9 @@ mod tests {
 
     #[test]
     fn transient_procfs_permission_is_retried_but_persistent_denial_fails_closed() {
+        let mut transient_retries = 0;
         let mut transient_attempts = 0_u8;
-        let observed = retry_transient_procfs_permission(|| {
+        let observed = retry_transient_procfs_permission(&mut transient_retries, || {
             transient_attempts += 1;
             if transient_attempts <= 3 {
                 Err(ProcessPlatformError::Io(io::Error::from(
@@ -1268,9 +1307,11 @@ mod tests {
         .expect("a bounded transient exec window should be retried");
         assert_eq!(observed, 17);
         assert_eq!(transient_attempts, 4);
+        assert_eq!(transient_retries, 3);
 
+        let mut persistent_retries = 0;
         let mut persistent_attempts = 0_u8;
-        let denied = retry_transient_procfs_permission(|| {
+        let denied = retry_transient_procfs_permission(&mut persistent_retries, || {
             persistent_attempts += 1;
             Err::<(), _>(ProcessPlatformError::Io(io::Error::from(
                 io::ErrorKind::PermissionDenied,
@@ -1285,6 +1326,36 @@ mod tests {
             persistent_attempts,
             MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES + 1
         );
+        assert_eq!(persistent_retries, MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES);
+
+        let mut shared_retries = MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES - 1;
+        let mut first_member_attempts = 0;
+        retry_transient_procfs_permission(&mut shared_retries, || {
+            first_member_attempts += 1;
+            if first_member_attempts == 1 {
+                Err(ProcessPlatformError::Io(io::Error::from(
+                    io::ErrorKind::PermissionDenied,
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("the final shared retry may settle one member");
+        assert_eq!(shared_retries, MAX_TRANSIENT_PROCFS_PERMISSION_RETRIES);
+
+        let mut second_member_attempts = 0;
+        let exhausted = retry_transient_procfs_permission(&mut shared_retries, || {
+            second_member_attempts += 1;
+            Err::<(), _>(ProcessPlatformError::Io(io::Error::from(
+                io::ErrorKind::PermissionDenied,
+            )))
+        });
+        assert!(matches!(
+            exhausted,
+            Err(ProcessPlatformError::Io(error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(second_member_attempts, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

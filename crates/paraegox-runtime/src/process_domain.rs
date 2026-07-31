@@ -585,8 +585,12 @@ impl ProcessDomain {
                 self.phase = ProcessDomainPhase::Draining;
                 if let Err(error) = self.graceful_stop(reason).await {
                     self.phase = ProcessDomainPhase::Recovering;
+                    // Once the worker fails any part of the signed stop
+                    // dialogue, its eventual loss is no longer a clean planned
+                    // exit. Record that fact before either reducer-driven or
+                    // direct signal escalation so cleanup cannot relabel it.
+                    self.begin_unexpected_recovery(RuntimeFailureFactKind::ShutdownFailed)?;
                     if matches!(error, ProcessDomainError::WorkerStopFailed) {
-                        self.begin_unexpected_recovery(RuntimeFailureFactKind::ShutdownFailed)?;
                         self.drive_recovery_stop(reason).await?;
                     } else {
                         self.escalate_termination().await?;
@@ -610,7 +614,7 @@ impl ProcessDomain {
         }
         // A cooperative stop can still return a non-clean outcome after shutdown
         // began. `begin_unexpected_recovery` makes that failure sticky by
-        // clearing `shutdown_expected_loss`; consume the current value here
+        // setting `shutdown_expected_loss` false; consume the current value here
         // rather than the optimistic value captured before the stop dialogue.
         let expected_loss = self.shutdown_expected_loss.unwrap_or(false);
         if let Err(error) = self.observe_process_loss(&transport, expected_loss) {
@@ -2053,6 +2057,7 @@ mod tests {
         Complete,
         Uncertain,
         FailedStop,
+        MissingStopAck,
         BlockAfterInvoked,
         HeartbeatThenExit,
     }
@@ -2221,7 +2226,8 @@ mod tests {
             let script = match dialogue {
                 WorkerDialogue::Complete
                 | WorkerDialogue::Uncertain
-                | WorkerDialogue::FailedStop => "/bin/cat \"$RESPONSE\"; /bin/cat >/dev/null",
+                | WorkerDialogue::FailedStop
+                | WorkerDialogue::MissingStopAck => "/bin/cat \"$RESPONSE\"; /bin/cat >/dev/null",
                 WorkerDialogue::BlockAfterInvoked => {
                     "/bin/cat \"$RESPONSE\"; trap '' TERM; while :; do :; done"
                 }
@@ -2402,6 +2408,18 @@ mod tests {
                         },
                     ),
                 ]);
+            } else if matches!(dialogue, WorkerDialogue::MissingStopAck) {
+                frames.push(worker_frame(
+                    identity,
+                    4,
+                    ProcessWorkerState::Running,
+                    1,
+                    ProcessFrameBody::Terminal {
+                        credit_id: 1,
+                        kind: InvocationTerminalKind::Completed,
+                        payload: Box::from(&b"output"[..]),
+                    },
+                ));
             } else if matches!(dialogue, WorkerDialogue::HeartbeatThenExit) {
                 frames.push(worker_frame(
                     identity,
@@ -2624,6 +2642,30 @@ mod tests {
             .expect("failed stop still requires process-loss cleanup");
         assert_ne!(domain.phase(), ProcessDomainPhase::Stopped);
         assert_ne!(domain.recovery().phase(), RecoveryPhase::Stopped);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_stop_ack_never_becomes_clean_stopped_state() {
+        let area = TestArea::create();
+        let fixture = DomainFixture::new(SideEffectClass::EffectFree);
+        let mut domain = ProcessDomain::start(fixture.start(&area, WorkerDialogue::MissingStopAck))
+            .await
+            .expect("domain should start");
+        let terminal = domain
+            .invoke(Box::from(&b"input"[..]))
+            .await
+            .expect("invocation should complete before the missing stop ack");
+        drop(terminal);
+
+        domain
+            .shutdown(StopReason::Planned)
+            .await
+            .expect("timed-out stop still requires process-loss cleanup");
+        assert_eq!(domain.phase(), ProcessDomainPhase::Recovering);
+        assert!(matches!(
+            domain.recovery().phase(),
+            RecoveryPhase::Backoff { .. }
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
