@@ -8,7 +8,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+nix.workspace = true
 paraegox-runtime = { path = "../paraegox-runtime" }
+tokio = { workspace = true, features = ["macros"] }
 
 [lints]
 workspace = true

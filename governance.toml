@@ -19,7 +19,7 @@ id = "GOV-WAIVER-0001"
 rule_id = "rust:expect"
 scope = "crates/paraegox-runtime/src/lib.rs"
 owner = "Runtime apply admission and state owner"
-reason = "Keep the admitted B2/P2a state mechanisms, S4/P2b Loop composition, S5/P2c ThreadDomain/ExecutorBudget composition, and fixed two-CoreService lifecycle evidence private until the P2e Runtime apply endpoint and assembly owner become their executable consumer. The binary consumes only the reactor/task/clock bootstrap, while canonical component and fixed lifecycle composition remain L2 evidence; remove or narrow this expectation in P2e."
+reason = "Keep the admitted B2/P2a state mechanisms, S4/P2b Loop composition, S5/P2c ThreadDomain/ExecutorBudget composition, the S6/P2d local POSIX ProcessDomain baseline, and fixed two-CoreService lifecycle evidence private until the P2e Runtime apply endpoint and assembly owner become their executable consumer. The binary consumes only the reactor/task/clock bootstrap, while these component mechanisms remain L2/P2d evidence; remove or narrow this expectation in P2e."
 expires_at = "2026-09-30"
 
 [[registry.waivers]]
@@ -28,6 +28,30 @@ rule_id = "rust:expect"
 scope = "crates/paraegox-deployment/src/lib.rs"
 owner = "Deployment projection and apply-envelope owner"
 reason = "Keep the tested canonical request producer private until the P2e DeploymentController becomes its admitted executable owner; remove the expectation in that bounded batch."
+expires_at = "2026-09-30"
+
+[[registry.waivers]]
+id = "GOV-WAIVER-0003"
+rule_id = "pytest:skip"
+scope = "tests/system/test_s6_python_reference_worker.py"
+owner = "ProcessDomain reference worker and system evidence owner"
+reason = "The S6 reference-worker system harness deliberately exercises POSIX process groups, Unix signals, and descriptor semantics. Keep the explicit non-POSIX skip until a separately admitted platform backend and equivalent cleanup harness exist; this waiver does not skip any supported POSIX profile."
+expires_at = "2026-09-30"
+
+[[registry.waivers]]
+id = "GOV-WAIVER-0004"
+rule_id = "rust:ignore"
+scope = "crates/paraegox-runtime/src/process_domain.rs"
+owner = "Runtime ProcessDomain cross-language evidence owner"
+reason = "Only the exact python_reference_worker_round_trips_through_rust_process_domain test is ignored by the Rust-only job because it requires the uv-managed interpreter; the uv CI job executes it explicitly. Remove this split-run exception when the P2e production Artifact runner or an independent cross-language suite becomes the sole owner of equivalent Rust-host/Python-worker evidence."
+expires_at = "2026-09-30"
+
+[[registry.waivers]]
+id = "GOV-WAIVER-0005"
+rule_id = "rust:ignore"
+scope = "crates/paraegox-runtime/src/process_domain.rs"
+owner = "Runtime ProcessDomain native-worker system evidence owner"
+reason = "Only the exact rust_reference_worker_faults_preserve_uncertain_ownership_and_cleanup test is ignored by the default library test because it consumes the separately built reference-worker executable by absolute path. CI builds that executable and runs this test explicitly; remove the split-run exception when P2e provides the production Artifact runner and equivalent end-to-end evidence."
 expires_at = "2026-09-30"
 
 [[registry.packages]]
@@ -45,40 +69,40 @@ removal_condition = "Removal requires migrating every registered mechanism consu
 path = "crates/paraegox-runtime-contracts"
 cargo_package = "paraegox-runtime-contracts"
 owner = "Runtime contract owner"
-responsibility = "Source-plan provenance, canonical PXTA binding assignments, canonical PXTE v1 Loop and additive PXTE v2 Loop+Thread inbound-Mailbox assignments, v2/v3 composite target digests, complete PXAR v1/v2/v3 Runtime apply requests, B1 apply-control commitments, writer-tenure signing and fingerprints, temporal constraints, and the canonical B2 signed apply-envelope wire contract; this package does not model a general execution plan or source-only Cards with no input Mailbox."
+responsibility = "Source-plan provenance, canonical PXTA binding assignments, canonical PXTE v1 Loop, additive PXTE v2 Loop+Thread, and additive PXTE v3 Loop+Thread+Process inbound-Mailbox assignments, v2/v3/v4 composite target digests, complete PXAR v1/v2/v3/v4 Runtime apply requests, strict PXWP v1 worker-session framing, B1 apply-control commitments, writer-tenure signing and fingerprints, temporal constraints, and the canonical B2 signed apply-envelope wire contract; desired Process profile references do not themselves enforce a sandbox or launch an OS process, and this package does not model a general execution plan or source-only Cards with no input Mailbox."
 status = "public"
-public_entrypoints = ["paraegox_runtime_contracts::assignment", "paraegox_runtime_contracts::execution", "paraegox_runtime_contracts::thread_execution", "paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply", "paraegox_runtime_contracts::temporal", "paraegox_runtime_contracts::wire"]
+public_entrypoints = ["paraegox_runtime_contracts::assignment", "paraegox_runtime_contracts::execution", "paraegox_runtime_contracts::thread_execution", "paraegox_runtime_contracts::process_execution", "paraegox_runtime_contracts::process_protocol", "paraegox_runtime_contracts::provenance", "paraegox_runtime_contracts::apply", "paraegox_runtime_contracts::temporal", "paraegox_runtime_contracts::wire"]
 consumers = ["paraegox-deployment", "paraegox-runtime"]
-first_tests = ["crates/paraegox-runtime-contracts/src/assignment.rs", "crates/paraegox-runtime-contracts/src/execution.rs", "crates/paraegox-runtime-contracts/src/thread_execution.rs", "crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs", "tests/contract/test_s5_runtime_thread_execution_request.py"]
+first_tests = ["crates/paraegox-runtime-contracts/src/assignment.rs", "crates/paraegox-runtime-contracts/src/execution.rs", "crates/paraegox-runtime-contracts/src/thread_execution.rs", "crates/paraegox-runtime-contracts/src/process_execution.rs", "crates/paraegox-runtime-contracts/src/process_protocol.rs", "crates/paraegox-runtime-contracts/src/provenance.rs", "crates/paraegox-runtime-contracts/src/apply.rs", "crates/paraegox-runtime-contracts/src/temporal.rs", "crates/paraegox-runtime-contracts/src/wire.rs", "tests/contract/test_s5_runtime_thread_execution_request.py", "tests/contract/test_s6_runtime_process_execution_request.py", "tests/contract/test_s6_process_worker_protocol.py"]
 removal_condition = "Removal requires replacing both the independent Deployment producer and Runtime consumer in one accepted contract migration."
 
 [[registry.packages]]
 path = "crates/paraegox-runtime"
 cargo_package = "paraegox-runtime"
 owner = "Runtime apply admission and state owner"
-responsibility = "Signed-request admission and apply-control transitions, bounded Mailbox and PortBinding, the current-thread RuntimeHost reactor and structured task owner, S4 LoopDomain dispatch, and S5 RuntimeHost-owned ExecutorBudget/ThreadDomain with fixed workers, permit-before-dequeue, signed timeout fencing, wedged capacity retention, joined-worker proof, and private single-subject trusted synchronous Card composition; it also contains a private fixed provider-consumer two-CoreService lifecycle owner. These L2 paths are not yet consumed by an apply endpoint, native-pool adapters remain fail-closed, and the trusted Card factory plus pre-install failure Drop remain finite same-build synchronous assumptions until P2e. This package has no ProcessDomain, durable journal, Fabric, Controller, or full RuntimeAssemblyEngine."
+responsibility = "Signed-request admission and apply-control transitions through strict PXAR v4 decoding, bounded Mailbox and PortBinding, the current-thread RuntimeHost reactor and structured task owner, the strict PXHW v1 inherited-stream watchdog contract and explicitly enabled same-reactor heartbeat/control endpoint, S4 LoopDomain dispatch, S5 RuntimeHost-owned ExecutorBudget/ThreadDomain with fixed workers, and a private S6 local POSIX ProcessDomain baseline with strict PXWP session transport, single-invocation credit ownership, liveness/recovery facts, bounded process-group termination, and identity-guarded ephemeral workspace cleanup; it also contains an internal Rust PXWP reference-worker fixture that validates its dialogue with the canonical protocol session and owns no Runtime or recovery authority, plus private single-subject trusted synchronous Card and fixed provider-consumer two-CoreService lifecycle evidence. PXHW frames prove only external observation of exact-generation reactor progress and are not readiness or Runtime/ProcessDomain receipts. These L2/P2d paths are not yet consumed by a public apply endpoint. Process launch resolution remains a trusted caller seam. The unexpected ProcessDomain destructor can preserve a still-live process plus workspace in one best-effort reaper, but that reaper is not registered or joined and cannot contribute cleanup proof; production assembly must replace it with a bounded RuntimeHost-owned reaper registry. Signed sandbox/resource policies, hostile descendants that escape their owned process group, and independently grouped ProcessDomain workers after an uncatchable RuntimeHost SIGKILL are not externally contained; a common cgroup/job object or durable external ownership journal is required before claiming production orphan cleanup. Durable RuntimeHost journal, Fabric, Controller, and a full RuntimeAssemblyEngine are also not implemented."
 status = "experimental"
-public_entrypoints = ["paraegox_runtime::run_runtime_host_process"]
+public_entrypoints = ["paraegox_runtime::host_watchdog", "paraegox_runtime::run_runtime_host_process"]
 consumers = ["paraegox-runtime-host"]
-first_tests = ["crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs", "crates/paraegox-runtime/src/request.rs", "crates/paraegox-runtime/src/mailbox.rs", "crates/paraegox-runtime/src/port_binding.rs", "crates/paraegox-runtime/src/runtime_clock.rs", "crates/paraegox-runtime/src/task_registry.rs", "crates/paraegox-runtime/src/dispatcher.rs", "crates/paraegox-runtime/src/loop_domain.rs", "crates/paraegox-runtime/src/card_instance.rs", "crates/paraegox-runtime/src/card_executor.rs", "crates/paraegox-runtime/src/component_runtime.rs", "crates/paraegox-runtime/src/thread_component_runtime.rs", "crates/paraegox-runtime/src/executor_budget.rs", "crates/paraegox-runtime/src/thread_domain.rs", "crates/paraegox-runtime/src/thread_registry.rs", "crates/paraegox-runtime/src/core_service.rs", "crates/paraegox-runtime/src/runtime_host.rs"]
-removal_condition = "Removal requires replacing the executable consumer and the proven canonical-request to bounded LoopDomain ownership path without adding a second desired-state, task, or payload-queue owner."
+first_tests = ["crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/apply_state.rs", "crates/paraegox-runtime/src/request.rs", "crates/paraegox-runtime/src/mailbox.rs", "crates/paraegox-runtime/src/port_binding.rs", "crates/paraegox-runtime/src/runtime_clock.rs", "crates/paraegox-runtime/src/task_registry.rs", "crates/paraegox-runtime/src/dispatcher.rs", "crates/paraegox-runtime/src/loop_domain.rs", "crates/paraegox-runtime/src/card_instance.rs", "crates/paraegox-runtime/src/card_executor.rs", "crates/paraegox-runtime/src/component_runtime.rs", "crates/paraegox-runtime/src/thread_component_runtime.rs", "crates/paraegox-runtime/src/executor_budget.rs", "crates/paraegox-runtime/src/thread_domain.rs", "crates/paraegox-runtime/src/thread_registry.rs", "crates/paraegox-runtime/src/process_domain.rs", "crates/paraegox-runtime/src/process_platform.rs", "crates/paraegox-runtime/src/process_transport.rs", "crates/paraegox-runtime/src/process_workspace.rs", "crates/paraegox-runtime/src/liveness.rs", "crates/paraegox-runtime/src/recovery.rs", "crates/paraegox-runtime/src/runtime_ownership.rs", "crates/paraegox-runtime/src/bin/paraegox-rust-reference-worker.rs", "crates/paraegox-runtime/tests/rust_reference_worker.rs", "crates/paraegox-runtime/src/core_service.rs", "crates/paraegox-runtime/src/host_watchdog.rs", "crates/paraegox-runtime/src/runtime_host.rs", "crates/paraegox-runtime-host/tests/external_watchdog.rs"]
+removal_condition = "Removal requires replacing the executable consumer and every proven canonical-request-to-bounded-Domain ownership path without adding a second desired-state, task, thread, process, recovery, or payload-queue owner."
 
 [[registry.packages]]
 path = "crates/paraegox-runtime-host"
 cargo_package = "paraegox-runtime-host"
-owner = "RuntimeHost process owner"
-responsibility = "Minimal executable composition root for the single RuntimeHost reactor and process shutdown signal; S5 adds only crate-private root ownership and cleanup evidence for planned ThreadDomains, while the public process remains idle and owns no Deployment planning, apply input, Card configuration, Fabric, or persistence."
+owner = "RuntimeHost process and external service-manager adapter owner"
+responsibility = "Minimal executable composition root for the single RuntimeHost reactor plus a separate POSIX reference OS service-manager adapter. The adapter runs in a different process fault domain, exclusively owns the exact RuntimeHost child/process group, bounded PXHW observation evidence, restart-window/backoff ledger charged at each actual replacement spawn attempt, TERM/KILL/reap actions, and quarantine mutation; it records Reaped and permits restart only after the direct child is reaped and that exact process group is observed absent. A post-spawn setup failure permanently consumes the spawned child generation and records its cleanup; if cleanup cannot be proven, the adapter retains the Child/PG owner in quarantine, forbids replacement, and remains synchronously owned across unexpected manager Drop. The reference executable keeps quarantined ownership in an explicit signal-responsive control loop instead of treating unbounded Drop as its normal quarantine path. This proof covers same-group descendants only. A ProcessDomain worker deliberately placed in its own process group is not enumerable from the inherited PXHW channel after RuntimeHost SIGKILL, so this adapter cannot claim its cleanup without a common cgroup/job object or durable external ownership journal. It does not create a P5 NodeDaemon, Node facts, Deployment authority, Runtime/ProcessDomain receipt, or second restart loop. The RuntimeHost process remains idle apart from its explicitly enabled watchdog endpoint and owns no Deployment planning, apply input, Card configuration, Fabric, or persistence."
 status = "internal"
-public_entrypoints = []
+public_entrypoints = ["paraegox_runtime_host::service_manager"]
 consumers = []
-first_tests = ["crates/paraegox-runtime/src/runtime_host.rs"]
+first_tests = ["crates/paraegox-runtime/src/host_watchdog.rs", "crates/paraegox-runtime/src/runtime_host.rs", "crates/paraegox-runtime-host/src/service_manager.rs", "crates/paraegox-runtime-host/tests/external_watchdog.rs"]
 removal_condition = "Remove only when another admitted OS-managed executable becomes the sole RuntimeHost reactor composition root."
 
 [[registry.packages]]
 path = "crates/paraegox-deployment"
 cargo_package = "paraegox-deployment"
 owner = "Deployment projection and apply-envelope owner"
-responsibility = "Pure projection from committed deployment identities and canonical target assignments plus Loop/Thread execution plans into complete Runtime slices and signature-independent PXAR v1/v2/v3 apply-request drafts; signing keys and I/O remain caller-owned."
+responsibility = "Pure projection from committed deployment identities and canonical target assignments plus Loop/Thread/Process execution plans into complete Runtime slices and signature-independent PXAR v1/v2/v3/v4 apply-request drafts; signing keys, clocks, process construction, and I/O remain caller-owned."
 status = "enabler"
 public_entrypoints = []
 consumers = []
@@ -166,12 +190,44 @@ compatibility = "PXTE v2 additively embeds one byte-exact optional PXTE v1 Loop 
 tests = ["crates/paraegox-runtime-contracts/src/thread_execution.rs", "crates/paraegox-deployment/src/envelope.rs", "crates/paraegox-runtime/src/admission.rs", "crates/paraegox-runtime/src/thread_component_runtime.rs", "tests/contract/test_s5_runtime_thread_execution_request.py", "tests/fixtures/wire/s5_runtime_apply_request_v3.json"]
 
 [[registry.public_apis]]
+module = "paraegox_runtime_contracts::process_execution"
+symbols = ["TARGET_EXECUTION_PLAN_V3_VERSION", "RUNTIME_APPLY_REQUEST_V4_VERSION", "MAX_PROCESS_DOMAINS", "MAX_PROCESS_MAILBOX_EXECUTIONS", "MAX_PROCESS_RESTART_ATTEMPTS", "MAX_PROCESS_WORKER_FRAME_BYTES", "PROCESS_WORKER_PROTOCOL_VERSION", "PROCESS_WORKER_HEADER_BYTES", "MAX_PROCESS_WORKER_PAYLOAD_BYTES", "MAX_PROCESS_WORKER_CREDITS", "MAX_PROCESS_WORKER_RETAINED_BYTES", "MAX_PROCESS_IPC_PAYLOAD_BYTES", "MAX_TARGET_EXECUTION_PLAN_V3_BYTES", "MAX_RUNTIME_APPLY_REQUEST_V4_BYTES", "ProcessDomainRef", "ProcessLaunchProfileRef", "ProcessTargetProfileRef", "ProcessSandboxProfileRef", "ProcessEntrypointRef", "TargetExecutionDigestV3", "WorkerRuntimeKind", "WorkspacePolicy", "ProcessAccessPolicy", "FailureContainmentPolicy", "SideEffectClass", "InvocationReplayPolicy", "RuntimeVersionRange", "ProcessProfileSelections", "ProcessLaunchSpec", "ProcessCapacitySpec", "ProcessLivenessBudgets", "ProcessShutdownBudgets", "ProcessLifecycleBudgets", "ProcessResourceLimits", "ProcessRestartPolicy", "ProcessDomainPolicies", "ProcessDomainSpec", "ProcessInvocationBudgets", "ProcessExecutionRequirements", "ProcessWorkloadSelection", "ProcessMailboxExecutionSpec", "TargetExecutionPlanV3", "TargetPlanAssignmentsV4", "RuntimePlanSliceV4", "RuntimeApplyRequestV4", "ProcessExecutionContractError", "TargetPlanV4ContractError", "ProcessExecutionRecordSection", "ProcessExecutionWireErrorCode", "ProcessExecutionWireError", "TargetPlanV4WireErrorCode", "RequestV4WireErrorCode", "RequestV4WireError"]
+owner = "Runtime Process execution contract owner"
+consumers = ["paraegox-deployment", "paraegox-runtime"]
+compatibility = "PXTE v3 additively embeds one byte-exact optional PXTE v2 Loop/Thread body and fixes bounded ProcessDomain and Process Mailbox desired records, exact profile identities and digests, resource/lifecycle/restart declarations, no-replay invocation requirements, canonical ordering, composite digest framing, and stable rejection codes. PXAR v4 strictly frames one unchanged signed envelope, PXTA v1, and PXTE v3 with no older-version fallback. These are desired-state and wire contracts only; profile references do not prove OS sandbox or resource enforcement. Incompatible framing, digest, eligibility, or scope changes require new explicit versions and domains."
+tests = ["crates/paraegox-runtime-contracts/src/process_execution.rs", "crates/paraegox-deployment/src/envelope.rs", "crates/paraegox-runtime/src/admission.rs", "tests/contract/test_s6_runtime_process_execution_request.py", "tests/fixtures/wire/s6_runtime_apply_request_v4.json"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime_contracts::process_protocol"
+symbols = ["PROCESS_WORKER_PROTOCOL_MAGIC", "PROCESS_WORKER_PROTOCOL_VERSION", "PROCESS_WORKER_HEADER_BYTES", "MAX_PROCESS_WORKER_FRAME_BYTES", "MAX_PROCESS_WORKER_PAYLOAD_BYTES", "MAX_PROCESS_WORKER_CREDITS", "MAX_PROCESS_WORKER_RETAINED_BYTES", "ProcessSessionGenerations", "ProcessSessionIdentity", "ProcessFrameDirection", "ProcessWorkerState", "ProcessFrameKind", "ConstructOutcome", "InvocationTerminalKind", "StopReason", "StoppedOutcome", "ProcessFrameBody", "ProcessFrame", "ProcessTerminalParts", "ProcessProtocolPhase", "ProcessProtocolSession", "ProcessProtocolErrorCode", "ProcessProtocolError"]
+owner = "Runtime Process worker protocol owner"
+consumers = ["paraegox-runtime", "paraegox-sdk reference worker"]
+compatibility = "PXWP v1 fixes the canonical frame, exact live-generation identity fence, direction and phase rules, per-direction sequencing, Invoke/Invoked acknowledgement, bounded credits and retained-byte accounting, heartbeat snapshots, cancellation, terminal results, and stable error codes. It does not define process spawning, OS containment, Runtime readiness, replay, or recovery policy. Incompatible framing or session semantics require a new protocol version."
+tests = ["crates/paraegox-runtime-contracts/src/process_protocol.rs", "tests/contract/test_s6_process_worker_protocol.py", "tests/unit/test_s6_python_worker_protocol.py", "tests/fixtures/wire/s6_process_worker_protocol_v1.json"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime::host_watchdog"
+symbols = ["HOST_WATCHDOG_PROTOCOL_MAGIC", "HOST_WATCHDOG_PROTOCOL_VERSION", "HOST_WATCHDOG_FRAME_BYTES", "HOST_WATCHDOG_ENABLE_ENV", "HOST_WATCHDOG_GENERATION_ENV", "HOST_WATCHDOG_HEARTBEAT_MILLIS_ENV", "HOST_WATCHDOG_HANDSHAKE_MILLIS_ENV", "HostWatchdogGeneration", "HostWatchdogSequence", "HostControlProbeNonce", "HostBootstrapPhase", "HostWatchdogDirection", "HostWatchdogFrameBody", "HostWatchdogFrame", "HostWatchdogProtocolErrorCode", "HostWatchdogProtocolError"]
+owner = "RuntimeHost watchdog contract owner"
+consumers = ["paraegox-runtime", "paraegox-runtime-host"]
+compatibility = "PXHW v1 fixes one strict 40-byte big-endian frame with magic/version, nonzero exact child generation, direction-local nonzero sequence, ordered bootstrap progress, running heartbeat, exact control probe/ack nonce, zero reserved bytes, and stable decode reason codes. The inherited stream binds the adapter to its spawned child; these frames are external reactor-progress observations only and cannot claim Card readiness, ProcessDomain terminal state, effect outcome, or a recovery receipt. Incompatible framing or semantics require a new explicit protocol version."
+tests = ["crates/paraegox-runtime/src/host_watchdog.rs", "crates/paraegox-runtime-host/tests/external_watchdog.rs"]
+
+[[registry.public_apis]]
 module = "paraegox_runtime"
 symbols = ["run_runtime_host_process", "RuntimeHostProcessError"]
 owner = "RuntimeHost process owner"
 consumers = ["paraegox-runtime-host"]
-compatibility = "This pre-1.0 executable bootstrap surface owns one current-thread reactor and Ctrl-C shutdown only; it deliberately exposes no Tokio type, apply endpoint, Card runner, readiness claim, or durable state."
-tests = ["crates/paraegox-runtime/src/runtime_host.rs"]
+compatibility = "This pre-1.0 executable bootstrap surface owns one current-thread reactor, Ctrl-C/TERM structured shutdown, and an optional explicit PXHW endpoint whose heartbeat and control acknowledgement run on that reactor. With no complete watchdog environment profile it retains the standalone idle behavior; an explicitly enabled incomplete/invalid profile fails closed. It exposes no Tokio type, apply endpoint, Card runner, readiness claim, external restart action, or durable state."
+tests = ["crates/paraegox-runtime/src/runtime_host.rs", "crates/paraegox-runtime-host/tests/external_watchdog.rs"]
+
+[[registry.public_apis]]
+module = "paraegox_runtime_host::service_manager"
+symbols = ["HostWatchdogTiming", "HostTerminationTiming", "HostRestartPolicy", "RuntimeHostServiceManagerPolicy", "RuntimeHostLaunch", "ServiceManagerFailure", "ServiceManagerEvidenceKind", "ServiceManagerEvidence", "RuntimeHostServiceManagerState", "RuntimeHostServiceManagerSnapshot", "RuntimeHostServiceManager", "ServiceManagerError"]
+owner = "External RuntimeHost lifecycle owner"
+consumers = ["POSIX OS service-manager profiles", "external RuntimeHost system harness"]
+compatibility = "This internal P2d reference adapter owns one exact RuntimeHost process group and the only restart-window/backoff/quarantine mutation ledger. The restart window counts actual replacement spawn attempts rather than pending schedules. Reaped/restart requires both direct-child reap and exact PGID absence, including TERM-ignoring same-group descendants; every OS-created child consumes a unique generation, and post-spawn setup cleanup failure retains the sole process owner and quarantines without replacement. The reference executable keeps that quarantine in a signal-responsive owner loop, with synchronous Drop retained only as the final fail-safe. Its fixed-capacity evidence records external observations and process actions, never Runtime/ProcessDomain receipts. The proof does not cover ProcessDomain workers deliberately launched into distinct process groups if RuntimeHost is uncatchably killed; production orphan cleanup needs a shared cgroup/job object or durable external ownership journal. It intentionally exposes no NodeDaemon/Node facts, Deployment input, arbitrary shell/environment launch, or second recovery-action owner; wider platform service-manager integration may replace this POSIX reference behind equivalent contract evidence."
+tests = ["crates/paraegox-runtime-host/src/service_manager.rs", "crates/paraegox-runtime-host/tests/external_watchdog.rs"]
 
 [cargo]
 manifest_path = "Cargo.toml"
@@ -194,7 +250,7 @@ allow_external_dependencies = []
 id = "CARGO-ARCH-003"
 source = "paraegox-runtime"
 allow_workspace_dependencies = ["paraegox-kernel", "paraegox-runtime-contracts"]
-allow_external_dependencies = ["ed25519-dalek", "tokio"]
+allow_external_dependencies = ["ed25519-dalek", "nix", "tokio"]
 
 [[cargo.rules]]
 id = "CARGO-ARCH-004"
@@ -206,7 +262,7 @@ allow_external_dependencies = ["ed25519-dalek"]
 id = "CARGO-ARCH-005"
 source = "paraegox-runtime-host"
 allow_workspace_dependencies = ["paraegox-runtime"]
-allow_external_dependencies = []
+allow_external_dependencies = ["nix", "tokio"]
 
 [[architecture.rules]]
 id = "ARCH-001"

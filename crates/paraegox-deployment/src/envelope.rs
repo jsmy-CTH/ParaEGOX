@@ -9,6 +9,14 @@ use paraegox_runtime_contracts::assignment::{
 use paraegox_runtime_contracts::execution::{
     RuntimeApplyRequestV2, RuntimePlanSliceV2, TargetPlanContractError,
 };
+use paraegox_runtime_contracts::process_execution::{
+    RuntimeApplyRequestV4, RuntimePlanSliceV4, TargetExecutionPlanV3, TargetPlanAssignmentsV4,
+    TargetPlanV4ContractError,
+};
+use paraegox_runtime_contracts::provenance::{
+    PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanRef, SourcePlanRevision,
+    SourceScopeRef,
+};
 use paraegox_runtime_contracts::temporal::ApplyTemporalConstraint;
 use paraegox_runtime_contracts::thread_execution::{
     RuntimeApplyRequestV3, RuntimePlanSliceV3, TargetPlanV3ContractError,
@@ -104,6 +112,32 @@ impl RuntimeApplyRequestV3Draft {
     }
 }
 
+/// Signature-independent PXAR v4 request paired with complete PXTA and additive PXTE v3.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeApplyRequestV4Draft {
+    slice: RuntimePlanSliceV4,
+    envelope: RuntimeApplyEnvelopeDraft,
+}
+
+impl RuntimeApplyRequestV4Draft {
+    /// Returns the unchanged envelope transcript the external writer must sign.
+    pub fn signing_transcript(&self) -> Result<ApplyRequestSigningTranscript, EnvelopeBuildError> {
+        self.envelope
+            .signing_transcript()
+            .map_err(EnvelopeBuildError::Envelope)
+    }
+
+    /// Finalizes the envelope and binds it to complete PXTA and additive PXTE v3.
+    pub fn finalize(self, signature: &[u8]) -> Result<RuntimeApplyRequestV4, EnvelopeBuildError> {
+        let envelope = self
+            .envelope
+            .finalize(signature)
+            .map_err(EnvelopeBuildError::Envelope)?;
+        RuntimeApplyRequestV4::try_new(envelope, self.slice)
+            .map_err(EnvelopeBuildError::TargetPlanV4Request)
+    }
+}
+
 /// Builds the complete signature-independent Runtime apply request.
 pub fn build_runtime_apply_request_draft(
     projection: &CommittedTargetProjection,
@@ -167,6 +201,51 @@ pub fn build_runtime_apply_request_v3_draft(
     Ok(RuntimeApplyRequestV3Draft { slice, envelope })
 }
 
+/// Builds a complete signature-independent PXAR v4 Runtime apply request.
+///
+/// `projection` remains tenure-neutral and owns the committed plan identity,
+/// target, and complete PXTA body. `execution` is the exact additive PXTE v3
+/// body selected for that projection. This function owns neither signing keys
+/// nor clock authority and performs no ProcessDomain or worker construction.
+pub fn build_runtime_apply_request_v4_draft(
+    projection: &CommittedTargetProjection,
+    execution: TargetExecutionPlanV3,
+    tenure: DeploymentWriterTenure,
+    expected_active: ExpectedActive,
+    operation_id: ApplyOperationId,
+    temporal: ApplyTemporalConstraint,
+    auth_claim: ApplyRequestAuthClaim,
+) -> Result<RuntimeApplyRequestV4Draft, EnvelopeBuildError> {
+    let assignments = TargetPlanAssignmentsV4::try_new(projection.assignments().clone(), execution)
+        .map_err(EnvelopeBuildError::TargetPlanV4Request)?;
+    let plan = projection.plan();
+    let provenance = PlanProvenance::new(
+        SourceScopeRef::from_bytes(*plan.scope().as_bytes()),
+        SourcePlanRef::from_bytes(*plan.plan().as_bytes()),
+        SourcePlanRevision::new(plan.revision().value()),
+        plan.digest(),
+    );
+    let header = RuntimeSliceHeader::new(
+        projection.target(),
+        provenance,
+        assignments.assignment_digest(),
+    );
+    let commitment = RuntimeSliceCommitment::try_new(header)
+        .map_err(TargetPlanV4ContractError::Provenance)
+        .map_err(EnvelopeBuildError::TargetPlanV4Request)?;
+    let slice = RuntimePlanSliceV4::try_new(commitment, assignments)
+        .map_err(EnvelopeBuildError::TargetPlanV4Request)?;
+    let control_commitment = build_runtime_apply_control_commitment(
+        slice.commitment(),
+        tenure,
+        expected_active,
+        operation_id,
+    )?;
+    let envelope = RuntimeApplyEnvelopeDraft::try_new(control_commitment, temporal, auth_claim)
+        .map_err(EnvelopeBuildError::Envelope)?;
+    Ok(RuntimeApplyRequestV4Draft { slice, envelope })
+}
+
 /// Builds the signature-independent form of one canonical B2 apply envelope.
 ///
 /// The returned draft exposes the complete request-authentication transcript.
@@ -206,6 +285,8 @@ pub enum EnvelopeBuildError {
     TargetPlanRequest(TargetPlanContractError),
     /// PXAR v3 and its additive Loop/Thread target plan failed validation.
     TargetPlanV3Request(TargetPlanV3ContractError),
+    /// PXAR v4 and its additive Loop/Thread/Process plan failed validation.
+    TargetPlanV4Request(TargetPlanV4ContractError),
 }
 
 impl From<ProjectionError> for EnvelopeBuildError {
@@ -225,6 +306,9 @@ impl fmt::Display for EnvelopeBuildError {
             }
             Self::TargetPlanV3Request(error) => {
                 write!(formatter, "complete v3 apply request failed: {error}")
+            }
+            Self::TargetPlanV4Request(error) => {
+                write!(formatter, "complete v4 apply request failed: {error}")
             }
         }
     }
@@ -257,6 +341,17 @@ mod tests {
         MailboxExecutionSpec, OverrunAction, RequestV2WireErrorCode, RunBoundProvenance,
         RuntimeApplyRequestV2, TargetExecutionPlan, TargetPlanAssignments, WorkloadKind,
     };
+    use paraegox_runtime_contracts::process_execution::{
+        FailureContainmentPolicy, InvocationReplayPolicy, ProcessAccessPolicy, ProcessCapacitySpec,
+        ProcessDomainPolicies, ProcessDomainRef, ProcessDomainSpec, ProcessEntrypointRef,
+        ProcessExecutionRequirements, ProcessInvocationBudgets, ProcessLaunchProfileRef,
+        ProcessLaunchSpec, ProcessLifecycleBudgets, ProcessLivenessBudgets,
+        ProcessMailboxExecutionSpec, ProcessProfileSelections, ProcessResourceLimits,
+        ProcessRestartPolicy, ProcessSandboxProfileRef, ProcessShutdownBudgets,
+        ProcessTargetProfileRef, ProcessWorkloadSelection, RuntimeApplyRequestV4,
+        RuntimeVersionRange, SideEffectClass, TargetExecutionPlanV3, TargetPlanV4ContractError,
+        WorkerRuntimeKind, WorkspacePolicy,
+    };
     use paraegox_runtime_contracts::provenance::{
         PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanDigest,
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
@@ -281,9 +376,9 @@ mod tests {
 
     use super::{
         EnvelopeBuildError, RuntimeApplyRequestDraft, RuntimeApplyRequestV2Draft,
-        RuntimeApplyRequestV3Draft, build_runtime_apply_envelope_draft,
+        RuntimeApplyRequestV3Draft, RuntimeApplyRequestV4Draft, build_runtime_apply_envelope_draft,
         build_runtime_apply_request_draft, build_runtime_apply_request_v2_draft,
-        build_runtime_apply_request_v3_draft,
+        build_runtime_apply_request_v3_draft, build_runtime_apply_request_v4_draft,
     };
 
     // TEST-ONLY fixed seed. Production code never holds a tenure-authority signing key.
@@ -298,6 +393,8 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/s4_runtime_apply_request_v2.json");
     const S5_APPLY_VECTOR_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s5_runtime_apply_request_v3.json");
+    const S6_APPLY_VECTOR_JSON: &str =
+        include_str!("../../../tests/fixtures/wire/s6_runtime_apply_request_v4.json");
     const APPLY_ENVELOPE_MAGIC: &[u8] = b"ParaEGOX\0runtime-apply-envelope";
 
     struct TlvLocation {
@@ -320,6 +417,10 @@ mod tests {
 
     fn s5_fixture_hex(name: &str) -> Vec<u8> {
         fixture_document_hex(S5_APPLY_VECTOR_JSON, name)
+    }
+
+    fn s6_fixture_hex(name: &str) -> Vec<u8> {
+        fixture_document_hex(S6_APPLY_VECTOR_JSON, name)
     }
 
     fn assert_v2_rejection(
@@ -738,6 +839,199 @@ mod tests {
         )
     }
 
+    fn s6_projection(
+        heartbeat_timeout_nanos: u64,
+        entrypoint_digest_byte: u8,
+    ) -> (CommittedTargetProjection, TargetExecutionPlanV3) {
+        let prior = s5_projection(1_000_000_000, 0, 3);
+        let Ok(schema) = SchemaRef::try_new([0x21; 16], 1, Digest32::from_bytes([0x22; 32])) else {
+            panic!("S6 fixture schema must be valid");
+        };
+        let source = PortEndpoint::new(
+            InstanceRef::from_bytes([0x43; 16]),
+            PortRef::from_bytes([0x53; 16]),
+            PortSpec::new(
+                PortDirection::Out,
+                schema,
+                InteractionKind::Signal,
+                PortCardinality::One,
+            ),
+        );
+        let target = PortEndpoint::new(
+            InstanceRef::from_bytes([0x63; 16]),
+            PortRef::from_bytes([0x73; 16]),
+            PortSpec::new(
+                PortDirection::In,
+                schema,
+                InteractionKind::Signal,
+                PortCardinality::One,
+            ),
+        );
+        let Ok(delivery) = DeliveryProfile::try_new(
+            128,
+            BoundedDuration::from_nanos(5_000_000_000),
+            OverflowPolicy::Latest,
+        ) else {
+            panic!("S6 fixture delivery must be valid");
+        };
+        let Ok(mailbox) = MailboxSpec::try_new(
+            2,
+            256,
+            BoundedDuration::from_nanos(5_000_000_000),
+            1,
+            256,
+            OverflowPolicy::Latest,
+        ) else {
+            panic!("S6 fixture Mailbox must be valid");
+        };
+        let Ok(process_binding) = BindingAssignment::try_new(
+            BindingId::from_bytes([0x33; 16]),
+            source,
+            target,
+            MailboxRef::from_bytes([0x83; 16]),
+            delivery,
+            mailbox,
+        ) else {
+            panic!("S6 fixture process binding must be valid");
+        };
+        let mut binding_records = prior.assignments().bindings().as_slice().to_vec();
+        binding_records.push(process_binding);
+        let Ok(bindings) = TargetAssignments::try_new(binding_records) else {
+            panic!("S6 complete PXTA must be valid");
+        };
+
+        let Ok(runtime_versions) = RuntimeVersionRange::try_new(3, 11, 3, 13) else {
+            panic!("S6 runtime version range must be valid");
+        };
+        let profiles = ProcessProfileSelections::new(
+            ProcessLaunchProfileRef::from_bytes([0xd2; 16]),
+            Digest32::from_bytes([0xd3; 32]),
+            ProcessTargetProfileRef::from_bytes([0xd4; 16]),
+            Digest32::from_bytes([0xd5; 32]),
+            ProcessSandboxProfileRef::from_bytes([0xd6; 16]),
+            Digest32::from_bytes([0xd7; 32]),
+        );
+        let Ok(launch) =
+            ProcessLaunchSpec::try_new(profiles, 1, WorkerRuntimeKind::Python, runtime_versions)
+        else {
+            panic!("S6 launch spec must be valid");
+        };
+        let Ok(capacity) = ProcessCapacitySpec::try_new(
+            8,
+            2,
+            BoundedDuration::from_nanos(2_000_000_000),
+            8,
+            4_096,
+            8_192,
+        ) else {
+            panic!("S6 process capacity must be valid");
+        };
+        let Ok(liveness) = ProcessLivenessBudgets::try_new(
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(100_000_000),
+            BoundedDuration::from_nanos(heartbeat_timeout_nanos),
+            BoundedDuration::from_nanos(1_000_000_000),
+        ) else {
+            panic!("S6 process liveness must be valid");
+        };
+        let Ok(shutdown) = ProcessShutdownBudgets::try_new(
+            BoundedDuration::from_nanos(2_000_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+        ) else {
+            panic!("S6 process shutdown must be valid");
+        };
+        let lifecycle = ProcessLifecycleBudgets::new(liveness, shutdown);
+        let Ok(resources) = ProcessResourceLimits::try_new(
+            65_536,
+            32,
+            4,
+            BoundedDuration::from_nanos(2_000_000_000),
+        ) else {
+            panic!("S6 process resource limits must be valid");
+        };
+        let Ok(restart) = ProcessRestartPolicy::try_new(
+            3,
+            BoundedDuration::from_nanos(60_000_000_000),
+            BoundedDuration::from_nanos(100_000_000),
+            BoundedDuration::from_nanos(5_000_000_000),
+            50,
+        ) else {
+            panic!("S6 restart policy must be valid");
+        };
+        let policies = ProcessDomainPolicies::new(
+            WorkspacePolicy::EphemeralPerInstanceGeneration,
+            ProcessAccessPolicy::NoRawHostAccess,
+            FailureContainmentPolicy::WholeProcessDomain,
+        );
+        let Ok(domain) = ProcessDomainSpec::try_new(
+            ProcessDomainRef::from_bytes([0xd1; 16]),
+            launch,
+            capacity,
+            lifecycle,
+            resources,
+            restart,
+            policies,
+        ) else {
+            panic!("S6 ProcessDomain must be valid");
+        };
+        let subject = CardSubjectSpec::new(
+            CardDefinitionRef::from_bytes([0xc1; 16]),
+            CardImplementationRef::from_bytes([0xc2; 16]),
+            Digest32::from_bytes([0xc3; 32]),
+            Digest32::from_bytes([0xc4; 32]),
+            Digest32::from_bytes([0xc5; 32]),
+        );
+        let Ok(invocation_budgets) = ProcessInvocationBudgets::try_new(
+            BoundedDuration::from_nanos(100_000_000),
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(500_000_000),
+            128,
+        ) else {
+            panic!("S6 invocation budgets must be valid");
+        };
+        let requirements = ProcessExecutionRequirements::new(
+            CallModel::Synchronous,
+            WorkloadKind::Device,
+            BlockingRisk::Unknown,
+            RunBoundProvenance::Unknown,
+            SideEffectClass::External,
+            InvocationReplayPolicy::NoReplay,
+            invocation_budgets,
+        );
+        let Ok(dispatch) = ThreadDispatchPolicy::try_new(DispatchClass::Background, 7, 9, 2, 1)
+        else {
+            panic!("S6 process dispatch must be valid");
+        };
+        let workload = ProcessWorkloadSelection::new(
+            subject,
+            ProcessEntrypointRef::from_bytes([0xc6; 16]),
+            Digest32::from_bytes([entrypoint_digest_byte; 32]),
+        );
+        let process_execution = ProcessMailboxExecutionSpec::new(
+            BindingId::from_bytes([0x33; 16]),
+            MailboxRef::from_bytes([0x83; 16]),
+            InstanceRef::from_bytes([0x63; 16]),
+            ProcessDomainRef::from_bytes([0xd1; 16]),
+            workload,
+            requirements,
+            dispatch,
+        );
+        let Ok(execution) = TargetExecutionPlanV3::try_new(
+            Some(prior.assignments().execution().clone()),
+            vec![domain],
+            vec![process_execution],
+        ) else {
+            panic!("S6 additive execution plan must be valid");
+        };
+        (
+            CommittedTargetProjection::new(prior.plan(), prior.target(), bindings),
+            execution,
+        )
+    }
+
     fn tenure(scope_byte: u8, epoch: u64) -> DeploymentWriterTenure {
         let writer = PlanWriterRef::from_bytes([9; 16]);
         let Ok(algorithm) = TenureProofAlgorithm::try_new(1) else {
@@ -930,6 +1224,26 @@ mod tests {
         draft
     }
 
+    fn s6_complete_draft(
+        heartbeat_timeout_nanos: u64,
+        entrypoint_digest_byte: u8,
+    ) -> RuntimeApplyRequestV4Draft {
+        let (projection, execution) =
+            s6_projection(heartbeat_timeout_nanos, entrypoint_digest_byte);
+        let Ok(draft) = build_runtime_apply_request_v4_draft(
+            &projection,
+            execution,
+            tenure(0x01, 1),
+            ExpectedActive::None,
+            ApplyOperationId::from_bytes([0x0d; 16]),
+            temporal(60),
+            auth_claim(b"test-only-request-nonce"),
+        ) else {
+            panic!("production producer must build the S6 v4 request");
+        };
+        draft
+    }
+
     fn sign_and_finalize(draft: RuntimeApplyEnvelopeDraft) -> RuntimeApplyEnvelope {
         let Ok(transcript) = draft.signing_transcript() else {
             panic!("test request transcript must be valid");
@@ -984,6 +1298,24 @@ mod tests {
         );
         let Ok(request) = draft.finalize(&signature.to_bytes()) else {
             panic!("complete signed v3 request must finalize");
+        };
+        request
+    }
+
+    fn sign_complete_v4(draft: RuntimeApplyRequestV4Draft) -> RuntimeApplyRequestV4 {
+        let Ok(transcript) = draft.signing_transcript() else {
+            panic!("complete v4 request transcript must be valid");
+        };
+        let writer_signing_key = SigningKey::from_bytes(&TEST_ONLY_WRITER_SEED);
+        let signature = writer_signing_key.sign(transcript.as_bytes());
+        assert!(
+            writer_signing_key
+                .verifying_key()
+                .verify_strict(transcript.as_bytes(), &signature)
+                .is_ok()
+        );
+        let Ok(request) = draft.finalize(&signature.to_bytes()) else {
+            panic!("complete signed v4 request must finalize");
         };
         request
     }
@@ -1253,6 +1585,116 @@ mod tests {
             decoded.request_digest(),
             decoded.envelope().request_digest()
         );
+    }
+
+    #[test]
+    fn production_v4_producer_exactly_matches_independent_s6_fixture() {
+        let expected_outer = s6_fixture_hex("outer_wire_hex");
+        let expected_bindings = s6_fixture_hex("pxta_body_hex");
+        let expected_prior = s6_fixture_hex("embedded_pxte_v2_body_hex");
+        let expected_execution = s6_fixture_hex("pxte_v3_body_hex");
+        let expected_execution_digest = s6_fixture_hex("pxte_v3_digest_hex");
+        let expected_composite_digest = s6_fixture_hex("composite_v4_digest_hex");
+        let expected_request_digest = s6_fixture_hex("request_digest_hex");
+        let first = sign_complete_v4(s6_complete_draft(500_000_000, 0xc7));
+        let second = sign_complete_v4(s6_complete_draft(500_000_000, 0xc7));
+
+        assert_eq!(first, second);
+        assert_eq!(first.canonical_wire(), expected_outer);
+        assert_eq!(first.canonical_wire().len(), 2_962);
+        assert_eq!(
+            first.slice().assignments().bindings().canonical_wire(),
+            expected_bindings
+        );
+        assert_eq!(first.slice().assignments().bindings().len(), 3);
+        let execution = first.slice().assignments().execution();
+        assert_eq!(execution.canonical_wire(), expected_execution);
+        assert_eq!(
+            execution
+                .thread_plan()
+                .unwrap_or_else(|| panic!("S6 must retain byte-exact PXTE v2"))
+                .canonical_wire(),
+            expected_prior
+        );
+        assert_eq!(execution.process_domains().len(), 1);
+        assert_eq!(execution.process_mailbox_executions().len(), 1);
+        assert_eq!(
+            execution.execution_digest().value().as_bytes().as_slice(),
+            expected_execution_digest
+        );
+        assert_eq!(
+            first
+                .slice()
+                .assignments()
+                .assignment_digest()
+                .value()
+                .as_bytes()
+                .as_slice(),
+            expected_composite_digest
+        );
+        assert_eq!(
+            first.request_digest().as_bytes().as_slice(),
+            expected_request_digest
+        );
+        let decoded = RuntimeApplyRequestV4::decode(first.canonical_wire())
+            .unwrap_or_else(|error| panic!("production v4 request must decode: {error}"));
+        assert_eq!(decoded, first);
+    }
+
+    #[test]
+    fn v4_process_fields_rebind_execution_slice_request_and_signature() {
+        let baseline = sign_complete_v4(s6_complete_draft(500_000_000, 0xc7));
+        let heartbeat_changed = sign_complete_v4(s6_complete_draft(600_000_000, 0xc7));
+        let entrypoint_changed = sign_complete_v4(s6_complete_draft(500_000_000, 0xc8));
+
+        for changed in [&heartbeat_changed, &entrypoint_changed] {
+            assert_ne!(
+                baseline
+                    .slice()
+                    .assignments()
+                    .execution()
+                    .execution_digest(),
+                changed.slice().assignments().execution().execution_digest()
+            );
+            assert_ne!(
+                baseline.slice().assignments().assignment_digest(),
+                changed.slice().assignments().assignment_digest()
+            );
+            assert_ne!(
+                baseline.slice().commitment().target_slice_digest(),
+                changed.slice().commitment().target_slice_digest()
+            );
+            assert_ne!(baseline.request_digest(), changed.request_digest());
+            assert_ne!(
+                baseline.envelope().authentication().signature(),
+                changed.envelope().authentication().signature()
+            );
+        }
+    }
+
+    #[test]
+    fn v4_builder_rejects_process_execution_without_exact_pxta_binding_before_signing() {
+        let (projection, execution) = s6_projection(500_000_000, 0xc7);
+        let bindings = projection.assignments().as_slice()[..2].to_vec();
+        let Ok(bindings) = TargetAssignments::try_new(bindings) else {
+            panic!("truncated fixture PXTA remains structurally valid");
+        };
+        let incomplete =
+            CommittedTargetProjection::new(projection.plan(), projection.target(), bindings);
+        let error = build_runtime_apply_request_v4_draft(
+            &incomplete,
+            execution,
+            tenure(0x01, 1),
+            ExpectedActive::None,
+            ApplyOperationId::from_bytes([0x0d; 16]),
+            temporal(60),
+            auth_claim(b"test-only-request-nonce"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            EnvelopeBuildError::TargetPlanV4Request(TargetPlanV4ContractError::OrphanBinding)
+        ));
     }
 
     #[test]

@@ -18,6 +18,9 @@ use paraegox_runtime_contracts::apply::{
 };
 use paraegox_runtime_contracts::assignment::RuntimeApplyRequest;
 use paraegox_runtime_contracts::execution::RuntimeApplyRequestV2;
+use paraegox_runtime_contracts::process_execution::{
+    RequestV4WireError, RuntimeApplyRequestV4, RuntimePlanSliceV4,
+};
 use paraegox_runtime_contracts::provenance::SourceScopeRef;
 use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
 use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
@@ -477,6 +480,91 @@ impl AdmissionTransition {
     }
 }
 
+/// Pure v4 admission result retaining the exact signed Process execution Slice.
+///
+/// This boundary proves canonical bytes, trust, signatures, replay, and target
+/// ingress time. It deliberately does not construct a ProcessDomain, launch a
+/// worker, accept Ready, or assemble P2e runtime state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeProcessExecutionRequestAdmissionTransition {
+    admission: AdmissionTransition,
+    slice: RuntimePlanSliceV4,
+}
+
+impl RuntimeProcessExecutionRequestAdmissionTransition {
+    const fn new(admission: AdmissionTransition, slice: RuntimePlanSliceV4) -> Self {
+        Self { admission, slice }
+    }
+
+    /// Returns the candidate replay/temporal snapshot.
+    #[must_use]
+    pub(crate) const fn next_state(&self) -> &AdmissionState {
+        self.admission.next_state()
+    }
+
+    /// Returns the apply-control value admitted by the concrete verifier.
+    #[must_use]
+    pub(crate) const fn admitted(&self) -> &AdmittedApply {
+        self.admission.admitted()
+    }
+
+    /// Returns the exact signed v4 Slice; no live process exists at this point.
+    #[must_use]
+    pub(crate) const fn slice(&self) -> &RuntimePlanSliceV4 {
+        &self.slice
+    }
+
+    /// Reports whether the signed envelope was fresh or an exact replay.
+    #[must_use]
+    pub(crate) const fn disposition(&self) -> AdmissionDisposition {
+        self.admission.disposition()
+    }
+
+    /// Consumes every value a future journal/assembly owner must keep together.
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (AdmissionState, AdmittedApply, RuntimePlanSliceV4) {
+        let (state, admitted) = self.admission.into_parts();
+        (state, admitted, self.slice)
+    }
+}
+
+/// Fail-closed PXAR v4 decoding or authenticated admission error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeProcessExecutionRequestAdmissionError {
+    /// Strict PXAR v4/PXTE v3 decoding or cross-body validation failed.
+    RequestWire(RequestV4WireError),
+    /// Existing exact trust, signature, replay, or temporal admission failed.
+    Admission(AdmissionError),
+}
+
+impl From<RequestV4WireError> for RuntimeProcessExecutionRequestAdmissionError {
+    fn from(value: RequestV4WireError) -> Self {
+        Self::RequestWire(value)
+    }
+}
+
+impl From<AdmissionError> for RuntimeProcessExecutionRequestAdmissionError {
+    fn from(value: AdmissionError) -> Self {
+        Self::Admission(value)
+    }
+}
+
+impl fmt::Display for RuntimeProcessExecutionRequestAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequestWire(error) => {
+                write!(
+                    formatter,
+                    "process execution apply request rejected: {error}"
+                )
+            }
+            Self::Admission(error) => write!(formatter, "signed apply admission rejected: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeProcessExecutionRequestAdmissionError {}
+
 /// Concrete cryptographic admission mechanism for canonical apply envelopes.
 ///
 /// This pure enabler owns policy evaluation, not a RuntimeHost, journal,
@@ -547,6 +635,28 @@ impl ApplyAdmission {
         let slice = request.slice().clone();
         let admission = self.admit_envelope(request.envelope().clone(), state, reading)?;
         Ok(RuntimeThreadExecutionRequestAdmissionTransition::new(
+            admission, slice,
+        ))
+    }
+
+    /// Strictly decodes and admits one PXAR v4 request whose signed Slice
+    /// commits the complete Loop, Thread, and Process execution plan.
+    ///
+    /// No v1-v3 fallback exists. Success retains desired state for the later
+    /// fence/prepare/assembly boundary but grants no launch or Ready authority.
+    pub(crate) fn admit_process_execution_request(
+        &self,
+        frame: &[u8],
+        state: &AdmissionState,
+        reading: ClockReading,
+    ) -> Result<
+        RuntimeProcessExecutionRequestAdmissionTransition,
+        RuntimeProcessExecutionRequestAdmissionError,
+    > {
+        let request = RuntimeApplyRequestV4::decode(frame)?;
+        let slice = request.slice().clone();
+        let admission = self.admit_envelope(request.envelope().clone(), state, reading)?;
+        Ok(RuntimeProcessExecutionRequestAdmissionTransition::new(
             admission, slice,
         ))
     }
@@ -994,6 +1104,9 @@ mod tests {
     use paraegox_runtime_contracts::execution::{
         CardDefinitionRef, CardImplementationRef, RuntimeApplyRequestV2,
     };
+    use paraegox_runtime_contracts::process_execution::{
+        RequestV4WireErrorCode, RuntimeApplyRequestV4,
+    };
     use paraegox_runtime_contracts::provenance::{
         PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanDigest,
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
@@ -1037,7 +1150,8 @@ mod tests {
     use super::{
         AdmissionConfigurationError, AdmissionDisposition, AdmissionError, AdmissionState,
         AdmissionStateLimits, ApplyAdmission, ApplyAdmissionPolicy, ED25519_ALGORITHM,
-        ED25519_ALGORITHM_VERSION, TrustedApplyIdentity, TrustedApplyKey, TrustedTenureKey,
+        ED25519_ALGORITHM_VERSION, RuntimeProcessExecutionRequestAdmissionError,
+        TrustedApplyIdentity, TrustedApplyKey, TrustedTenureKey,
     };
 
     const SCOPE: u8 = 1;
@@ -1060,6 +1174,8 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/s4_runtime_apply_request_v2.json");
     const PYTHON_THREAD_EXECUTION_REQUEST_FIXTURE_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s5_runtime_apply_request_v3.json");
+    const PYTHON_PROCESS_EXECUTION_REQUEST_FIXTURE_JSON: &str =
+        include_str!("../../../tests/fixtures/wire/s6_runtime_apply_request_v4.json");
     // TEST-ONLY keys matching the independently encoded Python contract fixture.
     const PYTHON_FIXTURE_TENURE_SEED: [u8; 32] = [0x11; 32];
     const PYTHON_FIXTURE_REQUEST_SEED: [u8; 32] = [0x22; 32];
@@ -1523,6 +1639,10 @@ mod tests {
         fixture_document_hex_bytes(PYTHON_THREAD_EXECUTION_REQUEST_FIXTURE_JSON, field)
     }
 
+    fn process_execution_request_fixture_hex_bytes(field: &str) -> Vec<u8> {
+        fixture_document_hex_bytes(PYTHON_PROCESS_EXECUTION_REQUEST_FIXTURE_JSON, field)
+    }
+
     fn fixture_document_hex_bytes(document: &str, field: &str) -> Vec<u8> {
         let marker = format!("\"{field}\": \"");
         let Some((_, tail)) = document.split_once(marker.as_str()) else {
@@ -1540,9 +1660,11 @@ mod tests {
         decoded
     }
 
-    fn python_fixture_admission_and_reading() -> (ApplyAdmission, ClockReading) {
+    fn python_fixture_admission_for_target(
+        trusted_target_byte: u8,
+    ) -> (ApplyAdmission, ClockReading) {
         let scope = SourceScopeRef::from_bytes([0x01; 16]);
-        let target = RuntimeHostId::from_bytes([0x05; 16]);
+        let target = RuntimeHostId::from_bytes([trusted_target_byte; 16]);
         let writer = PlanWriterRef::from_bytes([0x09; 16]);
         let principal = PrincipalRef::from_bytes([0x09; 16]);
 
@@ -1588,6 +1710,10 @@ mod tests {
             MonotonicInstant::from_ticks(0),
         );
         (ApplyAdmission::new(policy), reading)
+    }
+
+    fn python_fixture_admission_and_reading() -> (ApplyAdmission, ClockReading) {
+        python_fixture_admission_for_target(0x05)
     }
 
     fn hex_nibble(value: u8) -> u8 {
@@ -2415,6 +2541,181 @@ mod tests {
                 .is_err(),
             "v3 outer framing must not bypass the existing request signature"
         );
+    }
+
+    #[test]
+    fn python_process_request_fixture_reaches_strict_v4_admission_and_fence_only() {
+        let wire = process_execution_request_fixture_hex_bytes("outer_wire_hex");
+        let expected_bindings = process_execution_request_fixture_hex_bytes("pxta_body_hex");
+        let expected_execution = process_execution_request_fixture_hex_bytes("pxte_v3_body_hex");
+        let expected_prior =
+            process_execution_request_fixture_hex_bytes("embedded_pxte_v2_body_hex");
+        let expected_composite =
+            process_execution_request_fixture_hex_bytes("composite_v4_digest_hex");
+        let expected_request_digest =
+            process_execution_request_fixture_hex_bytes("request_digest_hex");
+        let (admission, reading) = python_fixture_admission_and_reading();
+
+        let decoded = RuntimeApplyRequestV4::decode(&wire)
+            .unwrap_or_else(|error| panic!("independent v4 request must decode: {error}"));
+        assert_eq!(decoded.canonical_wire(), wire);
+        assert_eq!(
+            decoded.slice().assignments().bindings().canonical_wire(),
+            expected_bindings
+        );
+        let execution = decoded.slice().assignments().execution();
+        assert_eq!(execution.canonical_wire(), expected_execution);
+        assert_eq!(
+            execution
+                .thread_plan()
+                .unwrap_or_else(|| panic!("v4 fixture must retain exact PXTE v2"))
+                .canonical_wire(),
+            expected_prior
+        );
+        assert_eq!(execution.process_domains().len(), 1);
+        assert_eq!(execution.process_mailbox_executions().len(), 1);
+
+        let initial_state = AdmissionState::for_new_boundary();
+        let transition = admission
+            .admit_process_execution_request(&wire, &initial_state, reading)
+            .unwrap_or_else(|error| panic!("independent v4 request must admit: {error}"));
+        assert_eq!(transition.disposition(), AdmissionDisposition::Fresh);
+        assert_eq!(transition.slice(), decoded.slice());
+        assert_eq!(transition.slice().assignments().bindings().len(), 3);
+        assert_eq!(
+            transition
+                .slice()
+                .assignments()
+                .assignment_digest()
+                .value()
+                .as_bytes()
+                .as_slice(),
+            expected_composite
+        );
+        assert_eq!(
+            transition.admitted().request_digest().as_bytes().as_slice(),
+            expected_request_digest
+        );
+        assert_eq!(transition.admitted().deadline().deadline().value(), 60);
+        assert_eq!(transition.next_state().tenure_nonce_count(), 1);
+        assert_eq!(transition.next_state().request_nonce_count(), 1);
+        assert_eq!(transition.next_state().temporal_lineage_count(), 1);
+        assert_eq!(initial_state, AdmissionState::for_new_boundary());
+
+        let replay = admission
+            .admit_process_execution_request(&wire, transition.next_state(), reading)
+            .unwrap_or_else(|error| panic!("exact v4 replay must admit read-only: {error}"));
+        assert_eq!(replay.disposition(), AdmissionDisposition::Replayed);
+        assert_eq!(replay.next_state(), transition.next_state());
+        assert_eq!(replay.slice(), transition.slice());
+
+        let control = ApplyControlState::new(
+            SourceScopeRef::from_bytes([0x01; 16]),
+            RuntimeHostId::from_bytes([0x05; 16]),
+        );
+        let fenced = evaluate_writer_fence(&control, transition.admitted(), reading)
+            .unwrap_or_else(|error| panic!("v4 request must pass the existing fence: {error}"));
+        let prepared = evaluate_prepare(fenced.next_state(), transition.admitted(), None, reading)
+            .unwrap_or_else(|error| panic!("v4 request must reach control prepare: {error}"));
+        assert_eq!(prepared.disposition(), PrepareDisposition::Prepared);
+        assert!(prepared.next_state().prepared().is_some());
+
+        let (_next_admission, admitted, retained_slice) = transition.clone().into_parts();
+        assert_eq!(retained_slice, *decoded.slice());
+        assert_eq!(admitted.request_digest(), decoded.request_digest());
+
+        let v3 = thread_execution_request_fixture_hex_bytes("outer_wire_hex");
+        let error = admission
+            .admit_process_execution_request(&v3, &initial_state, reading)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeProcessExecutionRequestAdmissionError::RequestWire(error)
+                if error.code() == RequestV4WireErrorCode::UnsupportedVersion
+        ));
+        assert_eq!(initial_state, AdmissionState::for_new_boundary());
+    }
+
+    #[test]
+    fn v4_tamper_target_auth_cas_and_deadline_reject_before_process_side_effects() {
+        let wire = process_execution_request_fixture_hex_bytes("outer_wire_hex");
+        let (admission, reading) = python_fixture_admission_and_reading();
+        let initial_state = AdmissionState::for_new_boundary();
+
+        let mut execution_tamper = wire.clone();
+        let last = execution_tamper
+            .last_mut()
+            .unwrap_or_else(|| panic!("v4 fixture must be nonempty"));
+        *last ^= 1;
+        assert!(matches!(
+            admission
+                .admit_process_execution_request(&execution_tamper, &initial_state, reading)
+                .unwrap_err(),
+            RuntimeProcessExecutionRequestAdmissionError::RequestWire(_)
+        ));
+        assert_eq!(initial_state, AdmissionState::for_new_boundary());
+
+        let envelope_len = u32::from_be_bytes([wire[6], wire[7], wire[8], wire[9]]) as usize;
+        let mut signature_tamper = wire.clone();
+        mutate_tlv(&mut signature_tamper[18..18 + envelope_len], 0x25);
+        assert_eq!(
+            admission
+                .admit_process_execution_request(&signature_tamper, &initial_state, reading)
+                .unwrap_err(),
+            RuntimeProcessExecutionRequestAdmissionError::Admission(
+                AdmissionError::InvalidRequestSignature
+            )
+        );
+
+        let mut cas_tamper = wire.clone();
+        mutate_tlv(&mut cas_tamper[18..18 + envelope_len], 0x16);
+        assert!(matches!(
+            admission
+                .admit_process_execution_request(&cas_tamper, &initial_state, reading)
+                .unwrap_err(),
+            RuntimeProcessExecutionRequestAdmissionError::RequestWire(_)
+        ));
+
+        let (wrong_target_trust, _) = python_fixture_admission_for_target(0x06);
+        assert_eq!(
+            wrong_target_trust
+                .admit_process_execution_request(&wire, &initial_state, reading)
+                .unwrap_err(),
+            RuntimeProcessExecutionRequestAdmissionError::Admission(
+                AdmissionError::UntrustedApplyKey
+            )
+        );
+
+        let transition = admission
+            .admit_process_execution_request(&wire, &initial_state, reading)
+            .unwrap_or_else(|error| panic!("baseline v4 fixture must admit: {error}"));
+        let wrong_target_control = ApplyControlState::new(
+            SourceScopeRef::from_bytes([0x01; 16]),
+            RuntimeHostId::from_bytes([0x06; 16]),
+        );
+        let fenced = evaluate_writer_fence(&wrong_target_control, transition.admitted(), reading)
+            .unwrap_or_else(|error| panic!("writer fence is target-neutral: {error}"));
+        assert_eq!(
+            evaluate_prepare(fenced.next_state(), transition.admitted(), None, reading)
+                .unwrap_err(),
+            ApplyRejection::TargetMismatch
+        );
+
+        let expired_reading = ClockReading::new(
+            reading.domain(),
+            reading.generation(),
+            MonotonicInstant::from_ticks(60),
+        );
+        let correct_control = ApplyControlState::new(
+            SourceScopeRef::from_bytes([0x01; 16]),
+            RuntimeHostId::from_bytes([0x05; 16]),
+        );
+        assert_eq!(
+            evaluate_writer_fence(&correct_control, transition.admitted(), expired_reading)
+                .unwrap_err(),
+            ApplyRejection::DeadlineExpired
+        );
+        assert_eq!(initial_state, AdmissionState::for_new_boundary());
     }
 
     #[test]

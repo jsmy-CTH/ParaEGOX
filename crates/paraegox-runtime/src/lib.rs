@@ -19,17 +19,36 @@ mod dispatcher;
     expect(dead_code, reason = "Awaiting admitted internal consumer")
 )] // GOV-WAIVER-0001
 mod executor_budget;
+pub mod host_watchdog;
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod liveness;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod loop_domain;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod mailbox;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod port_binding;
+#[cfg(unix)]
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod process_domain;
+#[cfg(unix)]
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod process_platform;
+#[cfg(unix)]
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod process_transport;
+#[cfg(unix)]
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod process_workspace;
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod recovery;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod request;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod runtime_clock;
 mod runtime_host;
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod runtime_ownership;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod task_registry;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001

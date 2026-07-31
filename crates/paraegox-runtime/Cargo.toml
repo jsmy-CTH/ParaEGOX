@@ -13,8 +13,17 @@ paraegox-kernel.workspace = true
 paraegox-runtime-contracts.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
+
+[[bin]]
+name = "paraegox-rust-reference-worker"
+path = "src/bin/paraegox-rust-reference-worker.rs"
+test = false
+bench = false
 
 [lints]
 workspace = true

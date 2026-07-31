@@ -9,10 +9,22 @@ use core::future::Future;
 use core::num::NonZeroUsize;
 use core::pin::Pin;
 use core::time::Duration;
+use std::env;
 use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsFd;
 
+#[cfg(unix)]
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+#[cfg(unix)]
+use nix::unistd::dup;
 use paraegox_kernel::time::{ClockDomainRef, ClockGeneration};
+#[cfg(unix)]
+use tokio::io::unix::AsyncFd;
 use tokio::runtime::Builder;
+use tokio::time::MissedTickBehavior;
 
 use crate::card_executor::catch_callback;
 use crate::component_runtime::{
@@ -21,6 +33,12 @@ use crate::component_runtime::{
 use crate::core_service::{
     CoreServiceLifecycleError, CoreServiceLifecycleOwner, CoreServiceLifecycleReport,
     CoreServiceStartupEvidence,
+};
+use crate::host_watchdog::{
+    HOST_WATCHDOG_ENABLE_ENV, HOST_WATCHDOG_FRAME_BYTES, HOST_WATCHDOG_GENERATION_ENV,
+    HOST_WATCHDOG_HANDSHAKE_MILLIS_ENV, HOST_WATCHDOG_HEARTBEAT_MILLIS_ENV, HostBootstrapPhase,
+    HostControlProbeNonce, HostWatchdogDirection, HostWatchdogFrame, HostWatchdogFrameBody,
+    HostWatchdogGeneration, HostWatchdogProtocolError, HostWatchdogSequence,
 };
 use crate::runtime_clock::RuntimeClock;
 use crate::task_registry::{
@@ -33,13 +51,84 @@ const RUNTIME_CLOCK_DOMAIN: ClockDomainRef = ClockDomainRef::from_bytes(*b"PX-ru
 const RUNTIME_CLOCK_GENERATION: u64 = 1;
 const MAX_RUNTIME_TASKS: usize = 256;
 const ROOT_CLEANUP_BUDGET: Duration = Duration::from_secs(5);
+const MIN_WATCHDOG_MILLIS: u64 = 10;
+const MAX_WATCHDOG_MILLIS: u64 = 60_000;
 
 /// The only values an owned Runtime task can return to the root scope.
 enum RuntimeOwnedTaskResult {
     Plain,
+    HostWatchdog(Result<(), RuntimeHostWatchdogError>),
     Component(ComponentTaskResult),
     CoreServices(Result<CoreServiceTaskReport, CoreServiceLifecycleError>),
     CoreServiceConstructionPanicked,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeHostWatchdogConfig {
+    generation: HostWatchdogGeneration,
+    heartbeat_interval: Duration,
+    handshake_timeout: Duration,
+}
+
+#[derive(Debug)]
+enum RuntimeHostWatchdogError {
+    Io(io::Error),
+    Protocol(HostWatchdogProtocolError),
+    HandshakeTimeout,
+    WrongDirection,
+    WrongGeneration,
+    WrongSequence,
+    UnexpectedFrame,
+    SequenceExhausted,
+    #[cfg(not(unix))]
+    UnsupportedPlatform,
+}
+
+impl RuntimeHostWatchdogConfig {
+    fn from_environment() -> Result<Option<Self>, RuntimeHostProcessError> {
+        match env::var(HOST_WATCHDOG_ENABLE_ENV) {
+            Err(env::VarError::NotPresent) => return Ok(None),
+            Ok(value) if value == "1" => {}
+            Ok(_) | Err(env::VarError::NotUnicode(_)) => {
+                return Err(RuntimeHostProcessError::WatchdogConfiguration);
+            }
+        }
+        if !cfg!(unix) {
+            return Err(RuntimeHostProcessError::WatchdogConfiguration);
+        }
+
+        let generation =
+            required_environment_u64(HOST_WATCHDOG_GENERATION_ENV).and_then(|value| {
+                HostWatchdogGeneration::try_new(value)
+                    .map_err(|_| RuntimeHostProcessError::WatchdogConfiguration)
+            })?;
+        let heartbeat_millis = bounded_watchdog_millis(required_environment_u64(
+            HOST_WATCHDOG_HEARTBEAT_MILLIS_ENV,
+        )?)?;
+        let handshake_millis = bounded_watchdog_millis(required_environment_u64(
+            HOST_WATCHDOG_HANDSHAKE_MILLIS_ENV,
+        )?)?;
+        Ok(Some(Self {
+            generation,
+            heartbeat_interval: Duration::from_millis(heartbeat_millis),
+            handshake_timeout: Duration::from_millis(handshake_millis),
+        }))
+    }
+}
+
+fn required_environment_u64(name: &str) -> Result<u64, RuntimeHostProcessError> {
+    env::var(name)
+        .map_err(|_| RuntimeHostProcessError::WatchdogConfiguration)?
+        .parse()
+        .map_err(|_| RuntimeHostProcessError::WatchdogConfiguration)
+}
+
+const fn bounded_watchdog_millis(value: u64) -> Result<u64, RuntimeHostProcessError> {
+    if value < MIN_WATCHDOG_MILLIS || value > MAX_WATCHDOG_MILLIS {
+        Err(RuntimeHostProcessError::WatchdogConfiguration)
+    } else {
+        Ok(value)
+    }
 }
 
 /// Outcome of the source-adapter operation that runs inside the component
@@ -156,16 +245,37 @@ type CoreServiceLifecycleFactory = Box<
         + 'static,
 >;
 
-/// Starts the RuntimeHost reactor and waits for the process shutdown signal.
+/// Starts the RuntimeHost reactor and waits for Ctrl-C or an OS termination
+/// signal.
 ///
 /// This process is intentionally idle until a later admitted control adapter
 /// supplies canonical apply requests. Starting it proves the single owned
 /// reactor and graceful root-scope exit only; it does not prove Card readiness,
-/// Deployment assembly, persistence, Fabric, or production availability.
+/// Deployment assembly, persistence, Fabric, or production availability. The
+/// external watchdog endpoint is disabled unless the complete explicit PXHW
+/// environment profile is installed by the spawning service manager.
 pub fn run_runtime_host_process() -> Result<(), RuntimeHostProcessError> {
-    run_reactor_until(tokio::signal::ctrl_c())
+    let watchdog = RuntimeHostWatchdogConfig::from_environment()?;
+    run_reactor_until_with_watchdog(runtime_host_shutdown_signal(), watchdog)
 }
 
+async fn runtime_host_shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+#[cfg(test)]
 fn run_reactor_until<F>(shutdown: F) -> Result<(), RuntimeHostProcessError>
 where
     F: Future<Output = io::Result<()>>,
@@ -173,6 +283,7 @@ where
     run_reactor_until_with_setup(shutdown, |_| Ok(()))
 }
 
+#[cfg(test)]
 fn run_reactor_until_with_setup<F, S>(shutdown: F, setup: S) -> Result<(), RuntimeHostProcessError>
 where
     F: Future<Output = io::Result<()>>,
@@ -181,6 +292,7 @@ where
     run_reactor_until_with_bootstrap(shutdown, None, setup)
 }
 
+#[cfg(test)]
 fn run_reactor_until_with_bootstrap<F, S>(
     shutdown: F,
     component: Option<ComponentLifecycleFactory>,
@@ -193,10 +305,41 @@ where
     run_reactor_until_with_owned_lifecycles(shutdown, component, None, setup)
 }
 
+#[cfg(test)]
 fn run_reactor_until_with_owned_lifecycles<F, S>(
     shutdown: F,
     component: Option<ComponentLifecycleFactory>,
     core_services: Option<CoreServiceLifecycleFactory>,
+    setup: S,
+) -> Result<(), RuntimeHostProcessError>
+where
+    F: Future<Output = io::Result<()>>,
+    S: FnOnce(&mut RuntimeHostScope) -> Result<(), RuntimeHostProcessError>,
+{
+    run_reactor_until_with_watchdog_and_owned_lifecycles(
+        shutdown,
+        component,
+        core_services,
+        None,
+        setup,
+    )
+}
+
+fn run_reactor_until_with_watchdog<F>(
+    shutdown: F,
+    watchdog: Option<RuntimeHostWatchdogConfig>,
+) -> Result<(), RuntimeHostProcessError>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    run_reactor_until_with_watchdog_and_owned_lifecycles(shutdown, None, None, watchdog, |_| Ok(()))
+}
+
+fn run_reactor_until_with_watchdog_and_owned_lifecycles<F, S>(
+    shutdown: F,
+    component: Option<ComponentLifecycleFactory>,
+    core_services: Option<CoreServiceLifecycleFactory>,
+    watchdog: Option<RuntimeHostWatchdogConfig>,
     setup: S,
 ) -> Result<(), RuntimeHostProcessError>
 where
@@ -216,8 +359,12 @@ where
         scope.spawn(RuntimeTaskKind::HostControl, move || async move {
             root_cancellation.cancelled().await;
         })?;
-        let component_setup = component.map_or(Ok(()), |build| {
-            scope.spawn_canonical_component_lifecycle(build)
+        let watchdog_setup =
+            watchdog.map_or(Ok(()), |config| scope.spawn_host_watchdog_endpoint(config));
+        let component_setup = watchdog_setup.and_then(|()| {
+            component.map_or(Ok(()), |build| {
+                scope.spawn_canonical_component_lifecycle(build)
+            })
         });
         let lifecycle_setup = component_setup.and_then(|()| {
             core_services.map_or(Ok(()), |build| {
@@ -235,6 +382,205 @@ where
             (Ok(()), Ok(())) => Ok(()),
         }
     })
+}
+
+#[cfg(unix)]
+async fn run_host_watchdog_endpoint(
+    config: RuntimeHostWatchdogConfig,
+    cancellation: crate::task_registry::CancellationView,
+) -> Result<(), RuntimeHostWatchdogError> {
+    let input = duplicate_nonblocking(&io::stdin())?;
+    let output = duplicate_nonblocking(&io::stdout())?;
+    let mut host_sequence = 1_u64;
+    let mut manager_sequence = 1_u64;
+
+    for phase in [
+        HostBootstrapPhase::ReactorStarted,
+        HostBootstrapPhase::ControlReady,
+        HostBootstrapPhase::Running,
+    ] {
+        write_host_watchdog_frame(
+            &output,
+            config.generation,
+            &mut host_sequence,
+            HostWatchdogFrameBody::BootstrapProgress(phase),
+        )
+        .await?;
+    }
+
+    let first_probe = tokio::time::timeout(
+        config.handshake_timeout,
+        read_manager_probe(&input, config.generation, &mut manager_sequence),
+    )
+    .await
+    .map_err(|_| RuntimeHostWatchdogError::HandshakeTimeout)??;
+    write_host_watchdog_frame(
+        &output,
+        config.generation,
+        &mut host_sequence,
+        HostWatchdogFrameBody::ControlAck(first_probe),
+    )
+    .await?;
+
+    let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Ok(()),
+            probe = read_manager_probe(&input, config.generation, &mut manager_sequence) => {
+                write_host_watchdog_frame(
+                    &output,
+                    config.generation,
+                    &mut host_sequence,
+                    HostWatchdogFrameBody::ControlAck(probe?),
+                ).await?;
+            }
+            _ = heartbeat.tick() => {
+                write_host_watchdog_frame(
+                    &output,
+                    config.generation,
+                    &mut host_sequence,
+                    HostWatchdogFrameBody::RunningHeartbeat,
+                ).await?;
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn run_host_watchdog_endpoint(
+    _config: RuntimeHostWatchdogConfig,
+    _cancellation: crate::task_registry::CancellationView,
+) -> Result<(), RuntimeHostWatchdogError> {
+    Err(RuntimeHostWatchdogError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+async fn write_host_watchdog_frame(
+    output: &AsyncFd<std::fs::File>,
+    generation: HostWatchdogGeneration,
+    sequence: &mut u64,
+    body: HostWatchdogFrameBody,
+) -> Result<(), RuntimeHostWatchdogError> {
+    let frame_sequence = take_watchdog_sequence(sequence)?;
+    let frame = HostWatchdogFrame::new(generation, frame_sequence, body).encode();
+    write_inherited_all(output, &frame).await
+}
+
+#[cfg(unix)]
+async fn read_manager_probe(
+    input: &AsyncFd<std::fs::File>,
+    generation: HostWatchdogGeneration,
+    expected_sequence: &mut u64,
+) -> Result<HostControlProbeNonce, RuntimeHostWatchdogError> {
+    let mut bytes = [0_u8; HOST_WATCHDOG_FRAME_BYTES];
+    read_inherited_exact(input, &mut bytes).await?;
+    let frame = HostWatchdogFrame::decode(&bytes).map_err(RuntimeHostWatchdogError::Protocol)?;
+    if frame.direction() != HostWatchdogDirection::ManagerToHost {
+        return Err(RuntimeHostWatchdogError::WrongDirection);
+    }
+    if frame.generation() != generation {
+        return Err(RuntimeHostWatchdogError::WrongGeneration);
+    }
+    if frame.sequence().value() != *expected_sequence {
+        return Err(RuntimeHostWatchdogError::WrongSequence);
+    }
+    *expected_sequence = expected_sequence
+        .checked_add(1)
+        .ok_or(RuntimeHostWatchdogError::SequenceExhausted)?;
+    match frame.body() {
+        HostWatchdogFrameBody::ControlProbe(nonce) => Ok(nonce),
+        HostWatchdogFrameBody::BootstrapProgress(_)
+        | HostWatchdogFrameBody::RunningHeartbeat
+        | HostWatchdogFrameBody::ControlAck(_) => Err(RuntimeHostWatchdogError::UnexpectedFrame),
+    }
+}
+
+#[cfg(unix)]
+fn duplicate_nonblocking<Fd>(
+    descriptor: &Fd,
+) -> Result<AsyncFd<std::fs::File>, RuntimeHostWatchdogError>
+where
+    Fd: AsFd,
+{
+    let duplicate = dup(descriptor).map_err(nix_watchdog_error)?;
+    let flags = fcntl(&duplicate, FcntlArg::F_GETFL).map_err(nix_watchdog_error)?;
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(&duplicate, FcntlArg::F_SETFL(flags)).map_err(nix_watchdog_error)?;
+    AsyncFd::new(std::fs::File::from(duplicate)).map_err(RuntimeHostWatchdogError::Io)
+}
+
+#[cfg(unix)]
+async fn read_inherited_exact(
+    input: &AsyncFd<std::fs::File>,
+    bytes: &mut [u8],
+) -> Result<(), RuntimeHostWatchdogError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let mut ready = input
+            .readable()
+            .await
+            .map_err(RuntimeHostWatchdogError::Io)?;
+        match ready.try_io(|inner| {
+            let mut file = inner.get_ref();
+            file.read(&mut bytes[offset..])
+        }) {
+            Ok(Ok(0)) => {
+                return Err(RuntimeHostWatchdogError::Io(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )));
+            }
+            Ok(Ok(read)) => offset += read,
+            Ok(Err(error)) => return Err(RuntimeHostWatchdogError::Io(error)),
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn write_inherited_all(
+    output: &AsyncFd<std::fs::File>,
+    bytes: &[u8],
+) -> Result<(), RuntimeHostWatchdogError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let mut ready = output
+            .writable()
+            .await
+            .map_err(RuntimeHostWatchdogError::Io)?;
+        match ready.try_io(|inner| {
+            let mut file = inner.get_ref();
+            file.write(&bytes[offset..])
+        }) {
+            Ok(Ok(0)) => {
+                return Err(RuntimeHostWatchdogError::Io(io::Error::from(
+                    io::ErrorKind::WriteZero,
+                )));
+            }
+            Ok(Ok(written)) => offset += written,
+            Ok(Err(error)) => return Err(RuntimeHostWatchdogError::Io(error)),
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn nix_watchdog_error(error: nix::errno::Errno) -> RuntimeHostWatchdogError {
+    RuntimeHostWatchdogError::Io(io::Error::from_raw_os_error(error as i32))
+}
+
+fn take_watchdog_sequence(
+    sequence: &mut u64,
+) -> Result<HostWatchdogSequence, RuntimeHostWatchdogError> {
+    let current =
+        HostWatchdogSequence::try_new(*sequence).map_err(RuntimeHostWatchdogError::Protocol)?;
+    *sequence = sequence
+        .checked_add(1)
+        .ok_or(RuntimeHostWatchdogError::SequenceExhausted)?;
+    Ok(current)
 }
 
 /// Internal root scope for the one reactor. Every spawned Runtime task must be
@@ -306,6 +652,25 @@ impl RuntimeHostScope {
                     future.await;
                     RuntimeOwnedTaskResult::Plain
                 }
+            })
+            .map(|_| ())
+            .map_err(spawn_error)
+    }
+
+    /// Installs the explicitly configured PXHW endpoint as a structured child
+    /// of this reactor. Its heartbeat and control acknowledgement are both
+    /// polled by this same current-thread event loop, while every liveness
+    /// conclusion and process action remains in the external manager.
+    fn spawn_host_watchdog_endpoint(
+        &mut self,
+        config: RuntimeHostWatchdogConfig,
+    ) -> Result<(), RuntimeHostProcessError> {
+        let cancellation = self.tasks.root_cancellation().child().view();
+        self.tasks
+            .try_spawn(RuntimeTaskKind::HostControl, move || async move {
+                RuntimeOwnedTaskResult::HostWatchdog(
+                    run_host_watchdog_endpoint(config, cancellation).await,
+                )
             })
             .map(|_| ())
             .map_err(spawn_error)
@@ -416,9 +781,14 @@ impl RuntimeHostScope {
         let mut component_nonzero = false;
         let mut core_service_failed = false;
         let mut core_service_nonzero = false;
+        let mut watchdog_failure = None;
         for completion in report.into_completions() {
             match completion.into_outcome() {
                 TaskOutcome::Completed(RuntimeOwnedTaskResult::Plain) => {}
+                TaskOutcome::Completed(RuntimeOwnedTaskResult::HostWatchdog(Ok(()))) => {}
+                TaskOutcome::Completed(RuntimeOwnedTaskResult::HostWatchdog(Err(error))) => {
+                    watchdog_failure = Some(watchdog_process_error(error));
+                }
                 TaskOutcome::Completed(RuntimeOwnedTaskResult::Component(component)) => {
                     let facts = component_task_facts(component);
                     panicked |= facts.panicked;
@@ -445,6 +815,9 @@ impl RuntimeHostScope {
         }
         if core_service_nonzero {
             return Err(RuntimeHostProcessError::OwnedCoreServiceNonZeroCleanup);
+        }
+        if let Some(error) = watchdog_failure {
+            return Err(error);
         }
         if panicked {
             return Err(RuntimeHostProcessError::OwnedTaskPanicked);
@@ -512,6 +885,12 @@ fn early_completion_error(
         TaskOutcome::Completed(RuntimeOwnedTaskResult::Plain) => {
             RuntimeHostProcessError::OwnedTaskExitedEarly
         }
+        TaskOutcome::Completed(RuntimeOwnedTaskResult::HostWatchdog(Ok(()))) => {
+            RuntimeHostProcessError::WatchdogExitedEarly
+        }
+        TaskOutcome::Completed(RuntimeOwnedTaskResult::HostWatchdog(Err(error))) => {
+            watchdog_process_error(error)
+        }
         TaskOutcome::Completed(RuntimeOwnedTaskResult::Component(component)) => {
             let facts = component_task_facts(component);
             if facts.nonzero_cleanup {
@@ -544,6 +923,33 @@ fn early_completion_error(
     }
 }
 
+fn watchdog_process_error(error: RuntimeHostWatchdogError) -> RuntimeHostProcessError {
+    match error {
+        RuntimeHostWatchdogError::Io(error) => {
+            let _ = error;
+            RuntimeHostProcessError::WatchdogIoFailed
+        }
+        RuntimeHostWatchdogError::HandshakeTimeout => {
+            RuntimeHostProcessError::WatchdogHandshakeFailed
+        }
+        RuntimeHostWatchdogError::Protocol(error) => {
+            let _ = error;
+            RuntimeHostProcessError::WatchdogProtocolFailed
+        }
+        RuntimeHostWatchdogError::WrongDirection
+        | RuntimeHostWatchdogError::WrongGeneration
+        | RuntimeHostWatchdogError::WrongSequence
+        | RuntimeHostWatchdogError::UnexpectedFrame
+        | RuntimeHostWatchdogError::SequenceExhausted => {
+            RuntimeHostProcessError::WatchdogProtocolFailed
+        }
+        #[cfg(not(unix))]
+        RuntimeHostWatchdogError::UnsupportedPlatform => {
+            RuntimeHostProcessError::WatchdogConfiguration
+        }
+    }
+}
+
 const fn spawn_error(error: TaskRegistryError) -> RuntimeHostProcessError {
     match error {
         TaskRegistryError::CapacityExhausted => RuntimeHostProcessError::TaskCapacityExhausted,
@@ -557,6 +963,11 @@ pub enum RuntimeHostProcessError {
     BuildReactor(io::Error),
     ShutdownSignal(io::Error),
     InvalidConfiguration,
+    WatchdogConfiguration,
+    WatchdogHandshakeFailed,
+    WatchdogIoFailed,
+    WatchdogProtocolFailed,
+    WatchdogExitedEarly,
     ClockFailed,
     TaskCapacityExhausted,
     TaskIdentifierExhausted,
@@ -583,6 +994,20 @@ impl fmt::Display for RuntimeHostProcessError {
             }
             Self::InvalidConfiguration => {
                 formatter.write_str("RuntimeHost static configuration is invalid")
+            }
+            Self::WatchdogConfiguration => {
+                formatter.write_str("RuntimeHost explicit watchdog profile is invalid")
+            }
+            Self::WatchdogHandshakeFailed => formatter
+                .write_str("RuntimeHost watchdog control handshake did not complete in time"),
+            Self::WatchdogIoFailed => {
+                formatter.write_str("RuntimeHost watchdog inherited stream failed")
+            }
+            Self::WatchdogProtocolFailed => {
+                formatter.write_str("RuntimeHost watchdog peer violated the PXHW contract")
+            }
+            Self::WatchdogExitedEarly => {
+                formatter.write_str("RuntimeHost watchdog endpoint exited before root shutdown")
             }
             Self::ClockFailed => formatter.write_str("RuntimeHost clock failed"),
             Self::TaskCapacityExhausted => {
@@ -627,6 +1052,11 @@ impl std::error::Error for RuntimeHostProcessError {
         match self {
             Self::BuildReactor(error) | Self::ShutdownSignal(error) => Some(error),
             Self::InvalidConfiguration
+            | Self::WatchdogConfiguration
+            | Self::WatchdogHandshakeFailed
+            | Self::WatchdogIoFailed
+            | Self::WatchdogProtocolFailed
+            | Self::WatchdogExitedEarly
             | Self::ClockFailed
             | Self::TaskCapacityExhausted
             | Self::TaskIdentifierExhausted
