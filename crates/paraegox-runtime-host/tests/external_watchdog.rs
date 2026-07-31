@@ -2,9 +2,9 @@
 
 use core::time::Duration;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -20,11 +20,13 @@ use paraegox_runtime::host_watchdog::{
 use paraegox_runtime_host::service_manager::{
     HostRestartPolicy, HostTerminationTiming, HostWatchdogTiming, RuntimeHostLaunch,
     RuntimeHostServiceManager, RuntimeHostServiceManagerPolicy, RuntimeHostServiceManagerSnapshot,
-    RuntimeHostServiceManagerState, ServiceManagerEvidenceKind, ServiceManagerFailure,
+    RuntimeHostServiceManagerState, ServiceManagerError, ServiceManagerEvidenceKind,
+    ServiceManagerFailure,
 };
 
 const POLL: Duration = Duration::from_millis(5);
 const STATE_TIMEOUT: Duration = Duration::from_secs(15);
+const FIXTURE_EXEC_BUSY_RETRIES: usize = 8;
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn runtime_host_executable() -> &'static str {
@@ -103,6 +105,132 @@ fn assert_process_group_gone(process_group: u32) {
         Err(Errno::ESRCH),
         "owned RuntimeHost process group must be absent before restart"
     );
+}
+
+fn install_executable_script(executable: &Path, script: &str) {
+    let staging = executable.with_extension("staging");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .expect("test fixture staging executable must be created");
+    file.write_all(script.as_bytes())
+        .expect("test fixture executable must be written");
+    let mut permissions = file
+        .metadata()
+        .expect("test fixture metadata must exist")
+        .permissions();
+    permissions.set_mode(0o700);
+    file.set_permissions(permissions)
+        .expect("test fixture executable mode must be installed");
+    file.sync_all()
+        .expect("test fixture executable must be synchronized");
+    drop(file);
+    fs::rename(staging, executable).expect("test fixture executable must be atomically published");
+}
+
+fn retry_fixture_exec_busy<T>(
+    mut attempt: impl FnMut() -> Result<T, ServiceManagerError>,
+    mut wait: impl FnMut(),
+) -> Result<T, ServiceManagerError> {
+    let mut executable_busy_retries = 0;
+    loop {
+        match attempt() {
+            Err(ServiceManagerError::Io(error))
+                if error.raw_os_error() == Some(Errno::ETXTBSY as i32)
+                    && executable_busy_retries < FIXTURE_EXEC_BUSY_RETRIES =>
+            {
+                executable_busy_retries += 1;
+                wait();
+            }
+            result => return result,
+        }
+    }
+}
+
+fn start_fresh_script_fixture(
+    executable: &Path,
+    policy: RuntimeHostServiceManagerPolicy,
+) -> Result<RuntimeHostServiceManager, ServiceManagerError> {
+    // Parallel integration-test spawns can transiently inherit another
+    // thread's close-on-exec writer for this freshly published script.
+    // Retry only that pre-child Linux exec race; production spawn stays
+    // fail-closed and every other fixture error returns immediately.
+    retry_fixture_exec_busy(
+        || {
+            let launch = RuntimeHostLaunch::try_new(executable)
+                .expect("fixture executable must be a valid exact launch");
+            RuntimeHostServiceManager::try_start(launch, policy)
+        },
+        || thread::sleep(POLL),
+    )
+}
+
+fn fixture_io_error(errno: Errno) -> ServiceManagerError {
+    ServiceManagerError::Io(io::Error::from_raw_os_error(errno as i32))
+}
+
+#[test]
+fn fixture_exec_busy_retry_is_exactly_bounded_and_error_specific() {
+    let mut eventual_attempts = 0;
+    let mut eventual_waits = 0;
+    let value = retry_fixture_exec_busy(
+        || {
+            eventual_attempts += 1;
+            if eventual_attempts <= 3 {
+                Err(fixture_io_error(Errno::ETXTBSY))
+            } else {
+                Ok(7_u8)
+            }
+        },
+        || eventual_waits += 1,
+    )
+    .expect("bounded executable-busy fixture must eventually succeed");
+    assert_eq!(value, 7);
+    assert_eq!(eventual_attempts, 4);
+    assert_eq!(eventual_waits, 3);
+
+    let mut exhausted_attempts = 0;
+    let mut exhausted_waits = 0;
+    let exhausted = retry_fixture_exec_busy(
+        || -> Result<(), ServiceManagerError> {
+            exhausted_attempts += 1;
+            Err(fixture_io_error(Errno::ETXTBSY))
+        },
+        || exhausted_waits += 1,
+    )
+    .expect_err("persistent executable-busy fixture must remain rejected");
+    assert!(
+        matches!(
+            exhausted,
+            ServiceManagerError::Io(error)
+                if error.raw_os_error() == Some(Errno::ETXTBSY as i32)
+        ),
+        "exhaustion must preserve ETXTBSY"
+    );
+    assert_eq!(exhausted_attempts, FIXTURE_EXEC_BUSY_RETRIES + 1);
+    assert_eq!(exhausted_waits, FIXTURE_EXEC_BUSY_RETRIES);
+
+    let mut unrelated_attempts = 0;
+    let mut unrelated_waits = 0;
+    let unrelated = retry_fixture_exec_busy(
+        || -> Result<(), ServiceManagerError> {
+            unrelated_attempts += 1;
+            Err(fixture_io_error(Errno::EACCES))
+        },
+        || unrelated_waits += 1,
+    )
+    .expect_err("unrelated fixture errors must remain rejected");
+    assert!(
+        matches!(
+            unrelated,
+            ServiceManagerError::Io(error)
+                if error.raw_os_error() == Some(Errno::EACCES as i32)
+        ),
+        "unrelated error must be preserved"
+    );
+    assert_eq!(unrelated_attempts, 1);
+    assert_eq!(unrelated_waits, 0);
 }
 
 #[test]
@@ -320,26 +448,45 @@ fn normal_manager_shutdown_reaps_leader_and_observes_exact_process_group_absent(
     )));
 }
 
-struct SameGroupDescendantFixture {
-    directory: PathBuf,
-    executable: PathBuf,
-    descendant_pid: PathBuf,
-}
+struct FixtureDirectory(PathBuf);
 
-impl SameGroupDescendantFixture {
-    fn create() -> Self {
+impl FixtureDirectory {
+    fn create(label: &str) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("test wall clock must follow the Unix epoch")
             .as_nanos();
         let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "paraegox-watchdog-pgid-{}-{unique}-{sequence}",
+            "paraegox-watchdog-{label}-{}-{unique}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&directory).expect("test fixture directory must be created");
-        let executable = directory.join("runtime-host-fixture.sh");
-        let descendant_pid = directory.join("descendant.pid");
+        Self(directory)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for FixtureDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct SameGroupDescendantFixture {
+    _directory: FixtureDirectory,
+    executable: PathBuf,
+    descendant_pid: PathBuf,
+}
+
+impl SameGroupDescendantFixture {
+    fn create() -> Self {
+        let directory = FixtureDirectory::create("pgid");
+        let executable = directory.path().join("runtime-host-fixture.sh");
+        let descendant_pid = directory.path().join("descendant.pid");
         let quoted_pid_path = descendant_pid
             .as_os_str()
             .to_string_lossy()
@@ -347,15 +494,9 @@ impl SameGroupDescendantFixture {
         let script = format!(
             "#!/bin/sh\ntrap '' TERM\n(\n  trap '' TERM\n  while :; do sleep 1; done\n) >/dev/null 2>&1 &\necho \"$!\" > '{quoted_pid_path}'\nsleep 0.2\nexit 23\n"
         );
-        fs::write(&executable, script).expect("test fixture executable must be written");
-        let mut permissions = fs::metadata(&executable)
-            .expect("test fixture metadata must exist")
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&executable, permissions)
-            .expect("test fixture executable mode must be installed");
+        install_executable_script(&executable, &script);
         Self {
-            directory,
+            _directory: directory,
             executable,
             descendant_pid,
         }
@@ -378,28 +519,16 @@ impl SameGroupDescendantFixture {
     }
 }
 
-impl Drop for SameGroupDescendantFixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
-    }
-}
-
 #[test]
 fn executable_quarantine_stays_signal_responsive_instead_of_falling_into_drop() {
-    let fixture = SameGroupDescendantFixture::create();
-    let failing_runtime = fixture.directory.join("failing-runtime-host.sh");
-    fs::write(&failing_runtime, "#!/bin/sh\nsleep 0.1\nexit 23\n")
-        .expect("failing RuntimeHost fixture must be written");
-    let mut permissions = fs::metadata(&failing_runtime)
-        .expect("failing RuntimeHost fixture metadata must exist")
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&failing_runtime, permissions)
-        .expect("failing RuntimeHost fixture mode must be installed");
-    let quarantine_log = fixture.directory.join("watchdog.stderr");
+    let fixture = FixtureDirectory::create("quarantine");
+    let quarantine_log = fixture.path().join("watchdog.stderr");
     let log = fs::File::create(&quarantine_log).expect("watchdog log must be created");
     let child = Command::new(watchdog_executable())
-        .arg(&failing_runtime)
+        // A nested watchdog has no RuntimeHost argument and exits immediately.
+        // It is a stable Cargo-built failing executable, not a freshly written
+        // script subject to the integration-test write-to-exec race.
+        .arg(watchdog_executable())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
@@ -463,9 +592,7 @@ fn descendant_cleanup_policy() -> RuntimeHostServiceManagerPolicy {
 #[test]
 fn leader_exit_does_not_restart_until_term_ignoring_same_group_descendant_is_killed() {
     let fixture = SameGroupDescendantFixture::create();
-    let launch = RuntimeHostLaunch::try_new(&fixture.executable)
-        .expect("fixture executable must be a valid exact launch");
-    let mut manager = RuntimeHostServiceManager::try_start(launch, descendant_cleanup_policy())
+    let mut manager = start_fresh_script_fixture(&fixture.executable, descendant_cleanup_policy())
         .expect("fixture service manager must start");
     let leader_pid = manager
         .snapshot()
