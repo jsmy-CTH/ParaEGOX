@@ -953,7 +953,7 @@ impl ProcessDomain {
             .await
             .is_err()
         {
-            return self.failed_stop_action_outcome();
+            return self.failed_stop_action_outcome().await;
         }
         let drained = timeout(
             bounded(self.desired.lifecycle().drain()),
@@ -976,14 +976,24 @@ impl ProcessDomain {
             .await
             .is_err()
         {
-            return self.failed_stop_action_outcome();
+            return self.failed_stop_action_outcome().await;
         }
         self.transport_mut()?.process_mut().close_stdin();
         Ok(RecoveryActionOutcome::Succeeded)
     }
 
-    fn failed_stop_action_outcome(&mut self) -> Result<RecoveryActionOutcome, ProcessDomainError> {
-        match self.process_is_gone() {
+    async fn failed_stop_action_outcome(
+        &mut self,
+    ) -> Result<RecoveryActionOutcome, ProcessDomainError> {
+        // EOF or a closed control pipe can become visible before the child is
+        // reapable and its process group disappears. Settle only within the
+        // signed action budget before making the sticky failure decision.
+        let budget = bounded(self.desired.lifecycle().cooperative_stop());
+        let process_is_gone = match self.transport_mut() {
+            Ok(transport) => wait_until_gone(transport, budget).await,
+            Err(error) => Err(error),
+        };
+        match process_is_gone {
             Ok(true) => Ok(RecoveryActionOutcome::ProcessAlreadyExited),
             Ok(false) => Ok(RecoveryActionOutcome::Failed),
             Err(error) => {
@@ -2015,7 +2025,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use nix::errno::Errno;
-    use nix::sys::signal::killpg;
+    use nix::sys::signal::{Signal, killpg};
     use paraegox_kernel::identity::RuntimeHostId;
     use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
     use paraegox_runtime_contracts::assignment::{BindingId, MailboxRef};
@@ -2078,6 +2088,7 @@ mod tests {
         MissingStopAck,
         BlockAfterInvoked,
         HeartbeatThenKilled,
+        CloseControlAndLive,
     }
 
     struct DomainFixture {
@@ -2256,6 +2267,7 @@ mod tests {
         fn start(&self, area: &TestArea, dialogue: WorkerDialogue) -> ProcessDomainStart {
             let worker_mode = match dialogue {
                 WorkerDialogue::BlockAfterInvoked => "block",
+                WorkerDialogue::CloseControlAndLive => "closed-control-live",
                 WorkerDialogue::Complete
                 | WorkerDialogue::Uncertain
                 | WorkerDialogue::FailedStop
@@ -2266,17 +2278,38 @@ mod tests {
                 "worker.pxwp.sh",
                 &shell_wire_assignment(&self.worker_wire(dialogue), worker_mode),
             );
-            let script = ". \"$RESPONSE\"; printf '%b' \"$RESPONSE_WIRE\"; \
+            let script = ". \"$RESPONSE\"; \
                           case \"$WORKER_MODE\" in \
-                          block) trap '' TERM; while :; do :; done ;; \
-                          *) while IFS= read -r _; do :; done ;; \
+                          block) printf '%b' \"$RESPONSE_WIRE\"; \
+                                 trap '' TERM; while :; do :; done ;; \
+                          closed-control-live) printf '%b' \"$RESPONSE_WIRE\"; \
+                                               trap '' TERM; \
+                                               trap 'exec 0<&-; \
+                                                     : > \"$CONTROL_CLOSED\"' USR1; \
+                                               : > \"$TRAP_READY\"; \
+                                               while :; do :; done ;; \
+                          *) printf '%b' \"$RESPONSE_WIRE\"; \
+                             while IFS= read -r _; do :; done ;; \
                           esac";
+            let mut environment = vec![(OsString::from("RESPONSE"), response.into_os_string())];
+            if matches!(dialogue, WorkerDialogue::CloseControlAndLive) {
+                environment.extend([
+                    (
+                        OsString::from("TRAP_READY"),
+                        area.0.join("trap-ready").into_os_string(),
+                    ),
+                    (
+                        OsString::from("CONTROL_CLOSED"),
+                        area.0.join("control-closed").into_os_string(),
+                    ),
+                ]);
+            }
             let program = ResolvedProcessProgram::try_resolve_for_test(
                 self.desired.launch(),
                 self.worker_digest,
                 PathBuf::from("/bin/sh"),
                 vec![OsString::from("-c"), OsString::from(script)],
-                vec![(OsString::from("RESPONSE"), response.into_os_string())],
+                environment,
             )
             .expect("resolved worker");
             self.start_with_program(area, program)
@@ -2389,7 +2422,10 @@ mod tests {
                     },
                 ),
             ];
-            if !matches!(dialogue, WorkerDialogue::HeartbeatThenKilled) {
+            if !matches!(
+                dialogue,
+                WorkerDialogue::HeartbeatThenKilled | WorkerDialogue::CloseControlAndLive
+            ) {
                 frames.push(worker_frame(
                     identity,
                     3,
@@ -2563,6 +2599,18 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "fallback owner did not reclaim process group and workspace"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_test_marker(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not create marker {}",
+                path.display()
             );
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2903,6 +2951,61 @@ mod tests {
             .await
             .expect("fresh generation should stop cleanly");
         assert_eq!(domain.phase(), ProcessDomainPhase::Stopped);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_process_with_closed_control_channel_remains_action_failure_quarantined() {
+        let area = TestArea::create();
+        let fixture = DomainFixture::new(SideEffectClass::EffectFree);
+        let mut domain =
+            ProcessDomain::start(fixture.start(&area, WorkerDialogue::CloseControlAndLive))
+                .await
+                .expect("domain should start");
+
+        let process_group = domain
+            .transport
+            .as_ref()
+            .expect("running domain owns its transport")
+            .process()
+            .process_group();
+        let workspace = domain.workspace().to_path_buf();
+        wait_for_test_marker(&area.0.join("trap-ready"));
+        killpg(process_group, Some(Signal::SIGUSR1))
+            .expect("USR1 should ask the live worker to close its control input descriptor");
+        wait_for_test_marker(&area.0.join("control-closed"));
+        assert!(
+            killpg(process_group, None).is_ok(),
+            "worker must remain live after closing its control input descriptor"
+        );
+        assert!(
+            !domain
+                .transport
+                .as_ref()
+                .expect("running domain owns its transport")
+                .is_poisoned(),
+            "closing the worker input must not pre-poison the host transport"
+        );
+        domain
+            .begin_unexpected_recovery(RuntimeFailureFactKind::HeartbeatMissed { last_sequence: 0 })
+            .expect("injected liveness failure should begin recovery");
+        assert!(
+            domain.recovery().pending_action().is_some_and(|action| {
+                action.action() == RecoveryAction::RequestCooperativeStop
+            })
+        );
+
+        domain
+            .shutdown(StopReason::ProtocolFailure)
+            .await
+            .expect("TERM-ignoring worker should be killed and cleaned exactly");
+        assert_eq!(domain.phase(), ProcessDomainPhase::Quarantined);
+        assert!(matches!(
+            domain.recovery().phase(),
+            RecoveryPhase::Quarantined {
+                reason: QuarantineReason::RecoveryActionFailed
+            }
+        ));
+        assert_group_and_workspace_reclaimed(process_group, &workspace);
     }
 
     #[tokio::test(flavor = "current_thread")]
