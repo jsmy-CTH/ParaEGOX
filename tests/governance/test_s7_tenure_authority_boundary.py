@@ -120,7 +120,8 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_future_rec
     assert "bootstrap refresh may legitimately pin a newer Runtime epoch" in package[
         "responsibility"
     ]
-    assert "has not yet been verified by an Ubuntu CI run" in package["responsibility"]
+    assert "committed at 1ed704c" in package["responsibility"]
+    assert "verified by Ubuntu CI run 30748840399" in package["responsibility"]
     assert "Runtime query, Controller reconciliation" in package["responsibility"]
     assert "production restart reassembly/recovery" in package["responsibility"]
     assert "remain absent" in package["responsibility"]
@@ -159,9 +160,10 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_future_rec
     assert "three distinct non-root Runtime, Controller, and Authority" in waiver_reasons[
         "GOV-WAIVER-0009"
     ]
-    assert "has not yet been verified by an Ubuntu CI run" in waiver_reasons[
+    assert "Ubuntu CI run 30748840399 at commit 1ed704c verified" in waiver_reasons[
         "GOV-WAIVER-0009"
     ]
+    assert "372 pytest passes and no skips" in waiver_reasons["GOV-WAIVER-0009"]
 
     forbidden_claims = {
         "AcquireTenureRequestV1",
