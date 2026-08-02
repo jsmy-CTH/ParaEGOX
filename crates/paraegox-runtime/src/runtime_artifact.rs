@@ -122,7 +122,7 @@ impl PinnedRuntimeArtifactV1 {
             )
             .map_err(nix_io_failure)?;
             let file = File::from(owned);
-            return Self::observe_open_file(proc_directory, file, policy, metadata);
+            Self::observe_open_file(proc_directory, file, policy, metadata)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -234,6 +234,7 @@ fn nix_io_failure(error: nix::errno::Errno) -> RuntimeArtifactObservationError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeArtifactObservationError {
+    #[cfg(not(target_os = "linux"))]
     UnsupportedPlatform,
     #[cfg(target_os = "linux")]
     UnsupportedProcFilesystem,

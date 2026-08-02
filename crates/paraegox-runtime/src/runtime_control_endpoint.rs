@@ -16,15 +16,21 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::path::{Path, PathBuf};
 
-use ed25519_dalek::{Signature, Signer, SigningKey};
+#[cfg(test)]
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, Signer};
+#[cfg(test)]
+use nix::unistd::{getegid, geteuid};
 use nix::{
     fcntl::{OFlag, open},
     sys::stat::Mode,
-    unistd::{Gid, UnlinkatFlags, chown, getegid, geteuid, getpid, unlinkat},
+    unistd::{Gid, UnlinkatFlags, chown, getpid, unlinkat},
 };
+#[cfg(test)]
+use paraegox_kernel::identity::PrincipalRef;
 use paraegox_kernel::{
     digest::Digest32,
-    identity::{PrincipalRef, RuntimeHostId},
+    identity::RuntimeHostId,
     time::{ClockDomainRef, ClockGeneration},
 };
 use paraegox_runtime_contracts::{
@@ -33,7 +39,7 @@ use paraegox_runtime_contracts::{
         RuntimeCompiledInstallationFactsV1, RuntimeInstallationError,
         VerifiedRuntimeInstallationV1, verify_immutable_manifest_ingress, verify_pinned_startup,
     },
-    provenance::{SourceScopeRef, TargetSliceDigest},
+    provenance::TargetSliceDigest,
     reference_control::{
         MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES,
         MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES, MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES,
@@ -45,8 +51,10 @@ use paraegox_runtime_contracts::{
         reference_local_control_endpoint_identity_digest_v1,
         reference_runtime_peer_credentials_digest_v1,
     },
-    wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef},
+    wire::ApplyAuthAlgorithm,
 };
+#[cfg(test)]
+use paraegox_runtime_contracts::{provenance::SourceScopeRef, wire::ApplyAuthKeyRef};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -205,6 +213,7 @@ where
         })
     }
 
+    #[cfg(test)]
     fn bootstrap_core(
         &self,
         channel: ReferenceChannelBindingV1,

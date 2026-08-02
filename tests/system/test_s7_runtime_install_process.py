@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -272,26 +273,44 @@ def _run_checked(
     return completed
 
 
-def _service_identity(uid: int, gid: int) -> ServiceIdentity:
-    prefix = (
+def _service_identity_command_prefix(
+    setpriv_path: Path, uid: int, gid: int
+) -> tuple[str, ...]:
+    return (
         "sudo",
         "-n",
-        "-u",
-        f"#{uid}",
-        "-g",
-        f"#{gid}",
+        "--",
+        os.fspath(setpriv_path),
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
         "--",
     )
+
+
+def _service_identity(setpriv_path: Path, uid: int, gid: int) -> ServiceIdentity:
+    prefix = _service_identity_command_prefix(setpriv_path, uid, gid)
     observed_uid = _run_checked([*prefix, "id", "-u"])
     observed_gid = _run_checked([*prefix, "id", "-g"])
+    observed_groups = _run_checked([*prefix, "id", "-G"])
     assert int(observed_uid.stdout.strip()) == uid
     assert int(observed_gid.stdout.strip()) == gid
+    assert observed_groups.stdout.split() == [str(gid)]
     return ServiceIdentity(uid, gid, prefix)
 
 
 def _linux_distinct_service_identities() -> ProvisionedServiceIdentities:
     assert sys.platform == "linux"
     _run_checked(["sudo", "-n", "true"])
+    discovered_setpriv = shutil.which("setpriv")
+    assert discovered_setpriv is not None
+    setpriv_path = Path(discovered_setpriv).resolve(strict=True)
+    assert setpriv_path.is_absolute() and setpriv_path.is_file()
+    setpriv_version = _run_checked(
+        ["sudo", "-n", "--", os.fspath(setpriv_path), "--version"]
+    )
+    assert setpriv_version.stderr == ""
+    assert setpriv_version.stdout.startswith("setpriv from util-linux ")
     import pwd
 
     preferred_names = ("nobody", "daemon", "www-data", "bin", "sys", "sync")
@@ -319,10 +338,14 @@ def _linux_distinct_service_identities() -> ProvisionedServiceIdentities:
         pytest.fail("three distinct non-root Runtime/Controller/Authority accounts are required")
 
     runtime_account, controller_account, authority_account = selected
-    runtime = _service_identity(runtime_account.pw_uid, runtime_account.pw_gid)
+    runtime = _service_identity(
+        setpriv_path, runtime_account.pw_uid, runtime_account.pw_gid
+    )
     # Controller runs with its own distinct UID and the Runtime socket group.
-    controller = _service_identity(controller_account.pw_uid, runtime.gid)
-    authority = _service_identity(authority_account.pw_uid, authority_account.pw_gid)
+    controller = _service_identity(setpriv_path, controller_account.pw_uid, runtime.gid)
+    authority = _service_identity(
+        setpriv_path, authority_account.pw_uid, authority_account.pw_gid
+    )
     assert len({runtime.uid, controller.uid, authority.uid}) == 3
     return ProvisionedServiceIdentities(runtime, controller, authority)
 
@@ -436,9 +459,17 @@ def runtime_host_binary() -> Path:
     return binary
 
 
+@pytest.fixture(scope="module")
+def service_identities() -> ProvisionedServiceIdentities:
+    return _linux_distinct_service_identities()
+
+
 @pytest.fixture
-def installed_runtime(runtime_host_binary: Path) -> Iterator[InstalledRuntime]:
-    identities = _linux_distinct_service_identities()
+def installed_runtime(
+    runtime_host_binary: Path,
+    service_identities: ProvisionedServiceIdentities,
+) -> Iterator[InstalledRuntime]:
+    identities = service_identities
     service = identities.runtime
     with tempfile.TemporaryDirectory(prefix="pxr-release-", dir="/tmp") as release_path:
         release_directory = Path(release_path).resolve()
@@ -632,6 +663,25 @@ def _installed_bytes(runtime: InstalledRuntime) -> dict[str, bytes]:
         "runtime.lock": _root_read(runtime.state_directory / "runtime.lock"),
         "runtime.snapshot": _root_read(runtime.state_directory / "runtime.snapshot"),
     }
+
+
+def test_service_identity_fixture_uses_exact_setpriv_drop_grammar(
+    service_identities: ProvisionedServiceIdentities,
+) -> None:
+    identities = (
+        service_identities.runtime,
+        service_identities.controller,
+        service_identities.authority,
+    )
+    assert len({identity.uid for identity in identities}) == 3
+    assert service_identities.controller.gid == service_identities.runtime.gid
+    assert len({identity.command_prefix[3] for identity in identities}) == 1
+    for identity in identities:
+        assert identity.command_prefix == _service_identity_command_prefix(
+            Path(identity.command_prefix[3]), identity.uid, identity.gid
+        )
+        assert "-u" not in identity.command_prefix
+        assert "-g" not in identity.command_prefix
 
 
 def test_real_installed_runtime_process_initializes_sequence_one_exactly_once(

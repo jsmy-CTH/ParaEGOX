@@ -33,6 +33,7 @@ from test_s7_runtime_install_process import (
     _run_checked,
     _run_text,
 )
+from test_s7_runtime_install_process import service_identities as service_identities
 
 pytest_plugins = ("test_s7_runtime_install_process",)
 
