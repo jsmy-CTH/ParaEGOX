@@ -1,0 +1,2365 @@
+#![cfg(unix)]
+
+//! Owner-private POSIX snapshot store for the Runtime journal.
+//!
+//! This module owns only the RuntimeHost filesystem transaction boundary. It
+//! deliberately does not initialize a store, decode installer artifacts, or
+//! abstract storage for another journal owner. A missing or invalid active
+//! snapshot is never reconstructed from a temporary file.
+
+use core::fmt;
+use std::fs::{self, File, Metadata, TryLockError};
+use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
+
+use nix::dir::Dir;
+use nix::fcntl::{OFlag, open, openat, renameat};
+use nix::sys::stat::{Mode, fchmod};
+use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
+use paraegox_kernel::digest::Digest32;
+
+use crate::runtime_journal::{
+    MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, RuntimeJournalError, RuntimeJournalSnapshot,
+};
+
+const LOCK_FILE_NAME: &str = "runtime.lock";
+const ACTIVE_FILE_NAME: &str = "runtime.snapshot";
+const TEMP_FILE_PREFIX: &str = ".runtime.snapshot.tmp-";
+const TEMP_TOKEN_BYTES: usize = 16;
+const TEMP_HEX_BYTES: usize = TEMP_TOKEN_BYTES * 2;
+const MAX_ORPHAN_TEMP_FILES: usize = 32;
+const STATE_DIRECTORY_MODE_BITS: u32 = 0o700;
+const STATE_DIRECTORY_MODE_MASK: u32 = 0o7777;
+const PRIVATE_FILE_MODE_BITS: u32 = 0o600;
+const PRIVATE_FILE_MODE_MASK: u32 = 0o7777;
+const PRIVATE_FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_FDINFO_BYTES: usize = 64 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_FDINFO_RECORDS: usize = 256;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_FDINFO_LINE_BYTES: usize = 4 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_MOUNTINFO_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_MOUNTINFO_RECORDS: usize = 4_096;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_MOUNTINFO_LINE_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeFilesystemPolicy {
+    ProductionReference,
+    #[cfg(test)]
+    ExplicitFixture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+struct RuntimeDirectory {
+    path: PathBuf,
+    file: File,
+    identity: FileIdentity,
+    owner_uid: u32,
+    owner_gid: u32,
+}
+
+impl fmt::Debug for RuntimeDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeDirectory")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .field("owner_uid", &self.owner_uid)
+            .field("owner_gid", &self.owner_gid)
+            .finish_non_exhaustive()
+    }
+}
+
+struct OpenedRegularFile {
+    file: File,
+    identity: FileIdentity,
+}
+
+struct ActiveSnapshot {
+    snapshot: RuntimeJournalSnapshot,
+    identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeStoreState {
+    Operational,
+    Stopped,
+}
+
+/// The single-writer, owner-private Runtime snapshot store.
+pub(crate) struct RuntimeStore {
+    directory: RuntimeDirectory,
+    lock_file: File,
+    lock_identity: FileIdentity,
+    active: ActiveSnapshot,
+    state: RuntimeStoreState,
+}
+
+impl fmt::Debug for RuntimeStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeStore")
+            .field("directory", &self.directory)
+            .field("lock_identity", &self.lock_identity)
+            .field("snapshot_sequence", &self.active.snapshot.sequence())
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for RuntimeStore {
+    fn drop(&mut self) {
+        // A forked child temporarily shares this open-file description until
+        // exec closes its CLOEXEC descriptor. Unlock explicitly so normal
+        // owner shutdown cannot leave restart availability dependent on that
+        // transient child reference reaching exec first.
+        let _ = self.lock_file.unlock();
+    }
+}
+
+impl RuntimeStore {
+    pub(crate) fn open(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+    ) -> Result<Self, RuntimeStoreOpenError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            expected_target_fingerprint,
+            RuntimeFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    fn open_with_policy(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+        filesystem_policy: RuntimeFilesystemPolicy,
+    ) -> Result<Self, RuntimeStoreOpenError> {
+        if expected_store_instance_id.iter().all(|byte| *byte == 0) {
+            return Err(RuntimeStoreOpenError::InvalidExpectedStoreInstanceId);
+        }
+        if expected_target_fingerprint
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return Err(RuntimeStoreOpenError::InvalidExpectedTargetFingerprint);
+        }
+        let directory = open_runtime_directory(directory, filesystem_policy)?;
+        let OpenedRegularFile {
+            file: lock_file,
+            identity: lock_identity,
+        } = open_existing_regular(
+            &directory,
+            LOCK_FILE_NAME,
+            OFlag::O_RDWR,
+            RuntimeFileStage::OpenLock,
+        )?;
+        lock_file.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => RuntimeStoreOpenError::LockContended,
+            TryLockError::Error(error) => RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::AcquireLock,
+                &error,
+            )),
+        })?;
+        validate_named_file_identity(
+            &directory,
+            LOCK_FILE_NAME,
+            lock_identity,
+            RuntimeFileStage::ValidateLockIdentity,
+        )?;
+
+        // Active is authoritative. It is decoded and identity-checked before
+        // orphan temporary files are even classified, so restart never elects
+        // a temporary file over a missing or invalid active snapshot.
+        let active = read_active_snapshot(&directory)?;
+        if active.snapshot.store_instance_id() != &expected_store_instance_id {
+            return Err(RuntimeStoreOpenError::StoreInstanceMismatch);
+        }
+        if active.snapshot.owner_target_fingerprint() != &expected_target_fingerprint {
+            return Err(RuntimeStoreOpenError::TargetFingerprintMismatch);
+        }
+        clean_valid_orphan_temps(&directory)?;
+
+        Ok(Self {
+            directory,
+            lock_file,
+            lock_identity,
+            active,
+            state: RuntimeStoreState::Operational,
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<&RuntimeJournalSnapshot, RuntimeStoreError> {
+        self.ensure_operational()?;
+        Ok(&self.active.snapshot)
+    }
+
+    pub(crate) fn revalidate_current(
+        &mut self,
+    ) -> Result<&RuntimeJournalSnapshot, RuntimeStoreError> {
+        self.ensure_operational()?;
+        if validate_runtime_directory_handle(&self.directory).is_err()
+            || validate_held_lock(&self.directory, &self.lock_file, self.lock_identity).is_err()
+        {
+            self.state = RuntimeStoreState::Stopped;
+            return Err(RuntimeStoreError::LockOrDirectoryIdentityChanged);
+        }
+        let disk = read_active_snapshot(&self.directory).map_err(|error| {
+            self.state = RuntimeStoreState::Stopped;
+            RuntimeStoreError::Open(error)
+        })?;
+        if disk.identity != self.active.identity || disk.snapshot != self.active.snapshot {
+            self.state = RuntimeStoreState::Stopped;
+            return Err(RuntimeStoreError::ActiveSnapshotChanged);
+        }
+        Ok(&self.active.snapshot)
+    }
+
+    pub(crate) fn commit(&mut self, next: RuntimeJournalSnapshot) -> Result<(), RuntimeStoreError> {
+        self.commit_with_entropy(next, RuntimeCommitFailpoint::None, system_random_token)
+    }
+
+    fn commit_with(
+        &mut self,
+        next: RuntimeJournalSnapshot,
+        token: [u8; TEMP_TOKEN_BYTES],
+        failpoint: RuntimeCommitFailpoint,
+    ) -> Result<(), RuntimeStoreError> {
+        self.commit_with_entropy(next, failpoint, || Ok(token))
+    }
+
+    fn commit_with_entropy(
+        &mut self,
+        next: RuntimeJournalSnapshot,
+        failpoint: RuntimeCommitFailpoint,
+        entropy: impl FnOnce() -> Result<[u8; TEMP_TOKEN_BYTES], io::Error>,
+    ) -> Result<(), RuntimeStoreError> {
+        self.prepare_commit(&next)?;
+        let token = entropy().map_err(|error| {
+            self.state = RuntimeStoreState::Stopped;
+            RuntimeStoreError::Publish(RuntimePublishFailure::RejectedBeforePublish(
+                RuntimePublishFault::io(RuntimeFileStage::GenerateTempName, &error),
+            ))
+        })?;
+        self.publish_prevalidated(next, token, failpoint)
+    }
+
+    fn prepare_commit(&mut self, next: &RuntimeJournalSnapshot) -> Result<(), RuntimeStoreError> {
+        self.ensure_operational()?;
+        next.validate_successor_of(&self.active.snapshot)
+            .map_err(|error| {
+                self.state = RuntimeStoreState::Stopped;
+                RuntimeStoreError::Journal(error)
+            })?;
+        self.revalidate_current()?;
+        Ok(())
+    }
+
+    fn publish_prevalidated(
+        &mut self,
+        next: RuntimeJournalSnapshot,
+        token: [u8; TEMP_TOKEN_BYTES],
+        failpoint: RuntimeCommitFailpoint,
+    ) -> Result<(), RuntimeStoreError> {
+        if let Err(error) = publish_atomic(
+            &self.directory,
+            next.canonical_wire(),
+            self.active.identity,
+            token,
+            failpoint,
+        ) {
+            self.state = RuntimeStoreState::Stopped;
+            return Err(RuntimeStoreError::Publish(error));
+        }
+
+        // The rename and directory fsync have completed, so any inability to
+        // prove the exact published bytes is post-publish uncertainty.
+        let read_back = read_active_snapshot(&self.directory).map_err(|error| {
+            self.state = RuntimeStoreState::Stopped;
+            RuntimeStoreError::Publish(RuntimePublishFailure::UncertainAfterPublish(
+                publish_fault_from_open(RuntimeFileStage::ReadBackPublished, error),
+            ))
+        })?;
+        if read_back.snapshot != next {
+            self.state = RuntimeStoreState::Stopped;
+            return Err(RuntimeStoreError::Publish(
+                RuntimePublishFailure::UncertainAfterPublish(RuntimePublishFault::injected(
+                    RuntimeFileStage::ReadBackPublished,
+                )),
+            ));
+        }
+        self.active = read_back;
+        Ok(())
+    }
+
+    fn ensure_operational(&self) -> Result<(), RuntimeStoreError> {
+        if self.state == RuntimeStoreState::Stopped {
+            return Err(RuntimeStoreError::Stopped);
+        }
+        Ok(())
+    }
+}
+
+fn open_runtime_directory(
+    path: &Path,
+    filesystem_policy: RuntimeFilesystemPolicy,
+) -> Result<RuntimeDirectory, RuntimeStoreOpenError> {
+    validate_lexical_absolute_path(path)?;
+    let owner_uid = geteuid().as_raw();
+    let owner_gid = getegid().as_raw();
+    validate_trusted_ancestor_chain(path, owner_uid)?;
+    let before = fs::symlink_metadata(path).map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::InspectDirectory,
+            &error,
+        ))
+    })?;
+    validate_directory_metadata(&before, owner_uid, owner_gid)?;
+    let owned = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        RuntimeStoreOpenError::Io(nix_failure(RuntimeFileStage::OpenDirectory, error))
+    })?;
+    let file = File::from(owned);
+    let after = file.metadata().map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::OpenDirectory,
+            &error,
+        ))
+    })?;
+    validate_directory_metadata(&after, owner_uid, owner_gid)?;
+    let identity = FileIdentity::from_metadata(&after);
+    if identity != FileIdentity::from_metadata(&before) {
+        return Err(RuntimeStoreOpenError::DirectoryIdentityChanged);
+    }
+    verify_filesystem(&file, filesystem_policy)?;
+    Ok(RuntimeDirectory {
+        path: path.to_path_buf(),
+        file,
+        identity,
+        owner_uid,
+        owner_gid,
+    })
+}
+
+fn validate_runtime_directory_handle(
+    directory: &RuntimeDirectory,
+) -> Result<(), RuntimeStoreOpenError> {
+    let metadata = directory.file.metadata().map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::ValidateDirectoryIdentity,
+            &error,
+        ))
+    })?;
+    validate_directory_metadata(&metadata, directory.owner_uid, directory.owner_gid)?;
+    if FileIdentity::from_metadata(&metadata) != directory.identity {
+        return Err(RuntimeStoreOpenError::DirectoryIdentityChanged);
+    }
+    Ok(())
+}
+
+fn validate_directory_metadata(
+    metadata: &Metadata,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<(), RuntimeStoreOpenError> {
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() || metadata.nlink() == 0
+    {
+        return Err(RuntimeStoreOpenError::UnsafeDirectoryType);
+    }
+    if metadata.uid() != owner_uid || metadata.gid() != owner_gid {
+        return Err(RuntimeStoreOpenError::DirectoryOwnerMismatch);
+    }
+    if metadata.mode() & STATE_DIRECTORY_MODE_MASK != STATE_DIRECTORY_MODE_BITS {
+        return Err(RuntimeStoreOpenError::UnsafeDirectoryMode);
+    }
+    Ok(())
+}
+
+fn validate_lexical_absolute_path(path: &Path) -> Result<(), RuntimeStoreOpenError> {
+    if !path.is_absolute() {
+        return Err(RuntimeStoreOpenError::PathMustBeAbsolute);
+    }
+    for component in path.components() {
+        if matches!(
+            component,
+            Component::CurDir | Component::ParentDir | Component::Prefix(_)
+        ) {
+            return Err(RuntimeStoreOpenError::UnsafeDirectoryPath);
+        }
+    }
+    Ok(())
+}
+
+fn validate_trusted_ancestor_chain(
+    path: &Path,
+    owner_uid: u32,
+) -> Result<(), RuntimeStoreOpenError> {
+    let parent = path
+        .parent()
+        .ok_or(RuntimeStoreOpenError::UnsafeDirectoryPath)?;
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        match component {
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::Normal(value) => current.push(value),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(RuntimeStoreOpenError::UnsafeDirectoryPath);
+            }
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::InspectAncestor,
+                &error,
+            ))
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_dir()
+            || metadata.nlink() == 0
+        {
+            return Err(RuntimeStoreOpenError::UnsafeAncestorType);
+        }
+        let mode = metadata.mode() & STATE_DIRECTORY_MODE_MASK;
+        let root_owned_sticky = metadata.uid() == 0 && mode & 0o1000 != 0;
+        let owner_is_trusted = metadata.uid() == 0 || metadata.uid() == owner_uid;
+        if !owner_is_trusted || (mode & 0o022 != 0 && !root_owned_sticky) {
+            return Err(RuntimeStoreOpenError::UntrustedAncestor);
+        }
+    }
+    Ok(())
+}
+
+fn open_existing_regular(
+    directory: &RuntimeDirectory,
+    name: &str,
+    access: OFlag,
+    stage: RuntimeFileStage,
+) -> Result<OpenedRegularFile, RuntimeStoreOpenError> {
+    let owned = openat(
+        &directory.file,
+        name,
+        access | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| RuntimeStoreOpenError::Io(nix_failure(stage, error)))?;
+    let file = File::from(owned);
+    let metadata = file
+        .metadata()
+        .map_err(|error| RuntimeStoreOpenError::Io(RuntimeIoFailure::new(stage, &error)))?;
+    validate_regular_file(&metadata, directory.owner_uid, directory.owner_gid)?;
+    Ok(OpenedRegularFile {
+        file,
+        identity: FileIdentity::from_metadata(&metadata),
+    })
+}
+
+fn validate_regular_file(
+    metadata: &Metadata,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<(), RuntimeStoreOpenError> {
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(RuntimeStoreOpenError::UnsafeFileType);
+    }
+    if metadata.uid() != owner_uid || metadata.gid() != owner_gid {
+        return Err(RuntimeStoreOpenError::FileOwnerMismatch);
+    }
+    if metadata.mode() & PRIVATE_FILE_MODE_MASK != PRIVATE_FILE_MODE_BITS {
+        return Err(RuntimeStoreOpenError::UnsafeFileMode);
+    }
+    Ok(())
+}
+
+fn validate_named_file_identity(
+    directory: &RuntimeDirectory,
+    name: &str,
+    expected: FileIdentity,
+    stage: RuntimeFileStage,
+) -> Result<(), RuntimeStoreOpenError> {
+    let current = open_existing_regular(directory, name, OFlag::O_RDONLY, stage)?;
+    if current.identity != expected {
+        return Err(RuntimeStoreOpenError::NamedFileIdentityChanged);
+    }
+    Ok(())
+}
+
+fn validate_held_lock(
+    directory: &RuntimeDirectory,
+    lock_file: &File,
+    expected: FileIdentity,
+) -> Result<(), RuntimeStoreOpenError> {
+    let metadata = lock_file.metadata().map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::ValidateLockIdentity,
+            &error,
+        ))
+    })?;
+    validate_regular_file(&metadata, directory.owner_uid, directory.owner_gid)?;
+    if FileIdentity::from_metadata(&metadata) != expected {
+        return Err(RuntimeStoreOpenError::NamedFileIdentityChanged);
+    }
+    validate_named_file_identity(
+        directory,
+        LOCK_FILE_NAME,
+        expected,
+        RuntimeFileStage::ValidateLockIdentity,
+    )
+}
+
+fn read_active_snapshot(
+    directory: &RuntimeDirectory,
+) -> Result<ActiveSnapshot, RuntimeStoreOpenError> {
+    let OpenedRegularFile { mut file, identity } = open_existing_regular(
+        directory,
+        ACTIVE_FILE_NAME,
+        OFlag::O_RDONLY,
+        RuntimeFileStage::OpenActive,
+    )?;
+    let before = file.metadata().map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(RuntimeFileStage::ReadActive, &error))
+    })?;
+    let length =
+        usize::try_from(before.len()).map_err(|_| RuntimeStoreOpenError::ActiveTooLarge)?;
+    if length == 0 {
+        return Err(RuntimeStoreOpenError::ActiveEmpty);
+    }
+    if length > MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES {
+        return Err(RuntimeStoreOpenError::ActiveTooLarge);
+    }
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(length)
+        .map_err(|_| RuntimeStoreOpenError::ActiveAllocationFailed)?;
+    encoded.resize(length, 0);
+    file.read_exact(&mut encoded).map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(RuntimeFileStage::ReadActive, &error))
+    })?;
+    let mut trailing = [0; 1];
+    if file.read(&mut trailing).map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(RuntimeFileStage::ReadActive, &error))
+    })? != 0
+    {
+        return Err(RuntimeStoreOpenError::ActiveChangedDuringRead);
+    }
+    let after = file.metadata().map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(RuntimeFileStage::ReadActive, &error))
+    })?;
+    validate_regular_file(&after, directory.owner_uid, directory.owner_gid)?;
+    if FileIdentity::from_metadata(&after) != identity || after.len() != before.len() {
+        return Err(RuntimeStoreOpenError::ActiveChangedDuringRead);
+    }
+    validate_named_file_identity(
+        directory,
+        ACTIVE_FILE_NAME,
+        identity,
+        RuntimeFileStage::ValidateActiveIdentity,
+    )?;
+    let snapshot =
+        RuntimeJournalSnapshot::decode(&encoded).map_err(RuntimeStoreOpenError::Journal)?;
+    if snapshot.canonical_wire() != encoded {
+        return Err(RuntimeStoreOpenError::Journal(
+            RuntimeJournalError::NonCanonicalEncoding,
+        ));
+    }
+    Ok(ActiveSnapshot { snapshot, identity })
+}
+
+fn clean_valid_orphan_temps(directory: &RuntimeDirectory) -> Result<(), RuntimeStoreOpenError> {
+    let mut entries = duplicate_directory_stream(directory)?;
+    let mut orphan_names = Vec::new();
+    for entry in entries.iter() {
+        let entry = entry.map_err(|error| {
+            RuntimeStoreOpenError::Io(nix_failure(RuntimeFileStage::ScanDirectory, error))
+        })?;
+        let name_bytes = entry.file_name().to_bytes();
+        if is_dot_entry(name_bytes) {
+            continue;
+        }
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| RuntimeStoreOpenError::UnknownDirectoryEntry)?;
+        if name == LOCK_FILE_NAME || name == ACTIVE_FILE_NAME {
+            continue;
+        }
+        if !valid_temp_name(name) {
+            return Err(RuntimeStoreOpenError::UnknownDirectoryEntry);
+        }
+        orphan_names.push(name.to_owned());
+        if orphan_names.len() > MAX_ORPHAN_TEMP_FILES {
+            return Err(RuntimeStoreOpenError::TooManyOrphanTemps);
+        }
+    }
+
+    for name in orphan_names {
+        let orphan = open_existing_regular(
+            directory,
+            &name,
+            OFlag::O_RDONLY,
+            RuntimeFileStage::InspectOrphanTemp,
+        )?;
+        validate_named_file_identity(
+            directory,
+            &name,
+            orphan.identity,
+            RuntimeFileStage::InspectOrphanTemp,
+        )?;
+        unlinkat(&directory.file, name.as_str(), UnlinkatFlags::NoRemoveDir).map_err(|error| {
+            RuntimeStoreOpenError::Io(nix_failure(RuntimeFileStage::RemoveOrphanTemp, error))
+        })?;
+        let metadata = orphan.file.metadata().map_err(|error| {
+            RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::RemoveOrphanTemp,
+                &error,
+            ))
+        })?;
+        if metadata.nlink() != 0 {
+            return Err(RuntimeStoreOpenError::NamedFileIdentityChanged);
+        }
+    }
+    directory.file.sync_all().map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::SyncOrphanCleanup,
+            &error,
+        ))
+    })
+}
+
+fn duplicate_directory_stream(directory: &RuntimeDirectory) -> Result<Dir, RuntimeStoreOpenError> {
+    let duplicate = directory.file.try_clone().map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::ScanDirectory,
+            &error,
+        ))
+    })?;
+    let descriptor: OwnedFd = duplicate.into();
+    Dir::from_fd(descriptor).map_err(|error| {
+        RuntimeStoreOpenError::Io(nix_failure(RuntimeFileStage::ScanDirectory, error))
+    })
+}
+
+fn is_dot_entry(name: &[u8]) -> bool {
+    name == b"." || name == b".."
+}
+
+fn publish_atomic(
+    directory: &RuntimeDirectory,
+    encoded: &[u8],
+    expected_active_identity: FileIdentity,
+    token: [u8; TEMP_TOKEN_BYTES],
+    failpoint: RuntimeCommitFailpoint,
+) -> Result<(), RuntimePublishFailure> {
+    if encoded.is_empty() || encoded.len() > MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES {
+        return Err(rejected_injected(RuntimeFileStage::ValidateEncodedSnapshot));
+    }
+    if failpoint == RuntimeCommitFailpoint::BeforeTempCreate {
+        return Err(rejected_injected(RuntimeFileStage::CreateTemp));
+    }
+    validate_named_file_identity(
+        directory,
+        ACTIVE_FILE_NAME,
+        expected_active_identity,
+        RuntimeFileStage::ValidateActiveIdentity,
+    )
+    .map_err(|error| rejected_open_error(RuntimeFileStage::ValidateActiveIdentity, error))?;
+
+    let temp_name = temp_name(token);
+    let owned = openat(
+        &directory.file,
+        temp_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        PRIVATE_FILE_MODE,
+    )
+    .map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
+            RuntimeFileStage::CreateTemp,
+            error,
+        ))
+    })?;
+    let mut temp = File::from(owned);
+    fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
+            RuntimeFileStage::InspectTemp,
+            error,
+        ))
+    })?;
+    let temp_metadata = temp.metadata().map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::io(
+            RuntimeFileStage::InspectTemp,
+            &error,
+        ))
+    })?;
+    validate_regular_file(&temp_metadata, directory.owner_uid, directory.owner_gid)
+        .map_err(|error| rejected_open_error(RuntimeFileStage::InspectTemp, error))?;
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortAfterTempCreate {
+        std::process::abort();
+    }
+    if failpoint == RuntimeCommitFailpoint::AfterTempCreate {
+        return Err(rejected_injected(RuntimeFileStage::CreateTemp));
+    }
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortAfterPartialWrite {
+        let partial_length = encoded.len().saturating_sub(1).max(1);
+        temp.write_all(&encoded[..partial_length])
+            .map_err(|error| {
+                RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::io(
+                    RuntimeFileStage::WriteTemp,
+                    &error,
+                ))
+            })?;
+        std::process::abort();
+    }
+    if failpoint == RuntimeCommitFailpoint::AfterPartialWrite {
+        let partial_length = encoded.len().saturating_sub(1).max(1);
+        temp.write_all(&encoded[..partial_length])
+            .map_err(|error| {
+                RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::io(
+                    RuntimeFileStage::WriteTemp,
+                    &error,
+                ))
+            })?;
+        return Err(rejected_injected(RuntimeFileStage::WriteTemp));
+    }
+    temp.write_all(encoded).map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::io(
+            RuntimeFileStage::WriteTemp,
+            &error,
+        ))
+    })?;
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortBeforeFileSync {
+        std::process::abort();
+    }
+    if failpoint == RuntimeCommitFailpoint::BeforeFileSync {
+        return Err(rejected_injected(RuntimeFileStage::SyncTemp));
+    }
+    temp.sync_all().map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::io(
+            RuntimeFileStage::SyncTemp,
+            &error,
+        ))
+    })?;
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortAfterFileSync {
+        std::process::abort();
+    }
+    if matches!(
+        failpoint,
+        RuntimeCommitFailpoint::AfterFileSync | RuntimeCommitFailpoint::BeforeRename
+    ) {
+        return Err(rejected_injected(RuntimeFileStage::Rename));
+    }
+    validate_named_file_identity(
+        directory,
+        ACTIVE_FILE_NAME,
+        expected_active_identity,
+        RuntimeFileStage::ValidateActiveIdentity,
+    )
+    .map_err(|error| rejected_open_error(RuntimeFileStage::ValidateActiveIdentity, error))?;
+    renameat(
+        &directory.file,
+        temp_name.as_str(),
+        &directory.file,
+        ACTIVE_FILE_NAME,
+    )
+    .map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
+            RuntimeFileStage::Rename,
+            error,
+        ))
+    })?;
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortAfterRename {
+        std::process::abort();
+    }
+    if matches!(
+        failpoint,
+        RuntimeCommitFailpoint::AfterRename | RuntimeCommitFailpoint::BeforeDirectorySync
+    ) {
+        return Err(uncertain_injected(RuntimeFileStage::SyncDirectory));
+    }
+    directory.file.sync_all().map_err(|error| {
+        RuntimePublishFailure::UncertainAfterPublish(RuntimePublishFault::io(
+            RuntimeFileStage::SyncDirectory,
+            &error,
+        ))
+    })?;
+    #[cfg(test)]
+    if matches!(
+        failpoint,
+        RuntimeCommitFailpoint::AbortAfterDirectorySync
+            | RuntimeCommitFailpoint::AbortAfterDurableCommitBeforeReturn
+    ) {
+        std::process::abort();
+    }
+    if failpoint == RuntimeCommitFailpoint::AfterDirectorySyncBeforeReturn {
+        return Err(uncertain_injected(RuntimeFileStage::ReturnDurableCommit));
+    }
+    Ok(())
+}
+
+fn system_random_token() -> Result<[u8; TEMP_TOKEN_BYTES], io::Error> {
+    let owned = open(
+        Path::new("/dev/urandom"),
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(errno_to_io)?;
+    let mut random = File::from(owned);
+    let mut token = [0; TEMP_TOKEN_BYTES];
+    random.read_exact(&mut token)?;
+    if token.iter().all(|byte| *byte == 0) {
+        return Err(io::Error::other(
+            "CSPRNG returned an all-zero Runtime temporary token",
+        ));
+    }
+    Ok(token)
+}
+
+fn temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::with_capacity(TEMP_FILE_PREFIX.len() + TEMP_HEX_BYTES);
+    name.push_str(TEMP_FILE_PREFIX);
+    for byte in token {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    name
+}
+
+fn valid_temp_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(TEMP_FILE_PREFIX) else {
+        return false;
+    };
+    suffix.len() == TEMP_HEX_BYTES
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn verify_filesystem(
+    directory: &File,
+    _policy: RuntimeFilesystemPolicy,
+) -> Result<(), RuntimeStoreOpenError> {
+    #[cfg(test)]
+    if _policy == RuntimeFilesystemPolicy::ExplicitFixture {
+        return Ok(());
+    }
+    let stat = nix::sys::statfs::fstatfs(directory).map_err(|error| {
+        RuntimeStoreOpenError::Io(nix_failure(RuntimeFileStage::InspectFilesystem, error))
+    })?;
+    #[cfg(target_os = "linux")]
+    {
+        if stat.filesystem_type() != nix::sys::statfs::EXT4_SUPER_MAGIC {
+            return Err(RuntimeStoreOpenError::UnsupportedFilesystem);
+        }
+        return verify_linux_ext4_mount(directory)
+            .map_err(|_| RuntimeStoreOpenError::UnsupportedFilesystem);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // APFS mode bits do not prove the absence of extended ACL entries,
+        // and this workspace forbids an unreviewed unsafe acl_get_fd_np
+        // wrapper. PC1 must admit an FD-anchored ACL and crash-durability
+        // backend before the macOS production profile can be enabled.
+        let _ = stat;
+        Err(RuntimeStoreOpenError::UnsupportedFilesystem)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = stat;
+        Err(RuntimeStoreOpenError::UnsupportedFilesystem)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_ext4_mount(directory: &File) -> Result<(), LinuxMountEvidenceError> {
+    let fdinfo_path = PathBuf::from(format!("/proc/self/fdinfo/{}", directory.as_raw_fd()));
+    let fdinfo = read_bounded_linux_proc_file(&fdinfo_path, MAX_LINUX_FDINFO_BYTES)?;
+    let mount_id = parse_linux_fdinfo_mount_id(&fdinfo)?;
+    let mountinfo =
+        read_bounded_linux_proc_file(Path::new("/proc/self/mountinfo"), MAX_LINUX_MOUNTINFO_BYTES)?;
+    parse_linux_mountinfo_exact_ext4(&mountinfo, mount_id)
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_linux_proc_file(
+    path: &Path,
+    maximum: usize,
+) -> Result<Vec<u8>, LinuxMountEvidenceError> {
+    let owned = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| LinuxMountEvidenceError::Io(errno_to_io(error).kind()))?;
+    let mut source = File::from(owned);
+    let capacity = maximum
+        .checked_add(1)
+        .ok_or(LinuxMountEvidenceError::EvidenceTooLarge)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| LinuxMountEvidenceError::AllocationFailed)?;
+    let mut chunk = [0_u8; 4_096];
+    loop {
+        let remaining = capacity.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Err(LinuxMountEvidenceError::EvidenceTooLarge);
+        }
+        let read = source
+            .read(&mut chunk[..remaining.min(chunk.len())])
+            .map_err(|error| LinuxMountEvidenceError::Io(error.kind()))?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > maximum {
+            return Err(LinuxMountEvidenceError::EvidenceTooLarge);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxMountEvidenceError {
+    Io(io::ErrorKind),
+    AllocationFailed,
+    EvidenceTooLarge,
+    TooManyRecords,
+    LineTooLong,
+    MalformedFdInfo,
+    MissingMountId,
+    DuplicateMountId,
+    MalformedMountInfo,
+    MissingMountRecord,
+    DuplicateMountRecord,
+    UnexpectedFilesystemType,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_fdinfo_mount_id(bytes: &[u8]) -> Result<u64, LinuxMountEvidenceError> {
+    if bytes.is_empty() || bytes.len() > MAX_LINUX_FDINFO_BYTES || !bytes.ends_with(b"\n") {
+        return Err(if bytes.len() > MAX_LINUX_FDINFO_BYTES {
+            LinuxMountEvidenceError::EvidenceTooLarge
+        } else {
+            LinuxMountEvidenceError::MalformedFdInfo
+        });
+    }
+    let mut record_count = 0_usize;
+    let mut mount_id = None;
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        record_count = record_count
+            .checked_add(1)
+            .ok_or(LinuxMountEvidenceError::TooManyRecords)?;
+        if record_count > MAX_LINUX_FDINFO_RECORDS {
+            return Err(LinuxMountEvidenceError::TooManyRecords);
+        }
+        if line.is_empty() {
+            return Err(LinuxMountEvidenceError::MalformedFdInfo);
+        }
+        if line.len() > MAX_LINUX_FDINFO_LINE_BYTES {
+            return Err(LinuxMountEvidenceError::LineTooLong);
+        }
+        let Some(value) = line.strip_prefix(b"mnt_id:") else {
+            continue;
+        };
+        let parsed = parse_positive_decimal(trim_horizontal_ascii(value))
+            .ok_or(LinuxMountEvidenceError::MalformedFdInfo)?;
+        if mount_id.replace(parsed).is_some() {
+            return Err(LinuxMountEvidenceError::DuplicateMountId);
+        }
+    }
+    mount_id.ok_or(LinuxMountEvidenceError::MissingMountId)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_mountinfo_exact_ext4(
+    bytes: &[u8],
+    expected_mount_id: u64,
+) -> Result<(), LinuxMountEvidenceError> {
+    if bytes.len() > MAX_LINUX_MOUNTINFO_BYTES {
+        return Err(LinuxMountEvidenceError::EvidenceTooLarge);
+    }
+    if expected_mount_id == 0 || bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err(LinuxMountEvidenceError::MalformedMountInfo);
+    }
+    let mut record_count = 0_usize;
+    let mut matched_ext4 = None;
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        record_count = record_count
+            .checked_add(1)
+            .ok_or(LinuxMountEvidenceError::TooManyRecords)?;
+        if record_count > MAX_LINUX_MOUNTINFO_RECORDS {
+            return Err(LinuxMountEvidenceError::TooManyRecords);
+        }
+        if line.is_empty() {
+            return Err(LinuxMountEvidenceError::MalformedMountInfo);
+        }
+        if line.len() > MAX_LINUX_MOUNTINFO_LINE_BYTES {
+            return Err(LinuxMountEvidenceError::LineTooLong);
+        }
+        let mut fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        let mount_id = parse_positive_decimal(
+            fields
+                .next()
+                .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?,
+        )
+        .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+        parse_positive_decimal(
+            fields
+                .next()
+                .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?,
+        )
+        .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+        parse_linux_device_number(
+            fields
+                .next()
+                .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?,
+        )?;
+        for _ in 0..3 {
+            if fields.next().is_none_or(|required| required.is_empty()) {
+                return Err(LinuxMountEvidenceError::MalformedMountInfo);
+            }
+        }
+        let filesystem_type = loop {
+            let field = fields
+                .next()
+                .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+            if field == b"-" {
+                break fields
+                    .next()
+                    .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+            }
+        };
+        let mount_source = fields
+            .next()
+            .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+        let super_options = fields
+            .next()
+            .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+        if filesystem_type.is_empty()
+            || mount_source.is_empty()
+            || super_options.is_empty()
+            || fields.next().is_some()
+        {
+            return Err(LinuxMountEvidenceError::MalformedMountInfo);
+        }
+        if mount_id == expected_mount_id
+            && matched_ext4.replace(filesystem_type == b"ext4").is_some()
+        {
+            return Err(LinuxMountEvidenceError::DuplicateMountRecord);
+        }
+    }
+    match matched_ext4 {
+        Some(true) => Ok(()),
+        Some(false) => Err(LinuxMountEvidenceError::UnexpectedFilesystemType),
+        None => Err(LinuxMountEvidenceError::MissingMountRecord),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_device_number(bytes: &[u8]) -> Result<(), LinuxMountEvidenceError> {
+    let mut parts = bytes.split(|byte| *byte == b':');
+    let major = parts
+        .next()
+        .and_then(parse_decimal)
+        .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+    let minor = parts
+        .next()
+        .and_then(parse_decimal)
+        .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+    if parts.next().is_some() {
+        return Err(LinuxMountEvidenceError::MalformedMountInfo);
+    }
+    let _ = (major, minor);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_positive_decimal(bytes: &[u8]) -> Option<u64> {
+    let value = parse_decimal(bytes)?;
+    (value != 0).then_some(value)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_decimal(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    bytes.iter().try_fold(0_u64, |value, byte| {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value.checked_mul(10)?.checked_add(u64::from(*byte - b'0'))
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn trim_horizontal_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes
+        .first()
+        .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+    {
+        bytes = &bytes[1..];
+    }
+    while bytes
+        .last()
+        .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+    {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn rejected_open_error(
+    stage: RuntimeFileStage,
+    error: RuntimeStoreOpenError,
+) -> RuntimePublishFailure {
+    match error {
+        RuntimeStoreOpenError::Io(failure) => {
+            RuntimePublishFailure::RejectedBeforePublish(failure.into())
+        }
+        _ => RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::injected(stage)),
+    }
+}
+
+fn publish_fault_from_open(
+    stage: RuntimeFileStage,
+    error: RuntimeStoreOpenError,
+) -> RuntimePublishFault {
+    match error {
+        RuntimeStoreOpenError::Io(failure) => failure.into(),
+        _ => RuntimePublishFault::injected(stage),
+    }
+}
+
+fn rejected_injected(stage: RuntimeFileStage) -> RuntimePublishFailure {
+    RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::injected(stage))
+}
+
+fn uncertain_injected(stage: RuntimeFileStage) -> RuntimePublishFailure {
+    RuntimePublishFailure::UncertainAfterPublish(RuntimePublishFault::injected(stage))
+}
+
+fn nix_failure(stage: RuntimeFileStage, error: nix::errno::Errno) -> RuntimeIoFailure {
+    RuntimeIoFailure::new(stage, &errno_to_io(error))
+}
+
+fn errno_to_io(error: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeCommitFailpoint {
+    None,
+    BeforeTempCreate,
+    AfterTempCreate,
+    AfterPartialWrite,
+    BeforeFileSync,
+    AfterFileSync,
+    BeforeRename,
+    AfterRename,
+    BeforeDirectorySync,
+    AfterDirectorySyncBeforeReturn,
+    #[cfg(test)]
+    AbortAfterTempCreate,
+    #[cfg(test)]
+    AbortAfterPartialWrite,
+    #[cfg(test)]
+    AbortBeforeFileSync,
+    #[cfg(test)]
+    AbortAfterFileSync,
+    #[cfg(test)]
+    AbortAfterRename,
+    #[cfg(test)]
+    AbortAfterDirectorySync,
+    #[cfg(test)]
+    AbortAfterDurableCommitBeforeReturn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFileStage {
+    InspectAncestor,
+    InspectDirectory,
+    OpenDirectory,
+    ValidateDirectoryIdentity,
+    InspectFilesystem,
+    ScanDirectory,
+    OpenLock,
+    AcquireLock,
+    ValidateLockIdentity,
+    OpenActive,
+    ReadActive,
+    ValidateActiveIdentity,
+    InspectOrphanTemp,
+    RemoveOrphanTemp,
+    SyncOrphanCleanup,
+    GenerateTempName,
+    ValidateEncodedSnapshot,
+    CreateTemp,
+    InspectTemp,
+    WriteTemp,
+    SyncTemp,
+    Rename,
+    SyncDirectory,
+    ReadBackPublished,
+    ReturnDurableCommit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeIoFailure {
+    pub(crate) stage: RuntimeFileStage,
+    pub(crate) kind: io::ErrorKind,
+}
+
+impl RuntimeIoFailure {
+    fn new(stage: RuntimeFileStage, error: &io::Error) -> Self {
+        Self {
+            stage,
+            kind: error.kind(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimePublishFault {
+    pub(crate) stage: RuntimeFileStage,
+    pub(crate) kind: Option<io::ErrorKind>,
+}
+
+impl RuntimePublishFault {
+    fn injected(stage: RuntimeFileStage) -> Self {
+        Self { stage, kind: None }
+    }
+
+    fn io(stage: RuntimeFileStage, error: &io::Error) -> Self {
+        Self {
+            stage,
+            kind: Some(error.kind()),
+        }
+    }
+
+    fn nix(stage: RuntimeFileStage, error: nix::errno::Errno) -> Self {
+        Self::io(stage, &errno_to_io(error))
+    }
+}
+
+impl From<RuntimeIoFailure> for RuntimePublishFault {
+    fn from(value: RuntimeIoFailure) -> Self {
+        Self {
+            stage: value.stage,
+            kind: Some(value.kind),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimePublishFailure {
+    RejectedBeforePublish(RuntimePublishFault),
+    UncertainAfterPublish(RuntimePublishFault),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeStoreOpenError {
+    InvalidExpectedStoreInstanceId,
+    InvalidExpectedTargetFingerprint,
+    PathMustBeAbsolute,
+    UnsafeDirectoryPath,
+    UnsafeAncestorType,
+    UntrustedAncestor,
+    UnsafeDirectoryType,
+    UnsafeDirectoryMode,
+    DirectoryOwnerMismatch,
+    DirectoryIdentityChanged,
+    UnsupportedFilesystem,
+    UnsafeFileType,
+    UnsafeFileMode,
+    FileOwnerMismatch,
+    NamedFileIdentityChanged,
+    UnknownDirectoryEntry,
+    TooManyOrphanTemps,
+    LockContended,
+    ActiveEmpty,
+    ActiveTooLarge,
+    ActiveAllocationFailed,
+    ActiveChangedDuringRead,
+    StoreInstanceMismatch,
+    TargetFingerprintMismatch,
+    Io(RuntimeIoFailure),
+    Journal(RuntimeJournalError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeStoreError {
+    Stopped,
+    LockOrDirectoryIdentityChanged,
+    ActiveSnapshotChanged,
+    Open(RuntimeStoreOpenError),
+    Journal(RuntimeJournalError),
+    Publish(RuntimePublishFailure),
+}
+
+impl fmt::Display for RuntimeStoreOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Runtime store cannot open: {self:?}")
+    }
+}
+
+impl std::error::Error for RuntimeStoreOpenError {}
+
+impl fmt::Display for RuntimeStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Runtime store stopped: {self:?}")
+    }
+}
+
+impl std::error::Error for RuntimeStoreError {}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::fs::{self, OpenOptions};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    use paraegox_kernel::digest::Digest32;
+
+    use super::{
+        ACTIVE_FILE_NAME, LOCK_FILE_NAME, LinuxMountEvidenceError, MAX_LINUX_FDINFO_BYTES,
+        MAX_LINUX_FDINFO_LINE_BYTES, MAX_LINUX_FDINFO_RECORDS, MAX_LINUX_MOUNTINFO_BYTES,
+        MAX_LINUX_MOUNTINFO_LINE_BYTES, MAX_LINUX_MOUNTINFO_RECORDS, MAX_ORPHAN_TEMP_FILES,
+        MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, RuntimeCommitFailpoint, RuntimeFileStage,
+        RuntimeFilesystemPolicy, RuntimePublishFailure, RuntimeStore, RuntimeStoreError,
+        RuntimeStoreOpenError, TEMP_FILE_PREFIX, parse_linux_fdinfo_mount_id,
+        parse_linux_mountinfo_exact_ext4, temp_name,
+    };
+    use crate::runtime_journal::{
+        HostClockAdmissionState, LiveMaterialization, OpaqueCanonicalValue, ReplayLedgerRecord,
+        RuntimeJournalError, RuntimeJournalSnapshot, RuntimeJournalState,
+        RuntimeJournalTransaction, WriterFenceRecord,
+    };
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    fn mountinfo_record(mount_id: usize, filesystem_type: &str) -> Vec<u8> {
+        format!("{mount_id} 1 8:1 / / rw,nosuid - {filesystem_type} /dev/root rw\n").into_bytes()
+    }
+
+    #[test]
+    fn linux_mount_evidence_accepts_only_a_unique_exact_ext4_record() {
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(b"pos:\t0\nflags:\t0100000\nmnt_id:\t42\n"),
+            Ok(42)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&mountinfo_record(42, "ext4"), 42),
+            Ok(())
+        );
+        for filesystem_type in ["ext2", "ext3", "overlay", "ext4foo", "EXT4", "ext4."] {
+            assert_eq!(
+                parse_linux_mountinfo_exact_ext4(&mountinfo_record(42, filesystem_type), 42,),
+                Err(LinuxMountEvidenceError::UnexpectedFilesystemType)
+            );
+        }
+    }
+
+    #[test]
+    fn linux_mount_evidence_rejects_missing_duplicate_and_malformed_records() {
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(b"pos:\t0\nflags:\t0100000\n"),
+            Err(LinuxMountEvidenceError::MissingMountId)
+        );
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(b"mnt_id:\t42\nmnt_id:\t42\n"),
+            Err(LinuxMountEvidenceError::DuplicateMountId)
+        );
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(b"mnt_id:\tnot-a-number\n"),
+            Err(LinuxMountEvidenceError::MalformedFdInfo)
+        );
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(b"mnt_id:\t42"),
+            Err(LinuxMountEvidenceError::MalformedFdInfo)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&mountinfo_record(41, "ext4"), 42),
+            Err(LinuxMountEvidenceError::MissingMountRecord)
+        );
+        let mut duplicate = mountinfo_record(42, "ext4");
+        duplicate.extend_from_slice(&mountinfo_record(42, "ext4"));
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&duplicate, 42),
+            Err(LinuxMountEvidenceError::DuplicateMountRecord)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(b"42 1 8:1 / / rw ext4 /dev/root rw\n", 42),
+            Err(LinuxMountEvidenceError::MalformedMountInfo)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(b"42 1 bad / / rw - ext4 /dev/root rw\n", 42),
+            Err(LinuxMountEvidenceError::MalformedMountInfo)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(b"42 1 8:1 / / rw - ext4 /dev/root rw", 42),
+            Err(LinuxMountEvidenceError::MalformedMountInfo)
+        );
+    }
+
+    #[test]
+    fn linux_mount_evidence_parser_work_is_strictly_bounded() {
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(&vec![b'x'; MAX_LINUX_FDINFO_BYTES + 1]),
+            Err(LinuxMountEvidenceError::EvidenceTooLarge)
+        );
+        let mut long_fdinfo_line = vec![b'x'; MAX_LINUX_FDINFO_LINE_BYTES + 1];
+        long_fdinfo_line.push(b'\n');
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(&long_fdinfo_line),
+            Err(LinuxMountEvidenceError::LineTooLong)
+        );
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(&b"field:\tvalue\n".repeat(MAX_LINUX_FDINFO_RECORDS + 1),),
+            Err(LinuxMountEvidenceError::TooManyRecords)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&vec![b'x'; MAX_LINUX_MOUNTINFO_BYTES + 1], 42,),
+            Err(LinuxMountEvidenceError::EvidenceTooLarge)
+        );
+        let mut long_mountinfo_line = vec![b'x'; MAX_LINUX_MOUNTINFO_LINE_BYTES + 1];
+        long_mountinfo_line.push(b'\n');
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&long_mountinfo_line, 42),
+            Err(LinuxMountEvidenceError::LineTooLong)
+        );
+        let mut too_many_mounts = Vec::new();
+        for mount_id in 1..=MAX_LINUX_MOUNTINFO_RECORDS + 1 {
+            too_many_mounts.extend_from_slice(&mountinfo_record(mount_id, "ext4"));
+        }
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&too_many_mounts, 1),
+            Err(LinuxMountEvidenceError::TooManyRecords)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_reference_rejects_dev_shm_tmpfs() {
+        let path = Path::new("/dev/shm").join(format!(
+            "paraegox-runtime-fs-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path)
+            .unwrap_or_else(|error| panic!("/dev/shm Runtime fixture create failed: {error}"));
+        set_mode(&path, 0o700);
+        let error =
+            super::open_runtime_directory(&path, RuntimeFilesystemPolicy::ProductionReference)
+                .err();
+        fs::remove_dir(&path)
+            .unwrap_or_else(|cleanup| panic!("/dev/shm Runtime fixture cleanup failed: {cleanup}"));
+        assert_eq!(error, Some(RuntimeStoreOpenError::UnsupportedFilesystem));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_reference_rejects_apfs_until_fd_anchored_acl_evidence_exists() {
+        let directory = TestDirectory::new();
+        assert_eq!(
+            super::open_runtime_directory(
+                directory.path(),
+                RuntimeFilesystemPolicy::ProductionReference,
+            )
+            .expect_err("APFS must remain unsupported without FD-anchored ACL evidence"),
+            RuntimeStoreOpenError::UnsupportedFilesystem
+        );
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let fixture_root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|error| panic!("fixture root canonicalize failed: {error}"));
+            let path = fixture_root.join(format!(
+                "paraegox-runtime-store-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path)
+                .unwrap_or_else(|error| panic!("fixture directory create failed: {error}"));
+            set_mode(&path, 0o700);
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|error| panic!("fixture chmod failed: {error}"));
+    }
+
+    fn digest(byte: u8) -> Digest32 {
+        Digest32::from_bytes([byte; 32])
+    }
+
+    fn pinned(bytes: &[u8], digest_byte: u8) -> OpaqueCanonicalValue {
+        OpaqueCanonicalValue::try_pinned_artifact(bytes, digest(digest_byte))
+            .unwrap_or_else(|error| panic!("fixture pinned artifact failed: {error}"))
+    }
+
+    fn sequence_one_state() -> RuntimeJournalState {
+        RuntimeJournalState {
+            last_transaction: RuntimeJournalTransaction::Initialized,
+            host: HostClockAdmissionState {
+                runtime_host_epoch_high_water: 0,
+                clock_domain: [0x33; 16],
+                clock_generation_high_water: 0,
+                build_descriptor: pinned(b"descriptor-v1", 0x44),
+                singleton_manifest: pinned(b"manifest-v1", 0x55),
+                store_pinned_build_identity: pinned(b"build-identity-v1", 0x56),
+                compiled_build_instance_id: [0x57; 32],
+                compiled_compatibility_digest: digest(0x58),
+                admission_policy_fingerprint: digest(0x66),
+                channel_policy_fingerprint: digest(0x67),
+                controller_key_fingerprint: digest(0x68),
+                tenure_nonces: Vec::new(),
+                request_nonces: Vec::new(),
+                temporal_lineages: Vec::new(),
+            },
+            writer_fence: None,
+            source_revision_high_water: None,
+            prepared: None,
+            active_desired: None,
+            live_materialization: LiveMaterialization::None,
+            recovery_action: None,
+            recovery_terminals: Vec::new(),
+            owned_resources: Vec::new(),
+            terminal_operations: Vec::new(),
+        }
+    }
+
+    fn initialized_idle_state() -> RuntimeJournalState {
+        let mut state = sequence_one_state();
+        state.last_transaction = RuntimeJournalTransaction::StartupInvalidation;
+        state.host.runtime_host_epoch_high_water = 3;
+        state.host.clock_generation_high_water = 5;
+        state
+    }
+
+    fn tenure_successor_state(previous: &RuntimeJournalState) -> RuntimeJournalState {
+        let mut current = previous.clone();
+        current.last_transaction = RuntimeJournalTransaction::TenureOnly;
+        current.host.tenure_nonces.push(ReplayLedgerRecord {
+            identity: digest(0x20),
+            value_digest: digest(0x21),
+        });
+        current.writer_fence = Some(WriterFenceRecord {
+            source_scope: [0x01; 16],
+            writer: [0x02; 16],
+            epoch: 1,
+            proof_envelope_digest: digest(0x21),
+            tenure_nonce_identity: digest(0x20),
+            principal: [0x03; 16],
+        });
+        current
+    }
+
+    fn sequence_one_snapshot(store: u8, target: u8) -> RuntimeJournalSnapshot {
+        RuntimeJournalSnapshot::try_new([store; 32], digest(target), 1, sequence_one_state())
+            .unwrap_or_else(|error| panic!("sequence-one fixture failed: {error}"))
+    }
+
+    fn idle_snapshot(store: u8, target: u8) -> RuntimeJournalSnapshot {
+        RuntimeJournalSnapshot::try_new([store; 32], digest(target), 2, initialized_idle_state())
+            .unwrap_or_else(|error| panic!("idle fixture failed: {error}"))
+    }
+
+    fn tenure_successor(previous: &RuntimeJournalSnapshot) -> RuntimeJournalSnapshot {
+        RuntimeJournalSnapshot::try_new(
+            *previous.store_instance_id(),
+            *previous.owner_target_fingerprint(),
+            previous.sequence() + 1,
+            tenure_successor_state(previous.state()),
+        )
+        .unwrap_or_else(|error| panic!("tenure successor fixture failed: {error}"))
+    }
+
+    fn install_private_file(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap_or_else(|error| panic!("fixture file write failed: {error}"));
+        set_mode(path, 0o600);
+    }
+
+    fn install_store(directory: &Path, snapshot: &RuntimeJournalSnapshot) {
+        install_private_file(&directory.join(LOCK_FILE_NAME), b"");
+        install_private_file(&directory.join(ACTIVE_FILE_NAME), snapshot.canonical_wire());
+    }
+
+    fn open_fixture(
+        directory: &Path,
+        snapshot: &RuntimeJournalSnapshot,
+    ) -> Result<RuntimeStore, RuntimeStoreOpenError> {
+        RuntimeStore::open_with_policy(
+            directory,
+            *snapshot.store_instance_id(),
+            *snapshot.owner_target_fingerprint(),
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+    }
+
+    fn fixture_with_snapshot(snapshot: &RuntimeJournalSnapshot) -> TestDirectory {
+        let directory = TestDirectory::new();
+        install_store(directory.path(), snapshot);
+        directory
+    }
+
+    fn install_orphan(directory: &Path, token: [u8; 16], bytes: &[u8]) -> PathBuf {
+        let path = directory.join(temp_name(token));
+        install_private_file(&path, bytes);
+        path
+    }
+
+    fn orphan_count(directory: &Path) -> usize {
+        fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("fixture directory read failed: {error}"))
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(TEMP_FILE_PREFIX))
+            })
+            .count()
+    }
+
+    fn decode_active(directory: &Path) -> RuntimeJournalSnapshot {
+        let bytes = fs::read(directory.join(ACTIVE_FILE_NAME))
+            .unwrap_or_else(|error| panic!("fixture active read failed: {error}"));
+        RuntimeJournalSnapshot::decode(&bytes)
+            .unwrap_or_else(|error| panic!("fixture active decode failed: {error}"))
+    }
+
+    fn assert_cloexec(file: &fs::File) {
+        let raw_flags = fcntl(file, FcntlArg::F_GETFD)
+            .unwrap_or_else(|error| panic!("F_GETFD failed: {error}"));
+        assert!(FdFlag::from_bits_truncate(raw_flags).contains(FdFlag::FD_CLOEXEC));
+    }
+
+    #[test]
+    fn invalid_expected_identity_precedes_all_path_and_filesystem_io() {
+        let nonexistent_relative = Path::new("relative/does-not-exist");
+        assert_eq!(
+            RuntimeStore::open_with_policy(
+                nonexistent_relative,
+                [0; 32],
+                digest(0x22),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            )
+            .err(),
+            Some(RuntimeStoreOpenError::InvalidExpectedStoreInstanceId)
+        );
+        assert_eq!(
+            RuntimeStore::open_with_policy(
+                nonexistent_relative,
+                [0x11; 32],
+                Digest32::from_bytes([0; 32]),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            )
+            .err(),
+            Some(RuntimeStoreOpenError::InvalidExpectedTargetFingerprint)
+        );
+    }
+
+    #[test]
+    fn open_binds_exact_store_target_and_bounded_canonical_active() {
+        let snapshot = sequence_one_snapshot(0x11, 0x22);
+        let directory = fixture_with_snapshot(&snapshot);
+        let store = open_fixture(directory.path(), &snapshot)
+            .unwrap_or_else(|error| panic!("valid Runtime store rejected: {error}"));
+        assert_eq!(
+            store
+                .snapshot()
+                .unwrap_or_else(|error| panic!("valid snapshot unavailable: {error}")),
+            &snapshot
+        );
+        drop(store);
+
+        assert_eq!(
+            RuntimeStore::open_with_policy(
+                directory.path(),
+                [0x12; 32],
+                *snapshot.owner_target_fingerprint(),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            )
+            .err(),
+            Some(RuntimeStoreOpenError::StoreInstanceMismatch)
+        );
+        assert_eq!(
+            RuntimeStore::open_with_policy(
+                directory.path(),
+                *snapshot.store_instance_id(),
+                digest(0x23),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            )
+            .err(),
+            Some(RuntimeStoreOpenError::TargetFingerprintMismatch)
+        );
+
+        let corrupt = fixture_with_snapshot(&snapshot);
+        let mut bytes = snapshot.canonical_wire().to_vec();
+        let last = bytes
+            .last_mut()
+            .unwrap_or_else(|| panic!("snapshot fixture must not be empty"));
+        *last ^= 1;
+        install_private_file(&corrupt.path().join(ACTIVE_FILE_NAME), &bytes);
+        assert_eq!(
+            open_fixture(corrupt.path(), &snapshot).err(),
+            Some(RuntimeStoreOpenError::Journal(
+                RuntimeJournalError::ChecksumMismatch
+            ))
+        );
+
+        let oversized = fixture_with_snapshot(&snapshot);
+        let active = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(oversized.path().join(ACTIVE_FILE_NAME))
+            .unwrap_or_else(|error| panic!("oversized fixture open failed: {error}"));
+        active
+            .set_len(
+                u64::try_from(MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES + 1)
+                    .unwrap_or_else(|_| panic!("snapshot maximum must fit u64")),
+            )
+            .unwrap_or_else(|error| panic!("oversized fixture set_len failed: {error}"));
+        drop(active);
+        assert_eq!(
+            open_fixture(oversized.path(), &snapshot).err(),
+            Some(RuntimeStoreOpenError::ActiveTooLarge)
+        );
+    }
+
+    #[test]
+    fn path_directory_and_regular_file_security_fail_closed() {
+        let snapshot = sequence_one_snapshot(0x11, 0x22);
+        assert_eq!(
+            RuntimeStore::open_with_policy(
+                Path::new("relative/runtime-state"),
+                *snapshot.store_instance_id(),
+                *snapshot.owner_target_fingerprint(),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            )
+            .err(),
+            Some(RuntimeStoreOpenError::PathMustBeAbsolute)
+        );
+
+        let target = fixture_with_snapshot(&snapshot);
+        let link_parent = TestDirectory::new();
+        let link = link_parent.path().join("runtime-link");
+        symlink(target.path(), &link)
+            .unwrap_or_else(|error| panic!("directory symlink fixture failed: {error}"));
+        assert!(matches!(
+            open_fixture(&link, &snapshot),
+            Err(RuntimeStoreOpenError::UnsafeDirectoryType)
+                | Err(RuntimeStoreOpenError::UnsafeAncestorType)
+        ));
+
+        let unsafe_mode = fixture_with_snapshot(&snapshot);
+        set_mode(unsafe_mode.path(), 0o750);
+        assert_eq!(
+            open_fixture(unsafe_mode.path(), &snapshot).err(),
+            Some(RuntimeStoreOpenError::UnsafeDirectoryMode)
+        );
+
+        let ancestor_root = TestDirectory::new();
+        let peer_writable = ancestor_root.path().join("peer-writable");
+        fs::create_dir(&peer_writable)
+            .unwrap_or_else(|error| panic!("peer-writable fixture create failed: {error}"));
+        set_mode(&peer_writable, 0o770);
+        let state = peer_writable.join("state");
+        fs::create_dir(&state)
+            .unwrap_or_else(|error| panic!("state fixture create failed: {error}"));
+        set_mode(&state, 0o700);
+        install_store(&state, &snapshot);
+        assert_eq!(
+            open_fixture(&state, &snapshot).err(),
+            Some(RuntimeStoreOpenError::UntrustedAncestor)
+        );
+
+        let unsafe_file_mode = fixture_with_snapshot(&snapshot);
+        set_mode(&unsafe_file_mode.path().join(ACTIVE_FILE_NAME), 0o640);
+        assert_eq!(
+            open_fixture(unsafe_file_mode.path(), &snapshot).err(),
+            Some(RuntimeStoreOpenError::UnsafeFileMode)
+        );
+
+        let hardlinked = fixture_with_snapshot(&snapshot);
+        fs::hard_link(
+            hardlinked.path().join(ACTIVE_FILE_NAME),
+            hardlinked.path().join("active-hardlink"),
+        )
+        .unwrap_or_else(|error| panic!("hardlink fixture failed: {error}"));
+        assert_eq!(
+            open_fixture(hardlinked.path(), &snapshot).err(),
+            Some(RuntimeStoreOpenError::UnsafeFileType)
+        );
+
+        let symlinked_active = fixture_with_snapshot(&snapshot);
+        fs::remove_file(symlinked_active.path().join(ACTIVE_FILE_NAME))
+            .unwrap_or_else(|error| panic!("active removal failed: {error}"));
+        symlink(
+            symlinked_active.path().join(LOCK_FILE_NAME),
+            symlinked_active.path().join(ACTIVE_FILE_NAME),
+        )
+        .unwrap_or_else(|error| panic!("active symlink fixture failed: {error}"));
+        assert!(matches!(
+            open_fixture(symlinked_active.path(), &snapshot),
+            Err(RuntimeStoreOpenError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn lock_and_directory_handles_are_cloexec_and_second_writer_is_rejected() {
+        let snapshot = sequence_one_snapshot(0x11, 0x22);
+        let directory = fixture_with_snapshot(&snapshot);
+        let first = open_fixture(directory.path(), &snapshot)
+            .unwrap_or_else(|error| panic!("first Runtime store open failed: {error}"));
+        assert_cloexec(&first.lock_file);
+        assert_cloexec(&first.directory.file);
+        assert_eq!(
+            open_fixture(directory.path(), &snapshot).err(),
+            Some(RuntimeStoreOpenError::LockContended)
+        );
+    }
+
+    #[test]
+    fn normal_drop_unlocks_even_while_a_fork_like_descriptor_reference_survives() {
+        let snapshot = sequence_one_snapshot(0x11, 0x22);
+        let directory = fixture_with_snapshot(&snapshot);
+        let first = open_fixture(directory.path(), &snapshot)
+            .unwrap_or_else(|error| panic!("first Runtime store open failed: {error}"));
+        let inherited_lock_reference = first
+            .lock_file
+            .try_clone()
+            .unwrap_or_else(|error| panic!("lock descriptor clone failed: {error}"));
+
+        drop(first);
+        let replacement = open_fixture(directory.path(), &snapshot)
+            .unwrap_or_else(|error| panic!("replacement Runtime store open failed: {error}"));
+
+        drop(replacement);
+        drop(inherited_lock_reference);
+    }
+
+    #[test]
+    fn revalidation_detects_active_content_or_file_identity_change_and_stops() {
+        let snapshot = sequence_one_snapshot(0x11, 0x22);
+        let directory = fixture_with_snapshot(&snapshot);
+        let mut store = open_fixture(directory.path(), &snapshot)
+            .unwrap_or_else(|error| panic!("Runtime store open failed: {error}"));
+        let replacement_path = directory.path().join("replacement");
+        install_private_file(&replacement_path, snapshot.canonical_wire());
+        fs::rename(&replacement_path, directory.path().join(ACTIVE_FILE_NAME))
+            .unwrap_or_else(|error| panic!("active replacement failed: {error}"));
+        assert_eq!(
+            store.revalidate_current().err(),
+            Some(RuntimeStoreError::ActiveSnapshotChanged)
+        );
+        assert_eq!(store.snapshot().err(), Some(RuntimeStoreError::Stopped));
+
+        let idle = idle_snapshot(0x31, 0x32);
+        let changed = tenure_successor(&idle);
+        let changed_directory = fixture_with_snapshot(&idle);
+        let mut changed_store = open_fixture(changed_directory.path(), &idle)
+            .unwrap_or_else(|error| panic!("changed fixture open failed: {error}"));
+        install_private_file(
+            &changed_directory.path().join(ACTIVE_FILE_NAME),
+            changed.canonical_wire(),
+        );
+        assert_eq!(
+            changed_store.revalidate_current().err(),
+            Some(RuntimeStoreError::ActiveSnapshotChanged)
+        );
+        assert_eq!(
+            changed_store.revalidate_current().err(),
+            Some(RuntimeStoreError::Stopped)
+        );
+    }
+
+    #[test]
+    fn commit_requires_exact_successor_and_publishes_canonical_bytes() {
+        let previous = idle_snapshot(0x41, 0x42);
+        let next = tenure_successor(&previous);
+        assert_eq!(next.validate_successor_of(&previous), Ok(()));
+        let directory = fixture_with_snapshot(&previous);
+        let mut store = open_fixture(directory.path(), &previous)
+            .unwrap_or_else(|error| panic!("Runtime store open failed: {error}"));
+        store
+            .commit_with(next.clone(), [0x51; 16], RuntimeCommitFailpoint::None)
+            .unwrap_or_else(|error| panic!("valid Runtime commit failed: {error}"));
+        assert_eq!(
+            store
+                .snapshot()
+                .unwrap_or_else(|error| panic!("published snapshot unavailable: {error}")),
+            &next
+        );
+        assert_eq!(
+            fs::read(directory.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("published bytes read failed: {error}")),
+            next.canonical_wire()
+        );
+        drop(store);
+        let reopened = open_fixture(directory.path(), &next)
+            .unwrap_or_else(|error| panic!("published Runtime store reopen failed: {error}"));
+        assert_eq!(
+            reopened
+                .snapshot()
+                .unwrap_or_else(|error| panic!("reopened snapshot unavailable: {error}")),
+            &next
+        );
+
+        let invalid_directory = fixture_with_snapshot(&previous);
+        let mut invalid_store = open_fixture(invalid_directory.path(), &previous)
+            .unwrap_or_else(|error| panic!("invalid fixture open failed: {error}"));
+        assert_eq!(
+            invalid_store
+                .commit_with(previous.clone(), [0x52; 16], RuntimeCommitFailpoint::None,)
+                .err(),
+            Some(RuntimeStoreError::Journal(
+                RuntimeJournalError::NonMonotonicTransition
+            ))
+        );
+        assert_eq!(
+            invalid_store.snapshot().err(),
+            Some(RuntimeStoreError::Stopped)
+        );
+        assert_eq!(decode_active(invalid_directory.path()), previous);
+    }
+
+    #[test]
+    fn commit_checks_state_successor_and_disk_before_requesting_temp_entropy() {
+        let previous = idle_snapshot(0x53, 0x54);
+        let next = tenure_successor(&previous);
+
+        let invalid_directory = fixture_with_snapshot(&previous);
+        let mut invalid_store = open_fixture(invalid_directory.path(), &previous)
+            .unwrap_or_else(|error| panic!("invalid fixture open failed: {error}"));
+        let invalid_entropy_called = Cell::new(false);
+        assert_eq!(
+            invalid_store
+                .commit_with_entropy(previous.clone(), RuntimeCommitFailpoint::None, || {
+                    invalid_entropy_called.set(true);
+                    Ok([0x61; 16])
+                },)
+                .err(),
+            Some(RuntimeStoreError::Journal(
+                RuntimeJournalError::NonMonotonicTransition
+            ))
+        );
+        assert!(!invalid_entropy_called.get());
+
+        let stopped_entropy_called = Cell::new(false);
+        assert_eq!(
+            invalid_store
+                .commit_with_entropy(next.clone(), RuntimeCommitFailpoint::None, || {
+                    stopped_entropy_called.set(true);
+                    Ok([0x62; 16])
+                })
+                .err(),
+            Some(RuntimeStoreError::Stopped)
+        );
+        assert!(!stopped_entropy_called.get());
+
+        let changed_directory = fixture_with_snapshot(&previous);
+        let mut changed_store = open_fixture(changed_directory.path(), &previous)
+            .unwrap_or_else(|error| panic!("changed fixture open failed: {error}"));
+        let replacement_path = changed_directory.path().join("replacement");
+        install_private_file(&replacement_path, previous.canonical_wire());
+        fs::rename(
+            &replacement_path,
+            changed_directory.path().join(ACTIVE_FILE_NAME),
+        )
+        .unwrap_or_else(|error| panic!("changed active install failed: {error}"));
+        let changed_entropy_called = Cell::new(false);
+        assert_eq!(
+            changed_store
+                .commit_with_entropy(next.clone(), RuntimeCommitFailpoint::None, || {
+                    changed_entropy_called.set(true);
+                    Ok([0x63; 16])
+                })
+                .err(),
+            Some(RuntimeStoreError::ActiveSnapshotChanged)
+        );
+        assert!(!changed_entropy_called.get());
+
+        let entropy_directory = fixture_with_snapshot(&previous);
+        let mut entropy_store = open_fixture(entropy_directory.path(), &previous)
+            .unwrap_or_else(|error| panic!("entropy fixture open failed: {error}"));
+        let entropy_called = Cell::new(false);
+        let error = entropy_store
+            .commit_with_entropy(next, RuntimeCommitFailpoint::None, || {
+                entropy_called.set(true);
+                Err(std::io::Error::other("fixture entropy unavailable"))
+            })
+            .expect_err("entropy failure must reject commit");
+        assert!(entropy_called.get());
+        assert!(matches!(
+            error,
+            RuntimeStoreError::Publish(RuntimePublishFailure::RejectedBeforePublish(fault))
+                if fault.stage == RuntimeFileStage::GenerateTempName
+        ));
+        assert_eq!(
+            entropy_store.snapshot().err(),
+            Some(RuntimeStoreError::Stopped)
+        );
+        assert_eq!(decode_active(entropy_directory.path()), previous);
+    }
+
+    #[test]
+    fn pre_rename_failures_keep_old_active_and_restart_discards_only_temps() {
+        let failpoints = [
+            RuntimeCommitFailpoint::BeforeTempCreate,
+            RuntimeCommitFailpoint::AfterTempCreate,
+            RuntimeCommitFailpoint::AfterPartialWrite,
+            RuntimeCommitFailpoint::BeforeFileSync,
+            RuntimeCommitFailpoint::AfterFileSync,
+            RuntimeCommitFailpoint::BeforeRename,
+        ];
+        for (index, failpoint) in failpoints.into_iter().enumerate() {
+            let previous = idle_snapshot(0x61, 0x62);
+            let next = tenure_successor(&previous);
+            let directory = fixture_with_snapshot(&previous);
+            let mut store = open_fixture(directory.path(), &previous)
+                .unwrap_or_else(|error| panic!("Runtime store open failed: {error}"));
+            let token_byte =
+                u8::try_from(index + 1).unwrap_or_else(|_| panic!("fixture token index must fit"));
+            assert!(matches!(
+                store.commit_with(next, [token_byte; 16], failpoint),
+                Err(RuntimeStoreError::Publish(
+                    RuntimePublishFailure::RejectedBeforePublish(_)
+                ))
+            ));
+            assert_eq!(store.snapshot().err(), Some(RuntimeStoreError::Stopped));
+            assert_eq!(decode_active(directory.path()), previous);
+            drop(store);
+
+            let reopened = open_fixture(directory.path(), &previous).unwrap_or_else(|error| {
+                panic!("old authoritative Runtime store failed to reopen: {error}")
+            });
+            assert_eq!(
+                reopened
+                    .snapshot()
+                    .unwrap_or_else(|error| panic!("reopened snapshot unavailable: {error}")),
+                &previous
+            );
+            assert_eq!(orphan_count(directory.path()), 0);
+        }
+    }
+
+    #[test]
+    fn post_rename_uncertainty_stops_owner_and_restart_selects_exact_new_active() {
+        for (index, failpoint) in [
+            RuntimeCommitFailpoint::AfterRename,
+            RuntimeCommitFailpoint::BeforeDirectorySync,
+            RuntimeCommitFailpoint::AfterDirectorySyncBeforeReturn,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let previous = idle_snapshot(0x71, 0x72);
+            let next = tenure_successor(&previous);
+            let directory = fixture_with_snapshot(&previous);
+            let mut store = open_fixture(directory.path(), &previous)
+                .unwrap_or_else(|error| panic!("Runtime store open failed: {error}"));
+            let token_byte =
+                u8::try_from(index + 20).unwrap_or_else(|_| panic!("fixture token index must fit"));
+            assert!(matches!(
+                store.commit_with(next.clone(), [token_byte; 16], failpoint),
+                Err(RuntimeStoreError::Publish(
+                    RuntimePublishFailure::UncertainAfterPublish(_)
+                ))
+            ));
+            assert_eq!(store.snapshot().err(), Some(RuntimeStoreError::Stopped));
+            assert_eq!(decode_active(directory.path()), next);
+            drop(store);
+
+            let reopened = open_fixture(directory.path(), &next).unwrap_or_else(|error| {
+                panic!("new authoritative Runtime store failed to reopen: {error}")
+            });
+            assert_eq!(
+                reopened
+                    .snapshot()
+                    .unwrap_or_else(|error| panic!("reopened snapshot unavailable: {error}")),
+                &next
+            );
+        }
+    }
+
+    #[test]
+    fn restart_never_promotes_temp_and_only_cleans_after_valid_active_wins() {
+        let previous = idle_snapshot(0x81, 0x82);
+        let next = tenure_successor(&previous);
+
+        let invalid_active = fixture_with_snapshot(&previous);
+        let orphan = install_orphan(invalid_active.path(), [0x31; 16], next.canonical_wire());
+        let mut corrupt = previous.canonical_wire().to_vec();
+        corrupt[0] ^= 1;
+        install_private_file(&invalid_active.path().join(ACTIVE_FILE_NAME), &corrupt);
+        assert!(matches!(
+            open_fixture(invalid_active.path(), &previous),
+            Err(RuntimeStoreOpenError::Journal(_))
+        ));
+        assert!(orphan.is_file());
+
+        let valid_active = fixture_with_snapshot(&previous);
+        let higher_temp = install_orphan(valid_active.path(), [0x32; 16], next.canonical_wire());
+        let store = open_fixture(valid_active.path(), &previous)
+            .unwrap_or_else(|error| panic!("valid active with orphan rejected: {error}"));
+        assert_eq!(
+            store
+                .snapshot()
+                .unwrap_or_else(|error| panic!("authoritative snapshot unavailable: {error}")),
+            &previous
+        );
+        assert!(!higher_temp.exists());
+        assert_eq!(decode_active(valid_active.path()), previous);
+    }
+
+    #[test]
+    fn orphan_scan_is_all_or_nothing_for_unknown_entries_and_capacity() {
+        let snapshot = sequence_one_snapshot(0x91, 0x92);
+        let unknown = fixture_with_snapshot(&snapshot);
+        let orphan = install_orphan(unknown.path(), [0x41; 16], b"orphan");
+        install_private_file(&unknown.path().join("unexpected"), b"unknown");
+        assert_eq!(
+            open_fixture(unknown.path(), &snapshot).err(),
+            Some(RuntimeStoreOpenError::UnknownDirectoryEntry)
+        );
+        assert!(orphan.is_file());
+
+        let overflow = fixture_with_snapshot(&snapshot);
+        let mut orphans = Vec::new();
+        for index in 0..=MAX_ORPHAN_TEMP_FILES {
+            let mut token = [0_u8; 16];
+            token[14..].copy_from_slice(
+                &u16::try_from(index + 1)
+                    .unwrap_or_else(|_| panic!("fixture orphan index must fit"))
+                    .to_be_bytes(),
+            );
+            orphans.push(install_orphan(overflow.path(), token, b"orphan"));
+        }
+        assert_eq!(
+            open_fixture(overflow.path(), &snapshot).err(),
+            Some(RuntimeStoreOpenError::TooManyOrphanTemps)
+        );
+        assert!(orphans.iter().all(|path| path.is_file()));
+    }
+
+    #[test]
+    fn subprocess_crashes_leave_only_the_strict_old_or_new_active_snapshot() {
+        let cases = [
+            ("temp-create", false),
+            ("partial-write", false),
+            ("before-file-fsync", false),
+            ("file-fsync", false),
+            ("rename", true),
+            ("directory-fsync", true),
+            ("durable-commit-before-return", true),
+        ];
+        for (point, published) in cases {
+            let previous = idle_snapshot(0xb1, 0xb2);
+            let next = tenure_successor(&previous);
+            let directory = fixture_with_snapshot(&previous);
+            let status = Command::new(
+                std::env::current_exe()
+                    .unwrap_or_else(|error| panic!("test executable lookup failed: {error}")),
+            )
+            .args([
+                "--exact",
+                "runtime_store::tests::subprocess_publish_crash_child",
+                "--nocapture",
+            ])
+            .env("PARAEGOX_TEST_RUNTIME_CRASH_STORE", directory.path())
+            .env("PARAEGOX_TEST_RUNTIME_CRASH_POINT", point)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|error| panic!("crash child spawn failed: {error}"));
+            assert!(!status.success(), "crash child returned at {point}");
+
+            let expected = if published { &next } else { &previous };
+            let recovered = open_fixture(directory.path(), expected)
+                .unwrap_or_else(|error| panic!("post-crash open failed at {point}: {error}"));
+            assert_eq!(
+                recovered.snapshot().unwrap_or_else(|error| {
+                    panic!("post-crash snapshot unavailable at {point}: {error}")
+                }),
+                expected
+            );
+            assert_eq!(decode_active(directory.path()), expected.clone());
+            assert_eq!(orphan_count(directory.path()), 0);
+        }
+    }
+
+    #[test]
+    fn subprocess_publish_crash_child() {
+        let Some(store) = std::env::var_os("PARAEGOX_TEST_RUNTIME_CRASH_STORE") else {
+            return;
+        };
+        let point = std::env::var("PARAEGOX_TEST_RUNTIME_CRASH_POINT")
+            .unwrap_or_else(|error| panic!("crash point missing: {error}"));
+        let failpoint = match point.as_str() {
+            "temp-create" => RuntimeCommitFailpoint::AbortAfterTempCreate,
+            "partial-write" => RuntimeCommitFailpoint::AbortAfterPartialWrite,
+            "before-file-fsync" => RuntimeCommitFailpoint::AbortBeforeFileSync,
+            "file-fsync" => RuntimeCommitFailpoint::AbortAfterFileSync,
+            "rename" => RuntimeCommitFailpoint::AbortAfterRename,
+            "directory-fsync" => RuntimeCommitFailpoint::AbortAfterDirectorySync,
+            "durable-commit-before-return" => {
+                RuntimeCommitFailpoint::AbortAfterDurableCommitBeforeReturn
+            }
+            _ => panic!("unknown Runtime crash point"),
+        };
+        let previous = idle_snapshot(0xb1, 0xb2);
+        let next = tenure_successor(&previous);
+        let mut runtime = open_fixture(Path::new(&store), &previous)
+            .unwrap_or_else(|error| panic!("crash child Runtime open failed: {error}"));
+        let result = runtime.commit_with(next, [0x71; 16], failpoint);
+        panic!("Runtime crash failpoint unexpectedly returned: {result:?}");
+    }
+
+    #[test]
+    fn lock_descriptor_closes_across_exec_even_when_spawned_child_survives_owner() {
+        let snapshot = sequence_one_snapshot(0xc1, 0xc2);
+        let directory = fixture_with_snapshot(&snapshot);
+        let marker_root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("marker root canonicalize failed: {error}"));
+        let marker = marker_root.join(format!(
+            "paraegox-runtime-lock-child-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let status = Command::new(
+            std::env::current_exe()
+                .unwrap_or_else(|error| panic!("test executable lookup failed: {error}")),
+        )
+        .args([
+            "--exact",
+            "runtime_store::tests::subprocess_lock_owner_child",
+            "--nocapture",
+        ])
+        .env("PARAEGOX_TEST_RUNTIME_LOCK_STORE", directory.path())
+        .env("PARAEGOX_TEST_RUNTIME_LOCK_MARKER", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap_or_else(|error| panic!("lock owner child spawn failed: {error}"));
+        assert!(!status.success(), "lock owner child unexpectedly returned");
+        let sleeper_pid = fs::read_to_string(&marker)
+            .unwrap_or_else(|error| panic!("sleeper marker read failed: {error}"));
+
+        let replacement = open_fixture(directory.path(), &snapshot);
+        let _ = Command::new("/bin/kill").arg(sleeper_pid.trim()).status();
+        let _ = fs::remove_file(&marker);
+        replacement.unwrap_or_else(|error| {
+            panic!("replacement could not acquire CLOEXEC-protected Runtime lock: {error}")
+        });
+    }
+
+    #[test]
+    fn subprocess_lock_owner_child() {
+        let Some(store) = std::env::var_os("PARAEGOX_TEST_RUNTIME_LOCK_STORE") else {
+            return;
+        };
+        let marker = std::env::var_os("PARAEGOX_TEST_RUNTIME_LOCK_MARKER")
+            .unwrap_or_else(|| panic!("lock marker missing"));
+        let snapshot = sequence_one_snapshot(0xc1, 0xc2);
+        let _runtime = open_fixture(Path::new(&store), &snapshot)
+            .unwrap_or_else(|error| panic!("lock child Runtime open failed: {error}"));
+        let sleeper = Command::new("/bin/sleep")
+            .arg("10")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|error| panic!("sleeper spawn failed: {error}"));
+        fs::write(marker, sleeper.id().to_string())
+            .unwrap_or_else(|error| panic!("sleeper marker write failed: {error}"));
+        std::process::abort();
+    }
+
+    #[test]
+    fn opened_directory_descriptor_cannot_be_redirected_by_path_replacement() {
+        let previous = idle_snapshot(0xa1, 0xa2);
+        let next = tenure_successor(&previous);
+        let configured = fixture_with_snapshot(&previous);
+        let mut store = open_fixture(configured.path(), &previous)
+            .unwrap_or_else(|error| panic!("Runtime store open failed: {error}"));
+        let configured_path = configured.path().to_path_buf();
+        let retained_path = configured_path.with_extension("opened-directory");
+        fs::rename(&configured_path, &retained_path)
+            .unwrap_or_else(|error| panic!("configured directory rename failed: {error}"));
+        fs::create_dir(&configured_path)
+            .unwrap_or_else(|error| panic!("replacement directory create failed: {error}"));
+        set_mode(&configured_path, 0o700);
+        install_private_file(&configured_path.join("attacker-marker"), b"replacement");
+
+        store
+            .commit_with(next.clone(), [0x51; 16], RuntimeCommitFailpoint::None)
+            .unwrap_or_else(|error| panic!("descriptor-relative commit failed: {error}"));
+        assert_eq!(decode_active(&retained_path), next);
+        assert!(!configured_path.join(ACTIVE_FILE_NAME).exists());
+        assert_eq!(
+            fs::read(configured_path.join("attacker-marker"))
+                .unwrap_or_else(|error| panic!("replacement marker read failed: {error}")),
+            b"replacement"
+        );
+
+        drop(store);
+        fs::remove_dir_all(&configured_path)
+            .unwrap_or_else(|error| panic!("replacement cleanup failed: {error}"));
+        fs::rename(&retained_path, &configured_path)
+            .unwrap_or_else(|error| panic!("configured directory restore failed: {error}"));
+    }
+}

@@ -37,7 +37,7 @@ const PLAN_COMMIT_INTENT_DIGEST_DOMAIN: &[u8] =
 const JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES: usize =
     4 + (5 * size_of::<u16>()) + 32 + 32 + (2 * size_of::<u64>());
 const JOURNAL_HEADER_BYTES: usize = JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES + 32;
-const MAX_CONTROLLER_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_CONTROLLER_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ALLOCATION_RECORDS: usize = 4_096;
 const MAX_CONTROLLER_LEDGER_RECORDS: usize = 256;
 const MAX_CONTROLLER_OPERATIONS: usize = MAX_CONTROLLER_LEDGER_RECORDS;
@@ -2029,6 +2029,22 @@ impl ControllerJournalSnapshot {
             return Err(ControllerJournalError::SnapshotSequenceNotNext);
         }
         self.state.validate_successor_of(&previous.state)
+    }
+
+    pub(crate) const fn store_instance_id(&self) -> &[u8; 32] {
+        &self.store_instance_id
+    }
+
+    pub(crate) const fn owner_identity_fingerprint(&self) -> ControllerOwnerIdentityFingerprint {
+        self.owner_identity_fingerprint
+    }
+
+    pub(crate) const fn snapshot_sequence(&self) -> u64 {
+        self.snapshot_sequence
+    }
+
+    pub(crate) const fn state(&self) -> &ControllerJournalState {
+        &self.state
     }
 
     pub(crate) fn encode(&self) -> Result<Box<[u8]>, ControllerJournalError> {

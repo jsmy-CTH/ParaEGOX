@@ -1,6 +1,8 @@
 use core::fmt;
 use std::fs::{self, File, Metadata, TryLockError};
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -25,6 +27,18 @@ const DIRECTORY_MODE_MASK: u32 = 0o022;
 const PRIVATE_FILE_MODE_BITS: u32 = 0o600;
 const PRIVATE_FILE_MODE_MASK: u32 = 0o7777;
 const PRIVATE_FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_FDINFO_BYTES: usize = 64 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_FDINFO_RECORDS: usize = 256;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_FDINFO_LINE_BYTES: usize = 4 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_MOUNTINFO_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_MOUNTINFO_RECORDS: usize = 4_096;
+#[cfg(any(target_os = "linux", test))]
+const MAX_LINUX_MOUNTINFO_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FilesystemPolicy {
@@ -64,6 +78,15 @@ impl fmt::Debug for AuthorityStore {
             .field("snapshot", &self.snapshot)
             .field("state", &self.state)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AuthorityStore {
+    fn drop(&mut self) {
+        // Fork temporarily duplicates the open-file description. Releasing
+        // the advisory lock explicitly keeps normal owner shutdown from
+        // waiting for an unrelated CLOEXEC child to reach exec.
+        let _ = self.lock_file.unlock();
     }
 }
 
@@ -154,8 +177,14 @@ impl AuthorityStore {
         })
     }
 
-    pub(super) fn snapshot(&self) -> &AuthoritySnapshot {
-        &self.snapshot
+    pub(super) fn snapshot(&self) -> Result<&AuthoritySnapshot, StoreError> {
+        self.ensure_operational()?;
+        Ok(&self.snapshot)
+    }
+
+    #[cfg(test)]
+    pub(super) fn clone_lock_descriptor_for_test(&self) -> io::Result<File> {
+        self.lock_file.try_clone()
     }
 
     pub(super) fn revalidate_current(&mut self) -> Result<&AuthoritySnapshot, StoreError> {
@@ -689,17 +718,273 @@ fn verify_filesystem(directory: &File, _policy: FilesystemPolicy) -> Result<(), 
     if _policy == FilesystemPolicy::ExplicitFixture {
         return Ok(());
     }
-    let stat = nix::sys::statfs::fstatfs(directory)
-        .map_err(|error| StoreOpenError::Io(nix_failure(FileStage::InspectFilesystem, error)))?;
-    #[cfg(target_os = "linux")]
-    if stat.filesystem_type() == nix::sys::statfs::EXT4_SUPER_MAGIC {
-        return Ok(());
-    }
     #[cfg(target_os = "macos")]
-    if stat.filesystem_type_name() == "apfs" {
-        return Ok(());
+    {
+        let _ = directory;
+        Err(StoreOpenError::UnsupportedFilesystem)
     }
-    Err(StoreOpenError::UnsupportedFilesystem)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stat = nix::sys::statfs::fstatfs(directory).map_err(|error| {
+            StoreOpenError::Io(nix_failure(FileStage::InspectFilesystem, error))
+        })?;
+        #[cfg(target_os = "linux")]
+        {
+            if stat.filesystem_type() != nix::sys::statfs::EXT4_SUPER_MAGIC {
+                Err(StoreOpenError::UnsupportedFilesystem)
+            } else {
+                verify_linux_ext4_mount(directory)
+                    .map_err(|_| StoreOpenError::UnsupportedFilesystem)
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = stat;
+            Err(StoreOpenError::UnsupportedFilesystem)
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxMountEvidenceError {
+    Io(io::ErrorKind),
+    AllocationFailed,
+    EvidenceTooLarge,
+    TooManyRecords,
+    LineTooLong,
+    MalformedFdInfo,
+    MissingMountId,
+    DuplicateMountId,
+    MalformedMountInfo,
+    MissingMountRecord,
+    DuplicateMountRecord,
+    UnexpectedFilesystemType,
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_ext4_mount(directory: &File) -> Result<(), LinuxMountEvidenceError> {
+    let fdinfo_path = PathBuf::from(format!("/proc/self/fdinfo/{}", directory.as_raw_fd()));
+    let fdinfo = read_bounded_linux_proc_file(&fdinfo_path, MAX_LINUX_FDINFO_BYTES)?;
+    let mount_id = parse_linux_fdinfo_mount_id(&fdinfo)?;
+    let mountinfo =
+        read_bounded_linux_proc_file(Path::new("/proc/self/mountinfo"), MAX_LINUX_MOUNTINFO_BYTES)?;
+    parse_linux_mountinfo_exact_ext4(&mountinfo, mount_id)
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_linux_proc_file(
+    path: &Path,
+    maximum: usize,
+) -> Result<Vec<u8>, LinuxMountEvidenceError> {
+    let owned = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| LinuxMountEvidenceError::Io(errno_to_io(error).kind()))?;
+    let mut source = File::from(owned);
+    let capacity = maximum
+        .checked_add(1)
+        .ok_or(LinuxMountEvidenceError::EvidenceTooLarge)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| LinuxMountEvidenceError::AllocationFailed)?;
+    let mut chunk = [0_u8; 4_096];
+    loop {
+        let remaining = capacity.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Err(LinuxMountEvidenceError::EvidenceTooLarge);
+        }
+        let read = source
+            .read(&mut chunk[..remaining.min(chunk.len())])
+            .map_err(|error| LinuxMountEvidenceError::Io(error.kind()))?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > maximum {
+            return Err(LinuxMountEvidenceError::EvidenceTooLarge);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_fdinfo_mount_id(bytes: &[u8]) -> Result<u64, LinuxMountEvidenceError> {
+    if bytes.is_empty() || bytes.len() > MAX_LINUX_FDINFO_BYTES || !bytes.ends_with(b"\n") {
+        return Err(if bytes.len() > MAX_LINUX_FDINFO_BYTES {
+            LinuxMountEvidenceError::EvidenceTooLarge
+        } else {
+            LinuxMountEvidenceError::MalformedFdInfo
+        });
+    }
+    let mut record_count = 0_usize;
+    let mut mount_id = None;
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        record_count = record_count
+            .checked_add(1)
+            .ok_or(LinuxMountEvidenceError::TooManyRecords)?;
+        if record_count > MAX_LINUX_FDINFO_RECORDS {
+            return Err(LinuxMountEvidenceError::TooManyRecords);
+        }
+        if line.is_empty() {
+            return Err(LinuxMountEvidenceError::MalformedFdInfo);
+        }
+        if line.len() > MAX_LINUX_FDINFO_LINE_BYTES {
+            return Err(LinuxMountEvidenceError::LineTooLong);
+        }
+        let Some(value) = line.strip_prefix(b"mnt_id:") else {
+            continue;
+        };
+        let parsed = parse_positive_decimal(trim_horizontal_ascii(value))
+            .ok_or(LinuxMountEvidenceError::MalformedFdInfo)?;
+        if mount_id.replace(parsed).is_some() {
+            return Err(LinuxMountEvidenceError::DuplicateMountId);
+        }
+    }
+    mount_id.ok_or(LinuxMountEvidenceError::MissingMountId)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_mountinfo_exact_ext4(
+    bytes: &[u8],
+    expected_mount_id: u64,
+) -> Result<(), LinuxMountEvidenceError> {
+    if bytes.len() > MAX_LINUX_MOUNTINFO_BYTES {
+        return Err(LinuxMountEvidenceError::EvidenceTooLarge);
+    }
+    if expected_mount_id == 0 || bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err(LinuxMountEvidenceError::MalformedMountInfo);
+    }
+    let mut record_count = 0_usize;
+    let mut matched_ext4 = None;
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        record_count = record_count
+            .checked_add(1)
+            .ok_or(LinuxMountEvidenceError::TooManyRecords)?;
+        if record_count > MAX_LINUX_MOUNTINFO_RECORDS {
+            return Err(LinuxMountEvidenceError::TooManyRecords);
+        }
+        if line.is_empty() {
+            return Err(LinuxMountEvidenceError::MalformedMountInfo);
+        }
+        if line.len() > MAX_LINUX_MOUNTINFO_LINE_BYTES {
+            return Err(LinuxMountEvidenceError::LineTooLong);
+        }
+        let mut fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        let mount_id = parse_positive_decimal(
+            fields
+                .next()
+                .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?,
+        )
+        .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+        parse_positive_decimal(
+            fields
+                .next()
+                .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?,
+        )
+        .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+        parse_linux_device_number(
+            fields
+                .next()
+                .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?,
+        )?;
+        for _ in 0..3 {
+            if fields.next().is_none_or(|required| required.is_empty()) {
+                return Err(LinuxMountEvidenceError::MalformedMountInfo);
+            }
+        }
+        let filesystem_type = loop {
+            let field = fields
+                .next()
+                .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+            if field == b"-" {
+                break fields
+                    .next()
+                    .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+            }
+        };
+        let mount_source = fields
+            .next()
+            .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+        let super_options = fields
+            .next()
+            .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+        if filesystem_type.is_empty()
+            || mount_source.is_empty()
+            || super_options.is_empty()
+            || fields.next().is_some()
+        {
+            return Err(LinuxMountEvidenceError::MalformedMountInfo);
+        }
+        if mount_id == expected_mount_id
+            && matched_ext4.replace(filesystem_type == b"ext4").is_some()
+        {
+            return Err(LinuxMountEvidenceError::DuplicateMountRecord);
+        }
+    }
+    match matched_ext4 {
+        Some(true) => Ok(()),
+        Some(false) => Err(LinuxMountEvidenceError::UnexpectedFilesystemType),
+        None => Err(LinuxMountEvidenceError::MissingMountRecord),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_device_number(bytes: &[u8]) -> Result<(), LinuxMountEvidenceError> {
+    let mut parts = bytes.split(|byte| *byte == b':');
+    let major = parts
+        .next()
+        .and_then(parse_decimal)
+        .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+    let minor = parts
+        .next()
+        .and_then(parse_decimal)
+        .ok_or(LinuxMountEvidenceError::MalformedMountInfo)?;
+    if parts.next().is_some() {
+        return Err(LinuxMountEvidenceError::MalformedMountInfo);
+    }
+    let _ = (major, minor);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_positive_decimal(bytes: &[u8]) -> Option<u64> {
+    let value = parse_decimal(bytes)?;
+    (value != 0).then_some(value)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_decimal(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    bytes.iter().try_fold(0_u64, |value, byte| {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value.checked_mul(10)?.checked_add(u64::from(*byte - b'0'))
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn trim_horizontal_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes
+        .first()
+        .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+    {
+        bytes = &bytes[1..];
+    }
+    while bytes
+        .last()
+        .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+    {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }
 
 fn rejected_open_error(stage: FileStage, error: StoreOpenError) -> PublishFailure {
@@ -955,12 +1240,107 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        ACTIVE_FILE_NAME, CommitFailpoint, FilesystemPolicy, LOCK_FILE_NAME, PublishFailure,
-        PublishMode, StoreOpenError, clean_valid_orphan_temps, ensure_fresh_directory,
-        open_directory, publish_atomic,
+        ACTIVE_FILE_NAME, CommitFailpoint, FilesystemPolicy, LOCK_FILE_NAME,
+        LinuxMountEvidenceError, MAX_LINUX_FDINFO_BYTES, MAX_LINUX_FDINFO_LINE_BYTES,
+        MAX_LINUX_FDINFO_RECORDS, MAX_LINUX_MOUNTINFO_BYTES, MAX_LINUX_MOUNTINFO_LINE_BYTES,
+        MAX_LINUX_MOUNTINFO_RECORDS, PublishFailure, PublishMode, StoreOpenError,
+        clean_valid_orphan_temps, ensure_fresh_directory, open_directory,
+        parse_linux_fdinfo_mount_id, parse_linux_mountinfo_exact_ext4, publish_atomic,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    fn mountinfo_record(mount_id: usize, filesystem_type: &str) -> Vec<u8> {
+        format!("{mount_id} 1 8:1 / / rw,nosuid - {filesystem_type} /dev/root rw\n").into_bytes()
+    }
+
+    #[test]
+    fn linux_mount_evidence_accepts_only_a_unique_exact_ext4_record() {
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(b"pos:\t0\nflags:\t0100000\nmnt_id:\t42\n"),
+            Ok(42)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&mountinfo_record(42, "ext4"), 42),
+            Ok(())
+        );
+        for filesystem_type in ["ext2", "ext3", "overlay", "ext4foo"] {
+            assert_eq!(
+                parse_linux_mountinfo_exact_ext4(&mountinfo_record(42, filesystem_type), 42,),
+                Err(LinuxMountEvidenceError::UnexpectedFilesystemType)
+            );
+        }
+    }
+
+    #[test]
+    fn linux_mount_evidence_rejects_missing_duplicate_and_malformed_records() {
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(b"pos:\t0\nflags:\t0100000\n"),
+            Err(LinuxMountEvidenceError::MissingMountId)
+        );
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(b"mnt_id:\t42\nmnt_id:\t42\n"),
+            Err(LinuxMountEvidenceError::DuplicateMountId)
+        );
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(b"mnt_id:\tnot-a-number\n"),
+            Err(LinuxMountEvidenceError::MalformedFdInfo)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&mountinfo_record(41, "ext4"), 42),
+            Err(LinuxMountEvidenceError::MissingMountRecord)
+        );
+        let mut duplicate = mountinfo_record(42, "ext4");
+        duplicate.extend_from_slice(&mountinfo_record(42, "ext4"));
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&duplicate, 42),
+            Err(LinuxMountEvidenceError::DuplicateMountRecord)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(b"42 1 8:1 / / rw ext4 /dev/root rw\n", 42),
+            Err(LinuxMountEvidenceError::MalformedMountInfo)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(b"42 1 bad / / rw - ext4 /dev/root rw\n", 42),
+            Err(LinuxMountEvidenceError::MalformedMountInfo)
+        );
+    }
+
+    #[test]
+    fn linux_mount_evidence_parser_work_is_strictly_bounded() {
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(&vec![b'x'; MAX_LINUX_FDINFO_BYTES + 1]),
+            Err(LinuxMountEvidenceError::EvidenceTooLarge)
+        );
+        let mut long_fdinfo_line = vec![b'x'; MAX_LINUX_FDINFO_LINE_BYTES + 1];
+        long_fdinfo_line.push(b'\n');
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(&long_fdinfo_line),
+            Err(LinuxMountEvidenceError::LineTooLong)
+        );
+        assert_eq!(
+            parse_linux_fdinfo_mount_id(&b"field:\tvalue\n".repeat(MAX_LINUX_FDINFO_RECORDS + 1),),
+            Err(LinuxMountEvidenceError::TooManyRecords)
+        );
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&vec![b'x'; MAX_LINUX_MOUNTINFO_BYTES + 1], 42,),
+            Err(LinuxMountEvidenceError::EvidenceTooLarge)
+        );
+        let mut long_mountinfo_line = vec![b'x'; MAX_LINUX_MOUNTINFO_LINE_BYTES + 1];
+        long_mountinfo_line.push(b'\n');
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&long_mountinfo_line, 42),
+            Err(LinuxMountEvidenceError::LineTooLong)
+        );
+        let mut too_many_mounts = Vec::new();
+        for mount_id in 1..=MAX_LINUX_MOUNTINFO_RECORDS + 1 {
+            too_many_mounts.extend_from_slice(&mountinfo_record(mount_id, "ext4"));
+        }
+        assert_eq!(
+            parse_linux_mountinfo_exact_ext4(&too_many_mounts, 1),
+            Err(LinuxMountEvidenceError::TooManyRecords)
+        );
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -997,6 +1377,25 @@ mod tests {
         let handle = open_directory(path.path(), FilesystemPolicy::ExplicitFixture)
             .unwrap_or_else(|error| panic!("fixture directory open failed: {error}"));
         (path, handle)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_apfs_is_rejected_by_the_production_reference_policy() {
+        let directory = TestDirectory::new();
+        let stat = nix::sys::statfs::statfs(directory.path())
+            .unwrap_or_else(|error| panic!("APFS fixture statfs failed: {error}"));
+        assert_eq!(
+            stat.filesystem_type_name(),
+            "apfs",
+            "the macOS production-rejection evidence must exercise a real APFS directory"
+        );
+        assert_eq!(
+            open_directory(directory.path(), FilesystemPolicy::ProductionReference).expect_err(
+                "macOS APFS must remain fail-closed without descriptor-bound ACL proof"
+            ),
+            StoreOpenError::UnsupportedFilesystem
+        );
     }
 
     fn install_active(path: &Path, bytes: &[u8]) {

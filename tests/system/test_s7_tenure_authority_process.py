@@ -1210,6 +1210,13 @@ def test_same_uid_authority_and_controller_configuration_is_rejected(
     assert list(fixture.state_dir.iterdir()) == []
 
 
+@pytest.mark.skipif(  # GOV-WAIVER-0007
+    sys.platform != "linux",
+    reason=(
+        "the production state-store profile is exact ext4; macOS APFS remains "
+        "unsupported until FD-anchored extended-ACL evidence is admitted"
+    ),
+)
 def test_wrong_peer_credential_cannot_advance_sequence_one_store(
     authority_binary: Path,
     authority_tmp_path: Path,

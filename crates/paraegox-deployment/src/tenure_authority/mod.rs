@@ -173,7 +173,7 @@ fn reconstruct_sequence_one_initialization_receipt_with_policy(
         filesystem_policy,
     )
     .map_err(map_receipt_store_error)?;
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().map_err(map_receipt_store_state_error)?;
     if snapshot.snapshot_sequence != 1
         || snapshot.epoch_high_water != 0
         || !snapshot.acquire_records.is_empty()
@@ -392,14 +392,18 @@ impl DeploymentTenureAuthority {
         })
     }
 
-    #[must_use]
-    pub(crate) fn snapshot_sequence(&self) -> u64 {
-        self.store.snapshot().snapshot_sequence
+    pub(crate) fn snapshot_sequence(&self) -> Result<u64, TenureAcquireError> {
+        self.store
+            .snapshot()
+            .map(|snapshot| snapshot.snapshot_sequence)
+            .map_err(map_acquire_store_error)
     }
 
-    #[must_use]
-    pub(crate) fn epoch_high_water(&self) -> u64 {
-        self.store.snapshot().epoch_high_water
+    pub(crate) fn epoch_high_water(&self) -> Result<u64, TenureAcquireError> {
+        self.store
+            .snapshot()
+            .map(|snapshot| snapshot.epoch_high_water)
+            .map_err(map_acquire_store_error)
     }
 }
 
@@ -627,6 +631,24 @@ fn map_initialization_error(error: InitializationError) -> TenureAuthorityInitia
 
 fn map_receipt_store_error(error: StoreOpenError) -> TenureAuthorityReceiptRecoveryError {
     TenureAuthorityReceiptRecoveryError::Store(store_open_diagnostic(error))
+}
+
+fn map_receipt_store_state_error(error: StoreError) -> TenureAuthorityReceiptRecoveryError {
+    let diagnostic = match error {
+        StoreError::Stopped => TenureAuthorityFailureDiagnostic::new(
+            "PXTA-STORE-STOPPED",
+            "read_snapshot",
+            "active_snapshot",
+            "stopped",
+        ),
+        _ => TenureAuthorityFailureDiagnostic::new(
+            "PXTA-STORE-STATE-INVALID",
+            "read_snapshot",
+            "active_snapshot",
+            "invalid",
+        ),
+    };
+    TenureAuthorityReceiptRecoveryError::Store(diagnostic)
 }
 
 fn map_open_signer_error(_error: SignerError) -> TenureAuthorityOpenError {
@@ -1349,8 +1371,8 @@ mod tests {
                 .acquire_authorized_request(&request)
                 .unwrap_or_else(|error| panic!("issuance failed: {error}"));
             assert_eq!(committed.disposition(), AcquireDisposition::Issued);
-            assert_eq!(authority.snapshot_sequence(), 2);
-            assert_eq!(authority.epoch_high_water(), 1);
+            assert_eq!(authority.snapshot_sequence(), Ok(2));
+            assert_eq!(authority.epoch_high_water(), Ok(1));
             assert_eq!(committed.response().proof().claim().epoch().value(), 1);
             committed.response().canonical_bytes().to_vec()
         };
@@ -1361,8 +1383,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("replay failed: {error}"));
         assert_eq!(replay.disposition(), AcquireDisposition::Replayed);
         assert_eq!(replay.response().canonical_bytes(), first_bytes);
-        assert_eq!(restarted.snapshot_sequence(), 2);
-        assert_eq!(restarted.epoch_high_water(), 1);
+        assert_eq!(restarted.snapshot_sequence(), Ok(2));
+        assert_eq!(restarted.epoch_high_water(), Ok(1));
     }
 
     #[test]
@@ -1376,8 +1398,8 @@ mod tests {
             authority.acquire_authorized_request(&fixture.request(1, 22)),
             Err(TenureAcquireError::OperationDigestConflict)
         );
-        assert_eq!(authority.snapshot_sequence(), 2);
-        assert_eq!(authority.epoch_high_water(), 1);
+        assert_eq!(authority.snapshot_sequence(), Ok(2));
+        assert_eq!(authority.epoch_high_water(), Ok(1));
     }
 
     #[test]
@@ -1396,15 +1418,15 @@ mod tests {
             authority.acquire_authorized_request(&request),
             Err(TenureAcquireError::ResponseBoundExceeded)
         );
-        assert_eq!(authority.snapshot_sequence(), 1);
-        assert_eq!(authority.epoch_high_water(), 0);
+        assert_eq!(authority.snapshot_sequence(), Ok(1));
+        assert_eq!(authority.epoch_high_water(), Ok(0));
 
         let committed = authority
             .acquire_authorized_request(&fixture.request(2, 24))
             .unwrap_or_else(|error| panic!("valid request after rejection failed: {error}"));
         assert_eq!(committed.disposition(), AcquireDisposition::Issued);
-        assert_eq!(authority.snapshot_sequence(), 2);
-        assert_eq!(authority.epoch_high_water(), 1);
+        assert_eq!(authority.snapshot_sequence(), Ok(2));
+        assert_eq!(authority.epoch_high_water(), Ok(1));
     }
 
     #[test]
@@ -1534,8 +1556,8 @@ mod tests {
                 authority.acquire_authorized_request(&request),
                 Err(expected)
             );
-            assert_eq!(authority.snapshot_sequence(), 1);
-            assert_eq!(authority.epoch_high_water(), 0);
+            assert_eq!(authority.snapshot_sequence(), Ok(1));
+            assert_eq!(authority.epoch_high_water(), Ok(0));
         }
     }
 
@@ -1553,6 +1575,14 @@ mod tests {
                 authority.acquire_authorized_request(&request),
                 Err(TenureAcquireError::StoreStopped)
             );
+            assert_eq!(
+                authority.snapshot_sequence(),
+                Err(TenureAcquireError::StoreStopped)
+            );
+            assert_eq!(
+                authority.epoch_high_water(),
+                Err(TenureAcquireError::StoreStopped)
+            );
         }
         let mut restarted = fixture.open();
         let replay = restarted
@@ -1560,7 +1590,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("restart replay failed: {error}"));
         assert_eq!(replay.disposition(), AcquireDisposition::Replayed);
         assert_eq!(replay.response().proof().claim().epoch().value(), 1);
-        assert_eq!(restarted.epoch_high_water(), 1);
+        assert_eq!(restarted.epoch_high_water(), Ok(1));
     }
 
     #[test]
@@ -1674,8 +1704,8 @@ mod tests {
         let orphan = install_orphan_temp(fixture.directory.path(), 2, &sequence_two);
 
         let authority = fixture.open();
-        assert_eq!(authority.snapshot_sequence(), 1);
-        assert_eq!(authority.epoch_high_water(), 0);
+        assert_eq!(authority.snapshot_sequence(), Ok(1));
+        assert_eq!(authority.epoch_high_water(), Ok(0));
         assert_eq!(
             fs::read(&active_path)
                 .unwrap_or_else(|error| panic!("authoritative snapshot reread failed: {error}")),
@@ -1696,7 +1726,7 @@ mod tests {
             .map(|index| install_orphan_temp(exact.directory.path(), index, &exact_snapshot))
             .collect::<Vec<_>>();
         let exact_authority = exact.open();
-        assert_eq!(exact_authority.snapshot_sequence(), 1);
+        assert_eq!(exact_authority.snapshot_sequence(), Ok(1));
         assert!(exact_orphans.iter().all(|path| !path.exists()));
         drop(exact_authority);
 
@@ -1769,7 +1799,7 @@ mod tests {
 
             let request = fixture.request(1, 50);
             let mut recovered = fixture.open();
-            assert_eq!(recovered.epoch_high_water(), u64::from(published));
+            assert_eq!(recovered.epoch_high_water(), Ok(u64::from(published)));
             let result = recovered
                 .acquire_authorized_request(&request)
                 .unwrap_or_else(|error| panic!("post-crash acquire failed at {point}: {error}"));
@@ -1781,7 +1811,7 @@ mod tests {
                     AcquireDisposition::Issued
                 }
             );
-            assert_eq!(recovered.epoch_high_water(), 1);
+            assert_eq!(recovered.epoch_high_water(), Ok(1));
         }
     }
 
@@ -1809,6 +1839,22 @@ mod tests {
         let mut authority = fixture.open();
         let result = authority.acquire_with_failpoint(&request, failpoint);
         panic!("crash failpoint unexpectedly returned: {result:?}");
+    }
+
+    #[test]
+    fn normal_drop_unlocks_even_while_a_fork_like_descriptor_reference_survives() {
+        let fixture = Fixture::new();
+        let authority = fixture.open();
+        let inherited_lock_reference = authority
+            .store
+            .clone_lock_descriptor_for_test()
+            .unwrap_or_else(|error| panic!("lock descriptor clone failed: {error}"));
+
+        drop(authority);
+        let replacement = fixture.open();
+
+        drop(replacement);
+        drop(inherited_lock_reference);
     }
 
     #[test]

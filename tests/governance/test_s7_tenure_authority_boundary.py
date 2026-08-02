@@ -11,9 +11,12 @@ DEPLOYMENT_SRC = DEPLOYMENT_ROOT / "src"
 RUNTIME_ROOT = REPO_ROOT / "crates" / "paraegox-runtime"
 RUNTIME_SRC = RUNTIME_ROOT / "src"
 
-INTERNAL_S7_D_MODULES = (
+INTERNAL_DEPLOYMENT_MODULES = (
+    "controller_initializer",
     "controller_journal",
+    "controller_store",
     "tenure_authority",
+    "tenure_client",
     "tenure_protocol",
 )
 PUBLIC_AUTHORITY_SYMBOLS = {
@@ -33,7 +36,7 @@ def _load_toml(path: Path) -> dict[str, Any]:
 
 def test_only_the_real_authority_process_is_promoted() -> None:
     library = _read_required(DEPLOYMENT_SRC / "lib.rs")
-    for module in INTERNAL_S7_D_MODULES:
+    for module in INTERNAL_DEPLOYMENT_MODULES:
         source = (
             DEPLOYMENT_SRC / module / "mod.rs"
             if module == "tenure_authority"
@@ -64,7 +67,7 @@ def test_only_the_real_authority_process_is_promoted() -> None:
     assert symbols == PUBLIC_AUTHORITY_SYMBOLS
 
 
-def test_governance_claims_authority_process_but_not_controller_or_runtime_vertical() -> None:
+def test_governance_claims_w1_foundations_but_not_executable_vertical() -> None:
     governance = _load_toml(REPO_ROOT / "governance.toml")["registry"]
     packages = [
         package
@@ -124,19 +127,25 @@ def test_authority_cli_has_no_environment_secret_or_production_test_backdoor() -
     assert "AcquireTenureResponseV1" not in binary
 
 
-def test_s7_d_does_not_create_deploymentd_or_runtime_apply_executables() -> None:
+def test_s7_e_w1_does_not_create_deploymentd_or_runtime_apply_executables() -> None:
     binaries = sorted(path.name for path in (DEPLOYMENT_SRC / "bin").glob("*.rs"))
     assert binaries == ["paraegox-tenure-authority.rs"]
     assert not (DEPLOYMENT_SRC / "bin" / "paraegox-deploymentd.rs").exists()
     assert not (DEPLOYMENT_SRC / "deployment_controller_process.rs").exists()
 
 
-def test_s7_d_runtime_journal_foundation_remains_crate_private_and_unwired() -> None:
+def test_s7_e_runtime_store_foundation_remains_crate_private_and_unwired() -> None:
     runtime_library = _read_required(RUNTIME_SRC / "lib.rs")
     _read_required(RUNTIME_SRC / "runtime_journal.rs")
+    _read_required(RUNTIME_SRC / "runtime_store.rs")
     assert re.search(r"(?m)^\s*mod\s+runtime_journal\s*;\s*$", runtime_library)
+    assert re.search(r"(?m)^\s*mod\s+runtime_store\s*;\s*$", runtime_library)
     assert not re.search(
         r"(?m)^\s*pub(?:\s*\([^)]*\))?\s+mod\s+runtime_journal\s*;\s*$",
+        runtime_library,
+    )
+    assert not re.search(
+        r"(?m)^\s*pub(?:\s*\([^)]*\))?\s+mod\s+runtime_store\s*;\s*$",
         runtime_library,
     )
     assert "run_runtime_apply_endpoint" not in runtime_library
@@ -152,7 +161,10 @@ def test_s7_d_runtime_journal_foundation_remains_crate_private_and_unwired() -> 
     assert "crates/paraegox-runtime/src/runtime_journal.rs" in runtime_package[
         "first_tests"
     ]
-    assert "journal file store/one-shot initializer" in runtime_package[
+    assert "crates/paraegox-runtime/src/runtime_store.rs" in runtime_package[
+        "first_tests"
+    ]
+    assert "Runtime one-shot initializer" in runtime_package[
         "responsibility"
     ]
     assert "not implemented" in runtime_package["responsibility"]

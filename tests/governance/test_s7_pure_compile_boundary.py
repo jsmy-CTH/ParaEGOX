@@ -168,7 +168,7 @@ def test_pure_compile_sources_do_not_reimplement_manifest_or_side_effects() -> N
             )
 
 
-def test_s7_c_pure_compile_owners_remain_private_after_s7_d() -> None:
+def test_s7_c_pure_compile_owners_remain_private_during_s7_e_w1() -> None:
     governance = _load_toml(REPO_ROOT / "governance.toml")
     registry = governance["registry"]
 
