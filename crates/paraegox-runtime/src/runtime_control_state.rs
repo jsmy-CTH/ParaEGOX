@@ -67,14 +67,17 @@ pub(crate) enum RuntimeAdmissionDisposition {
     AlreadyDurable,
 }
 
-/// Ephemeral capability binding full admission to the exact snapshot produced
-/// by the preceding tenure-only commit.
+/// Ephemeral capability binding full admission to the exact current tenure
+/// snapshot.
 ///
-/// Its fields are deliberately private and it is deliberately not `Clone`:
-/// only this facade can mint it, and the full-admission call consumes it.  A
+/// It may be minted by the preceding tenure-only transition, an exact durable
+/// full-admission replay, or an owner-private resident-tenure continuation in
+/// the same service process. Its fields are deliberately private and it is
+/// deliberately not `Clone`: the full-admission call consumes it, and a fresh
+/// process cannot restore the resident continuation from durable state. A
 /// fresh external retry that observes only the durable tenure stage therefore
 /// cannot recompute `admitted_at_nanos` and silently renew the signed remaining
-/// budget.  No temporal fact is persisted in the tenure-only transaction.
+/// budget. No temporal fact is persisted in the tenure-only transaction.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RuntimePreparedReferenceAdmission {
     admission: RuntimeApplyAdmissionInput,
@@ -85,6 +88,11 @@ impl RuntimePreparedReferenceAdmission {
     #[must_use]
     pub(crate) const fn bound_sequence(&self) -> u64 {
         self.tenure_snapshot.sequence()
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure(&self) -> RuntimeTenureAdmissionInput {
+        self.admission.tenure
     }
 }
 
@@ -229,8 +237,39 @@ impl RuntimeControlState {
         }
     }
 
-    /// Commits the separate full-admission successor using the non-renewable
-    /// capability minted by the exact preceding tenure transition.
+    /// Mints a sequence-bound full-admission capability for a new request only
+    /// when the apply core proves that this exact tenure already completed one
+    /// full admission in the current service process.
+    ///
+    /// The resident tenure is deliberately owner-private and non-durable.  A
+    /// process reconstructed from a tenure-only or fully admitted snapshot
+    /// cannot call this path successfully without first completing a new full
+    /// admission commit itself.
+    pub(crate) fn try_reference_resident_tenure_continuation(
+        &self,
+        request: &ReferenceApplyRequestV1,
+        preflight: RuntimeReferenceApplyPreflight,
+        resident_tenure: RuntimeTenureAdmissionInput,
+    ) -> Result<Option<RuntimePreparedReferenceAdmission>, RuntimeControlStateError> {
+        let input = self.try_reference_admission_input(request, preflight)?;
+        if input.tenure != resident_tenure {
+            return Ok(None);
+        }
+        if tenure_admission_status(self.snapshot.state(), input.tenure)
+            != AdmissionMutationStatus::Exact
+            || full_admission_status(self.snapshot.state(), &input) != AdmissionMutationStatus::New
+        {
+            return Err(RuntimeControlStateError::PreflightRejected);
+        }
+        Ok(Some(RuntimePreparedReferenceAdmission {
+            admission: input,
+            tenure_snapshot: self.snapshot.clone(),
+        }))
+    }
+
+    /// Commits the separate full-admission successor using a non-renewable,
+    /// sequence-bound capability minted by an exact tenure transition or an
+    /// authorized resident-tenure continuation.
     pub(crate) fn try_reference_full_admission(
         &self,
         prepared: RuntimePreparedReferenceAdmission,
@@ -2153,18 +2192,24 @@ mod tests {
         assert_eq!(counters.stop.get(), 0);
         assert_eq!(counters.cleanup.get(), 0);
 
+        assert!(matches!(
+            core.try_apply(&loop_request, preflight(0x74, 0x75, 0x76, 1_000),),
+            Ok(RuntimeReferenceApplyOutcome::Terminal(_))
+        ));
+        assert_eq!(commits.get(), 6, "terminal replay must not commit");
+
         let empty_request = empty_apply_request_with_expected(
             &ingress,
             8,
-            2,
             1,
+            0,
             0x55,
             0x64,
             b"materialize-empty-nonce",
             ExpectedActive::Exact(loop_request.target_slice_digest()),
         );
         let empty = core
-            .try_apply(&empty_request, preflight(0x84, 0x85, 0x86, 1_000))
+            .try_apply(&empty_request, preflight(0x74, 0x85, 0x86, 1_000))
             .unwrap_or_else(|error| {
                 panic!(
                     "head-first empty failed after {} commits (stop {}, cleanup {}): {error:?}",
@@ -2180,8 +2225,8 @@ mod tests {
             empty.receipt().facts().outcome(),
             ReferenceApplyTerminalOutcomeV1::EmptyDeactivateExactZero
         );
-        assert_eq!(empty.receipt().facts().completion_snapshot_sequence(), 13);
-        assert_eq!(commits.get(), 11);
+        assert_eq!(empty.receipt().facts().completion_snapshot_sequence(), 12);
+        assert_eq!(commits.get(), 10);
         assert_eq!(counters.materialize.get(), 1);
         assert_eq!(counters.start.get(), 1);
         assert_eq!(counters.stop.get(), 1);
@@ -2198,6 +2243,315 @@ mod tests {
                 .iter()
                 .all(|resource| resource.phase == crate::runtime_journal::ResourcePhase::Terminal)
         );
+    }
+
+    #[test]
+    fn restarted_core_terminal_replay_does_not_restore_same_tenure_continuation() {
+        let (installation, compiled) = installation();
+        let ingress = installation
+            .immutable_manifest_ingress()
+            .expect("manifest ingress");
+        let started = RuntimeControlState::try_start(&installed_sequence_one(
+            &installation,
+            compiled,
+            installation.manifest_canonical_wire(),
+            installation.manifest_digest(),
+        ))
+        .expect("startup");
+        let commits = Rc::new(Cell::new(0));
+        let counters = FakeOwnerCounters::new();
+        let mut core = RuntimeReferenceApplyCore::try_new_with_owner(
+            FakeApplyStore {
+                snapshot: started.snapshot().clone(),
+                commits: Rc::clone(&commits),
+            },
+            FakeApplyClock {
+                observed_at_nanos: 2_000,
+            },
+            FakeMaterializationOwner::new(counters.clone()),
+            reference_apply_signer(),
+            reference_apply_channel(),
+        )
+        .expect("materialized apply core");
+        let loop_request = apply_request(&ingress, 7, 1, 0, 0x54, 0x63, b"resident-restart-loop");
+        let loop_evidence = preflight(0x74, 0x75, 0x76, 1_000);
+        assert!(matches!(
+            core.try_apply(&loop_request, loop_evidence),
+            Ok(RuntimeReferenceApplyOutcome::Terminal(_))
+        ));
+        assert_eq!(commits.get(), 6);
+
+        let (store, clock, owner, signer, channel) = core.into_test_recovery_parts();
+        let mut restarted =
+            RuntimeReferenceApplyCore::try_new_with_owner(store, clock, owner, signer, channel)
+                .expect("restarted core");
+        assert!(matches!(
+            restarted.try_apply(&loop_request, loop_evidence),
+            Ok(RuntimeReferenceApplyOutcome::Terminal(_))
+        ));
+        assert_eq!(commits.get(), 6, "terminal replay must not commit");
+
+        let empty_request = empty_apply_request_with_expected(
+            &ingress,
+            8,
+            1,
+            0,
+            0x55,
+            0x64,
+            b"resident-restart-empty",
+            ExpectedActive::Exact(loop_request.target_slice_digest()),
+        );
+        let before = restarted.snapshot().clone();
+        assert_eq!(
+            restarted.try_apply(&empty_request, preflight(0x74, 0x85, 0x86, 1_000)),
+            Ok(RuntimeReferenceApplyOutcome::TenureOnlyDurable)
+        );
+        assert_eq!(restarted.snapshot(), &before);
+        assert_eq!(commits.get(), 6);
+        assert_eq!(counters.stop.get(), 0);
+        assert_eq!(counters.cleanup.get(), 0);
+    }
+
+    #[test]
+    fn same_tenure_full_commit_failure_consumes_resident_continuation() {
+        let (installation, compiled) = installation();
+        let ingress = installation
+            .immutable_manifest_ingress()
+            .expect("manifest ingress");
+        let started = RuntimeControlState::try_start(&installed_sequence_one(
+            &installation,
+            compiled,
+            installation.manifest_canonical_wire(),
+            installation.manifest_digest(),
+        ))
+        .expect("startup");
+        // The active Loop consumes six publications. The same-tenure Empty
+        // skips tenure and fails before publishing its full admission.
+        let store = FailpointApplyStore::new(started.snapshot().clone(), 7);
+        let published = Rc::clone(&store.published);
+        let counters = FakeOwnerCounters::new();
+        let mut core = RuntimeReferenceApplyCore::try_new_with_owner(
+            store,
+            FakeApplyClock {
+                observed_at_nanos: 2_000,
+            },
+            FakeMaterializationOwner::new(counters.clone()),
+            reference_apply_signer(),
+            reference_apply_channel(),
+        )
+        .expect("failpoint core");
+        let loop_request = apply_request(&ingress, 7, 1, 0, 0x54, 0x63, b"resident-fail-loop");
+        core.try_apply(&loop_request, preflight(0x74, 0x75, 0x76, 1_000))
+            .expect("active predecessor");
+
+        let empty_request = empty_apply_request_with_expected(
+            &ingress,
+            8,
+            1,
+            0,
+            0x55,
+            0x64,
+            b"resident-fail-empty",
+            ExpectedActive::Exact(loop_request.target_slice_digest()),
+        );
+        let evidence = preflight(0x74, 0x85, 0x86, 1_000);
+        assert!(matches!(
+            core.try_apply(&empty_request, evidence),
+            Err(RuntimeReferenceApplyError::Store(
+                RuntimeReferenceApplyStoreError::Unavailable
+            ))
+        ));
+        let before_retry = core.snapshot().clone();
+        assert_eq!(published.get(), 6);
+        assert_eq!(counters.stop.get(), 0);
+
+        assert_eq!(
+            core.try_apply(&empty_request, evidence),
+            Ok(RuntimeReferenceApplyOutcome::TenureOnlyDurable)
+        );
+        assert_eq!(core.snapshot(), &before_retry);
+        assert_eq!(published.get(), 6);
+        assert_eq!(counters.stop.get(), 0);
+        assert_eq!(counters.cleanup.get(), 0);
+    }
+
+    #[test]
+    fn uncertain_same_tenure_full_commit_consumes_resident_continuation() {
+        let (installation, compiled) = installation();
+        let ingress = installation
+            .immutable_manifest_ingress()
+            .expect("manifest ingress");
+        let started = RuntimeControlState::try_start(&installed_sequence_one(
+            &installation,
+            compiled,
+            installation.manifest_canonical_wire(),
+            installation.manifest_digest(),
+        ))
+        .expect("startup");
+        // The active Loop consumes six publications. The same-tenure full
+        // admission is published seventh, but the store reports uncertainty.
+        let store = FailpointApplyStore::new_after_publish(started.snapshot().clone(), 7);
+        let durable = store.clone();
+        let published = Rc::clone(&store.published);
+        let counters = FakeOwnerCounters::new();
+        let mut core = RuntimeReferenceApplyCore::try_new_with_owner(
+            store,
+            FakeApplyClock {
+                observed_at_nanos: 2_000,
+            },
+            FakeMaterializationOwner::new(counters.clone()),
+            reference_apply_signer(),
+            reference_apply_channel(),
+        )
+        .expect("failpoint core");
+        let loop_request = apply_request(&ingress, 7, 1, 0, 0x54, 0x63, b"resident-uncertain-loop");
+        core.try_apply(&loop_request, preflight(0x74, 0x75, 0x76, 1_000))
+            .expect("active predecessor");
+        assert!(core.has_test_resident_full_admitted_tenure());
+
+        let empty_request = empty_apply_request_with_expected(
+            &ingress,
+            8,
+            1,
+            0,
+            0x55,
+            0x64,
+            b"resident-uncertain-empty",
+            ExpectedActive::Exact(loop_request.target_slice_digest()),
+        );
+        assert!(matches!(
+            core.try_apply(&empty_request, preflight(0x74, 0x85, 0x86, 1_000)),
+            Err(RuntimeReferenceApplyError::Store(
+                RuntimeReferenceApplyStoreError::Unavailable
+            ))
+        ));
+        assert!(!core.has_test_resident_full_admitted_tenure());
+        assert_eq!(published.get(), 7);
+        assert_eq!(durable.snapshot.borrow().sequence(), 9);
+        assert_eq!(core.snapshot().sequence(), 8);
+        assert_eq!(counters.stop.get(), 0);
+        assert_eq!(counters.cleanup.get(), 0);
+    }
+
+    #[test]
+    fn higher_tenure_full_commit_failure_cannot_reuse_old_resident_continuation() {
+        let (installation, compiled) = installation();
+        let ingress = installation
+            .immutable_manifest_ingress()
+            .expect("manifest ingress");
+        let started = RuntimeControlState::try_start(&installed_sequence_one(
+            &installation,
+            compiled,
+            installation.manifest_canonical_wire(),
+            installation.manifest_digest(),
+        ))
+        .expect("startup");
+        // The active Loop consumes six publications. Higher tenure publishes
+        // its fence seventh, then fails before publishing full admission.
+        let store = FailpointApplyStore::new(started.snapshot().clone(), 8);
+        let published = Rc::clone(&store.published);
+        let counters = FakeOwnerCounters::new();
+        let mut core = RuntimeReferenceApplyCore::try_new_with_owner(
+            store,
+            FakeApplyClock {
+                observed_at_nanos: 2_000,
+            },
+            FakeMaterializationOwner::new(counters.clone()),
+            reference_apply_signer(),
+            reference_apply_channel(),
+        )
+        .expect("failpoint core");
+        let loop_request = apply_request(&ingress, 7, 1, 0, 0x54, 0x63, b"higher-fail-loop");
+        core.try_apply(&loop_request, preflight(0x74, 0x75, 0x76, 1_000))
+            .expect("active predecessor");
+
+        let empty_request = empty_apply_request_with_expected(
+            &ingress,
+            8,
+            2,
+            1,
+            0x55,
+            0x64,
+            b"higher-fail-empty",
+            ExpectedActive::Exact(loop_request.target_slice_digest()),
+        );
+        let evidence = preflight(0x84, 0x85, 0x86, 1_000);
+        assert!(matches!(
+            core.try_apply(&empty_request, evidence),
+            Err(RuntimeReferenceApplyError::Store(
+                RuntimeReferenceApplyStoreError::Unavailable
+            ))
+        ));
+        let before_retry = core.snapshot().clone();
+        assert_eq!(published.get(), 7);
+        assert_eq!(counters.stop.get(), 0);
+
+        assert_eq!(
+            core.try_apply(&empty_request, evidence),
+            Ok(RuntimeReferenceApplyOutcome::TenureOnlyDurable)
+        );
+        assert_eq!(core.snapshot(), &before_retry);
+        assert_eq!(published.get(), 7);
+        assert_eq!(counters.stop.get(), 0);
+        assert_eq!(counters.cleanup.get(), 0);
+    }
+
+    #[test]
+    fn uncertain_higher_tenure_fence_commit_clears_old_resident_continuation() {
+        let (installation, compiled) = installation();
+        let ingress = installation
+            .immutable_manifest_ingress()
+            .expect("manifest ingress");
+        let started = RuntimeControlState::try_start(&installed_sequence_one(
+            &installation,
+            compiled,
+            installation.manifest_canonical_wire(),
+            installation.manifest_digest(),
+        ))
+        .expect("startup");
+        // The active Loop consumes six publications. The higher-tenure fence is
+        // published seventh, but the store reports an uncertain failure.
+        let store = FailpointApplyStore::new_after_publish(started.snapshot().clone(), 7);
+        let durable = store.clone();
+        let published = Rc::clone(&store.published);
+        let counters = FakeOwnerCounters::new();
+        let mut core = RuntimeReferenceApplyCore::try_new_with_owner(
+            store,
+            FakeApplyClock {
+                observed_at_nanos: 2_000,
+            },
+            FakeMaterializationOwner::new(counters.clone()),
+            reference_apply_signer(),
+            reference_apply_channel(),
+        )
+        .expect("failpoint core");
+        let loop_request = apply_request(&ingress, 7, 1, 0, 0x54, 0x63, b"fence-uncertain-loop");
+        core.try_apply(&loop_request, preflight(0x74, 0x75, 0x76, 1_000))
+            .expect("active predecessor");
+        assert!(core.has_test_resident_full_admitted_tenure());
+
+        let empty_request = empty_apply_request_with_expected(
+            &ingress,
+            8,
+            2,
+            1,
+            0x55,
+            0x64,
+            b"fence-uncertain-empty",
+            ExpectedActive::Exact(loop_request.target_slice_digest()),
+        );
+        assert!(matches!(
+            core.try_apply(&empty_request, preflight(0x84, 0x85, 0x86, 1_000)),
+            Err(RuntimeReferenceApplyError::Store(
+                RuntimeReferenceApplyStoreError::Unavailable
+            ))
+        ));
+        assert!(!core.has_test_resident_full_admitted_tenure());
+        assert_eq!(published.get(), 7);
+        assert_eq!(durable.snapshot.borrow().sequence(), 9);
+        assert_eq!(core.snapshot().sequence(), 8);
+        assert_eq!(counters.stop.get(), 0);
+        assert_eq!(counters.cleanup.get(), 0);
     }
 
     #[test]
@@ -2670,15 +3024,15 @@ mod tests {
         let empty_request = empty_apply_request_with_expected(
             &ingress,
             8,
-            2,
             1,
+            0,
             0x55,
             0x64,
             b"production-owner-empty",
             ExpectedActive::Exact(loop_request.target_slice_digest()),
         );
         let empty = core
-            .try_apply(&empty_request, preflight(0x84, 0x85, 0x86, 1_000))
+            .try_apply(&empty_request, preflight(0x74, 0x85, 0x86, 1_000))
             .expect("compiled loop cleanup");
         let RuntimeReferenceApplyOutcome::Terminal(empty) = empty else {
             panic!("compiled cleanup must return terminal receipt")
@@ -2687,7 +3041,7 @@ mod tests {
             empty.receipt().facts().outcome(),
             ReferenceApplyTerminalOutcomeV1::EmptyDeactivateExactZero
         );
-        assert_eq!(commits.get(), 11);
+        assert_eq!(commits.get(), 10);
         assert!(matches!(
             core.snapshot().state().live_materialization,
             LiveMaterialization::ExactZero { .. }

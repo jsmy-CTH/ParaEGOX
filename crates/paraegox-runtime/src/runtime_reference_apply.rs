@@ -29,8 +29,8 @@ use crate::{
         OpaqueCanonicalValue, PreparedOperation, PreparedPhase, ResourceKind, ResourcePhase,
         RuntimeDeadlineObservation, RuntimeJournalSnapshot, RuntimeOneSourceCallbackSuccessInput,
         RuntimeOneSourceOwnershipInput, RuntimeOneSourceResourceRefs,
-        RuntimeOneSourceTombstonesInput, RuntimeStartActionInput, RuntimeTerminalInput,
-        RuntimeTerminalPreview, TerminalHeadDisposition, TerminalOutcome,
+        RuntimeOneSourceTombstonesInput, RuntimeStartActionInput, RuntimeTenureAdmissionInput,
+        RuntimeTerminalInput, RuntimeTerminalPreview, TerminalHeadDisposition, TerminalOutcome,
         decode_and_validate_terminal_receipt,
     },
     runtime_store::RuntimeStore,
@@ -327,6 +327,16 @@ pub(crate) enum RuntimeReferenceApplyOutcome {
     TenureOnlyDurable,
 }
 
+/// Non-durable proof that this service process successfully published one full
+/// admission under the exact current writer tenure.
+///
+/// It is intentionally absent at construction and omitted from recovery parts.
+/// Terminal replay and an already-durable full admission therefore cannot
+/// manufacture permission for a later request after restart.
+struct RuntimeResidentFullAdmissionTenure {
+    tenure: RuntimeTenureAdmissionInput,
+}
+
 /// Single-writer apply core.  `state` is advanced only after the store confirms
 /// the complete successor publication (including directory fsync in
 /// `RuntimeStore::commit`).
@@ -337,6 +347,7 @@ pub(crate) struct RuntimeReferenceApplyCore<S, C, O = RuntimeNoMaterializationOw
     owner: O,
     signer: RuntimeReferenceApplySigner,
     channel: ReferenceChannelBindingV1,
+    resident_full_admitted_tenure: Option<RuntimeResidentFullAdmissionTenure>,
 }
 
 impl<S, C> RuntimeReferenceApplyCore<S, C, RuntimeNoMaterializationOwner>
@@ -378,6 +389,7 @@ where
             owner,
             signer,
             channel,
+            resident_full_admitted_tenure: None,
         })
     }
 
@@ -403,6 +415,11 @@ where
             self.signer,
             self.channel,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn has_test_resident_full_admitted_tenure(&self) -> bool {
+        self.resident_full_admitted_tenure.is_some()
     }
 
     /// Looks up one exact historical terminal result without requiring a
@@ -434,16 +451,39 @@ where
         let tenure = self.state.try_reference_tenure_only(request, preflight)?;
         let (tenured, tenure_disposition, prepared) = tenure.into_parts();
         if tenure_disposition == RuntimeAdmissionDisposition::Committed {
+            self.resident_full_admitted_tenure = None;
             self.commit_state(tenured)?;
         }
-        let Some(prepared) = prepared else {
-            return Ok(RuntimeReferenceApplyOutcome::TenureOnlyDurable);
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            None => {
+                let Some(resident_tenure) = self
+                    .resident_full_admitted_tenure
+                    .take()
+                    .map(|resident| resident.tenure)
+                else {
+                    return Ok(RuntimeReferenceApplyOutcome::TenureOnlyDurable);
+                };
+                let Some(prepared) = self.state.try_reference_resident_tenure_continuation(
+                    request,
+                    preflight,
+                    resident_tenure,
+                )?
+                else {
+                    return Ok(RuntimeReferenceApplyOutcome::TenureOnlyDurable);
+                };
+                prepared
+            }
         };
 
+        let admitted_tenure = prepared.tenure();
         let full = self.state.try_reference_full_admission(prepared)?;
         let (admitted, full_disposition, _) = full.into_parts();
         if full_disposition == RuntimeAdmissionDisposition::Committed {
             self.commit_state(admitted)?;
+            self.resident_full_admitted_tenure = Some(RuntimeResidentFullAdmissionTenure {
+                tenure: admitted_tenure,
+            });
         }
 
         match request.target_execution().mode() {
