@@ -880,8 +880,7 @@ fn verify_filesystem(
         if stat.filesystem_type() != nix::sys::statfs::EXT4_SUPER_MAGIC {
             return Err(RuntimeStoreOpenError::UnsupportedFilesystem);
         }
-        return verify_linux_ext4_mount(directory)
-            .map_err(|_| RuntimeStoreOpenError::UnsupportedFilesystem);
+        verify_linux_ext4_mount(directory).map_err(|_| RuntimeStoreOpenError::UnsupportedFilesystem)
     }
     #[cfg(target_os = "macos")]
     {
