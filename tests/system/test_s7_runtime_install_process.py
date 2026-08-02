@@ -474,10 +474,25 @@ def installed_runtime(
     with tempfile.TemporaryDirectory(prefix="pxr-release-", dir="/tmp") as release_path:
         release_directory = Path(release_path).resolve()
         release_directory.chmod(0o700)
+        staged_release_binary = release_directory / "paraegox-runtime-host"
+        assert not staged_release_binary.exists()
+        shutil.copyfile(runtime_host_binary, staged_release_binary)
+        staged_release_binary.chmod(0o755)
+        staged_metadata = staged_release_binary.lstat()
+        build_metadata = runtime_host_binary.stat()
+        assert staged_release_binary.is_file() and not staged_release_binary.is_symlink()
+        assert staged_metadata.st_nlink == 1
+        assert (staged_metadata.st_dev, staged_metadata.st_ino) != (
+            build_metadata.st_dev,
+            build_metadata.st_ino,
+        )
+        assert _mode_bits(staged_release_binary) == 0o755
+        assert staged_metadata.st_size == build_metadata.st_size
+        assert _sha256_file(staged_release_binary) == _sha256_file(runtime_host_binary)
         release_descriptor = release_directory / "runtime.pxbd"
         released = _run_text(
             [
-                os.fspath(runtime_host_binary),
+                os.fspath(staged_release_binary),
                 "release-descriptor-v1",
                 os.fspath(release_descriptor),
             ]
@@ -577,7 +592,7 @@ def installed_runtime(
                         "root",
                         "-m",
                         "0555",
-                        os.fspath(runtime_host_binary),
+                        os.fspath(staged_release_binary),
                         os.fspath(installed_binary),
                     ]
                 )
@@ -620,7 +635,7 @@ def installed_runtime(
                     cwd=root,
                 )
                 yield InstalledRuntime(
-                    source_binary=runtime_host_binary,
+                    source_binary=staged_release_binary,
                     installed_binary=installed_binary,
                     descriptor_path=descriptor_path,
                     descriptor_bytes=descriptor_bytes,
@@ -689,6 +704,9 @@ def test_real_installed_runtime_process_initializes_sequence_one_exactly_once(
 ) -> None:
     runtime = installed_runtime
     descriptor = runtime.descriptor_bytes
+    source_metadata = runtime.source_binary.lstat()
+    assert runtime.source_binary.is_file() and not runtime.source_binary.is_symlink()
+    assert source_metadata.st_nlink == 1
     installed_length = runtime.installed_binary.stat().st_size
     installed_sha256 = _sha256_file(runtime.installed_binary)
 

@@ -330,7 +330,7 @@ class InstalledControllerProfile:
         return [
             *self.runtime.service.command_prefix,
             os.fspath(self.runtime.installed_binary),
-            "serve-v1",
+            "serve-bootstrap-v1",
             os.fspath(self.runtime.state_directory),
             self.runtime_store_id.hex(),
             *self.runtime.provisioning.command_arguments(),
@@ -748,8 +748,11 @@ def _wait_for_authority_socket(
 def _runtime_server(
     profile: InstalledControllerProfile,
 ) -> Iterator[subprocess.Popen[str]]:
+    command = profile.runtime_serve_command()
+    subcommand_index = len(profile.runtime.service.command_prefix) + 1
+    assert command[subcommand_index] == "serve-bootstrap-v1"
     process = subprocess.Popen(
-        profile.runtime_serve_command(),
+        command,
         cwd=profile.root,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
