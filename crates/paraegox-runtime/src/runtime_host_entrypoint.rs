@@ -1,10 +1,12 @@
-//! RuntimeHost executable dispatch for the S7-E release/install vertical.
+//! RuntimeHost executable dispatch for the S7-E/S7-F control vertical.
 //!
 //! No arguments preserves the existing idle RuntimeHost process. The versioned
 //! commands are deliberately narrow: the release producer emits the descriptor
 //! for this exact executable, the install operation is the only producer of the
 //! singleton manifest before it initializes the Runtime store, and the Linux
-//! bootstrap service consumes exact provisioned key and service identities.
+//! bootstrap service consumes exact provisioned key and service identities,
+//! while the explicit offline migration command upgrades only a stopped v3
+//! journal after retaining exact read-only evidence.
 
 use core::fmt;
 use std::env;
@@ -44,7 +46,10 @@ use crate::runtime_provisioning::{
     RuntimeProvisioningError, RuntimeProvisioningInputV1, RuntimeProvisioningV1,
 };
 #[cfg(any(target_os = "linux", all(test, unix)))]
-use crate::runtime_store::{RuntimeInitializerBeginError, RuntimeInitializerPreflight};
+use crate::runtime_store::{
+    RuntimeInitializerBeginError, RuntimeInitializerPreflight, RuntimeStore,
+    RuntimeStoreMigrationDisposition, RuntimeStoreMigrationError,
+};
 #[cfg(unix)]
 use paraegox_runtime_contracts::installation::{
     MAX_INSTALLED_RUNTIME_BUILD_DESCRIPTOR_BYTES, RuntimeInstallationError,
@@ -58,6 +63,7 @@ use paraegox_runtime_contracts::installation::{
 const RELEASE_DESCRIPTOR_COMMAND: &str = "release-descriptor-v1";
 const INSTALL_COMMAND: &str = "install-v1";
 const SERVE_BOOTSTRAP_COMMAND: &str = "serve-bootstrap-v1";
+const MIGRATE_JOURNAL_V3_TO_V4_COMMAND: &str = "migrate-journal-v3-to-v4-v1";
 
 /// Runs the exact RuntimeHost executable mode selected by process arguments.
 ///
@@ -89,14 +95,21 @@ pub fn run_runtime_host_entrypoint(
         RuntimeHostCommand::ServeBootstrap(arguments) => {
             run_bootstrap_service(embedded_metadata, *arguments)
         }
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        RuntimeHostCommand::MigrateJournalV3ToV4(arguments) => {
+            run_journal_v3_to_v4_migration(*arguments)
+        }
         #[cfg(all(unix, not(target_os = "linux"), not(test)))]
-        RuntimeHostCommand::Install(_) | RuntimeHostCommand::ServeBootstrap(_) => {
+        RuntimeHostCommand::Install(_)
+        | RuntimeHostCommand::ServeBootstrap(_)
+        | RuntimeHostCommand::MigrateJournalV3ToV4(_) => {
             Err(RuntimeHostEntrypointFailure::UnsupportedPlatform.into())
         }
         #[cfg(not(unix))]
         RuntimeHostCommand::ReleaseDescriptor { .. }
         | RuntimeHostCommand::Install(_)
-        | RuntimeHostCommand::ServeBootstrap(_) => {
+        | RuntimeHostCommand::ServeBootstrap(_)
+        | RuntimeHostCommand::MigrateJournalV3ToV4(_) => {
             Err(RuntimeHostEntrypointFailure::UnsupportedPlatform.into())
         }
     }
@@ -108,6 +121,7 @@ enum RuntimeHostCommand {
     ReleaseDescriptor { descriptor_output: PathBuf },
     Install(Box<RuntimeInstallArgumentsV1>),
     ServeBootstrap(Box<RuntimeBootstrapArgumentsV1>),
+    MigrateJournalV3ToV4(Box<RuntimeJournalMigrationArgumentsV1>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -124,6 +138,15 @@ struct RuntimeBootstrapArgumentsV1 {
     state_directory: PathBuf,
     expected_store_instance_id: [u8; 32],
     provisioning: RuntimeProvisioningArgumentsV1,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RuntimeJournalMigrationArgumentsV1 {
+    state_directory: PathBuf,
+    evidence_directory: PathBuf,
+    expected_store_instance_id: [u8; 32],
+    expected_target_fingerprint: Digest32,
+    migration_id: [u8; 32],
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -220,6 +243,24 @@ fn parse_runtime_host_command(
                 state_directory,
                 expected_store_instance_id,
                 provisioning,
+            },
+        )));
+    }
+    if command == OsStr::new(MIGRATE_JOURNAL_V3_TO_V4_COMMAND) {
+        let state_directory = PathBuf::from(required_argument(&mut arguments)?);
+        let evidence_directory = PathBuf::from(required_argument(&mut arguments)?);
+        let expected_store_instance_id = parse_hex_array(required_argument(&mut arguments)?)?;
+        let expected_target_fingerprint =
+            parse_digest_argument(required_argument(&mut arguments)?)?;
+        let migration_id = parse_hex_array(required_argument(&mut arguments)?)?;
+        reject_additional_arguments(&mut arguments)?;
+        return Ok(RuntimeHostCommand::MigrateJournalV3ToV4(Box::new(
+            RuntimeJournalMigrationArgumentsV1 {
+                state_directory,
+                evidence_directory,
+                expected_store_instance_id,
+                expected_target_fingerprint,
+                migration_id,
             },
         )));
     }
@@ -432,6 +473,47 @@ fn run_bootstrap_service(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn run_journal_v3_to_v4_migration(
+    arguments: RuntimeJournalMigrationArgumentsV1,
+) -> Result<(), RuntimeHostEntrypointError> {
+    let outcome = RuntimeStore::migrate_payload_v3_offline(
+        &arguments.state_directory,
+        &arguments.evidence_directory,
+        arguments.expected_store_instance_id,
+        arguments.expected_target_fingerprint,
+        arguments.migration_id,
+    )?;
+    let disposition = match outcome.disposition {
+        RuntimeStoreMigrationDisposition::Migrated => b"migrated".as_slice(),
+        RuntimeStoreMigrationDisposition::AlreadyMigrated => b"already_migrated".as_slice(),
+    };
+    let receipt = outcome.receipt;
+    let mut stdout = io::stdout().lock();
+    let result = (|| -> io::Result<()> {
+        stdout.write_all(b"runtime_journal_migration_v1 disposition=")?;
+        stdout.write_all(disposition)?;
+        stdout.write_all(b" migration_id=")?;
+        write_lower_hex(&mut stdout, receipt.migration_id())?;
+        write!(
+            stdout,
+            " source_payload_version={}",
+            receipt.source_payload_version()
+        )?;
+        stdout.write_all(b" source_checksum=")?;
+        write_lower_hex(&mut stdout, receipt.source_checksum().as_bytes())?;
+        stdout.write_all(b" store_instance_id=")?;
+        write_lower_hex(&mut stdout, receipt.source_store_instance_id())?;
+        stdout.write_all(b" target_fingerprint=")?;
+        write_lower_hex(&mut stdout, receipt.source_target_fingerprint().as_bytes())?;
+        write!(stdout, " source_sequence={}", receipt.source_sequence())?;
+        stdout.write_all(b" receipt=")?;
+        write_lower_hex(&mut stdout, receipt.canonical_wire())?;
+        stdout.write_all(b"\n")
+    })();
+    result.map_err(|error| RuntimeHostEntrypointFailure::Output(error.kind()).into())
+}
+
 #[cfg(unix)]
 fn write_stdout_fact(name: &str, bytes: &[u8]) -> Result<(), RuntimeHostEntrypointError> {
     let mut stdout = io::stdout().lock();
@@ -477,6 +559,8 @@ enum RuntimeHostEntrypointFailure {
     Output(io::ErrorKind),
     #[cfg(any(target_os = "linux", all(test, unix)))]
     Bootstrap(RuntimeBootstrapEndpointError),
+    #[cfg(any(target_os = "linux", all(test, unix)))]
+    Migration(RuntimeStoreMigrationError),
 }
 
 impl fmt::Display for RuntimeHostEntrypointFailure {
@@ -501,6 +585,8 @@ impl fmt::Display for RuntimeHostEntrypointFailure {
             Self::Output(kind) => write!(formatter, "operator output I/O: {kind:?}"),
             #[cfg(any(target_os = "linux", all(test, unix)))]
             Self::Bootstrap(error) => write!(formatter, "Runtime bootstrap service: {error}"),
+            #[cfg(any(target_os = "linux", all(test, unix)))]
+            Self::Migration(error) => write!(formatter, "Runtime journal migration: {error}"),
         }
     }
 }
@@ -569,6 +655,13 @@ impl From<RuntimeInitializerBeginError> for RuntimeHostEntrypointError {
 impl From<RuntimeBootstrapEndpointError> for RuntimeHostEntrypointError {
     fn from(error: RuntimeBootstrapEndpointError) -> Self {
         RuntimeHostEntrypointFailure::Bootstrap(error).into()
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+impl From<RuntimeStoreMigrationError> for RuntimeHostEntrypointError {
+    fn from(error: RuntimeStoreMigrationError) -> Self {
+        RuntimeHostEntrypointFailure::Migration(error).into()
     }
 }
 
@@ -697,6 +790,17 @@ mod tests {
         command
     }
 
+    fn valid_migration_command() -> Vec<OsString> {
+        vec![
+            os(MIGRATE_JOURNAL_V3_TO_V4_COMMAND),
+            os("/tmp/runtime-state"),
+            os("/tmp/runtime-migration-evidence"),
+            os(&"41".repeat(32)),
+            os(&"42".repeat(32)),
+            os(&"43".repeat(32)),
+        ]
+    }
+
     #[test]
     fn bootstrap_command_is_exact_versioned_and_uses_key_paths() {
         assert!(matches!(
@@ -720,6 +824,39 @@ mod tests {
         let mut signed_gid = valid_bootstrap_command();
         signed_gid[20] = os("+1002");
         assert!(parse_runtime_host_command(signed_gid.into_iter()).is_err());
+    }
+
+    #[test]
+    fn journal_migration_command_is_exact_versioned_and_lower_hex_only() {
+        assert_eq!(
+            parse_runtime_host_command(valid_migration_command().into_iter())
+                .unwrap_or_else(|error| panic!("migration command rejected: {error}")),
+            RuntimeHostCommand::MigrateJournalV3ToV4(Box::new(
+                RuntimeJournalMigrationArgumentsV1 {
+                    state_directory: PathBuf::from("/tmp/runtime-state"),
+                    evidence_directory: PathBuf::from("/tmp/runtime-migration-evidence"),
+                    expected_store_instance_id: [0x41; 32],
+                    expected_target_fingerprint: Digest32::from_bytes([0x42; 32]),
+                    migration_id: [0x43; 32],
+                }
+            ))
+        );
+
+        let mut missing = valid_migration_command();
+        missing.pop();
+        assert!(parse_runtime_host_command(missing.into_iter()).is_err());
+        let mut extra = valid_migration_command();
+        extra.push(os("extra"));
+        assert!(parse_runtime_host_command(extra.into_iter()).is_err());
+        let mut uppercase = valid_migration_command();
+        uppercase[4] = os(&"AA".repeat(32));
+        assert!(parse_runtime_host_command(uppercase.into_iter()).is_err());
+        let mut wrong_width = valid_migration_command();
+        wrong_width[5] = os(&"43".repeat(31));
+        assert!(parse_runtime_host_command(wrong_width.into_iter()).is_err());
+        let mut old_unversioned_name = valid_migration_command();
+        old_unversioned_name[0] = os("migrate-journal-v3-to-v4");
+        assert!(parse_runtime_host_command(old_unversioned_name.into_iter()).is_err());
     }
 
     #[test]

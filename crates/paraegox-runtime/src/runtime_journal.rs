@@ -4,9 +4,9 @@
 //! performs no filesystem I/O, initialization, endpoint startup, apply, or
 //! recovery action. In particular, descriptor and singleton-manifest values are
 //! retained as exact opaque bytes plus their externally supplied digests. Their
-//! canonical schemas and semantic bounds remain owned by the crate-private S7-B
-//! successor contract until S7-E connects the real producer and Runtime
-//! consumer. The store-pinned build identity is nevertheless persisted as the
+//! canonical schemas and semantic bounds remain owned by the promoted S7-E/F
+//! Runtime contract facade and its real producer/consumer path. The
+//! store-pinned build identity is persisted as the
 //! exact four-field journal projection required by that contract; it is not a
 //! second contract type or digest domain. Nothing here decodes or reconstructs
 //! the descriptor or manifest contracts.
@@ -14,19 +14,27 @@
 use core::fmt;
 
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
-use paraegox_runtime_contracts::provenance::{SourcePlanDigest, TargetSliceDigest};
+use paraegox_kernel::identity::RuntimeHostId;
+use paraegox_runtime_contracts::apply::ExpectedActive;
+use paraegox_runtime_contracts::provenance::{
+    PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanDigest, SourcePlanRef,
+    SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest, TargetSliceDigest,
+};
 use paraegox_runtime_contracts::reference_control::{
-    MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, REFERENCE_ADMISSION_REQUEST_NONCE_CAPACITY,
-    REFERENCE_ADMISSION_TEMPORAL_LINEAGE_CAPACITY, REFERENCE_ADMISSION_TENURE_NONCE_CAPACITY,
+    MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES,
+    REFERENCE_ADMISSION_REQUEST_NONCE_CAPACITY, REFERENCE_ADMISSION_TEMPORAL_LINEAGE_CAPACITY,
+    REFERENCE_ADMISSION_TENURE_NONCE_CAPACITY, ReferenceApplyRequestV1,
     ReferenceApplyTerminalHeadV1, ReferenceApplyTerminalLifecycleEffectV1,
-    ReferenceApplyTerminalOutcomeV1, ReferenceApplyTerminalReceiptV1,
+    ReferenceApplyTerminalOutcomeV1, ReferenceApplyTerminalReceiptV1, ReferenceAssemblyModeV1,
+    reference_apply_ingress_identities_v1,
 };
 
 pub(crate) const RUNTIME_JOURNAL_ENVELOPE_VERSION: u16 = 1;
 // Payload v2 had no production initializer or store. The fixed-width build
 // identity introduced by v3 therefore has no supported v2 decoder, migrator, or
 // stored-version fallback.
-pub(crate) const RUNTIME_JOURNAL_PAYLOAD_VERSION: u16 = 3;
+const RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION: u16 = 3;
+pub(crate) const RUNTIME_JOURNAL_PAYLOAD_VERSION: u16 = 4;
 pub(crate) const RUNTIME_JOURNAL_OWNER_KIND: u16 = 3;
 pub(crate) const RUNTIME_JOURNAL_CHECKSUM_ALGORITHM: u16 = 1;
 pub(crate) const RUNTIME_JOURNAL_CHECKSUM_VERSION: u16 = 1;
@@ -63,6 +71,76 @@ const HEADER_BYTES: usize = HEADER_WITHOUT_CHECKSUM_BYTES + 32;
 
 type Ref16 = [u8; 16];
 
+/// Complete contract-owned provenance required to re-establish one durable
+/// target Slice commitment after restart.
+///
+/// The journal persists these fixed facts next to each prepared, desired,
+/// retiring, recovery, and terminal lineage. Validation reconstructs the
+/// canonical [`RuntimeSliceCommitment`] instead of trusting a stored digest or
+/// inventing a Runtime-local digest domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DurableSliceProvenance {
+    pub(crate) target: Ref16,
+    pub(crate) source_scope: Ref16,
+    pub(crate) source_plan: Ref16,
+    pub(crate) source_revision: u64,
+    pub(crate) source_plan_digest: SourcePlanDigest,
+    pub(crate) assignment_digest: TargetAssignmentDigest,
+    pub(crate) target_slice_digest: TargetSliceDigest,
+}
+
+impl DurableSliceProvenance {
+    pub(crate) fn try_new(
+        target: RuntimeHostId,
+        provenance: PlanProvenance,
+        assignment_digest: TargetAssignmentDigest,
+        target_slice_digest: TargetSliceDigest,
+    ) -> Result<Self, RuntimeJournalError> {
+        let value = Self {
+            target: *target.as_bytes(),
+            source_scope: *provenance.source_scope().as_bytes(),
+            source_plan: *provenance.source_plan().as_bytes(),
+            source_revision: provenance.source_revision().value(),
+            source_plan_digest: provenance.source_plan_digest(),
+            assignment_digest,
+            target_slice_digest,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) const fn plan_provenance(self) -> PlanProvenance {
+        PlanProvenance::new(
+            SourceScopeRef::from_bytes(self.source_scope),
+            SourcePlanRef::from_bytes(self.source_plan),
+            SourcePlanRevision::new(self.source_revision),
+            self.source_plan_digest,
+        )
+    }
+
+    fn validate(self) -> Result<(), RuntimeJournalError> {
+        ensure_nonzero_ref(&self.target)?;
+        ensure_nonzero_ref(&self.source_scope)?;
+        ensure_nonzero_ref(&self.source_plan)?;
+        ensure_nonzero_digest(self.source_plan_digest.value())?;
+        ensure_nonzero_digest(self.assignment_digest.value())?;
+        ensure_nonzero_digest(self.target_slice_digest.value())?;
+        if self.source_revision == 0 {
+            return Err(RuntimeJournalError::InvalidStateInvariant);
+        }
+        let commitment = RuntimeSliceCommitment::try_new(RuntimeSliceHeader::new(
+            RuntimeHostId::from_bytes(self.target),
+            self.plan_provenance(),
+            self.assignment_digest,
+        ))
+        .map_err(|_| RuntimeJournalError::InvalidStateInvariant)?;
+        if commitment.target_slice_digest() != self.target_slice_digest {
+            return Err(RuntimeJournalError::InvalidStateInvariant);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OpaqueCanonicalValue {
     pub(crate) canonical_bytes: Box<[u8]>,
@@ -82,6 +160,17 @@ impl OpaqueCanonicalValue {
         digest: Digest32,
     ) -> Result<Self, RuntimeJournalError> {
         Self::try_new(canonical_bytes, digest, MAX_OPAQUE_REQUEST_OR_SLICE_BYTES)
+    }
+
+    pub(crate) fn try_runtime_slice(
+        canonical_bytes: &[u8],
+        digest: Digest32,
+    ) -> Result<Self, RuntimeJournalError> {
+        Self::try_new(
+            canonical_bytes,
+            digest,
+            MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES,
+        )
     }
 
     pub(crate) fn try_resource_evidence(
@@ -285,6 +374,7 @@ pub(crate) struct RuntimeApplyAdmissionInput {
     pub(crate) request: OpaqueCanonicalValue,
     pub(crate) request_nonce_identity: Digest32,
     pub(crate) operation_id: Ref16,
+    pub(crate) slice_provenance: DurableSliceProvenance,
     pub(crate) source_revision: u64,
     pub(crate) source_plan_digest: SourcePlanDigest,
     pub(crate) incoming_slice_digest: TargetSliceDigest,
@@ -629,6 +719,7 @@ pub(crate) enum ExpectedActiveCas {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RetiringLiveFacts {
     pub(crate) old_slice: OpaqueCanonicalValue,
+    pub(crate) old_slice_provenance: DurableSliceProvenance,
     pub(crate) old_source_plan_digest: SourcePlanDigest,
     pub(crate) old_manifest_digest: Digest32,
     pub(crate) signed_start_budget_nanos: u64,
@@ -646,9 +737,10 @@ pub(crate) struct PreparedOperation {
     pub(crate) operation_id: Ref16,
     pub(crate) source_revision: u64,
     pub(crate) request: OpaqueCanonicalValue,
+    pub(crate) slice_provenance: DurableSliceProvenance,
     // The request is the sole copy of the exact Slice. These owner-owned
-    // commitments are cross-checks supplied by the future S7-E strict request
-    // decoder, not a second independently mutable Slice body.
+    // commitments are cross-checks supplied by the S7-E strict request
+    // decoder/facade, not a second independently mutable Slice body.
     pub(crate) request_nonce_identity: Digest32,
     pub(crate) source_plan_digest: SourcePlanDigest,
     pub(crate) incoming_slice_digest: TargetSliceDigest,
@@ -688,6 +780,7 @@ pub(crate) struct ActiveDesiredHead {
     pub(crate) source_scope: Ref16,
     pub(crate) source_revision: u64,
     pub(crate) slice: OpaqueCanonicalValue,
+    pub(crate) slice_provenance: DurableSliceProvenance,
     pub(crate) source_plan_digest: SourcePlanDigest,
     pub(crate) manifest_digest: Digest32,
     pub(crate) operation_id: Ref16,
@@ -792,6 +885,7 @@ pub(crate) struct RecoveryAction {
     pub(crate) source_scope: Ref16,
     pub(crate) source_revision: u64,
     pub(crate) source_plan_digest: SourcePlanDigest,
+    pub(crate) slice_provenance: DurableSliceProvenance,
     pub(crate) active_slice_digest: TargetSliceDigest,
     pub(crate) manifest_digest: Digest32,
     pub(crate) store_pinned_build_identity: StorePinnedBuildIdentity,
@@ -1156,6 +1250,7 @@ pub(crate) struct TerminalOperationRecord {
     pub(crate) operation_id: Ref16,
     pub(crate) request_digest: Digest32,
     pub(crate) request_nonce_identity: Digest32,
+    pub(crate) slice_provenance: DurableSliceProvenance,
     pub(crate) source_revision: u64,
     pub(crate) source_plan_digest: SourcePlanDigest,
     pub(crate) target_slice_digest: TargetSliceDigest,
@@ -1946,8 +2041,16 @@ impl RuntimeJournalState {
             }
             ensure_nonzero_digest(&terminal.request_digest)?;
             ensure_nonzero_digest(&terminal.request_nonce_identity)?;
+            terminal.slice_provenance.validate()?;
             ensure_nonzero_digest(terminal.source_plan_digest.value())?;
             ensure_nonzero_digest(terminal.target_slice_digest.value())?;
+            if terminal.slice_provenance.source_scope != terminal.source_scope
+                || terminal.slice_provenance.source_revision != terminal.source_revision
+                || terminal.slice_provenance.source_plan_digest != terminal.source_plan_digest
+                || terminal.slice_provenance.target_slice_digest != terminal.target_slice_digest
+            {
+                return Err(RuntimeJournalError::DanglingReference);
+            }
             ensure_nonzero_ref(&terminal.temporal_constraint_id)?;
             ensure_nonzero_digest(&terminal.temporal_lineage_digest)?;
             if terminal.installed_clock_generation == 0 || terminal.installed_deadline_nanos == 0 {
@@ -2264,6 +2367,7 @@ impl RuntimeJournalState {
                 && terminal.operation_id == active.operation_id
                 && terminal.source_revision == active.source_revision
                 && terminal.source_plan_digest == active.source_plan_digest
+                && terminal.slice_provenance == active.slice_provenance
                 && terminal.target_slice_digest == TargetSliceDigest::new(active.slice.digest)
                 && terminal.incoming_kind == active.kind
                 && terminal.head_disposition == TerminalHeadDisposition::CommittedIncoming
@@ -2293,6 +2397,7 @@ impl RuntimeJournalState {
                     && terminal.operation_id == active.operation_id
                     && terminal.source_revision == active.source_revision
                     && terminal.source_plan_digest == active.source_plan_digest
+                    && terminal.slice_provenance == active.slice_provenance
                     && terminal.target_slice_digest == TargetSliceDigest::new(active.slice.digest)
                     && terminal.selection.primary == TerminalOutcome::OneSourceLoopActive
                     && terminal.head_disposition == TerminalHeadDisposition::CommittedIncoming
@@ -2312,6 +2417,7 @@ impl RuntimeJournalState {
                 terminal.recovery.source_scope == active.source_scope
                     && terminal.recovery.source_revision == active.source_revision
                     && terminal.recovery.source_plan_digest == active.source_plan_digest
+                    && terminal.recovery.slice_provenance == active.slice_provenance
                     && terminal.recovery.active_slice_digest
                         == TargetSliceDigest::new(active.slice.digest)
                     && terminal.selection.primary == TerminalOutcome::OneSourceLoopActive
@@ -2343,6 +2449,7 @@ impl RuntimeJournalState {
                     && terminal.operation_id == active.operation_id
                     && terminal.source_revision == active.source_revision
                     && terminal.source_plan_digest == active.source_plan_digest
+                    && terminal.slice_provenance == active.slice_provenance
                     && terminal.target_slice_digest == TargetSliceDigest::new(active.slice.digest)
                     && terminal.incoming_kind == DesiredHeadKind::EmptyDeactivate
                     && terminal.head_disposition == TerminalHeadDisposition::CommittedIncoming
@@ -2800,6 +2907,7 @@ impl RuntimeJournalState {
                     || active.kind != DesiredHeadKind::OneSourceLoop
                     || active.source_scope != prepared.source_scope
                     || active.source_revision != prepared.source_revision
+                    || active.slice_provenance != prepared.slice_provenance
                     || TargetSliceDigest::new(active.slice.digest) != prepared.incoming_slice_digest
                     || active.source_plan_digest != prepared.source_plan_digest
                     || active.manifest_digest != prepared.manifest_digest
@@ -2912,6 +3020,7 @@ impl RuntimeJournalState {
             || action.resource_generation != resource_generation
             || old_active.kind != DesiredHeadKind::OneSourceLoop
             || retiring.old_slice != old_active.slice
+            || retiring.old_slice_provenance != old_active.slice_provenance
             || retiring.old_source_plan_digest != old_active.source_plan_digest
             || retiring.old_manifest_digest != old_active.manifest_digest
             || retiring.old_runtime_host_epoch != runtime_host_epoch
@@ -2921,6 +3030,7 @@ impl RuntimeJournalState {
             || current_active.kind != DesiredHeadKind::EmptyDeactivate
             || current_active.source_scope != current_prepared.source_scope
             || current_active.source_revision != current_prepared.source_revision
+            || current_active.slice_provenance != current_prepared.slice_provenance
             || TargetSliceDigest::new(current_active.slice.digest)
                 != current_prepared.incoming_slice_digest
             || current_active.source_plan_digest != current_prepared.source_plan_digest
@@ -2968,6 +3078,7 @@ impl RuntimeJournalState {
             || active.kind != DesiredHeadKind::EmptyDeactivate
             || active.source_scope != prepared.source_scope
             || active.source_revision != prepared.source_revision
+            || active.slice_provenance != prepared.slice_provenance
             || TargetSliceDigest::new(active.slice.digest) != prepared.incoming_slice_digest
             || active.source_plan_digest != prepared.source_plan_digest
             || active.operation_id != prepared.operation_id
@@ -3429,7 +3540,7 @@ fn recovery_failure_evidence_digest(
     resource_census_digest: Digest32,
 ) -> Result<Digest32, RuntimeJournalError> {
     let mut encoded = Encoder::with_capacity(512);
-    encode_recovery_action(&mut encoded, recovery);
+    encode_recovery_action(&mut encoded, recovery, RUNTIME_JOURNAL_PAYLOAD_VERSION);
     encode_terminal_selection(&mut encoded, selection);
     encoded.digest(&resource_census_digest);
     let mut builder = Digest32Builder::try_new(RUNTIME_RECOVERY_FAILURE_DOMAIN)?;
@@ -3581,6 +3692,7 @@ fn prepared_identity_equal(current: &PreparedOperation, previous: &PreparedOpera
         && current.operation_id == previous.operation_id
         && current.source_revision == previous.source_revision
         && current.request == previous.request
+        && current.slice_provenance == previous.slice_provenance
         && current.request_nonce_identity == previous.request_nonce_identity
         && current.source_plan_digest == previous.source_plan_digest
         && current.incoming_slice_digest == previous.incoming_slice_digest
@@ -3863,6 +3975,7 @@ fn appended_terminal_for_prepared<'a>(
             && terminal.operation_id == prepared.operation_id
             && terminal.request_digest == prepared.request.digest
             && terminal.request_nonce_identity == prepared.request_nonce_identity
+            && terminal.slice_provenance == prepared.slice_provenance
             && terminal.source_revision == prepared.source_revision
             && terminal.source_plan_digest == prepared.source_plan_digest
             && terminal.target_slice_digest == prepared.incoming_slice_digest
@@ -4195,10 +4308,18 @@ impl PreparedOperation {
     ) -> Result<(), RuntimeJournalError> {
         self.request
             .validate_bound(MAX_OPAQUE_REQUEST_OR_SLICE_BYTES)?;
+        self.slice_provenance.validate()?;
         ensure_nonzero_digest(&self.request_nonce_identity)?;
         ensure_nonzero_digest(self.source_plan_digest.value())?;
         ensure_nonzero_digest(self.incoming_slice_digest.value())?;
         ensure_nonzero_digest(&self.manifest_digest)?;
+        if self.slice_provenance.source_scope != self.source_scope
+            || self.slice_provenance.source_revision != self.source_revision
+            || self.slice_provenance.source_plan_digest != self.source_plan_digest
+            || self.slice_provenance.target_slice_digest != self.incoming_slice_digest
+        {
+            return Err(RuntimeJournalError::DanglingReference);
+        }
         ensure_nonzero_ref(&self.temporal_constraint_id)?;
         ensure_nonzero_digest(&self.temporal_lineage_digest)?;
         if self.installed_clock_generation == 0 || self.installed_deadline_nanos == 0 {
@@ -4229,6 +4350,14 @@ impl PreparedOperation {
                 if self.action.map(|value| value.kind) == Some(JournalActionKind::DrainToEmpty) =>
             {
                 facts.validate(pinned_manifest_digest)?;
+                if facts.old_slice_provenance.source_scope != self.source_scope
+                    || facts.old_slice_provenance.target != self.slice_provenance.target
+                    || facts.old_slice_provenance.source_revision >= self.source_revision
+                    || self.expected_active
+                        != ExpectedActiveCas::Exact(facts.old_slice_provenance.target_slice_digest)
+                {
+                    return Err(RuntimeJournalError::DanglingReference);
+                }
             }
             (PreparedPhase::HeadCommittedRetiringOld, None) => {
                 return Err(RuntimeJournalError::InvalidStateInvariant);
@@ -4275,11 +4404,15 @@ impl PreparedOperation {
 impl RetiringLiveFacts {
     fn validate(&self, pinned_manifest_digest: &Digest32) -> Result<(), RuntimeJournalError> {
         self.old_slice
-            .validate_bound(MAX_OPAQUE_REQUEST_OR_SLICE_BYTES)?;
+            .validate_bound(MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES)?;
+        self.old_slice_provenance.validate()?;
         ensure_nonzero_digest(self.old_source_plan_digest.value())?;
         ensure_nonzero_digest(&self.old_manifest_digest)?;
         ensure_nonzero_digest(&self.old_resource_census_digest)?;
-        if &self.old_manifest_digest != pinned_manifest_digest
+        if self.old_slice_provenance.source_plan_digest != self.old_source_plan_digest
+            || self.old_slice_provenance.target_slice_digest
+                != TargetSliceDigest::new(self.old_slice.digest)
+            || &self.old_manifest_digest != pinned_manifest_digest
             || self.signed_start_budget_nanos == 0
             || self.signed_drain_budget_nanos == 0
             || self.signed_cleanup_budget_nanos == 0
@@ -4296,9 +4429,18 @@ impl RetiringLiveFacts {
 impl ActiveDesiredHead {
     fn validate(&self, pinned_manifest_digest: &Digest32) -> Result<(), RuntimeJournalError> {
         self.slice
-            .validate_bound(MAX_OPAQUE_REQUEST_OR_SLICE_BYTES)?;
+            .validate_bound(MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES)?;
+        self.slice_provenance.validate()?;
         ensure_nonzero_digest(self.source_plan_digest.value())?;
         ensure_nonzero_digest(&self.manifest_digest)?;
+        if self.slice_provenance.source_scope != self.source_scope
+            || self.slice_provenance.source_revision != self.source_revision
+            || self.slice_provenance.source_plan_digest != self.source_plan_digest
+            || self.slice_provenance.target_slice_digest
+                != TargetSliceDigest::new(self.slice.digest)
+        {
+            return Err(RuntimeJournalError::DanglingReference);
+        }
         if &self.manifest_digest != pinned_manifest_digest {
             return Err(RuntimeJournalError::DanglingReference);
         }
@@ -4323,6 +4465,7 @@ impl RecoveryAction {
             || active.source_scope != self.source_scope
             || active.source_revision != self.source_revision
             || active.source_plan_digest != self.source_plan_digest
+            || active.slice_provenance != self.slice_provenance
             || TargetSliceDigest::new(active.slice.digest) != self.active_slice_digest
             || active.manifest_digest != self.manifest_digest
         {
@@ -4340,6 +4483,7 @@ impl RecoveryAction {
             return Err(RuntimeJournalError::InvalidStateInvariant);
         }
         validate_action(self.action, host)?;
+        self.slice_provenance.validate()?;
         ensure_nonzero_ref(&self.source_scope)?;
         ensure_nonzero_digest(self.source_plan_digest.value())?;
         ensure_nonzero_digest(self.active_slice_digest.value())?;
@@ -4347,6 +4491,13 @@ impl RecoveryAction {
         self.store_pinned_build_identity.validate()?;
         ensure_nonzero_digest(&self.compiled_compatibility_digest)?;
         ensure_nonzero_digest(&self.deadline_evidence_digest)?;
+        if self.slice_provenance.source_scope != self.source_scope
+            || self.slice_provenance.source_revision != self.source_revision
+            || self.slice_provenance.source_plan_digest != self.source_plan_digest
+            || self.slice_provenance.target_slice_digest != self.active_slice_digest
+        {
+            return Err(RuntimeJournalError::DanglingReference);
+        }
         if self
             .compiled_build_instance_id
             .iter()
@@ -4472,6 +4623,7 @@ impl RecoveryTerminalRecord {
             terminal.source_scope == self.recovery.source_scope
                 && terminal.source_revision == self.recovery.source_revision
                 && terminal.source_plan_digest == self.recovery.source_plan_digest
+                && terminal.slice_provenance == self.recovery.slice_provenance
                 && terminal.target_slice_digest == self.recovery.active_slice_digest
                 && terminal.incoming_kind == DesiredHeadKind::OneSourceLoop
                 && terminal.head_disposition == TerminalHeadDisposition::CommittedIncoming
@@ -4684,6 +4836,7 @@ fn validate_prepared_latch_successor(
     if current.source_scope != previous.source_scope
         || current.source_revision != previous.source_revision
         || current.request != previous.request
+        || current.slice_provenance != previous.slice_provenance
         || current.request_nonce_identity != previous.request_nonce_identity
         || current.source_plan_digest != previous.source_plan_digest
         || current.incoming_slice_digest != previous.incoming_slice_digest
@@ -4713,6 +4866,7 @@ fn validate_recovery_latch_successor(
     };
     if current.action.action_id == previous.action.action_id
         && (current.action != previous.action
+            || current.slice_provenance != previous.slice_provenance
             || current.active_slice_digest != previous.active_slice_digest
             || current.manifest_digest != previous.manifest_digest
             || current.store_pinned_build_identity != previous.store_pinned_build_identity
@@ -5112,6 +5266,49 @@ pub(crate) struct RuntimeJournalSnapshot {
     canonical_wire: Box<[u8]>,
 }
 
+/// Strictly parsed source evidence plus the canonical v4 snapshot produced by
+/// one explicit payload-v3 migration. Store code consumes this owner-produced
+/// metadata instead of duplicating journal header offsets or checksum parsing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeJournalPayloadV3Migration {
+    snapshot: RuntimeJournalSnapshot,
+    source_payload_version: u16,
+    source_checksum: Digest32,
+    source_store_instance_id: [u8; 32],
+    source_target_fingerprint: Digest32,
+    source_sequence: u64,
+}
+
+impl RuntimeJournalPayloadV3Migration {
+    pub(crate) const fn snapshot(&self) -> &RuntimeJournalSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn into_snapshot(self) -> RuntimeJournalSnapshot {
+        self.snapshot
+    }
+
+    pub(crate) const fn source_payload_version(&self) -> u16 {
+        self.source_payload_version
+    }
+
+    pub(crate) const fn source_checksum(&self) -> Digest32 {
+        self.source_checksum
+    }
+
+    pub(crate) const fn source_store_instance_id(&self) -> &[u8; 32] {
+        &self.source_store_instance_id
+    }
+
+    pub(crate) const fn source_target_fingerprint(&self) -> Digest32 {
+        self.source_target_fingerprint
+    }
+
+    pub(crate) const fn source_sequence(&self) -> u64 {
+        self.source_sequence
+    }
+}
+
 impl RuntimeJournalSnapshot {
     pub(crate) fn try_initialize(
         store_instance_id: [u8; 32],
@@ -5173,6 +5370,11 @@ impl RuntimeJournalSnapshot {
         validate_envelope_identity(&store_instance_id, &owner_target_fingerprint, sequence)?;
         state.validate(sequence)?;
         state.validate_owner_target_binding(&owner_target_fingerprint)?;
+        validate_prepared_request_business_invariants(
+            &state,
+            store_instance_id,
+            RuntimeJournalError::InvalidStateInvariant,
+        )?;
         validate_terminal_receipts(store_instance_id, &state)?;
         let payload = encode_payload(&state)?;
         let canonical_wire = encode_snapshot(
@@ -5242,6 +5444,11 @@ impl RuntimeJournalSnapshot {
         let state = decode_payload(payload)?;
         state.validate(sequence)?;
         state.validate_owner_target_binding(&owner_target_fingerprint)?;
+        validate_prepared_request_business_invariants(
+            &state,
+            store_instance_id,
+            RuntimeJournalError::InvalidStateInvariant,
+        )?;
         validate_terminal_receipts(store_instance_id, &state)?;
         if encode_payload(&state)? != payload {
             return Err(RuntimeJournalError::NonCanonicalEncoding);
@@ -5252,6 +5459,91 @@ impl RuntimeJournalSnapshot {
             sequence,
             state,
             canonical_wire: frame.into(),
+        })
+    }
+
+    /// Explicitly migrates one strictly validated payload-v3 snapshot into the
+    /// v4 format. Normal [`Self::decode`] never falls back to this path.
+    ///
+    /// V3 snapshots with durable Slice lineage that cannot be reconstructed
+    /// from the exact prepared PXAR fail closed; in particular active,
+    /// retiring, recovery, and terminal-only history cannot supply the missing
+    /// `SourcePlanRef` and are never guessed.
+    pub(crate) fn migrate_payload_v3(frame: &[u8]) -> Result<Self, RuntimeJournalError> {
+        Ok(Self::migrate_payload_v3_with_metadata(frame)?.into_snapshot())
+    }
+
+    /// Performs the same strict conversion while retaining the already parsed
+    /// source identity/checksum facts required by an offline migration receipt.
+    pub(crate) fn migrate_payload_v3_with_metadata(
+        frame: &[u8],
+    ) -> Result<RuntimeJournalPayloadV3Migration, RuntimeJournalError> {
+        if frame.len() > MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES {
+            return Err(RuntimeJournalError::SnapshotTooLarge);
+        }
+        if frame.len() < HEADER_BYTES {
+            return Err(RuntimeJournalError::Truncated);
+        }
+        let mut header = Cursor::new(frame);
+        if header.array::<4>()? != *RUNTIME_JOURNAL_MAGIC {
+            return Err(RuntimeJournalError::InvalidMagic);
+        }
+        if header.u16()? != RUNTIME_JOURNAL_ENVELOPE_VERSION {
+            return Err(RuntimeJournalError::UnsupportedEnvelopeVersion);
+        }
+        if header.u16()? != RUNTIME_JOURNAL_OWNER_KIND {
+            return Err(RuntimeJournalError::WrongOwnerKind);
+        }
+        let source_payload_version = header.u16()?;
+        if source_payload_version != RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION {
+            return Err(RuntimeJournalError::UnsupportedPayloadVersion);
+        }
+        if header.u16()? != RUNTIME_JOURNAL_CHECKSUM_ALGORITHM
+            || header.u16()? != RUNTIME_JOURNAL_CHECKSUM_VERSION
+        {
+            return Err(RuntimeJournalError::UnsupportedChecksumProfile);
+        }
+        let store_instance_id = header.array::<32>()?;
+        let owner_target_fingerprint = Digest32::from_bytes(header.array::<32>()?);
+        let sequence = header.u64()?;
+        let payload_length =
+            usize::try_from(header.u64()?).map_err(|_| RuntimeJournalError::IntegerOverflow)?;
+        validate_envelope_identity(&store_instance_id, &owner_target_fingerprint, sequence)?;
+        if payload_length > MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES - HEADER_BYTES {
+            return Err(RuntimeJournalError::LengthBomb);
+        }
+        let checksum = Digest32::from_bytes(header.array::<32>()?);
+        let expected_length = HEADER_BYTES
+            .checked_add(payload_length)
+            .ok_or(RuntimeJournalError::IntegerOverflow)?;
+        if expected_length != frame.len() {
+            return if expected_length < frame.len() {
+                Err(RuntimeJournalError::TrailingBytes)
+            } else {
+                Err(RuntimeJournalError::Truncated)
+            };
+        }
+        let payload = &frame[HEADER_BYTES..];
+        if snapshot_checksum(&frame[..HEADER_WITHOUT_CHECKSUM_BYTES], payload)? != checksum {
+            return Err(RuntimeJournalError::ChecksumMismatch);
+        }
+        let state = decode_payload_version(payload, RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION)?;
+        if encode_payload_version(&state, RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION)? != payload {
+            return Err(RuntimeJournalError::NonCanonicalEncoding);
+        }
+        validate_prepared_request_business_invariants(
+            &state,
+            store_instance_id,
+            RuntimeJournalError::LegacyProvenanceUnavailable,
+        )?;
+        let snapshot = Self::try_new(store_instance_id, owner_target_fingerprint, sequence, state)?;
+        Ok(RuntimeJournalPayloadV3Migration {
+            snapshot,
+            source_payload_version,
+            source_checksum: checksum,
+            source_store_instance_id: store_instance_id,
+            source_target_fingerprint: owner_target_fingerprint,
+            source_sequence: sequence,
         })
     }
 
@@ -5382,7 +5674,12 @@ impl RuntimeJournalSnapshot {
         &self,
         input: RuntimeApplyAdmissionInput,
     ) -> Result<Self, RuntimeJournalError> {
-        if input.tenure.expected_store_instance_id != self.store_instance_id
+        input.slice_provenance.validate()?;
+        if input.slice_provenance.source_scope != input.tenure.source_scope
+            || input.slice_provenance.source_revision != input.source_revision
+            || input.slice_provenance.source_plan_digest != input.source_plan_digest
+            || input.slice_provenance.target_slice_digest != input.incoming_slice_digest
+            || input.tenure.expected_store_instance_id != self.store_instance_id
             || input.tenure.owner_target_fingerprint != self.owner_target_fingerprint
             || self.state.writer_fence != Some(input.tenure.fence())
             || input.manifest_digest != self.state.host.singleton_manifest.digest
@@ -5433,6 +5730,7 @@ impl RuntimeJournalSnapshot {
             operation_id: input.operation_id,
             source_revision: input.source_revision,
             request: input.request,
+            slice_provenance: input.slice_provenance,
             request_nonce_identity: input.request_nonce_identity,
             source_plan_digest: input.source_plan_digest,
             incoming_slice_digest: input.incoming_slice_digest,
@@ -5719,6 +6017,7 @@ impl RuntimeJournalSnapshot {
             source_scope: prepared.source_scope,
             source_revision: prepared.source_revision,
             slice: incoming_slice,
+            slice_provenance: prepared.slice_provenance,
             source_plan_digest: prepared.source_plan_digest,
             manifest_digest: prepared.manifest_digest,
             operation_id: prepared.operation_id,
@@ -5932,6 +6231,7 @@ impl RuntimeJournalSnapshot {
         current_prepared.action = Some(action);
         current_prepared.retiring = Some(RetiringLiveFacts {
             old_slice: old_active.slice.clone(),
+            old_slice_provenance: old_active.slice_provenance,
             old_source_plan_digest: old_active.source_plan_digest,
             old_manifest_digest: old_active.manifest_digest,
             signed_start_budget_nanos: input.budgets.start_nanos,
@@ -5947,6 +6247,7 @@ impl RuntimeJournalSnapshot {
             source_scope: prepared.source_scope,
             source_revision: prepared.source_revision,
             slice: input.incoming_slice,
+            slice_provenance: prepared.slice_provenance,
             source_plan_digest: prepared.source_plan_digest,
             manifest_digest: prepared.manifest_digest,
             operation_id: prepared.operation_id,
@@ -6361,6 +6662,7 @@ impl RuntimeJournalSnapshot {
             source_scope: prepared.source_scope,
             source_revision: prepared.source_revision,
             slice: incoming_slice,
+            slice_provenance: prepared.slice_provenance,
             source_plan_digest: prepared.source_plan_digest,
             manifest_digest: prepared.manifest_digest,
             operation_id: prepared.operation_id,
@@ -6464,6 +6766,47 @@ impl RuntimeJournalSnapshot {
 
     pub(crate) const fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Canonical digest of the exact resource set owned by this journal
+    /// snapshot. Consumers must use this projection instead of duplicating the
+    /// owner-private census domain or encoding.
+    pub(crate) fn resource_census_digest(&self) -> Result<Digest32, RuntimeJournalError> {
+        compute_resource_census_digest(&self.state.owned_resources)
+    }
+
+    #[cfg(test)]
+    pub(super) fn legacy_payload_v3_wire_for_test(&self) -> Result<Vec<u8>, RuntimeJournalError> {
+        self.legacy_payload_v3_wire_for_state_for_test(&self.state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn legacy_payload_v3_wire_for_state_for_test(
+        &self,
+        state: &RuntimeJournalState,
+    ) -> Result<Vec<u8>, RuntimeJournalError> {
+        let payload = encode_payload_version(state, RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION)?;
+        encode_snapshot_version(
+            &self.store_instance_id,
+            &self.owner_target_fingerprint,
+            self.sequence,
+            &payload,
+            RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn resealed_v4_wire_for_test(
+        &self,
+        state: &RuntimeJournalState,
+    ) -> Result<Vec<u8>, RuntimeJournalError> {
+        let payload = encode_payload(state)?;
+        encode_snapshot(
+            &self.store_instance_id,
+            &self.owner_target_fingerprint,
+            self.sequence,
+            &payload,
+        )
     }
 
     pub(crate) const fn state(&self) -> &RuntimeJournalState {
@@ -6618,6 +6961,7 @@ fn terminal_record(
         operation_id: prepared.operation_id,
         request_digest: prepared.request.digest,
         request_nonce_identity: prepared.request_nonce_identity,
+        slice_provenance: prepared.slice_provenance,
         source_revision: prepared.source_revision,
         source_plan_digest: prepared.source_plan_digest,
         target_slice_digest: prepared.incoming_slice_digest,
@@ -6761,6 +7105,28 @@ fn encode_snapshot(
     sequence: u64,
     payload: &[u8],
 ) -> Result<Vec<u8>, RuntimeJournalError> {
+    encode_snapshot_version(
+        store_instance_id,
+        owner_target_fingerprint,
+        sequence,
+        payload,
+        RUNTIME_JOURNAL_PAYLOAD_VERSION,
+    )
+}
+
+fn encode_snapshot_version(
+    store_instance_id: &[u8; 32],
+    owner_target_fingerprint: &Digest32,
+    sequence: u64,
+    payload: &[u8],
+    payload_version: u16,
+) -> Result<Vec<u8>, RuntimeJournalError> {
+    if !matches!(
+        payload_version,
+        RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION | RUNTIME_JOURNAL_PAYLOAD_VERSION
+    ) {
+        return Err(RuntimeJournalError::UnsupportedPayloadVersion);
+    }
     let total_length = HEADER_BYTES
         .checked_add(payload.len())
         .ok_or(RuntimeJournalError::IntegerOverflow)?;
@@ -6773,7 +7139,7 @@ fn encode_snapshot(
     header.bytes(RUNTIME_JOURNAL_MAGIC);
     header.u16(RUNTIME_JOURNAL_ENVELOPE_VERSION);
     header.u16(RUNTIME_JOURNAL_OWNER_KIND);
-    header.u16(RUNTIME_JOURNAL_PAYLOAD_VERSION);
+    header.u16(payload_version);
     header.u16(RUNTIME_JOURNAL_CHECKSUM_ALGORITHM);
     header.u16(RUNTIME_JOURNAL_CHECKSUM_VERSION);
     header.bytes(store_instance_id);
@@ -6797,6 +7163,19 @@ fn snapshot_checksum(header: &[u8], payload: &[u8]) -> Result<Digest32, RuntimeJ
 }
 
 fn encode_payload(state: &RuntimeJournalState) -> Result<Vec<u8>, RuntimeJournalError> {
+    encode_payload_version(state, RUNTIME_JOURNAL_PAYLOAD_VERSION)
+}
+
+fn encode_payload_version(
+    state: &RuntimeJournalState,
+    payload_version: u16,
+) -> Result<Vec<u8>, RuntimeJournalError> {
+    if !matches!(
+        payload_version,
+        RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION | RUNTIME_JOURNAL_PAYLOAD_VERSION
+    ) {
+        return Err(RuntimeJournalError::UnsupportedPayloadVersion);
+    }
     let mut encoder = Encoder::with_capacity(1024);
     encoder.u8(state.last_transaction as u8);
     let host = &state.host;
@@ -6856,6 +7235,9 @@ fn encode_payload(state: &RuntimeJournalState) -> Result<Vec<u8>, RuntimeJournal
         encoder.bytes(&prepared.operation_id);
         encoder.u64(prepared.source_revision);
         encoder.opaque(&prepared.request)?;
+        if payload_version == RUNTIME_JOURNAL_PAYLOAD_VERSION {
+            encode_slice_provenance(&mut encoder, prepared.slice_provenance);
+        }
         encoder.digest(&prepared.request_nonce_identity);
         encoder.digest(prepared.source_plan_digest.value());
         encoder.digest(prepared.incoming_slice_digest.value());
@@ -6871,6 +7253,9 @@ fn encode_payload(state: &RuntimeJournalState) -> Result<Vec<u8>, RuntimeJournal
         encoder.presence(prepared.retiring.is_some());
         if let Some(retiring) = &prepared.retiring {
             encoder.opaque(&retiring.old_slice)?;
+            if payload_version == RUNTIME_JOURNAL_PAYLOAD_VERSION {
+                encode_slice_provenance(&mut encoder, retiring.old_slice_provenance);
+            }
             encoder.digest(retiring.old_source_plan_digest.value());
             encoder.digest(&retiring.old_manifest_digest);
             encoder.u64(retiring.signed_start_budget_nanos);
@@ -6890,6 +7275,9 @@ fn encode_payload(state: &RuntimeJournalState) -> Result<Vec<u8>, RuntimeJournal
         encoder.bytes(&active.source_scope);
         encoder.u64(active.source_revision);
         encoder.opaque(&active.slice)?;
+        if payload_version == RUNTIME_JOURNAL_PAYLOAD_VERSION {
+            encode_slice_provenance(&mut encoder, active.slice_provenance);
+        }
         encoder.digest(active.source_plan_digest.value());
         encoder.digest(&active.manifest_digest);
         encoder.bytes(&active.operation_id);
@@ -6900,12 +7288,12 @@ fn encode_payload(state: &RuntimeJournalState) -> Result<Vec<u8>, RuntimeJournal
 
     encoder.presence(state.recovery_action.is_some());
     if let Some(recovery) = state.recovery_action {
-        encode_recovery_action(&mut encoder, recovery);
+        encode_recovery_action(&mut encoder, recovery, payload_version);
     }
 
     encoder.count(state.recovery_terminals.len())?;
     for terminal in &state.recovery_terminals {
-        encode_recovery_action(&mut encoder, terminal.recovery);
+        encode_recovery_action(&mut encoder, terminal.recovery, payload_version);
         encode_terminal_selection(&mut encoder, terminal.selection);
         encoder.digest(&terminal.resource_census_digest);
         encoder.optional_digest(terminal.failure_latch_digest);
@@ -6933,6 +7321,9 @@ fn encode_payload(state: &RuntimeJournalState) -> Result<Vec<u8>, RuntimeJournal
         encoder.bytes(&terminal.operation_id);
         encoder.digest(&terminal.request_digest);
         encoder.digest(&terminal.request_nonce_identity);
+        if payload_version == RUNTIME_JOURNAL_PAYLOAD_VERSION {
+            encode_slice_provenance(&mut encoder, terminal.slice_provenance);
+        }
         encoder.u64(terminal.source_revision);
         encoder.digest(terminal.source_plan_digest.value());
         encoder.digest(terminal.target_slice_digest.value());
@@ -6976,11 +7367,14 @@ fn encode_action(encoder: &mut Encoder, action: JournalActionRef) {
     encoder.u64(action.resource_generation);
 }
 
-fn encode_recovery_action(encoder: &mut Encoder, recovery: RecoveryAction) {
+fn encode_recovery_action(encoder: &mut Encoder, recovery: RecoveryAction, payload_version: u16) {
     encode_action(encoder, recovery.action);
     encoder.bytes(&recovery.source_scope);
     encoder.u64(recovery.source_revision);
     encoder.digest(recovery.source_plan_digest.value());
+    if payload_version == RUNTIME_JOURNAL_PAYLOAD_VERSION {
+        encode_slice_provenance(encoder, recovery.slice_provenance);
+    }
     encoder.digest(recovery.active_slice_digest.value());
     encoder.digest(&recovery.manifest_digest);
     encode_store_pinned_build_identity(encoder, recovery.store_pinned_build_identity);
@@ -6998,6 +7392,16 @@ fn encode_store_pinned_build_identity(encoder: &mut Encoder, identity: StorePinn
     encoder.digest(&identity.build_descriptor_digest());
     encoder.digest(&identity.runtime_artifact_sha256());
     encoder.digest(&identity.compiled_reference_compatibility_digest());
+}
+
+fn encode_slice_provenance(encoder: &mut Encoder, provenance: DurableSliceProvenance) {
+    encoder.bytes(&provenance.target);
+    encoder.bytes(&provenance.source_scope);
+    encoder.bytes(&provenance.source_plan);
+    encoder.u64(provenance.source_revision);
+    encoder.digest(provenance.source_plan_digest.value());
+    encoder.digest(provenance.assignment_digest.value());
+    encoder.digest(provenance.target_slice_digest.value());
 }
 
 fn encode_terminal_selection(encoder: &mut Encoder, selection: TerminalOutcomeSelection) {
@@ -7228,6 +7632,19 @@ impl Encoder {
 }
 
 fn decode_payload(payload: &[u8]) -> Result<RuntimeJournalState, RuntimeJournalError> {
+    decode_payload_version(payload, RUNTIME_JOURNAL_PAYLOAD_VERSION)
+}
+
+fn decode_payload_version(
+    payload: &[u8],
+    payload_version: u16,
+) -> Result<RuntimeJournalState, RuntimeJournalError> {
+    if !matches!(
+        payload_version,
+        RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION | RUNTIME_JOURNAL_PAYLOAD_VERSION
+    ) {
+        return Err(RuntimeJournalError::UnsupportedPayloadVersion);
+    }
     if payload.len() > MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES - HEADER_BYTES {
         return Err(RuntimeJournalError::LengthBomb);
     }
@@ -7299,14 +7716,40 @@ fn decode_payload(payload: &[u8]) -> Result<RuntimeJournalState, RuntimeJournalE
     };
 
     let prepared = if cursor.presence()? {
+        let source_scope = cursor.array::<16>()?;
+        let operation_id = cursor.array::<16>()?;
+        let source_revision = cursor.u64()?;
+        let request = cursor.opaque(MAX_OPAQUE_REQUEST_OR_SLICE_BYTES)?;
+        let slice_provenance = if payload_version == RUNTIME_JOURNAL_PAYLOAD_VERSION {
+            decode_slice_provenance(&mut cursor)?
+        } else {
+            durable_provenance_from_prepared_v3(&request)?
+        };
+        let request_nonce_identity = cursor.digest()?;
+        let source_plan_digest = SourcePlanDigest::new(cursor.digest()?);
+        let incoming_slice_digest = TargetSliceDigest::new(cursor.digest()?);
+        if slice_provenance.source_scope != source_scope
+            || slice_provenance.source_revision != source_revision
+            || slice_provenance.source_plan_digest != source_plan_digest
+            || slice_provenance.target_slice_digest != incoming_slice_digest
+        {
+            return Err(
+                if payload_version == RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION {
+                    RuntimeJournalError::LegacyProvenanceUnavailable
+                } else {
+                    RuntimeJournalError::DanglingReference
+                },
+            );
+        }
         Some(PreparedOperation {
-            source_scope: cursor.array::<16>()?,
-            operation_id: cursor.array::<16>()?,
-            source_revision: cursor.u64()?,
-            request: cursor.opaque(MAX_OPAQUE_REQUEST_OR_SLICE_BYTES)?,
-            request_nonce_identity: cursor.digest()?,
-            source_plan_digest: SourcePlanDigest::new(cursor.digest()?),
-            incoming_slice_digest: TargetSliceDigest::new(cursor.digest()?),
+            source_scope,
+            operation_id,
+            source_revision,
+            request,
+            slice_provenance,
+            request_nonce_identity,
+            source_plan_digest,
+            incoming_slice_digest,
             incoming_kind: DesiredHeadKind::decode(cursor.u8()?)?,
             manifest_digest: cursor.digest()?,
             expected_active: decode_expected_active(&mut cursor)?,
@@ -7317,8 +7760,12 @@ fn decode_payload(payload: &[u8]) -> Result<RuntimeJournalState, RuntimeJournalE
             phase: PreparedPhase::decode(cursor.u8()?)?,
             action: decode_optional_action(&mut cursor)?,
             retiring: if cursor.presence()? {
+                if payload_version == RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION {
+                    return Err(RuntimeJournalError::LegacyProvenanceUnavailable);
+                }
                 Some(RetiringLiveFacts {
-                    old_slice: cursor.opaque(MAX_OPAQUE_REQUEST_OR_SLICE_BYTES)?,
+                    old_slice: cursor.opaque(MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES)?,
+                    old_slice_provenance: decode_slice_provenance(&mut cursor)?,
                     old_source_plan_digest: SourcePlanDigest::new(cursor.digest()?),
                     old_manifest_digest: cursor.digest()?,
                     signed_start_budget_nanos: cursor.u64()?,
@@ -7339,11 +7786,15 @@ fn decode_payload(payload: &[u8]) -> Result<RuntimeJournalState, RuntimeJournalE
     };
 
     let active_desired = if cursor.presence()? {
+        if payload_version == RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION {
+            return Err(RuntimeJournalError::LegacyProvenanceUnavailable);
+        }
         Some(ActiveDesiredHead {
             kind: DesiredHeadKind::decode(cursor.u8()?)?,
             source_scope: cursor.array::<16>()?,
             source_revision: cursor.u64()?,
-            slice: cursor.opaque(MAX_OPAQUE_REQUEST_OR_SLICE_BYTES)?,
+            slice: cursor.opaque(MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES)?,
+            slice_provenance: decode_slice_provenance(&mut cursor)?,
             source_plan_digest: SourcePlanDigest::new(cursor.digest()?),
             manifest_digest: cursor.digest()?,
             operation_id: cursor.array::<16>()?,
@@ -7356,12 +7807,18 @@ fn decode_payload(payload: &[u8]) -> Result<RuntimeJournalState, RuntimeJournalE
     let live_materialization = decode_live_materialization(&mut cursor)?;
 
     let recovery_action = if cursor.presence()? {
+        if payload_version == RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION {
+            return Err(RuntimeJournalError::LegacyProvenanceUnavailable);
+        }
         Some(decode_recovery_action(&mut cursor)?)
     } else {
         None
     };
 
     let recovery_terminal_count = cursor.count(MAX_RUNTIME_RECOVERY_TERMINALS)?;
+    if payload_version == RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION && recovery_terminal_count != 0 {
+        return Err(RuntimeJournalError::LegacyProvenanceUnavailable);
+    }
     let mut recovery_terminals = Vec::with_capacity(recovery_terminal_count);
     for _ in 0..recovery_terminal_count {
         recovery_terminals.push(RecoveryTerminalRecord {
@@ -7392,6 +7849,9 @@ fn decode_payload(payload: &[u8]) -> Result<RuntimeJournalState, RuntimeJournalE
     }
 
     let terminal_count = cursor.count(MAX_RUNTIME_TERMINAL_OPERATIONS)?;
+    if payload_version == RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION && terminal_count != 0 {
+        return Err(RuntimeJournalError::LegacyProvenanceUnavailable);
+    }
     let mut terminal_operations = Vec::with_capacity(terminal_count);
     for _ in 0..terminal_count {
         terminal_operations.push(TerminalOperationRecord {
@@ -7399,6 +7859,7 @@ fn decode_payload(payload: &[u8]) -> Result<RuntimeJournalState, RuntimeJournalE
             operation_id: cursor.array::<16>()?,
             request_digest: cursor.digest()?,
             request_nonce_identity: cursor.digest()?,
+            slice_provenance: decode_slice_provenance(&mut cursor)?,
             source_revision: cursor.u64()?,
             source_plan_digest: SourcePlanDigest::new(cursor.digest()?),
             target_slice_digest: TargetSliceDigest::new(cursor.digest()?),
@@ -7476,6 +7937,7 @@ fn decode_recovery_action(cursor: &mut Cursor<'_>) -> Result<RecoveryAction, Run
         source_scope: cursor.array::<16>()?,
         source_revision: cursor.u64()?,
         source_plan_digest: SourcePlanDigest::new(cursor.digest()?),
+        slice_provenance: decode_slice_provenance(cursor)?,
         active_slice_digest: TargetSliceDigest::new(cursor.digest()?),
         manifest_digest: cursor.digest()?,
         store_pinned_build_identity: decode_store_pinned_build_identity(cursor)?,
@@ -7498,6 +7960,140 @@ fn decode_store_pinned_build_identity(
         cursor.digest()?,
         cursor.digest()?,
     )
+}
+
+fn decode_slice_provenance(
+    cursor: &mut Cursor<'_>,
+) -> Result<DurableSliceProvenance, RuntimeJournalError> {
+    let value = DurableSliceProvenance {
+        target: cursor.array::<16>()?,
+        source_scope: cursor.array::<16>()?,
+        source_plan: cursor.array::<16>()?,
+        source_revision: cursor.u64()?,
+        source_plan_digest: SourcePlanDigest::new(cursor.digest()?),
+        assignment_digest: TargetAssignmentDigest::new(cursor.digest()?),
+        target_slice_digest: TargetSliceDigest::new(cursor.digest()?),
+    };
+    value.validate()?;
+    Ok(value)
+}
+
+fn durable_provenance_from_prepared_v3(
+    request: &OpaqueCanonicalValue,
+) -> Result<DurableSliceProvenance, RuntimeJournalError> {
+    let decoded = ReferenceApplyRequestV1::decode(&request.canonical_bytes)
+        .map_err(|_| RuntimeJournalError::LegacyProvenanceUnavailable)?;
+    if decoded.canonical_wire() != request.canonical_bytes.as_ref()
+        || decoded.envelope_request_digest() != request.digest
+    {
+        return Err(RuntimeJournalError::LegacyProvenanceUnavailable);
+    }
+    DurableSliceProvenance::try_new(
+        decoded.target(),
+        decoded.provenance(),
+        decoded.assignment_digest(),
+        decoded.target_slice_digest(),
+    )
+    .map_err(|_| RuntimeJournalError::LegacyProvenanceUnavailable)
+}
+
+fn validate_prepared_request_business_invariants(
+    state: &RuntimeJournalState,
+    store_instance_id: [u8; 32],
+    mismatch: RuntimeJournalError,
+) -> Result<(), RuntimeJournalError> {
+    let Some(prepared) = state.prepared.as_ref() else {
+        return Ok(());
+    };
+    // Historical journal transition unit fixtures use short opaque request
+    // labels to exercise state-machine branches independently. Production
+    // builds have no bypass: every persisted Prepared request is strict PXAR.
+    #[cfg(test)]
+    if !prepared.request.canonical_bytes.starts_with(b"PXAR") {
+        return Ok(());
+    }
+    let request =
+        ReferenceApplyRequestV1::decode(&prepared.request.canonical_bytes).map_err(|_| mismatch)?;
+    let provenance = request.provenance();
+    let control = request.control_commitment().control();
+    let writer = control.writer_context();
+    let proof = writer.proof();
+    let authentication = request.authentication().claim();
+    let temporal = request.temporal();
+    let ingress = reference_apply_ingress_identities_v1(&request).map_err(|_| mismatch)?;
+    let execution = request.target_execution();
+    let expected_active = match control.expected_active() {
+        ExpectedActive::None => ExpectedActiveCas::None,
+        ExpectedActive::Exact(digest) => ExpectedActiveCas::Exact(digest),
+    };
+    let incoming_kind = match execution.mode() {
+        ReferenceAssemblyModeV1::OneSourceLoop => DesiredHeadKind::OneSourceLoop,
+        ReferenceAssemblyModeV1::EmptyDeactivate => DesiredHeadKind::EmptyDeactivate,
+    };
+    let fence = state.writer_fence.ok_or(mismatch)?;
+    let temporal_record = state
+        .host
+        .temporal_lineages
+        .iter()
+        .find(|record| record.constraint_id == prepared.temporal_constraint_id)
+        .ok_or(mismatch)?;
+    let proof_digest = proof.envelope_digest().map_err(|_| mismatch)?;
+    let prepared_tenure_recorded = state.host.tenure_nonces.iter().any(|record| {
+        record.identity == ingress.tenure_nonce_identity() && record.value_digest == proof_digest
+    });
+    let prepared_tenure_is_current = ingress.tenure_nonce_identity() == fence.tenure_nonce_identity
+        && proof_digest == fence.proof_envelope_digest
+        && writer.writer().as_bytes() == &fence.writer
+        && writer.epoch().value() == fence.epoch
+        && authentication.principal().as_bytes() == &fence.principal;
+    // A higher-tenure transaction intentionally preserves the exact old PXAR
+    // while advancing the current writer fence and marking its Prepared
+    // operation for reconciliation. The old proof must remain in the bounded
+    // tenure ledger, and the replacement fence must be for the same source at
+    // a strictly higher epoch; requiring the preserved PXAR to equal the new
+    // fence would make the admitted takeover successor impossible to reopen.
+    let prepared_tenure_is_superseded = prepared_tenure_recorded
+        && fence.source_scope == prepared.source_scope
+        && fence.epoch > writer.epoch().value()
+        && matches!(
+            prepared.phase,
+            PreparedPhase::SupersededBeforeEffects
+                | PreparedPhase::SupersededReconcileRequired
+                | PreparedPhase::StartupExpiredNoEffects
+                | PreparedPhase::StartupReconcileRequired
+        );
+    let slice_provenance = DurableSliceProvenance::try_new(
+        request.target(),
+        provenance,
+        request.assignment_digest(),
+        request.target_slice_digest(),
+    )
+    .map_err(|_| mismatch)?;
+    if request.canonical_wire() != prepared.request.canonical_bytes.as_ref()
+        || request.envelope_request_digest() != prepared.request.digest
+        || request.expected_runtime_store_instance_id() != store_instance_id
+        || *control.operation_id().as_bytes() != prepared.operation_id
+        || provenance.source_scope().as_bytes() != &prepared.source_scope
+        || provenance.source_revision().value() != prepared.source_revision
+        || provenance.source_plan_digest() != prepared.source_plan_digest
+        || slice_provenance != prepared.slice_provenance
+        || request.target_slice_digest() != prepared.incoming_slice_digest
+        || request.assignment_digest() != prepared.slice_provenance.assignment_digest
+        || incoming_kind != prepared.incoming_kind
+        || execution.manifest_digest() != prepared.manifest_digest
+        || expected_active != prepared.expected_active
+        || temporal.constraint_id().as_bytes() != &prepared.temporal_constraint_id
+        || temporal.target_clock_generation().value() != prepared.installed_clock_generation
+        || temporal.original_budget().value() != temporal_record.original_budget_nanos
+        || temporal.remaining_budget().value() != temporal_record.remaining_budget_nanos
+        || ingress.request_nonce_identity() != prepared.request_nonce_identity
+        || ingress.temporal_lineage_digest() != prepared.temporal_lineage_digest
+        || !prepared_tenure_recorded
+        || (!prepared_tenure_is_current && !prepared_tenure_is_superseded)
+    {
+        return Err(mismatch);
+    }
+    Ok(())
 }
 
 fn decode_terminal_selection(
@@ -7756,6 +8352,7 @@ pub(crate) enum RuntimeJournalError {
     MultipleSourceScopes,
     MultipleOwnerActions,
     DanglingReference,
+    LegacyProvenanceUnavailable,
     InvalidStateInvariant,
     NonMonotonicTransition,
     IntegerOverflow,
@@ -7795,6 +8392,9 @@ impl fmt::Display for RuntimeJournalError {
             Self::MultipleSourceScopes => "Runtime journal contains multiple source scopes",
             Self::MultipleOwnerActions => "Runtime journal contains multiple owner actions",
             Self::DanglingReference => "Runtime journal contains a dangling reference",
+            Self::LegacyProvenanceUnavailable => {
+                "Runtime journal v3 lacks authoritative Slice provenance required by v4"
+            }
             Self::InvalidStateInvariant => "Runtime journal state invariant failed",
             Self::NonMonotonicTransition => "Runtime journal transition is not monotonic",
             Self::IntegerOverflow => "Runtime journal integer conversion overflow",
@@ -7825,6 +8425,39 @@ mod tests {
         TargetSliceDigest::new(value.digest)
     }
 
+    fn slice_provenance(
+        source_scope: Ref16,
+        source_revision: u64,
+        source_plan_digest: SourcePlanDigest,
+        discriminator: u8,
+    ) -> DurableSliceProvenance {
+        let provenance = PlanProvenance::new(
+            SourceScopeRef::from_bytes(source_scope),
+            SourcePlanRef::from_bytes([discriminator; 16]),
+            SourcePlanRevision::new(source_revision),
+            source_plan_digest,
+        );
+        let assignment_digest = TargetAssignmentDigest::new(digest(discriminator.wrapping_add(1)));
+        let commitment = RuntimeSliceCommitment::try_new(RuntimeSliceHeader::new(
+            RuntimeHostId::from_bytes([0x23; 16]),
+            provenance,
+            assignment_digest,
+        ))
+        .expect("fixture Slice commitment must build");
+        DurableSliceProvenance::try_new(
+            RuntimeHostId::from_bytes([0x23; 16]),
+            provenance,
+            assignment_digest,
+            commitment.target_slice_digest(),
+        )
+        .expect("fixture durable Slice provenance must validate")
+    }
+
+    fn opaque_slice(bytes: &[u8], provenance: DurableSliceProvenance) -> OpaqueCanonicalValue {
+        OpaqueCanonicalValue::try_runtime_slice(bytes, *provenance.target_slice_digest.value())
+            .expect("fixture canonical Slice must validate")
+    }
+
     fn indexed_digest(index: usize) -> Digest32 {
         let mut bytes = [0_u8; 32];
         bytes[30..].copy_from_slice(
@@ -7853,6 +8486,18 @@ mod tests {
     fn pinned(bytes: &[u8], digest_byte: u8) -> OpaqueCanonicalValue {
         OpaqueCanonicalValue::try_pinned_artifact(bytes, digest(digest_byte))
             .expect("fixture pinned value must validate")
+    }
+
+    fn rewrite_payload_version(snapshot: &RuntimeJournalSnapshot, payload_version: u16) -> Vec<u8> {
+        let mut frame = snapshot.canonical_wire().to_vec();
+        frame[8..10].copy_from_slice(&payload_version.to_be_bytes());
+        let checksum = snapshot_checksum(
+            &frame[..HEADER_WITHOUT_CHECKSUM_BYTES],
+            &frame[HEADER_BYTES..],
+        )
+        .expect("fixture checksum must rebuild");
+        frame[HEADER_WITHOUT_CHECKSUM_BYTES..HEADER_BYTES].copy_from_slice(checksum.as_bytes());
+        frame
     }
 
     fn store_pinned_build_identity() -> StorePinnedBuildIdentity {
@@ -7895,6 +8540,7 @@ mod tests {
         operation_id: Ref16,
         request_digest: Digest32,
         request_nonce_identity: Digest32,
+        slice_provenance: DurableSliceProvenance,
         source_revision: u64,
         source_plan_digest: SourcePlanDigest,
         target_slice_digest: TargetSliceDigest,
@@ -7908,6 +8554,7 @@ mod tests {
                 operation_id: prepared.operation_id,
                 request_digest: prepared.request.digest,
                 request_nonce_identity: prepared.request_nonce_identity,
+                slice_provenance: prepared.slice_provenance,
                 source_revision: prepared.source_revision,
                 source_plan_digest: prepared.source_plan_digest,
                 target_slice_digest: prepared.incoming_slice_digest,
@@ -8092,6 +8739,7 @@ mod tests {
             operation_id: identity.operation_id,
             request_digest: identity.request_digest,
             request_nonce_identity: identity.request_nonce_identity,
+            slice_provenance: identity.slice_provenance,
             source_revision: identity.source_revision,
             source_plan_digest: identity.source_plan_digest,
             target_slice_digest: identity.target_slice_digest,
@@ -8280,14 +8928,17 @@ mod tests {
     }
 
     fn production_one_source_admission_input() -> RuntimeApplyAdmissionInput {
+        let source_plan_digest = source_plan_digest(0x35);
+        let slice_provenance = slice_provenance([0x01; 16], 1, source_plan_digest, 0x36);
         RuntimeApplyAdmissionInput {
             tenure: production_tenure_input(),
             request: opaque(b"one-source-request-with-sole-slice", 0x31),
             request_nonce_identity: digest(0x30),
             operation_id: [0x34; 16],
+            slice_provenance,
             source_revision: 1,
-            source_plan_digest: source_plan_digest(0x35),
-            incoming_slice_digest: target_slice_digest(0x36),
+            source_plan_digest,
+            incoming_slice_digest: slice_provenance.target_slice_digest,
             incoming_kind: DesiredHeadKind::OneSourceLoop,
             manifest_digest: digest(0x55),
             expected_active: ExpectedActiveCas::None,
@@ -8308,14 +8959,22 @@ mod tests {
         expected_active: TargetSliceDigest,
         deadline_nanos: u64,
     ) -> RuntimeApplyAdmissionInput {
+        let source_plan_digest = source_plan_digest(base.wrapping_add(5));
+        let slice_provenance = slice_provenance(
+            [0x01; 16],
+            revision,
+            source_plan_digest,
+            base.wrapping_add(6),
+        );
         RuntimeApplyAdmissionInput {
             tenure: production_tenure_input(),
             request: opaque(b"empty-request-with-sole-slice", base.wrapping_add(1)),
             request_nonce_identity: digest(base),
             operation_id: [base.wrapping_add(4); 16],
+            slice_provenance,
             source_revision: revision,
-            source_plan_digest: source_plan_digest(base.wrapping_add(5)),
-            incoming_slice_digest: target_slice_digest(base.wrapping_add(6)),
+            source_plan_digest,
+            incoming_slice_digest: slice_provenance.target_slice_digest,
             incoming_kind: DesiredHeadKind::EmptyDeactivate,
             manifest_digest: digest(0x55),
             expected_active: ExpectedActiveCas::Exact(expected_active),
@@ -8346,12 +9005,13 @@ mod tests {
 
     fn active_state() -> RuntimeJournalState {
         let scope = [0x01; 16];
-        let active_slice = opaque(b"active-slice-v1", 0x71);
+        let source_plan_digest = source_plan_digest(0x70);
+        let slice_provenance = slice_provenance(scope, 11, source_plan_digest, 0x71);
+        let active_slice = opaque_slice(b"active-slice-v1", slice_provenance);
         let request_nonce_identity = digest(0x12);
         let request_digest = digest(0x13);
         let temporal_constraint_id = [0x14; 16];
         let temporal_lineage_digest = digest(0x15);
-        let source_plan_digest = source_plan_digest(0x70);
         let operation_id = [0x04; 16];
         let mut state = initialized_idle_state();
         state.host.tenure_nonces = vec![ReplayLedgerRecord {
@@ -8389,6 +9049,7 @@ mod tests {
             source_scope: scope,
             source_revision: 11,
             slice: active_slice.clone(),
+            slice_provenance,
             source_plan_digest,
             manifest_digest: digest(0x55),
             operation_id,
@@ -8411,6 +9072,7 @@ mod tests {
                 operation_id,
                 request_digest,
                 request_nonce_identity,
+                slice_provenance,
                 source_revision: 11,
                 source_plan_digest,
                 target_slice_digest: opaque_target_slice(&active_slice),
@@ -8437,7 +9099,9 @@ mod tests {
         let scope = [0x01; 16];
         let operation_id = [0x42; 16];
         let action_id = [0x43; 16];
-        let empty_slice = opaque(b"canonical-empty-v1", 0x81);
+        let empty_source_plan_digest = source_plan_digest(0x80);
+        let empty_slice_provenance = slice_provenance(scope, 12, empty_source_plan_digest, 0x81);
+        let empty_slice = opaque_slice(b"canonical-empty-v1", empty_slice_provenance);
         let mut state = active_state();
         let old_active = state
             .active_desired
@@ -8472,8 +9136,9 @@ mod tests {
             operation_id,
             source_revision: 12,
             request,
+            slice_provenance: empty_slice_provenance,
             request_nonce_identity,
-            source_plan_digest: source_plan_digest(0x80),
+            source_plan_digest: empty_source_plan_digest,
             incoming_slice_digest: opaque_target_slice(&empty_slice),
             incoming_kind: DesiredHeadKind::EmptyDeactivate,
             manifest_digest: digest(0x55),
@@ -8494,6 +9159,7 @@ mod tests {
             }),
             retiring: Some(RetiringLiveFacts {
                 old_slice: old_active.slice,
+                old_slice_provenance: old_active.slice_provenance,
                 old_source_plan_digest: old_active.source_plan_digest,
                 old_manifest_digest: old_active.manifest_digest,
                 signed_start_budget_nanos: 100,
@@ -8521,7 +9187,8 @@ mod tests {
             source_scope: scope,
             source_revision: 12,
             slice: empty_slice.clone(),
-            source_plan_digest: source_plan_digest(0x80),
+            slice_provenance: empty_slice_provenance,
+            source_plan_digest: empty_source_plan_digest,
             manifest_digest: digest(0x55),
             operation_id,
             committing_result_digest: None,
@@ -8565,6 +9232,7 @@ mod tests {
             source_scope: active.source_scope,
             source_revision: active.source_revision,
             source_plan_digest: active.source_plan_digest,
+            slice_provenance: active.slice_provenance,
             active_slice_digest,
             manifest_digest: digest(0x55),
             store_pinned_build_identity: store_pinned_build_identity(),
@@ -8785,6 +9453,8 @@ mod tests {
 
     fn admitted_one_source_state(previous: &RuntimeJournalState) -> RuntimeJournalState {
         let request = opaque(b"one-source-request-with-sole-slice", 0x31);
+        let source_plan_digest = source_plan_digest(0x35);
+        let slice_provenance = slice_provenance([0x01; 16], 1, source_plan_digest, 0x36);
         let mut current = previous.clone();
         current.last_transaction = RuntimeJournalTransaction::FullAdmission;
         current.host.request_nonces.push(ReplayLedgerRecord {
@@ -8810,9 +9480,10 @@ mod tests {
             operation_id: [0x34; 16],
             source_revision: 1,
             request,
+            slice_provenance,
             request_nonce_identity: digest(0x30),
-            source_plan_digest: source_plan_digest(0x35),
-            incoming_slice_digest: target_slice_digest(0x36),
+            source_plan_digest,
+            incoming_slice_digest: slice_provenance.target_slice_digest,
             incoming_kind: DesiredHeadKind::OneSourceLoop,
             manifest_digest: digest(0x55),
             expected_active: ExpectedActiveCas::None,
@@ -8997,7 +9668,8 @@ mod tests {
                 kind: DesiredHeadKind::OneSourceLoop,
                 source_scope: prepared.source_scope,
                 source_revision: prepared.source_revision,
-                slice: opaque(b"one-source-slice-from-request", 0x36),
+                slice: opaque_slice(b"one-source-slice-from-request", prepared.slice_provenance),
+                slice_provenance: prepared.slice_provenance,
                 source_plan_digest: prepared.source_plan_digest,
                 manifest_digest: prepared.manifest_digest,
                 operation_id: prepared.operation_id,
@@ -9075,7 +9747,8 @@ mod tests {
             kind: DesiredHeadKind::OneSourceLoop,
             source_scope: prepared.source_scope,
             source_revision: prepared.source_revision,
-            slice: opaque(b"one-source-slice-from-request", 0x36),
+            slice: opaque_slice(b"one-source-slice-from-request", prepared.slice_provenance),
+            slice_provenance: prepared.slice_provenance,
             source_plan_digest: prepared.source_plan_digest,
             manifest_digest: prepared.manifest_digest,
             operation_id: prepared.operation_id,
@@ -9118,6 +9791,13 @@ mod tests {
             .expect("fixture revision offset must fit")
             .saturating_mul(8);
         let fixture_base = 0xb0_u8.wrapping_add(revision_offset);
+        let source_plan_digest = source_plan_digest(fixture_base.wrapping_add(5));
+        let slice_provenance = slice_provenance(
+            [0x01; 16],
+            next_revision,
+            source_plan_digest,
+            fixture_base.wrapping_add(6),
+        );
         let request = opaque(
             b"empty-request-with-sole-slice",
             fixture_base.wrapping_add(1),
@@ -9147,9 +9827,10 @@ mod tests {
             operation_id: [fixture_base.wrapping_add(4); 16],
             source_revision: next_revision,
             request,
+            slice_provenance,
             request_nonce_identity: digest(fixture_base),
-            source_plan_digest: source_plan_digest(fixture_base.wrapping_add(5)),
-            incoming_slice_digest: target_slice_digest(fixture_base.wrapping_add(6)),
+            source_plan_digest,
+            incoming_slice_digest: slice_provenance.target_slice_digest,
             incoming_kind: DesiredHeadKind::EmptyDeactivate,
             manifest_digest: digest(0x55),
             expected_active: ExpectedActiveCas::Exact(opaque_target_slice(&old_active.slice)),
@@ -9203,6 +9884,7 @@ mod tests {
         current_prepared.action = Some(action);
         current_prepared.retiring = Some(RetiringLiveFacts {
             old_slice: old_active.slice.clone(),
+            old_slice_provenance: old_active.slice_provenance,
             old_source_plan_digest: old_active.source_plan_digest,
             old_manifest_digest: old_active.manifest_digest,
             signed_start_budget_nanos: 100,
@@ -9217,7 +9899,8 @@ mod tests {
             kind: DesiredHeadKind::EmptyDeactivate,
             source_scope: prepared.source_scope,
             source_revision: prepared.source_revision,
-            slice: opaque(b"canonical-empty-from-request", 0xb6),
+            slice: opaque_slice(b"canonical-empty-from-request", prepared.slice_provenance),
+            slice_provenance: prepared.slice_provenance,
             source_plan_digest: prepared.source_plan_digest,
             manifest_digest: prepared.manifest_digest,
             operation_id: prepared.operation_id,
@@ -9270,6 +9953,7 @@ mod tests {
                     canonical_bytes: b"canonical-empty-from-request".to_vec().into(),
                     digest: *prepared.incoming_slice_digest.value(),
                 },
+                slice_provenance: prepared.slice_provenance,
                 source_plan_digest: prepared.source_plan_digest,
                 manifest_digest: prepared.manifest_digest,
                 operation_id: prepared.operation_id,
@@ -9500,6 +10184,7 @@ mod tests {
             source_scope: active.source_scope,
             source_revision: active.source_revision,
             source_plan_digest: active.source_plan_digest,
+            slice_provenance: active.slice_provenance,
             active_slice_digest: opaque_target_slice(&active.slice),
             manifest_digest: active.manifest_digest,
             store_pinned_build_identity: previous.host.store_pinned_build_identity,
@@ -9923,14 +10608,18 @@ mod tests {
             .collect();
         state.terminal_operations = (0..MAX_RUNTIME_TERMINAL_OPERATIONS)
             .map(|index| {
+                let source_plan_digest = source_plan_digest(0xe4);
+                let slice_provenance =
+                    slice_provenance([0x01; 16], (index + 1) as u64, source_plan_digest, 0xe5);
                 let mut terminal = terminal_record_for(
                     TerminalIdentityFixture {
                         operation_id: indexed_ref(index),
                         request_digest: indexed_digest(300 + index),
                         request_nonce_identity: indexed_digest(index),
+                        slice_provenance,
                         source_revision: (index + 1) as u64,
-                        source_plan_digest: source_plan_digest(0xe4),
-                        target_slice_digest: target_slice_digest(0xe5),
+                        source_plan_digest,
+                        target_slice_digest: slice_provenance.target_slice_digest,
                         temporal_constraint_id: indexed_ref(index),
                         temporal_lineage_digest: indexed_digest(600 + index),
                     },
@@ -10060,10 +10749,10 @@ mod tests {
     }
 
     #[test]
-    fn payload_v2_has_no_supported_stored_version_fallback() {
+    fn unknown_payload_versions_have_no_runtime_fallback() {
         let snapshot =
             RuntimeJournalSnapshot::try_initialize([0x11; 32], digest(0x22), sequence_one_input())
-                .expect("fixture v3 snapshot must initialize");
+                .expect("fixture v4 snapshot must initialize");
         let mut version_two = snapshot.canonical_wire().to_vec();
         version_two[8..10].copy_from_slice(&2_u16.to_be_bytes());
 
@@ -10074,16 +10763,64 @@ mod tests {
     }
 
     #[test]
+    fn payload_v3_requires_explicit_migration_and_clean_state_reopens_as_v4() {
+        let current =
+            RuntimeJournalSnapshot::try_initialize([0x11; 32], digest(0x22), sequence_one_input())
+                .expect("fixture v4 snapshot must initialize");
+        // Sequence one has no Slice-bearing records, so its v3 and v4 payloads
+        // are byte-identical; only the checksummed version discriminator differs.
+        let legacy = rewrite_payload_version(&current, RUNTIME_JOURNAL_LEGACY_PAYLOAD_VERSION);
+        let before = legacy.clone();
+
+        assert_eq!(
+            RuntimeJournalSnapshot::decode(&legacy),
+            Err(RuntimeJournalError::UnsupportedPayloadVersion),
+            "normal startup must never try a legacy parser",
+        );
+        let migrated = RuntimeJournalSnapshot::migrate_payload_v3(&legacy)
+            .expect("clean v3 sequence one must migrate explicitly");
+        assert_eq!(legacy, before, "migration must not mutate source evidence");
+        assert_eq!(migrated.sequence(), current.sequence());
+        assert_eq!(migrated.state(), current.state());
+        assert_eq!(&migrated.canonical_wire()[8..10], &4_u16.to_be_bytes());
+        assert_eq!(
+            RuntimeJournalSnapshot::decode(migrated.canonical_wire()),
+            Ok(migrated),
+        );
+    }
+
+    #[test]
+    fn payload_v3_active_lineage_without_source_plan_ref_fails_closed_without_mutation() {
+        let current = snapshot(7, active_state());
+        let legacy = current
+            .legacy_payload_v3_wire_for_test()
+            .expect("real active v3 layout");
+        let before = legacy.clone();
+        assert_eq!(
+            RuntimeJournalSnapshot::migrate_payload_v3(&legacy),
+            Err(RuntimeJournalError::LegacyProvenanceUnavailable)
+        );
+        assert_eq!(legacy, before);
+
+        let mut corrupt = legacy.clone();
+        *corrupt.last_mut().expect("fixture is nonempty") ^= 1;
+        assert_eq!(
+            RuntimeJournalSnapshot::migrate_payload_v3(&corrupt),
+            Err(RuntimeJournalError::ChecksumMismatch),
+        );
+    }
+
+    #[test]
     fn sequence_one_has_a_frozen_envelope_checksum_and_round_trips() {
         let snapshot = snapshot(1, sequence_one_state());
         let encoded = snapshot.canonical_wire();
         assert_eq!(encoded.len(), 561);
-        assert_eq!(&encoded[..14], b"PXJR\0\x01\0\x03\0\x03\0\x01\0\x01");
+        assert_eq!(&encoded[..14], b"PXJR\0\x01\0\x03\0\x04\0\x01\0\x01");
         assert_eq!(
             &encoded[HEADER_WITHOUT_CHECKSUM_BYTES..HEADER_BYTES],
             &[
-                80, 238, 20, 132, 228, 168, 76, 246, 79, 5, 49, 164, 237, 65, 129, 250, 140, 224,
-                109, 210, 85, 106, 198, 134, 88, 64, 74, 224, 120, 193, 87, 249,
+                118, 222, 150, 62, 140, 8, 11, 167, 54, 127, 255, 214, 111, 141, 73, 12, 58, 157,
+                238, 195, 216, 33, 208, 169, 178, 63, 191, 46, 159, 156, 65, 23,
             ]
         );
         let decoded = RuntimeJournalSnapshot::decode(encoded).expect("golden must decode");
@@ -10098,12 +10835,12 @@ mod tests {
     #[test]
     fn full_live_ready_state_has_a_frozen_envelope_checksum() {
         let snapshot = snapshot(7, active_state());
-        assert_eq!(snapshot.canonical_wire().len(), 2_090);
+        assert_eq!(snapshot.canonical_wire().len(), 2_394);
         assert_eq!(
             &snapshot.canonical_wire()[HEADER_WITHOUT_CHECKSUM_BYTES..HEADER_BYTES],
             &[
-                35, 51, 157, 4, 145, 108, 247, 64, 34, 224, 137, 160, 67, 110, 10, 28, 203, 175,
-                252, 97, 176, 84, 54, 116, 53, 135, 10, 168, 167, 220, 5, 164,
+                207, 182, 71, 148, 129, 179, 151, 245, 5, 22, 18, 78, 193, 96, 175, 133, 232, 193,
+                150, 175, 63, 225, 41, 130, 53, 26, 81, 176, 64, 245, 208, 209,
             ],
         );
     }
@@ -10246,6 +10983,71 @@ mod tests {
     }
 
     #[test]
+    fn checksum_valid_slice_provenance_mismatch_fails_closed_without_mutation() {
+        let original = snapshot(7, active_state());
+        let original_wire = original.canonical_wire().to_vec();
+        for mutate in [
+            |value: &mut DurableSliceProvenance| value.source_plan[0] ^= 1,
+            |value: &mut DurableSliceProvenance| {
+                value.assignment_digest = TargetAssignmentDigest::new(digest(0xf9));
+            },
+        ] {
+            let mut state = active_state();
+            mutate(
+                &mut state
+                    .active_desired
+                    .as_mut()
+                    .expect("fixture active")
+                    .slice_provenance,
+            );
+            assert_eq!(
+                RuntimeJournalSnapshot::decode(&unvalidated_wire(7, &state)),
+                Err(RuntimeJournalError::InvalidStateInvariant)
+            );
+        }
+
+        let mut retiring_rewrite = draining_state();
+        let rewritten_plan_digest = source_plan_digest(0xe7);
+        let rewritten_provenance = slice_provenance([0xe6; 16], 11, rewritten_plan_digest, 0xe8);
+        let retiring = retiring_rewrite
+            .prepared
+            .as_mut()
+            .and_then(|prepared| prepared.retiring.as_mut())
+            .expect("fixture retiring facts");
+        retiring.old_slice =
+            opaque_slice(b"self-consistent-foreign-old-slice", rewritten_provenance);
+        retiring.old_slice_provenance = rewritten_provenance;
+        retiring.old_source_plan_digest = rewritten_plan_digest;
+        assert!(
+            RuntimeJournalSnapshot::decode(&unvalidated_wire(7, &retiring_rewrite)).is_err(),
+            "checksum-valid self-consistent foreign retiring provenance must fail closed"
+        );
+
+        assert_eq!(original.canonical_wire(), original_wire);
+        assert_eq!(RuntimeJournalSnapshot::decode(&original_wire), Ok(original));
+    }
+
+    #[test]
+    fn snapshot_resource_census_projection_matches_owner_canonical_digest() {
+        let empty = snapshot(2, initialized_idle_state());
+        assert_eq!(
+            empty.resource_census_digest(),
+            compute_resource_census_digest(&empty.state().owned_resources)
+        );
+
+        let nonempty = snapshot(7, active_state());
+        assert!(!nonempty.state().owned_resources.is_empty());
+        assert_eq!(
+            nonempty.resource_census_digest(),
+            compute_resource_census_digest(&nonempty.state().owned_resources)
+        );
+        assert_ne!(
+            empty.resource_census_digest().expect("empty census"),
+            nonempty.resource_census_digest().expect("nonempty census")
+        );
+    }
+
+    #[test]
     fn opaque_values_are_nonempty_nonzero_digest_and_locally_bounded() {
         assert_eq!(
             OpaqueCanonicalValue::try_pinned_artifact(&[], digest(1)),
@@ -10269,6 +11071,14 @@ mod tests {
         let oversized_request = vec![0_u8; MAX_OPAQUE_REQUEST_OR_SLICE_BYTES + 1];
         assert_eq!(
             OpaqueCanonicalValue::try_request_or_slice(&oversized_request, digest(1)),
+            Err(RuntimeJournalError::OpaqueValueTooLarge)
+        );
+
+        let exact_slice = vec![0_u8; MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES];
+        assert!(OpaqueCanonicalValue::try_runtime_slice(&exact_slice, digest(2)).is_ok());
+        let oversized_slice = vec![0_u8; MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES + 1];
+        assert_eq!(
+            OpaqueCanonicalValue::try_runtime_slice(&oversized_slice, digest(2)),
             Err(RuntimeJournalError::OpaqueValueTooLarge)
         );
 
@@ -10486,14 +11296,17 @@ mod tests {
         let mut terminals = initialized_idle_state();
         terminals.terminal_operations = (0..=MAX_RUNTIME_TERMINAL_OPERATIONS)
             .map(|index| {
+                let source_plan_digest = source_plan_digest(0xf2);
+                let slice_provenance = slice_provenance([0x01; 16], 1, source_plan_digest, 0xf3);
                 terminal_record_for(
                     TerminalIdentityFixture {
                         operation_id: indexed_ref(index),
                         request_digest: digest(0xf1),
                         request_nonce_identity: indexed_digest(index),
+                        slice_provenance,
                         source_revision: 1,
-                        source_plan_digest: source_plan_digest(0xf2),
-                        target_slice_digest: target_slice_digest(0xf3),
+                        source_plan_digest,
+                        target_slice_digest: slice_provenance.target_slice_digest,
                         temporal_constraint_id: indexed_ref(index),
                         temporal_lineage_digest: digest(0xf4),
                     },
@@ -10580,14 +11393,17 @@ mod tests {
         );
 
         let mut scopes = active_state();
+        let wrong_plan_digest = source_plan_digest(9);
+        let wrong_slice_provenance = slice_provenance([1; 16], 1, wrong_plan_digest, 10);
         let mut wrong_scope = terminal_record_for(
             TerminalIdentityFixture {
                 operation_id: [1; 16],
                 request_digest: digest(7),
                 request_nonce_identity: digest(8),
+                slice_provenance: wrong_slice_provenance,
                 source_revision: 1,
-                source_plan_digest: source_plan_digest(9),
-                target_slice_digest: target_slice_digest(10),
+                source_plan_digest: wrong_plan_digest,
+                target_slice_digest: wrong_slice_provenance.target_slice_digest,
                 temporal_constraint_id: [2; 16],
                 temporal_lineage_digest: digest(11),
             },
@@ -10640,14 +11456,17 @@ mod tests {
             source_scope: [1; 16],
             revision: 12,
         });
+        let multiple_plan_digest = source_plan_digest(0xa2);
+        let multiple_slice_provenance = slice_provenance([1; 16], 12, multiple_plan_digest, 0xa3);
         multiple.prepared = Some(PreparedOperation {
             source_scope: [1; 16],
             operation_id: [0xa1; 16],
             source_revision: 12,
             request,
+            slice_provenance: multiple_slice_provenance,
             request_nonce_identity: digest(0xa1),
-            source_plan_digest: source_plan_digest(0xa2),
-            incoming_slice_digest: target_slice_digest(0xa3),
+            source_plan_digest: multiple_plan_digest,
+            incoming_slice_digest: multiple_slice_provenance.target_slice_digest,
             incoming_kind: DesiredHeadKind::OneSourceLoop,
             manifest_digest: digest(0x55),
             expected_active: ExpectedActiveCas::Exact(target_slice_digest(0x71)),
@@ -10687,6 +11506,7 @@ mod tests {
             source_scope: active.source_scope,
             source_revision: active.source_revision,
             source_plan_digest: active.source_plan_digest,
+            slice_provenance: active.slice_provenance,
             active_slice_digest,
             manifest_digest: digest(0x55),
             store_pinned_build_identity: store_pinned_build_identity(),
@@ -11184,8 +12004,8 @@ mod tests {
             .incoming_slice_digest = target_slice_digest(0xf6);
         swapped.last_transaction = RuntimeJournalTransaction::PreparedProgress;
         assert_eq!(
-            snapshot(10, swapped).validate_successor_of(&snapshot(9, admitted)),
-            Err(RuntimeJournalError::NonMonotonicTransition)
+            RuntimeJournalSnapshot::try_new([0x11; 32], digest(0x22), 10, swapped),
+            Err(RuntimeJournalError::DanglingReference)
         );
     }
 
@@ -11317,7 +12137,15 @@ mod tests {
             .expect("real ownership evidence must commit");
         let active = owned
             .try_one_source_success_terminal_successor(
-                opaque(b"one-source-slice-from-request", 0x36),
+                opaque_slice(
+                    b"one-source-slice-from-request",
+                    owned
+                        .state()
+                        .prepared
+                        .as_ref()
+                        .expect("one-source prepared")
+                        .slice_provenance,
+                ),
                 RuntimeOneSourceCallbackSuccessInput {
                     action_id: [0x37; 16],
                 },
@@ -11364,7 +12192,15 @@ mod tests {
         let draining = empty_admitted
             .try_empty_head_retire_successor(RuntimeEmptyRetireInput {
                 action_id: [0xb7; 16],
-                incoming_slice: opaque(b"canonical-empty-from-request", 0xb6),
+                incoming_slice: opaque_slice(
+                    b"canonical-empty-from-request",
+                    empty_admitted
+                        .state()
+                        .prepared
+                        .as_ref()
+                        .expect("empty prepared")
+                        .slice_provenance,
+                ),
                 budgets: RuntimeRetiringLifecycleBudgets {
                     start_nanos: 100,
                     drain_nanos: 200,
@@ -11448,7 +12284,15 @@ mod tests {
             .expect("higher-revision empty must admit");
         let fast_path = second_empty
             .try_empty_exact_zero_fast_path_successor(
-                opaque(b"next-canonical-empty-from-request", 0xd6),
+                opaque_slice(
+                    b"next-canonical-empty-from-request",
+                    second_empty
+                        .state()
+                        .prepared
+                        .as_ref()
+                        .expect("next empty prepared")
+                        .slice_provenance,
+                ),
                 RuntimeTerminalInput {
                     canonical_response: OpaqueCanonicalValue::try_terminal_response(
                         b"next-empty-exact-zero-response",

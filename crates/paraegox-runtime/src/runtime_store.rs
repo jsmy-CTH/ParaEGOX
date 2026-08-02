@@ -23,23 +23,42 @@ use nix::fcntl::{OFlag, open, openat, renameat};
 use nix::fcntl::{RenameFlags, renameat2};
 use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
-use paraegox_kernel::digest::Digest32;
+use paraegox_kernel::digest::{Digest32, Digest32Builder};
 
 use crate::runtime_journal::{
-    MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, RuntimeJournalError, RuntimeJournalSnapshot,
+    MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, RUNTIME_JOURNAL_PAYLOAD_VERSION, RuntimeJournalError,
+    RuntimeJournalPayloadV3Migration, RuntimeJournalSnapshot,
 };
 
 const LOCK_FILE_NAME: &str = "runtime.lock";
 const ACTIVE_FILE_NAME: &str = "runtime.snapshot";
 const TEMP_FILE_PREFIX: &str = ".runtime.snapshot.tmp-";
+const MIGRATION_SOURCE_FILE_PREFIX: &str = "runtime.snapshot.source-v3-";
+const MIGRATION_SOURCE_FILE_SUFFIX: &str = ".evidence";
+const MIGRATION_RECEIPT_FILE_PREFIX: &str = "runtime.snapshot.migration-v1-";
+const MIGRATION_RECEIPT_FILE_SUFFIX: &str = ".receipt";
+const MIGRATION_EVIDENCE_TEMP_PREFIX: &str = ".runtime.snapshot.migration.tmp-";
+const RUNTIME_MIGRATION_RECEIPT_MAGIC: &[u8; 4] = b"PXMR";
+const RUNTIME_MIGRATION_RECEIPT_VERSION: u16 = 1;
+const RUNTIME_MIGRATION_SOURCE_PAYLOAD_VERSION: u16 = 3;
+const RUNTIME_MIGRATION_EVIDENCE_DOMAIN: &[u8] =
+    b"paraegox.runtime.owner-journal.migration-evidence.sha256.v1";
+const RUNTIME_MIGRATION_RECEIPT_DOMAIN: &[u8] =
+    b"paraegox.runtime.owner-journal.migration-receipt.sha256.v1";
+const MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES: usize = 226;
+const MIGRATION_RECEIPT_BYTES: usize = MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES + 32;
 pub(crate) const TEMP_TOKEN_BYTES: usize = 16;
 const TEMP_HEX_BYTES: usize = TEMP_TOKEN_BYTES * 2;
 const MAX_ORPHAN_TEMP_FILES: usize = 32;
+const MAX_MIGRATION_EVIDENCE_ORPHAN_TEMPS: usize = 16;
+const MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES: usize = 64;
 const STATE_DIRECTORY_MODE_BITS: u32 = 0o700;
 const STATE_DIRECTORY_MODE_MASK: u32 = 0o7777;
 const PRIVATE_FILE_MODE_BITS: u32 = 0o600;
 const PRIVATE_FILE_MODE_MASK: u32 = 0o7777;
 const PRIVATE_FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
+const READ_ONLY_EVIDENCE_MODE_BITS: u32 = 0o400;
+const READ_ONLY_EVIDENCE_MODE: Mode = Mode::S_IRUSR;
 #[cfg(any(target_os = "linux", test))]
 const MAX_LINUX_FDINFO_BYTES: usize = 64 * 1024;
 #[cfg(any(target_os = "linux", test))]
@@ -119,6 +138,297 @@ struct OpenedRegularFile {
 struct ActiveSnapshot {
     snapshot: RuntimeJournalSnapshot,
     identity: FileIdentity,
+}
+
+struct ActiveSnapshotBytes {
+    encoded: Vec<u8>,
+    identity: FileIdentity,
+}
+
+/// Exact, fixed-width audit receipt for one explicit Runtime payload-v3 to
+/// payload-v4 store migration. The separately retained source file remains the
+/// rollback/audit evidence; this receipt binds that file to the exact target
+/// bytes without becoming a second journal authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeStoreMigrationReceipt {
+    migration_id: [u8; 32],
+    source_payload_version: u16,
+    source_checksum: Digest32,
+    source_store_instance_id: [u8; 32],
+    source_target_fingerprint: Digest32,
+    source_sequence: u64,
+    source_snapshot_length: u64,
+    source_snapshot_digest: Digest32,
+    target_payload_version: u16,
+    target_snapshot_length: u64,
+    target_snapshot_digest: Digest32,
+    canonical_wire: [u8; MIGRATION_RECEIPT_BYTES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeStoreMigrationDisposition {
+    Migrated,
+    AlreadyMigrated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeStoreMigrationOutcome {
+    pub(crate) disposition: RuntimeStoreMigrationDisposition,
+    pub(crate) receipt: RuntimeStoreMigrationReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeMigrationTokens {
+    source_evidence: [u8; TEMP_TOKEN_BYTES],
+    receipt_evidence: [u8; TEMP_TOKEN_BYTES],
+    active_snapshot: [u8; TEMP_TOKEN_BYTES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeMigrationFailpoints {
+    source_evidence: RuntimeCommitFailpoint,
+    receipt_evidence: RuntimeCommitFailpoint,
+    active_snapshot: RuntimeCommitFailpoint,
+}
+
+impl RuntimeMigrationFailpoints {
+    const NONE: Self = Self {
+        source_evidence: RuntimeCommitFailpoint::None,
+        receipt_evidence: RuntimeCommitFailpoint::None,
+        active_snapshot: RuntimeCommitFailpoint::None,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeMigrationRequest<'a> {
+    directory: &'a Path,
+    evidence_directory: &'a Path,
+    expected_store_instance_id: [u8; 32],
+    expected_target_fingerprint: Digest32,
+    migration_id: [u8; 32],
+}
+
+struct RuntimeMigrationGuard {
+    directory: RuntimeDirectory,
+    lock_file: File,
+    lock_identity: FileIdentity,
+}
+
+impl Drop for RuntimeMigrationGuard {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
+}
+
+impl RuntimeStoreMigrationReceipt {
+    fn try_new(
+        migration_id: [u8; 32],
+        source: &RuntimeJournalPayloadV3Migration,
+        source_wire: &[u8],
+        target: &RuntimeJournalSnapshot,
+    ) -> Result<Self, RuntimeStoreMigrationError> {
+        if migration_id.iter().all(|byte| *byte == 0) {
+            return Err(RuntimeStoreMigrationError::InvalidMigrationId);
+        }
+        if source.source_payload_version() != RUNTIME_MIGRATION_SOURCE_PAYLOAD_VERSION
+            || source.source_store_instance_id() != target.store_instance_id()
+            || source.source_target_fingerprint() != *target.owner_target_fingerprint()
+            || source.source_sequence() != target.sequence()
+            || source.snapshot() != target
+            || source_wire.is_empty()
+            || source_wire.len() > MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES
+            || target.canonical_wire().is_empty()
+            || target.canonical_wire().len() > MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES
+        {
+            return Err(RuntimeStoreMigrationError::InvalidReceipt);
+        }
+        let source_snapshot_length = u64::try_from(source_wire.len())
+            .map_err(|_| RuntimeStoreMigrationError::InvalidReceipt)?;
+        let target_snapshot_length = u64::try_from(target.canonical_wire().len())
+            .map_err(|_| RuntimeStoreMigrationError::InvalidReceipt)?;
+        let source_snapshot_digest = exact_migration_evidence_digest(source_wire)?;
+        let target_snapshot_digest = exact_migration_evidence_digest(target.canonical_wire())?;
+
+        let mut prefix = Vec::with_capacity(MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES);
+        prefix.extend_from_slice(RUNTIME_MIGRATION_RECEIPT_MAGIC);
+        prefix.extend_from_slice(&RUNTIME_MIGRATION_RECEIPT_VERSION.to_be_bytes());
+        prefix.extend_from_slice(&migration_id);
+        prefix.extend_from_slice(&source.source_payload_version().to_be_bytes());
+        prefix.extend_from_slice(source.source_checksum().as_bytes());
+        prefix.extend_from_slice(source.source_store_instance_id());
+        prefix.extend_from_slice(source.source_target_fingerprint().as_bytes());
+        prefix.extend_from_slice(&source.source_sequence().to_be_bytes());
+        prefix.extend_from_slice(&source_snapshot_length.to_be_bytes());
+        prefix.extend_from_slice(source_snapshot_digest.as_bytes());
+        prefix.extend_from_slice(&RUNTIME_JOURNAL_PAYLOAD_VERSION.to_be_bytes());
+        prefix.extend_from_slice(&target_snapshot_length.to_be_bytes());
+        prefix.extend_from_slice(target_snapshot_digest.as_bytes());
+        if prefix.len() != MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES {
+            return Err(RuntimeStoreMigrationError::InvalidReceipt);
+        }
+        let receipt_checksum = exact_migration_receipt_checksum(&prefix)?;
+        prefix.extend_from_slice(receipt_checksum.as_bytes());
+        let canonical_wire: [u8; MIGRATION_RECEIPT_BYTES] = prefix
+            .try_into()
+            .map_err(|_| RuntimeStoreMigrationError::InvalidReceipt)?;
+        Ok(Self {
+            migration_id,
+            source_payload_version: source.source_payload_version(),
+            source_checksum: source.source_checksum(),
+            source_store_instance_id: *source.source_store_instance_id(),
+            source_target_fingerprint: source.source_target_fingerprint(),
+            source_sequence: source.source_sequence(),
+            source_snapshot_length,
+            source_snapshot_digest,
+            target_payload_version: RUNTIME_JOURNAL_PAYLOAD_VERSION,
+            target_snapshot_length,
+            target_snapshot_digest,
+            canonical_wire,
+        })
+    }
+
+    fn decode(frame: &[u8]) -> Result<Self, RuntimeStoreMigrationError> {
+        if frame.len() != MIGRATION_RECEIPT_BYTES {
+            return Err(RuntimeStoreMigrationError::InvalidReceipt);
+        }
+        let mut cursor = RuntimeMigrationReceiptCursor::new(frame);
+        if cursor.array::<4>()? != *RUNTIME_MIGRATION_RECEIPT_MAGIC
+            || cursor.u16()? != RUNTIME_MIGRATION_RECEIPT_VERSION
+        {
+            return Err(RuntimeStoreMigrationError::InvalidReceipt);
+        }
+        let migration_id = cursor.array::<32>()?;
+        let source_payload_version = cursor.u16()?;
+        let source_checksum = Digest32::from_bytes(cursor.array::<32>()?);
+        let source_store_instance_id = cursor.array::<32>()?;
+        let source_target_fingerprint = Digest32::from_bytes(cursor.array::<32>()?);
+        let source_sequence = cursor.u64()?;
+        let source_snapshot_length = cursor.u64()?;
+        let source_snapshot_digest = Digest32::from_bytes(cursor.array::<32>()?);
+        let target_payload_version = cursor.u16()?;
+        let target_snapshot_length = cursor.u64()?;
+        let target_snapshot_digest = Digest32::from_bytes(cursor.array::<32>()?);
+        let receipt_checksum = Digest32::from_bytes(cursor.array::<32>()?);
+        cursor.finish()?;
+        if migration_id.iter().all(|byte| *byte == 0)
+            || source_payload_version != RUNTIME_MIGRATION_SOURCE_PAYLOAD_VERSION
+            || target_payload_version != RUNTIME_JOURNAL_PAYLOAD_VERSION
+            || source_store_instance_id.iter().all(|byte| *byte == 0)
+            || source_sequence == 0
+            || source_snapshot_length == 0
+            || source_snapshot_length > MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES as u64
+            || target_snapshot_length == 0
+            || target_snapshot_length > MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES as u64
+            || exact_migration_receipt_checksum(&frame[..MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES])?
+                != receipt_checksum
+        {
+            return Err(RuntimeStoreMigrationError::InvalidReceipt);
+        }
+        Ok(Self {
+            migration_id,
+            source_payload_version,
+            source_checksum,
+            source_store_instance_id,
+            source_target_fingerprint,
+            source_sequence,
+            source_snapshot_length,
+            source_snapshot_digest,
+            target_payload_version,
+            target_snapshot_length,
+            target_snapshot_digest,
+            canonical_wire: frame
+                .try_into()
+                .map_err(|_| RuntimeStoreMigrationError::InvalidReceipt)?,
+        })
+    }
+
+    pub(crate) const fn migration_id(&self) -> &[u8; 32] {
+        &self.migration_id
+    }
+
+    pub(crate) const fn source_payload_version(&self) -> u16 {
+        self.source_payload_version
+    }
+
+    pub(crate) const fn source_checksum(&self) -> Digest32 {
+        self.source_checksum
+    }
+
+    pub(crate) const fn source_store_instance_id(&self) -> &[u8; 32] {
+        &self.source_store_instance_id
+    }
+
+    pub(crate) const fn source_target_fingerprint(&self) -> Digest32 {
+        self.source_target_fingerprint
+    }
+
+    pub(crate) const fn source_sequence(&self) -> u64 {
+        self.source_sequence
+    }
+
+    pub(crate) const fn canonical_wire(&self) -> &[u8; MIGRATION_RECEIPT_BYTES] {
+        &self.canonical_wire
+    }
+}
+
+struct RuntimeMigrationReceiptCursor<'a> {
+    frame: &'a [u8],
+    position: usize,
+}
+
+impl<'a> RuntimeMigrationReceiptCursor<'a> {
+    const fn new(frame: &'a [u8]) -> Self {
+        Self { frame, position: 0 }
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], RuntimeStoreMigrationError> {
+        let end = self
+            .position
+            .checked_add(N)
+            .ok_or(RuntimeStoreMigrationError::InvalidReceipt)?;
+        let bytes = self
+            .frame
+            .get(self.position..end)
+            .ok_or(RuntimeStoreMigrationError::InvalidReceipt)?;
+        self.position = end;
+        bytes
+            .try_into()
+            .map_err(|_| RuntimeStoreMigrationError::InvalidReceipt)
+    }
+
+    fn u16(&mut self) -> Result<u16, RuntimeStoreMigrationError> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, RuntimeStoreMigrationError> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    fn finish(self) -> Result<(), RuntimeStoreMigrationError> {
+        if self.position == self.frame.len() {
+            Ok(())
+        } else {
+            Err(RuntimeStoreMigrationError::InvalidReceipt)
+        }
+    }
+}
+
+fn exact_migration_evidence_digest(bytes: &[u8]) -> Result<Digest32, RuntimeStoreMigrationError> {
+    let mut builder = Digest32Builder::try_new(RUNTIME_MIGRATION_EVIDENCE_DOMAIN)
+        .map_err(|_| RuntimeStoreMigrationError::InvalidReceipt)?;
+    builder
+        .field_bytes(bytes)
+        .map_err(|_| RuntimeStoreMigrationError::InvalidReceipt)?;
+    Ok(builder.finish())
+}
+
+fn exact_migration_receipt_checksum(bytes: &[u8]) -> Result<Digest32, RuntimeStoreMigrationError> {
+    let mut builder = Digest32Builder::try_new(RUNTIME_MIGRATION_RECEIPT_DOMAIN)
+        .map_err(|_| RuntimeStoreMigrationError::InvalidReceipt)?;
+    builder
+        .field_bytes(bytes)
+        .map_err(|_| RuntimeStoreMigrationError::InvalidReceipt)?;
+    Ok(builder.finish())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +511,87 @@ impl Drop for RuntimeStore {
 }
 
 impl RuntimeStore {
+    /// Explicitly migrates one stopped Runtime store from payload v3 to v4.
+    ///
+    /// The caller selects a separate operator-owned evidence directory and a
+    /// stable migration id. Normal store open never invokes this path. A retry
+    /// after an uncertain publish accepts a v4 active snapshot only when the
+    /// exact read-only v3 evidence and receipt prove that this migration id
+    /// produced those exact target bytes.
+    pub(crate) fn migrate_payload_v3_offline(
+        directory: &Path,
+        evidence_directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+        migration_id: [u8; 32],
+    ) -> Result<RuntimeStoreMigrationOutcome, RuntimeStoreMigrationError> {
+        Self::migrate_payload_v3_offline_with_policy(
+            RuntimeMigrationRequest {
+                directory,
+                evidence_directory,
+                expected_store_instance_id,
+                expected_target_fingerprint,
+                migration_id,
+            },
+            RuntimeFilesystemPolicy::ProductionReference,
+            None,
+            RuntimeMigrationFailpoints::NONE,
+        )
+    }
+
+    fn migrate_payload_v3_offline_with_policy(
+        request: RuntimeMigrationRequest<'_>,
+        filesystem_policy: RuntimeFilesystemPolicy,
+        tokens: Option<RuntimeMigrationTokens>,
+        failpoints: RuntimeMigrationFailpoints,
+    ) -> Result<RuntimeStoreMigrationOutcome, RuntimeStoreMigrationError> {
+        validate_migration_inputs(
+            request.expected_store_instance_id,
+            request.expected_target_fingerprint,
+            request.migration_id,
+        )?;
+        let guard = acquire_runtime_migration_guard(request.directory, filesystem_policy)?;
+        let evidence_directory =
+            open_runtime_directory(request.evidence_directory, filesystem_policy)
+                .map_err(RuntimeStoreMigrationError::EvidenceDirectory)?;
+        if guard.directory.identity == evidence_directory.identity {
+            return Err(RuntimeStoreMigrationError::EvidenceDirectoryMatchesStore);
+        }
+        let active = read_active_snapshot_bytes(&guard.directory)
+            .map_err(RuntimeStoreMigrationError::Store)?;
+
+        match RuntimeJournalSnapshot::decode(&active.encoded) {
+            Ok(target) => resume_completed_runtime_migration(
+                &guard,
+                &evidence_directory,
+                request.expected_store_instance_id,
+                request.expected_target_fingerprint,
+                request.migration_id,
+                active,
+                target,
+            ),
+            Err(RuntimeJournalError::UnsupportedPayloadVersion) => {
+                let source =
+                    RuntimeJournalSnapshot::migrate_payload_v3_with_metadata(&active.encoded)
+                        .map_err(RuntimeStoreMigrationError::Journal)?;
+                let tokens = match tokens {
+                    Some(tokens) => tokens,
+                    None => runtime_migration_tokens()?,
+                };
+                publish_runtime_migration(
+                    request,
+                    &guard,
+                    &evidence_directory,
+                    active,
+                    source,
+                    tokens,
+                    failpoints,
+                )
+            }
+            Err(error) => Err(RuntimeStoreMigrationError::Journal(error)),
+        }
+    }
+
     pub(crate) fn open(
         directory: &Path,
         expected_store_instance_id: [u8; 32],
@@ -384,6 +775,874 @@ impl RuntimeStore {
         }
         Ok(())
     }
+}
+
+fn validate_migration_inputs(
+    expected_store_instance_id: [u8; 32],
+    expected_target_fingerprint: Digest32,
+    migration_id: [u8; 32],
+) -> Result<(), RuntimeStoreMigrationError> {
+    if expected_store_instance_id.iter().all(|byte| *byte == 0) {
+        return Err(RuntimeStoreMigrationError::InvalidExpectedStoreInstanceId);
+    }
+    if expected_target_fingerprint
+        .as_bytes()
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err(RuntimeStoreMigrationError::InvalidExpectedTargetFingerprint);
+    }
+    if migration_id.iter().all(|byte| *byte == 0) {
+        return Err(RuntimeStoreMigrationError::InvalidMigrationId);
+    }
+    Ok(())
+}
+
+fn acquire_runtime_migration_guard(
+    directory: &Path,
+    filesystem_policy: RuntimeFilesystemPolicy,
+) -> Result<RuntimeMigrationGuard, RuntimeStoreMigrationError> {
+    let directory = open_runtime_directory(directory, filesystem_policy)
+        .map_err(RuntimeStoreMigrationError::Store)?;
+    let OpenedRegularFile {
+        file: lock_file,
+        identity: lock_identity,
+    } = open_existing_regular(
+        &directory,
+        LOCK_FILE_NAME,
+        OFlag::O_RDWR,
+        RuntimeFileStage::OpenLock,
+    )
+    .map_err(RuntimeStoreMigrationError::Store)?;
+    lock_file.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => RuntimeStoreMigrationError::LockContended,
+        TryLockError::Error(error) => RuntimeStoreMigrationError::Store(RuntimeStoreOpenError::Io(
+            RuntimeIoFailure::new(RuntimeFileStage::AcquireLock, &error),
+        )),
+    })?;
+    validate_named_file_identity(
+        &directory,
+        LOCK_FILE_NAME,
+        lock_identity,
+        RuntimeFileStage::ValidateLockIdentity,
+    )
+    .map_err(RuntimeStoreMigrationError::Store)?;
+    Ok(RuntimeMigrationGuard {
+        directory,
+        lock_file,
+        lock_identity,
+    })
+}
+
+fn runtime_migration_tokens() -> Result<RuntimeMigrationTokens, RuntimeStoreMigrationError> {
+    Ok(RuntimeMigrationTokens {
+        source_evidence: system_random_token().map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+                RuntimeFileStage::GenerateMigrationEvidenceTempName,
+                &error,
+            ))
+        })?,
+        receipt_evidence: system_random_token().map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+                RuntimeFileStage::GenerateMigrationEvidenceTempName,
+                &error,
+            ))
+        })?,
+        active_snapshot: system_random_token().map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+                RuntimeFileStage::GenerateTempName,
+                &error,
+            ))
+        })?,
+    })
+}
+
+fn resume_completed_runtime_migration(
+    guard: &RuntimeMigrationGuard,
+    evidence_directory: &RuntimeDirectory,
+    expected_store_instance_id: [u8; 32],
+    expected_target_fingerprint: Digest32,
+    migration_id: [u8; 32],
+    active: ActiveSnapshotBytes,
+    target: RuntimeJournalSnapshot,
+) -> Result<RuntimeStoreMigrationOutcome, RuntimeStoreMigrationError> {
+    validate_migration_target_identity(
+        &target,
+        expected_store_instance_id,
+        expected_target_fingerprint,
+    )?;
+    if target.canonical_wire() != active.encoded {
+        return Err(RuntimeStoreMigrationError::TargetMismatch);
+    }
+    clean_runtime_migration_evidence_temps(evidence_directory, migration_id)
+        .map_err(|_| published_but_unverified(RuntimeFileStage::InspectMigrationEvidence))?;
+    let (source_wire, stored_receipt) =
+        read_runtime_migration_evidence(evidence_directory, migration_id)
+            .map_err(|_| published_but_unverified(RuntimeFileStage::ReadBackMigrationEvidence))?;
+    let source = RuntimeJournalSnapshot::migrate_payload_v3_with_metadata(&source_wire)
+        .map_err(|_| published_but_unverified(RuntimeFileStage::ReadBackMigrationEvidence))?;
+    validate_migration_source_identity(
+        &source,
+        expected_store_instance_id,
+        expected_target_fingerprint,
+    )
+    .map_err(|_| published_but_unverified(RuntimeFileStage::ReadBackMigrationEvidence))?;
+    if source.snapshot() != &target || source.snapshot().canonical_wire() != active.encoded {
+        return Err(published_but_unverified(
+            RuntimeFileStage::ReadBackPublished,
+        ));
+    }
+    let expected_receipt =
+        RuntimeStoreMigrationReceipt::try_new(migration_id, &source, &source_wire, &target)
+            .map_err(|_| published_but_unverified(RuntimeFileStage::ReadBackMigrationEvidence))?;
+    if stored_receipt != expected_receipt {
+        return Err(published_but_unverified(
+            RuntimeFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+    validate_migration_handles(guard, evidence_directory)
+        .map_err(|_| published_but_unverified(RuntimeFileStage::VerifyPublishedMigration))?;
+    clean_valid_orphan_temps(&guard.directory)
+        .map_err(|_| published_but_unverified(RuntimeFileStage::VerifyPublishedMigration))?;
+    let revalidated = read_active_snapshot(&guard.directory)
+        .map_err(|_| published_but_unverified(RuntimeFileStage::ReadBackPublished))?;
+    if revalidated.identity != active.identity || revalidated.snapshot != target {
+        return Err(published_but_unverified(
+            RuntimeFileStage::ReadBackPublished,
+        ));
+    }
+    Ok(RuntimeStoreMigrationOutcome {
+        disposition: RuntimeStoreMigrationDisposition::AlreadyMigrated,
+        receipt: stored_receipt,
+    })
+}
+
+fn publish_runtime_migration(
+    request: RuntimeMigrationRequest<'_>,
+    guard: &RuntimeMigrationGuard,
+    evidence_directory: &RuntimeDirectory,
+    active: ActiveSnapshotBytes,
+    source: RuntimeJournalPayloadV3Migration,
+    tokens: RuntimeMigrationTokens,
+    failpoints: RuntimeMigrationFailpoints,
+) -> Result<RuntimeStoreMigrationOutcome, RuntimeStoreMigrationError> {
+    validate_migration_source_identity(
+        &source,
+        request.expected_store_instance_id,
+        request.expected_target_fingerprint,
+    )?;
+    let target_wire = source.snapshot().canonical_wire().to_vec();
+    let target = RuntimeJournalSnapshot::decode(&target_wire)
+        .map_err(RuntimeStoreMigrationError::Journal)?;
+    validate_migration_target_identity(
+        &target,
+        request.expected_store_instance_id,
+        request.expected_target_fingerprint,
+    )?;
+    let receipt = RuntimeStoreMigrationReceipt::try_new(
+        request.migration_id,
+        &source,
+        &active.encoded,
+        &target,
+    )?;
+
+    clean_valid_orphan_temps(&guard.directory).map_err(RuntimeStoreMigrationError::Store)?;
+    clean_runtime_migration_evidence_temps(evidence_directory, request.migration_id)?;
+    ensure_read_only_migration_evidence(
+        evidence_directory,
+        request.migration_id,
+        &migration_source_file_name(request.migration_id),
+        &active.encoded,
+        MigrationEvidenceKind::Source,
+        tokens.source_evidence,
+        failpoints.source_evidence,
+    )?;
+    ensure_read_only_migration_evidence(
+        evidence_directory,
+        request.migration_id,
+        &migration_receipt_file_name(request.migration_id),
+        receipt.canonical_wire(),
+        MigrationEvidenceKind::Receipt,
+        tokens.receipt_evidence,
+        failpoints.receipt_evidence,
+    )?;
+    let (stored_source, stored_receipt) =
+        read_runtime_migration_evidence(evidence_directory, request.migration_id).map_err(
+            |_| uncertain_migration_evidence_publish(RuntimeFileStage::ReadBackMigrationEvidence),
+        )?;
+    if stored_source != active.encoded || stored_receipt != receipt {
+        return Err(uncertain_migration_evidence_publish(
+            RuntimeFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+
+    validate_migration_handles(guard, evidence_directory)?;
+    let current =
+        read_active_snapshot_bytes(&guard.directory).map_err(RuntimeStoreMigrationError::Store)?;
+    if current.identity != active.identity || current.encoded != active.encoded {
+        return Err(RuntimeStoreMigrationError::TargetMismatch);
+    }
+    publish_atomic(
+        &guard.directory,
+        &target_wire,
+        RuntimePublishMode::ReplaceExisting(active.identity),
+        tokens.active_snapshot,
+        failpoints.active_snapshot,
+    )
+    .map_err(RuntimeStoreMigrationError::Publish)?;
+
+    #[cfg(test)]
+    if failpoints.active_snapshot == RuntimeCommitFailpoint::MigrationActiveReadBackFailure {
+        return Err(published_but_unverified(
+            RuntimeFileStage::ReadBackPublished,
+        ));
+    }
+    let published = read_active_snapshot(&guard.directory)
+        .map_err(|_| published_but_unverified(RuntimeFileStage::ReadBackPublished))?;
+    if published.snapshot != target || published.snapshot.canonical_wire() != target_wire {
+        return Err(published_but_unverified(
+            RuntimeFileStage::ReadBackPublished,
+        ));
+    }
+    validate_migration_handles(guard, evidence_directory)
+        .map_err(|_| published_but_unverified(RuntimeFileStage::VerifyPublishedMigration))?;
+    #[cfg(test)]
+    if failpoints.active_snapshot == RuntimeCommitFailpoint::MigrationPostPublishEvidenceFailure {
+        return Err(published_but_unverified(
+            RuntimeFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+    let (stored_source, stored_receipt) =
+        read_runtime_migration_evidence(evidence_directory, request.migration_id)
+            .map_err(|_| published_but_unverified(RuntimeFileStage::ReadBackMigrationEvidence))?;
+    if stored_source != active.encoded || stored_receipt != receipt {
+        return Err(published_but_unverified(
+            RuntimeFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+    Ok(RuntimeStoreMigrationOutcome {
+        disposition: RuntimeStoreMigrationDisposition::Migrated,
+        receipt,
+    })
+}
+
+fn validate_migration_source_identity(
+    source: &RuntimeJournalPayloadV3Migration,
+    expected_store_instance_id: [u8; 32],
+    expected_target_fingerprint: Digest32,
+) -> Result<(), RuntimeStoreMigrationError> {
+    if source.source_store_instance_id() != &expected_store_instance_id {
+        return Err(RuntimeStoreMigrationError::StoreInstanceMismatch);
+    }
+    if source.source_target_fingerprint() != expected_target_fingerprint {
+        return Err(RuntimeStoreMigrationError::TargetFingerprintMismatch);
+    }
+    Ok(())
+}
+
+fn validate_migration_target_identity(
+    target: &RuntimeJournalSnapshot,
+    expected_store_instance_id: [u8; 32],
+    expected_target_fingerprint: Digest32,
+) -> Result<(), RuntimeStoreMigrationError> {
+    if target.store_instance_id() != &expected_store_instance_id {
+        return Err(RuntimeStoreMigrationError::StoreInstanceMismatch);
+    }
+    if target.owner_target_fingerprint() != &expected_target_fingerprint {
+        return Err(RuntimeStoreMigrationError::TargetFingerprintMismatch);
+    }
+    Ok(())
+}
+
+fn validate_migration_handles(
+    guard: &RuntimeMigrationGuard,
+    evidence_directory: &RuntimeDirectory,
+) -> Result<(), RuntimeStoreMigrationError> {
+    validate_runtime_directory_handle(&guard.directory)
+        .map_err(RuntimeStoreMigrationError::Store)?;
+    validate_held_lock(&guard.directory, &guard.lock_file, guard.lock_identity)
+        .map_err(RuntimeStoreMigrationError::Store)?;
+    validate_runtime_directory_handle(evidence_directory)
+        .map_err(RuntimeStoreMigrationError::EvidenceDirectory)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigrationEvidenceKind {
+    Source,
+    Receipt,
+}
+
+fn migration_source_file_name(migration_id: [u8; 32]) -> String {
+    let mut name = String::with_capacity(
+        MIGRATION_SOURCE_FILE_PREFIX.len() + 64 + MIGRATION_SOURCE_FILE_SUFFIX.len(),
+    );
+    name.push_str(MIGRATION_SOURCE_FILE_PREFIX);
+    append_lower_hex(&mut name, &migration_id);
+    name.push_str(MIGRATION_SOURCE_FILE_SUFFIX);
+    name
+}
+
+fn migration_receipt_file_name(migration_id: [u8; 32]) -> String {
+    let mut name = String::with_capacity(
+        MIGRATION_RECEIPT_FILE_PREFIX.len() + 64 + MIGRATION_RECEIPT_FILE_SUFFIX.len(),
+    );
+    name.push_str(MIGRATION_RECEIPT_FILE_PREFIX);
+    append_lower_hex(&mut name, &migration_id);
+    name.push_str(MIGRATION_RECEIPT_FILE_SUFFIX);
+    name
+}
+
+fn migration_evidence_temp_name(
+    migration_id: [u8; 32],
+    kind: MigrationEvidenceKind,
+    token: [u8; TEMP_TOKEN_BYTES],
+) -> String {
+    let label = match kind {
+        MigrationEvidenceKind::Source => "source-",
+        MigrationEvidenceKind::Receipt => "receipt-",
+    };
+    let mut name = String::with_capacity(
+        MIGRATION_EVIDENCE_TEMP_PREFIX.len() + 64 + 1 + label.len() + TEMP_HEX_BYTES,
+    );
+    name.push_str(MIGRATION_EVIDENCE_TEMP_PREFIX);
+    append_lower_hex(&mut name, &migration_id);
+    name.push('-');
+    name.push_str(label);
+    append_lower_hex(&mut name, &token);
+    name
+}
+
+fn append_lower_hex(output: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+}
+
+fn migration_evidence_temp_prefix(migration_id: [u8; 32]) -> String {
+    let mut prefix = String::with_capacity(MIGRATION_EVIDENCE_TEMP_PREFIX.len() + 64 + 1);
+    prefix.push_str(MIGRATION_EVIDENCE_TEMP_PREFIX);
+    append_lower_hex(&mut prefix, &migration_id);
+    prefix.push('-');
+    prefix
+}
+
+fn valid_migration_evidence_temp_name(name: &str, migration_id: [u8; 32]) -> bool {
+    let prefix = migration_evidence_temp_prefix(migration_id);
+    let Some(suffix) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some(token) = suffix
+        .strip_prefix("source-")
+        .or_else(|| suffix.strip_prefix("receipt-"))
+    else {
+        return false;
+    };
+    token.len() == TEMP_HEX_BYTES
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn clean_runtime_migration_evidence_temps(
+    directory: &RuntimeDirectory,
+    migration_id: [u8; 32],
+) -> Result<(), RuntimeStoreMigrationError> {
+    let expected_prefix = migration_evidence_temp_prefix(migration_id);
+    let mut entries = duplicate_directory_stream(directory)
+        .map_err(RuntimeStoreMigrationError::EvidenceDirectory)?;
+    let mut orphan_names = Vec::new();
+    let mut total_entries = 0_usize;
+    for entry in entries.iter() {
+        let entry = entry.map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+                RuntimeFileStage::InspectMigrationEvidence,
+                error,
+            ))
+        })?;
+        let name_bytes = entry.file_name().to_bytes();
+        if is_dot_entry(name_bytes) {
+            continue;
+        }
+        total_entries = total_entries
+            .checked_add(1)
+            .ok_or(RuntimeStoreMigrationError::TooManyEvidenceDirectoryEntries)?;
+        if total_entries > MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES {
+            return Err(RuntimeStoreMigrationError::TooManyEvidenceDirectoryEntries);
+        }
+        if !name_bytes.starts_with(expected_prefix.as_bytes()) {
+            continue;
+        }
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| RuntimeStoreMigrationError::UnknownEvidenceEntry)?;
+        if !valid_migration_evidence_temp_name(name, migration_id) {
+            return Err(RuntimeStoreMigrationError::UnknownEvidenceEntry);
+        }
+        orphan_names.push(name.to_owned());
+        if orphan_names.len() > MAX_MIGRATION_EVIDENCE_ORPHAN_TEMPS {
+            return Err(RuntimeStoreMigrationError::TooManyEvidenceTemps);
+        }
+    }
+
+    if orphan_names.is_empty() {
+        return Ok(());
+    }
+    let mut validated_orphans = Vec::with_capacity(orphan_names.len());
+    for name in orphan_names {
+        let (file, identity) = open_migration_evidence_temp(directory, &name)?;
+        validate_named_migration_evidence_temp_identity(directory, &name, identity)?;
+        validated_orphans.push((name, file));
+    }
+    // Deliberately start unlink only after every candidate has passed both
+    // descriptor metadata and second named-identity validation. A malformed or
+    // replaced later candidate therefore cannot leave a half-cleaned audit dir.
+    for (name, file) in validated_orphans {
+        unlinkat(&directory.file, name.as_str(), UnlinkatFlags::NoRemoveDir).map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+                RuntimeFileStage::InspectMigrationEvidence,
+                error,
+            ))
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+                RuntimeFileStage::InspectMigrationEvidence,
+                &error,
+            ))
+        })?;
+        if metadata.nlink() != 0 {
+            return Err(RuntimeStoreMigrationError::EvidenceChangedDuringRead);
+        }
+    }
+    directory.file.sync_all().map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::SyncMigrationEvidenceDirectory,
+            &error,
+        ))
+    })
+}
+
+fn open_migration_evidence_temp(
+    directory: &RuntimeDirectory,
+    name: &str,
+) -> Result<(File, FileIdentity), RuntimeStoreMigrationError> {
+    let owned = openat(
+        &directory.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+            RuntimeFileStage::InspectMigrationEvidence,
+            error,
+        ))
+    })?;
+    let file = File::from(owned);
+    let metadata = file.metadata().map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::InspectMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_migration_evidence_temp_metadata(&metadata, directory.owner_uid, directory.owner_gid)?;
+    Ok((file, FileIdentity::from_metadata(&metadata)))
+}
+
+fn validate_migration_evidence_temp_metadata(
+    metadata: &Metadata,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<(), RuntimeStoreMigrationError> {
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(RuntimeStoreMigrationError::UnsafeEvidenceFile);
+    }
+    if metadata.uid() != owner_uid || metadata.gid() != owner_gid {
+        return Err(RuntimeStoreMigrationError::EvidenceOwnerMismatch);
+    }
+    let mode = metadata.mode() & PRIVATE_FILE_MODE_MASK;
+    if mode != PRIVATE_FILE_MODE_BITS && mode != READ_ONLY_EVIDENCE_MODE_BITS {
+        return Err(RuntimeStoreMigrationError::UnsafeEvidenceMode);
+    }
+    Ok(())
+}
+
+fn validate_named_migration_evidence_temp_identity(
+    directory: &RuntimeDirectory,
+    name: &str,
+    expected: FileIdentity,
+) -> Result<(), RuntimeStoreMigrationError> {
+    let (file, identity) = open_migration_evidence_temp(directory, name)?;
+    drop(file);
+    if identity != expected {
+        return Err(RuntimeStoreMigrationError::EvidenceChangedDuringRead);
+    }
+    Ok(())
+}
+
+fn read_runtime_migration_evidence(
+    directory: &RuntimeDirectory,
+    migration_id: [u8; 32],
+) -> Result<(Vec<u8>, RuntimeStoreMigrationReceipt), RuntimeStoreMigrationError> {
+    let source = read_read_only_migration_evidence(
+        directory,
+        &migration_source_file_name(migration_id),
+        MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES,
+    )?;
+    let receipt_wire = read_read_only_migration_evidence(
+        directory,
+        &migration_receipt_file_name(migration_id),
+        MIGRATION_RECEIPT_BYTES,
+    )?;
+    let receipt = RuntimeStoreMigrationReceipt::decode(&receipt_wire)?;
+    if receipt.migration_id != migration_id
+        || receipt.source_snapshot_length != source.len() as u64
+        || receipt.source_snapshot_digest != exact_migration_evidence_digest(&source)?
+    {
+        return Err(RuntimeStoreMigrationError::EvidenceMismatch);
+    }
+    Ok((source, receipt))
+}
+
+fn ensure_read_only_migration_evidence(
+    directory: &RuntimeDirectory,
+    migration_id: [u8; 32],
+    name: &str,
+    bytes: &[u8],
+    kind: MigrationEvidenceKind,
+    token: [u8; TEMP_TOKEN_BYTES],
+    failpoint: RuntimeCommitFailpoint,
+) -> Result<(), RuntimeStoreMigrationError> {
+    match read_read_only_migration_evidence(directory, name, bytes.len()) {
+        Ok(existing) => {
+            if existing == bytes {
+                return Ok(());
+            }
+            return Err(RuntimeStoreMigrationError::EvidenceMismatch);
+        }
+        Err(RuntimeStoreMigrationError::EvidenceMissing) => {}
+        Err(error) => return Err(error),
+    }
+    if failpoint == RuntimeCommitFailpoint::BeforeTempCreate {
+        return Err(rejected_migration_evidence_publish(
+            RuntimeFileStage::CreateMigrationEvidenceTemp,
+        ));
+    }
+    let temp_name = migration_evidence_temp_name(migration_id, kind, token);
+    let owned = openat(
+        &directory.file,
+        temp_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        PRIVATE_FILE_MODE,
+    )
+    .map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+            RuntimeFileStage::CreateMigrationEvidenceTemp,
+            error,
+        ))
+    })?;
+    let mut temp = File::from(owned);
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortAfterTempCreate {
+        std::process::abort();
+    }
+    if failpoint == RuntimeCommitFailpoint::AfterTempCreate {
+        return Err(rejected_migration_evidence_publish(
+            RuntimeFileStage::CreateMigrationEvidenceTemp,
+        ));
+    }
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortAfterPartialWrite {
+        let partial_length = bytes.len().saturating_sub(1).max(1);
+        temp.write_all(&bytes[..partial_length]).map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+                RuntimeFileStage::WriteMigrationEvidenceTemp,
+                &error,
+            ))
+        })?;
+        std::process::abort();
+    }
+    if failpoint == RuntimeCommitFailpoint::AfterPartialWrite {
+        let partial_length = bytes.len().saturating_sub(1).max(1);
+        temp.write_all(&bytes[..partial_length]).map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+                RuntimeFileStage::WriteMigrationEvidenceTemp,
+                &error,
+            ))
+        })?;
+        return Err(rejected_migration_evidence_publish(
+            RuntimeFileStage::WriteMigrationEvidenceTemp,
+        ));
+    }
+    temp.write_all(bytes).map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::WriteMigrationEvidenceTemp,
+            &error,
+        ))
+    })?;
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortBeforeFileSync {
+        std::process::abort();
+    }
+    if failpoint == RuntimeCommitFailpoint::BeforeFileSync {
+        return Err(rejected_migration_evidence_publish(
+            RuntimeFileStage::SyncMigrationEvidenceTemp,
+        ));
+    }
+    fchmod(&temp, READ_ONLY_EVIDENCE_MODE).map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+            RuntimeFileStage::InspectMigrationEvidence,
+            error,
+        ))
+    })?;
+    let metadata = temp.metadata().map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::InspectMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_read_only_evidence_metadata(&metadata, directory.owner_uid, directory.owner_gid)?;
+    temp.sync_all().map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::SyncMigrationEvidenceTemp,
+            &error,
+        ))
+    })?;
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortAfterFileSync {
+        std::process::abort();
+    }
+    if matches!(
+        failpoint,
+        RuntimeCommitFailpoint::AfterFileSync | RuntimeCommitFailpoint::BeforeRename
+    ) {
+        return Err(rejected_migration_evidence_publish(
+            RuntimeFileStage::RenameMigrationEvidence,
+        ));
+    }
+    validate_runtime_directory_handle(directory)
+        .map_err(RuntimeStoreMigrationError::EvidenceDirectory)?;
+    ensure_migration_evidence_missing(directory, name)?;
+    publish_migration_evidence_temp(directory, &temp_name, name)?;
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::AbortAfterRename {
+        std::process::abort();
+    }
+    if matches!(
+        failpoint,
+        RuntimeCommitFailpoint::AfterRename | RuntimeCommitFailpoint::BeforeDirectorySync
+    ) {
+        return Err(uncertain_migration_evidence_publish(
+            RuntimeFileStage::SyncMigrationEvidenceDirectory,
+        ));
+    }
+    directory.file.sync_all().map_err(|error| {
+        RuntimeStoreMigrationError::EvidencePublish(RuntimePublishFailure::UncertainAfterPublish(
+            RuntimePublishFault::io(RuntimeFileStage::SyncMigrationEvidenceDirectory, &error),
+        ))
+    })?;
+    #[cfg(test)]
+    if matches!(
+        failpoint,
+        RuntimeCommitFailpoint::AbortAfterDirectorySync
+            | RuntimeCommitFailpoint::AbortAfterDurableCommitBeforeReturn
+    ) {
+        std::process::abort();
+    }
+    if failpoint == RuntimeCommitFailpoint::AfterDirectorySyncBeforeReturn {
+        return Err(uncertain_migration_evidence_publish(
+            RuntimeFileStage::ReturnMigrationEvidence,
+        ));
+    }
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::MigrationEvidenceReadBackFailure {
+        return Err(uncertain_migration_evidence_publish(
+            RuntimeFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+    let read_back =
+        read_read_only_migration_evidence(directory, name, bytes.len()).map_err(|_| {
+            uncertain_migration_evidence_publish(RuntimeFileStage::ReadBackMigrationEvidence)
+        })?;
+    if read_back != bytes {
+        return Err(uncertain_migration_evidence_publish(
+            RuntimeFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+    Ok(())
+}
+
+fn publish_migration_evidence_temp(
+    directory: &RuntimeDirectory,
+    temp_name: &str,
+    final_name: &str,
+) -> Result<(), RuntimeStoreMigrationError> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        renameat2(
+            &directory.file,
+            temp_name,
+            &directory.file,
+            final_name,
+            RenameFlags::RENAME_NOREPLACE,
+        )
+        .map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+                RuntimeFileStage::RenameMigrationEvidence,
+                error,
+            ))
+        })
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        renameat(&directory.file, temp_name, &directory.file, final_name).map_err(|error| {
+            RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+                RuntimeFileStage::RenameMigrationEvidence,
+                error,
+            ))
+        })
+    }
+}
+
+fn ensure_migration_evidence_missing(
+    directory: &RuntimeDirectory,
+    name: &str,
+) -> Result<(), RuntimeStoreMigrationError> {
+    match openat(
+        &directory.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            Err(RuntimeStoreMigrationError::EvidenceMismatch)
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(()),
+        Err(error) => Err(RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+            RuntimeFileStage::OpenMigrationEvidence,
+            error,
+        ))),
+    }
+}
+
+fn read_read_only_migration_evidence(
+    directory: &RuntimeDirectory,
+    name: &str,
+    maximum_length: usize,
+) -> Result<Vec<u8>, RuntimeStoreMigrationError> {
+    let owned = match openat(
+        &directory.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => file,
+        Err(nix::errno::Errno::ENOENT) => {
+            return Err(RuntimeStoreMigrationError::EvidenceMissing);
+        }
+        Err(error) => {
+            return Err(RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+                RuntimeFileStage::OpenMigrationEvidence,
+                error,
+            )));
+        }
+    };
+    let mut file = File::from(owned);
+    let before = file.metadata().map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::InspectMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_read_only_evidence_metadata(&before, directory.owner_uid, directory.owner_gid)?;
+    let identity = FileIdentity::from_metadata(&before);
+    let length =
+        usize::try_from(before.len()).map_err(|_| RuntimeStoreMigrationError::EvidenceTooLarge)?;
+    if length == 0 || length > maximum_length {
+        return Err(RuntimeStoreMigrationError::EvidenceTooLarge);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| RuntimeStoreMigrationError::EvidenceAllocationFailed)?;
+    bytes.resize(length, 0);
+    file.read_exact(&mut bytes).map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::ReadMigrationEvidence,
+            &error,
+        ))
+    })?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing).map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::ReadMigrationEvidence,
+            &error,
+        ))
+    })? != 0
+    {
+        return Err(RuntimeStoreMigrationError::EvidenceChangedDuringRead);
+    }
+    let after = file.metadata().map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::ReadMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_read_only_evidence_metadata(&after, directory.owner_uid, directory.owner_gid)?;
+    if FileIdentity::from_metadata(&after) != identity || after.len() != before.len() {
+        return Err(RuntimeStoreMigrationError::EvidenceChangedDuringRead);
+    }
+    validate_named_read_only_evidence_identity(directory, name, identity)?;
+    Ok(bytes)
+}
+
+fn validate_read_only_evidence_metadata(
+    metadata: &Metadata,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<(), RuntimeStoreMigrationError> {
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(RuntimeStoreMigrationError::UnsafeEvidenceFile);
+    }
+    if metadata.uid() != owner_uid || metadata.gid() != owner_gid {
+        return Err(RuntimeStoreMigrationError::EvidenceOwnerMismatch);
+    }
+    if metadata.mode() & PRIVATE_FILE_MODE_MASK != READ_ONLY_EVIDENCE_MODE_BITS {
+        return Err(RuntimeStoreMigrationError::UnsafeEvidenceMode);
+    }
+    Ok(())
+}
+
+fn validate_named_read_only_evidence_identity(
+    directory: &RuntimeDirectory,
+    name: &str,
+    expected: FileIdentity,
+) -> Result<(), RuntimeStoreMigrationError> {
+    let owned = openat(
+        &directory.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(nix_failure(
+            RuntimeFileStage::OpenMigrationEvidence,
+            error,
+        ))
+    })?;
+    let file = File::from(owned);
+    let metadata = file.metadata().map_err(|error| {
+        RuntimeStoreMigrationError::EvidenceIo(RuntimeIoFailure::new(
+            RuntimeFileStage::InspectMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_read_only_evidence_metadata(&metadata, directory.owner_uid, directory.owner_gid)?;
+    if FileIdentity::from_metadata(&metadata) != expected {
+        return Err(RuntimeStoreMigrationError::EvidenceChangedDuringRead);
+    }
+    Ok(())
 }
 
 fn open_runtime_directory(
@@ -877,6 +2136,20 @@ fn validate_held_lock(
 fn read_active_snapshot(
     directory: &RuntimeDirectory,
 ) -> Result<ActiveSnapshot, RuntimeStoreOpenError> {
+    let ActiveSnapshotBytes { encoded, identity } = read_active_snapshot_bytes(directory)?;
+    let snapshot =
+        RuntimeJournalSnapshot::decode(&encoded).map_err(RuntimeStoreOpenError::Journal)?;
+    if snapshot.canonical_wire() != encoded {
+        return Err(RuntimeStoreOpenError::Journal(
+            RuntimeJournalError::NonCanonicalEncoding,
+        ));
+    }
+    Ok(ActiveSnapshot { snapshot, identity })
+}
+
+fn read_active_snapshot_bytes(
+    directory: &RuntimeDirectory,
+) -> Result<ActiveSnapshotBytes, RuntimeStoreOpenError> {
     let OpenedRegularFile { mut file, identity } = open_existing_regular(
         directory,
         ACTIVE_FILE_NAME,
@@ -922,14 +2195,7 @@ fn read_active_snapshot(
         identity,
         RuntimeFileStage::ValidateActiveIdentity,
     )?;
-    let snapshot =
-        RuntimeJournalSnapshot::decode(&encoded).map_err(RuntimeStoreOpenError::Journal)?;
-    if snapshot.canonical_wire() != encoded {
-        return Err(RuntimeStoreOpenError::Journal(
-            RuntimeJournalError::NonCanonicalEncoding,
-        ));
-    }
-    Ok(ActiveSnapshot { snapshot, identity })
+    Ok(ActiveSnapshotBytes { encoded, identity })
 }
 
 fn clean_valid_orphan_temps(directory: &RuntimeDirectory) -> Result<(), RuntimeStoreOpenError> {
@@ -1639,6 +2905,18 @@ fn uncertain_injected(stage: RuntimeFileStage) -> RuntimePublishFailure {
     RuntimePublishFailure::UncertainAfterPublish(RuntimePublishFault::injected(stage))
 }
 
+fn rejected_migration_evidence_publish(stage: RuntimeFileStage) -> RuntimeStoreMigrationError {
+    RuntimeStoreMigrationError::EvidencePublish(rejected_injected(stage))
+}
+
+fn uncertain_migration_evidence_publish(stage: RuntimeFileStage) -> RuntimeStoreMigrationError {
+    RuntimeStoreMigrationError::EvidencePublish(uncertain_injected(stage))
+}
+
+fn published_but_unverified(stage: RuntimeFileStage) -> RuntimeStoreMigrationError {
+    RuntimeStoreMigrationError::PublishedButUnverified(stage)
+}
+
 fn nix_failure(stage: RuntimeFileStage, error: nix::errno::Errno) -> RuntimeIoFailure {
     RuntimeIoFailure::new(stage, &errno_to_io(error))
 }
@@ -1675,6 +2953,12 @@ pub(crate) enum RuntimeCommitFailpoint {
     AbortAfterDirectorySync,
     #[cfg(test)]
     AbortAfterDurableCommitBeforeReturn,
+    #[cfg(test)]
+    MigrationEvidenceReadBackFailure,
+    #[cfg(test)]
+    MigrationActiveReadBackFailure,
+    #[cfg(test)]
+    MigrationPostPublishEvidenceFailure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1699,6 +2983,18 @@ pub(crate) enum RuntimeFileStage {
     InspectOrphanTemp,
     RemoveOrphanTemp,
     SyncOrphanCleanup,
+    GenerateMigrationEvidenceTempName,
+    OpenMigrationEvidence,
+    CreateMigrationEvidenceTemp,
+    InspectMigrationEvidence,
+    ReadMigrationEvidence,
+    WriteMigrationEvidenceTemp,
+    SyncMigrationEvidenceTemp,
+    RenameMigrationEvidence,
+    SyncMigrationEvidenceDirectory,
+    ReturnMigrationEvidence,
+    ReadBackMigrationEvidence,
+    VerifyPublishedMigration,
     GenerateTempName,
     ValidateEncodedSnapshot,
     RequireMissingActive,
@@ -1831,6 +3127,37 @@ pub(crate) enum RuntimeStoreError {
     Publish(RuntimePublishFailure),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeStoreMigrationError {
+    InvalidExpectedStoreInstanceId,
+    InvalidExpectedTargetFingerprint,
+    InvalidMigrationId,
+    EvidenceDirectoryMatchesStore,
+    LockContended,
+    StoreInstanceMismatch,
+    TargetFingerprintMismatch,
+    Store(RuntimeStoreOpenError),
+    EvidenceDirectory(RuntimeStoreOpenError),
+    Journal(RuntimeJournalError),
+    EvidenceMissing,
+    EvidenceTooLarge,
+    EvidenceAllocationFailed,
+    EvidenceChangedDuringRead,
+    UnknownEvidenceEntry,
+    TooManyEvidenceDirectoryEntries,
+    TooManyEvidenceTemps,
+    UnsafeEvidenceFile,
+    UnsafeEvidenceMode,
+    EvidenceOwnerMismatch,
+    EvidenceMismatch,
+    InvalidReceipt,
+    TargetMismatch,
+    EvidenceIo(RuntimeIoFailure),
+    EvidencePublish(RuntimePublishFailure),
+    Publish(RuntimePublishFailure),
+    PublishedButUnverified(RuntimeFileStage),
+}
+
 impl fmt::Display for RuntimeStoreOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "Runtime store cannot open: {self:?}")
@@ -1863,6 +3190,14 @@ impl fmt::Display for RuntimeStoreError {
 
 impl std::error::Error for RuntimeStoreError {}
 
+impl fmt::Display for RuntimeStoreMigrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Runtime store migration failed: {self:?}")
+    }
+}
+
+impl std::error::Error for RuntimeStoreMigrationError {}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1878,13 +3213,18 @@ mod tests {
     use super::{
         ACTIVE_FILE_NAME, LOCK_FILE_NAME, LinuxMountEvidenceError, MAX_LINUX_FDINFO_BYTES,
         MAX_LINUX_FDINFO_LINE_BYTES, MAX_LINUX_FDINFO_RECORDS, MAX_LINUX_MOUNTINFO_BYTES,
-        MAX_LINUX_MOUNTINFO_LINE_BYTES, MAX_LINUX_MOUNTINFO_RECORDS, MAX_ORPHAN_TEMP_FILES,
-        MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, PRIVATE_FILE_MODE_BITS, PRIVATE_FILE_MODE_MASK,
-        RuntimeCommitFailpoint, RuntimeFileStage, RuntimeFilesystemPolicy,
-        RuntimeInitializerBeginError, RuntimeInitializerGuard, RuntimeInitializerPreflight,
-        RuntimeInitializerPublishError, RuntimePublishFailure, RuntimeStore, RuntimeStoreError,
-        RuntimeStoreOpenError, TEMP_FILE_PREFIX, TEMP_TOKEN_BYTES, parse_linux_fdinfo_mount_id,
-        parse_linux_mountinfo_exact_ext4, temp_name, validate_runtime_service_identity,
+        MAX_LINUX_MOUNTINFO_LINE_BYTES, MAX_LINUX_MOUNTINFO_RECORDS,
+        MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES, MAX_MIGRATION_EVIDENCE_ORPHAN_TEMPS,
+        MAX_ORPHAN_TEMP_FILES, MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, MigrationEvidenceKind,
+        PRIVATE_FILE_MODE_BITS, PRIVATE_FILE_MODE_MASK, RuntimeCommitFailpoint, RuntimeFileStage,
+        RuntimeFilesystemPolicy, RuntimeInitializerBeginError, RuntimeInitializerGuard,
+        RuntimeInitializerPreflight, RuntimeInitializerPublishError, RuntimeMigrationFailpoints,
+        RuntimeMigrationRequest, RuntimeMigrationTokens, RuntimePublishFailure, RuntimeStore,
+        RuntimeStoreError, RuntimeStoreMigrationDisposition, RuntimeStoreMigrationError,
+        RuntimeStoreMigrationReceipt, RuntimeStoreOpenError, TEMP_FILE_PREFIX, TEMP_TOKEN_BYTES,
+        migration_evidence_temp_name, migration_receipt_file_name, migration_source_file_name,
+        parse_linux_fdinfo_mount_id, parse_linux_mountinfo_exact_ext4, temp_name,
+        validate_runtime_service_identity,
     };
     use crate::runtime_journal::{
         HostClockAdmissionState, LiveMaterialization, OpaqueCanonicalValue, ReplayLedgerRecord,
@@ -2191,8 +3531,12 @@ mod tests {
     }
 
     fn install_store(directory: &Path, snapshot: &RuntimeJournalSnapshot) {
+        install_store_bytes(directory, snapshot.canonical_wire());
+    }
+
+    fn install_store_bytes(directory: &Path, snapshot: &[u8]) {
         install_private_file(&directory.join(LOCK_FILE_NAME), b"");
-        install_private_file(&directory.join(ACTIVE_FILE_NAME), snapshot.canonical_wire());
+        install_private_file(&directory.join(ACTIVE_FILE_NAME), snapshot);
     }
 
     fn open_fixture(
@@ -2211,6 +3555,57 @@ mod tests {
         let directory = TestDirectory::new();
         install_store(directory.path(), snapshot);
         directory
+    }
+
+    fn migration_tokens(byte: u8) -> RuntimeMigrationTokens {
+        RuntimeMigrationTokens {
+            source_evidence: [byte; TEMP_TOKEN_BYTES],
+            receipt_evidence: [byte.wrapping_add(1); TEMP_TOKEN_BYTES],
+            active_snapshot: [byte.wrapping_add(2); TEMP_TOKEN_BYTES],
+        }
+    }
+
+    fn migrate_fixture(
+        directory: &Path,
+        evidence_directory: &Path,
+        snapshot: &RuntimeJournalSnapshot,
+        migration_id: [u8; 32],
+        token_byte: u8,
+        failpoint: RuntimeCommitFailpoint,
+    ) -> Result<super::RuntimeStoreMigrationOutcome, RuntimeStoreMigrationError> {
+        migrate_fixture_with_failpoints(
+            directory,
+            evidence_directory,
+            snapshot,
+            migration_id,
+            token_byte,
+            RuntimeMigrationFailpoints {
+                active_snapshot: failpoint,
+                ..RuntimeMigrationFailpoints::NONE
+            },
+        )
+    }
+
+    fn migrate_fixture_with_failpoints(
+        directory: &Path,
+        evidence_directory: &Path,
+        snapshot: &RuntimeJournalSnapshot,
+        migration_id: [u8; 32],
+        token_byte: u8,
+        failpoints: RuntimeMigrationFailpoints,
+    ) -> Result<super::RuntimeStoreMigrationOutcome, RuntimeStoreMigrationError> {
+        RuntimeStore::migrate_payload_v3_offline_with_policy(
+            RuntimeMigrationRequest {
+                directory,
+                evidence_directory,
+                expected_store_instance_id: *snapshot.store_instance_id(),
+                expected_target_fingerprint: *snapshot.owner_target_fingerprint(),
+                migration_id,
+            },
+            RuntimeFilesystemPolicy::ExplicitFixture,
+            Some(migration_tokens(token_byte)),
+            failpoints,
+        )
     }
 
     fn install_orphan(directory: &Path, token: [u8; 16], bytes: &[u8]) -> PathBuf {
@@ -2243,6 +3638,984 @@ mod tests {
         let raw_flags = fcntl(file, FcntlArg::F_GETFD)
             .unwrap_or_else(|error| panic!("F_GETFD failed: {error}"));
         assert!(FdFlag::from_bits_truncate(raw_flags).contains(FdFlag::FD_CLOEXEC));
+    }
+
+    #[test]
+    fn explicit_payload_v3_store_migration_retains_read_only_evidence_and_resumes() {
+        let expected = sequence_one_snapshot(0xd1, 0xd2);
+        let legacy = expected
+            .legacy_payload_v3_wire_for_test()
+            .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+        let store = TestDirectory::new();
+        let evidence = TestDirectory::new();
+        install_store_bytes(store.path(), &legacy);
+        let migration_id = [0xd3; 32];
+
+        assert_eq!(
+            open_fixture(store.path(), &expected).err(),
+            Some(RuntimeStoreOpenError::Journal(
+                RuntimeJournalError::UnsupportedPayloadVersion,
+            )),
+            "normal Runtime open must never invoke the offline v3 parser",
+        );
+        let outcome = migrate_fixture(
+            store.path(),
+            evidence.path(),
+            &expected,
+            migration_id,
+            0x41,
+            RuntimeCommitFailpoint::None,
+        )
+        .unwrap_or_else(|error| panic!("explicit migration failed: {error}"));
+        assert_eq!(
+            outcome.disposition,
+            RuntimeStoreMigrationDisposition::Migrated
+        );
+        assert_eq!(outcome.receipt.migration_id(), &migration_id);
+        assert_eq!(outcome.receipt.source_payload_version(), 3);
+        assert_eq!(
+            outcome.receipt.source_store_instance_id(),
+            expected.store_instance_id()
+        );
+        assert_eq!(
+            outcome.receipt.source_target_fingerprint(),
+            *expected.owner_target_fingerprint()
+        );
+        assert_eq!(outcome.receipt.source_sequence(), expected.sequence());
+        let source_metadata = fs::metadata(
+            evidence
+                .path()
+                .join(migration_source_file_name(migration_id)),
+        )
+        .unwrap_or_else(|error| panic!("source evidence metadata failed: {error}"));
+        let receipt_path = evidence
+            .path()
+            .join(migration_receipt_file_name(migration_id));
+        let receipt_metadata = fs::metadata(&receipt_path)
+            .unwrap_or_else(|error| panic!("receipt metadata failed: {error}"));
+        assert_eq!(
+            source_metadata.mode() & PRIVATE_FILE_MODE_MASK,
+            super::READ_ONLY_EVIDENCE_MODE_BITS
+        );
+        assert_eq!(
+            receipt_metadata.mode() & PRIVATE_FILE_MODE_MASK,
+            super::READ_ONLY_EVIDENCE_MODE_BITS
+        );
+        assert_eq!(
+            fs::read(
+                evidence
+                    .path()
+                    .join(migration_source_file_name(migration_id))
+            )
+            .unwrap_or_else(|error| panic!("source evidence read failed: {error}")),
+            legacy
+        );
+        let receipt_wire =
+            fs::read(&receipt_path).unwrap_or_else(|error| panic!("receipt read failed: {error}"));
+        assert_eq!(receipt_wire.len(), super::MIGRATION_RECEIPT_BYTES);
+        assert_eq!(&receipt_wire[..4], b"PXMR");
+        assert_eq!(&receipt_wire[4..6], &1_u16.to_be_bytes());
+        assert_eq!(
+            RuntimeStoreMigrationReceipt::decode(&receipt_wire),
+            Ok(outcome.receipt.clone())
+        );
+        assert_eq!(decode_active(store.path()), expected);
+        drop(
+            open_fixture(store.path(), &expected).unwrap_or_else(|error| {
+                panic!("target parser could not reopen migrated store: {error}")
+            }),
+        );
+
+        let resumed = migrate_fixture(
+            store.path(),
+            evidence.path(),
+            &expected,
+            migration_id,
+            0x51,
+            RuntimeCommitFailpoint::None,
+        )
+        .unwrap_or_else(|error| panic!("completed migration did not resume: {error}"));
+        assert_eq!(
+            resumed.disposition,
+            RuntimeStoreMigrationDisposition::AlreadyMigrated
+        );
+        assert_eq!(resumed.receipt, outcome.receipt);
+        assert_eq!(decode_active(store.path()), expected);
+    }
+
+    #[test]
+    fn migration_requires_a_stopped_owner_same_lock_and_separate_evidence_directory() {
+        let expected = sequence_one_snapshot(0xd4, 0xd5);
+        let legacy = expected
+            .legacy_payload_v3_wire_for_test()
+            .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+        let store = TestDirectory::new();
+        let evidence = TestDirectory::new();
+        install_store_bytes(store.path(), &legacy);
+        let guard = super::acquire_runtime_migration_guard(
+            store.path(),
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+        .unwrap_or_else(|error| panic!("fixture migration lock failed: {error}"));
+        assert_eq!(
+            migrate_fixture(
+                store.path(),
+                evidence.path(),
+                &expected,
+                [0xd6; 32],
+                0x61,
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeStoreMigrationError::LockContended)
+        );
+        assert_eq!(
+            fs::read(store.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("active read failed: {error}")),
+            legacy
+        );
+        assert_eq!(
+            fs::read_dir(evidence.path())
+                .unwrap_or_else(|error| panic!("evidence scan failed: {error}"))
+                .count(),
+            0
+        );
+        drop(guard);
+
+        assert_eq!(
+            migrate_fixture(
+                store.path(),
+                store.path(),
+                &expected,
+                [0xd6; 32],
+                0x62,
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeStoreMigrationError::EvidenceDirectoryMatchesStore)
+        );
+        assert_eq!(
+            fs::read(store.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("active read failed: {error}")),
+            legacy
+        );
+    }
+
+    #[test]
+    fn corrupt_and_unknown_sources_fail_closed_without_evidence_or_active_mutation() {
+        let expected = sequence_one_snapshot(0xd7, 0xd8);
+        let legacy = expected
+            .legacy_payload_v3_wire_for_test()
+            .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+        let cases = [
+            {
+                let mut corrupt = legacy.clone();
+                let last = corrupt
+                    .last_mut()
+                    .unwrap_or_else(|| panic!("legacy fixture must not be empty"));
+                *last ^= 1;
+                (
+                    corrupt,
+                    RuntimeJournalError::ChecksumMismatch,
+                    "checksum-corrupt",
+                )
+            },
+            {
+                let mut unknown = legacy.clone();
+                unknown[8..10].copy_from_slice(&99_u16.to_be_bytes());
+                (
+                    unknown,
+                    RuntimeJournalError::UnsupportedPayloadVersion,
+                    "unknown-version",
+                )
+            },
+        ];
+        for (wire, journal_error, label) in cases {
+            let store = TestDirectory::new();
+            let evidence = TestDirectory::new();
+            install_store_bytes(store.path(), &wire);
+            assert_eq!(
+                migrate_fixture(
+                    store.path(),
+                    evidence.path(),
+                    &expected,
+                    [0xd9; 32],
+                    0x71,
+                    RuntimeCommitFailpoint::None,
+                ),
+                Err(RuntimeStoreMigrationError::Journal(journal_error)),
+                "{label} must preserve the journal decoder failure"
+            );
+            assert_eq!(
+                fs::read(store.path().join(ACTIVE_FILE_NAME))
+                    .unwrap_or_else(|error| panic!("{label} active read failed: {error}")),
+                wire,
+                "{label} must not mutate active"
+            );
+            assert_eq!(
+                fs::read_dir(evidence.path())
+                    .unwrap_or_else(|error| panic!("{label} evidence scan failed: {error}"))
+                    .count(),
+                0,
+                "{label} must not emit evidence"
+            );
+        }
+        // Slice-bearing v3 layouts are rejected as LegacyProvenanceUnavailable
+        // by runtime_journal's real active-lineage fixture before this store
+        // boundary can publish either evidence or target bytes.
+    }
+
+    #[test]
+    fn migrated_v4_without_exact_evidence_and_tampered_evidence_fail_closed() {
+        let expected = sequence_one_snapshot(0xda, 0xdb);
+        let fresh_v4 = fixture_with_snapshot(&expected);
+        let missing_evidence = TestDirectory::new();
+        assert_eq!(
+            migrate_fixture(
+                fresh_v4.path(),
+                missing_evidence.path(),
+                &expected,
+                [0xdc; 32],
+                0x81,
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeStoreMigrationError::PublishedButUnverified(
+                RuntimeFileStage::ReadBackMigrationEvidence,
+            )),
+            "an arbitrary v4 store is not proof that this migration completed"
+        );
+        assert_eq!(decode_active(fresh_v4.path()), expected);
+
+        let legacy = expected
+            .legacy_payload_v3_wire_for_test()
+            .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+        let store = TestDirectory::new();
+        let evidence = TestDirectory::new();
+        install_store_bytes(store.path(), &legacy);
+        let migration_id = [0xdd; 32];
+        migrate_fixture(
+            store.path(),
+            evidence.path(),
+            &expected,
+            migration_id,
+            0x82,
+            RuntimeCommitFailpoint::None,
+        )
+        .unwrap_or_else(|error| panic!("fixture migration failed: {error}"));
+        let receipt_path = evidence
+            .path()
+            .join(migration_receipt_file_name(migration_id));
+        set_mode(&receipt_path, 0o600);
+        assert_eq!(
+            migrate_fixture(
+                store.path(),
+                evidence.path(),
+                &expected,
+                migration_id,
+                0x83,
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeStoreMigrationError::PublishedButUnverified(
+                RuntimeFileStage::ReadBackMigrationEvidence,
+            ))
+        );
+        assert_eq!(decode_active(store.path()), expected);
+
+        let mut corrupt_receipt =
+            fs::read(&receipt_path).unwrap_or_else(|error| panic!("receipt read failed: {error}"));
+        corrupt_receipt[10] ^= 1;
+        fs::write(&receipt_path, &corrupt_receipt)
+            .unwrap_or_else(|error| panic!("receipt corruption failed: {error}"));
+        set_mode(&receipt_path, super::READ_ONLY_EVIDENCE_MODE_BITS);
+        assert_eq!(
+            migrate_fixture(
+                store.path(),
+                evidence.path(),
+                &expected,
+                migration_id,
+                0x84,
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeStoreMigrationError::PublishedButUnverified(
+                RuntimeFileStage::ReadBackMigrationEvidence,
+            ))
+        );
+        assert_eq!(decode_active(store.path()), expected);
+    }
+
+    #[test]
+    fn migration_publish_failpoints_leave_only_strict_old_or_exact_new_active() {
+        for (index, failpoint) in [
+            RuntimeCommitFailpoint::BeforeTempCreate,
+            RuntimeCommitFailpoint::AfterTempCreate,
+            RuntimeCommitFailpoint::AfterPartialWrite,
+            RuntimeCommitFailpoint::BeforeFileSync,
+            RuntimeCommitFailpoint::AfterFileSync,
+            RuntimeCommitFailpoint::BeforeRename,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected = sequence_one_snapshot(0xde, 0xdf);
+            let legacy = expected
+                .legacy_payload_v3_wire_for_test()
+                .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+            let store = TestDirectory::new();
+            let evidence = TestDirectory::new();
+            install_store_bytes(store.path(), &legacy);
+            let migration_id = [0xe0; 32];
+            assert!(matches!(
+                migrate_fixture(
+                    store.path(),
+                    evidence.path(),
+                    &expected,
+                    migration_id,
+                    u8::try_from(0x90 + index).unwrap_or_else(|_| panic!("token index must fit")),
+                    failpoint,
+                ),
+                Err(RuntimeStoreMigrationError::Publish(
+                    RuntimePublishFailure::RejectedBeforePublish(_)
+                ))
+            ));
+            assert_eq!(
+                fs::read(store.path().join(ACTIVE_FILE_NAME))
+                    .unwrap_or_else(|error| panic!("old active read failed: {error}")),
+                legacy
+            );
+            let completed = migrate_fixture(
+                store.path(),
+                evidence.path(),
+                &expected,
+                migration_id,
+                u8::try_from(0xa0 + index).unwrap_or_else(|_| panic!("retry token index must fit")),
+                RuntimeCommitFailpoint::None,
+            )
+            .unwrap_or_else(|error| panic!("pre-publish retry failed: {error}"));
+            assert_eq!(
+                completed.disposition,
+                RuntimeStoreMigrationDisposition::Migrated
+            );
+            assert_eq!(decode_active(store.path()), expected);
+            assert_eq!(orphan_count(store.path()), 0);
+        }
+
+        for (index, failpoint) in [
+            RuntimeCommitFailpoint::AfterRename,
+            RuntimeCommitFailpoint::BeforeDirectorySync,
+            RuntimeCommitFailpoint::AfterDirectorySyncBeforeReturn,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected = sequence_one_snapshot(0xe1, 0xe2);
+            let legacy = expected
+                .legacy_payload_v3_wire_for_test()
+                .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+            let store = TestDirectory::new();
+            let evidence = TestDirectory::new();
+            install_store_bytes(store.path(), &legacy);
+            let migration_id = [0xe3; 32];
+            assert!(matches!(
+                migrate_fixture(
+                    store.path(),
+                    evidence.path(),
+                    &expected,
+                    migration_id,
+                    u8::try_from(0xb0 + index).unwrap_or_else(|_| panic!("token index must fit")),
+                    failpoint,
+                ),
+                Err(RuntimeStoreMigrationError::Publish(
+                    RuntimePublishFailure::UncertainAfterPublish(_)
+                ))
+            ));
+            assert_eq!(decode_active(store.path()), expected);
+            let resumed = migrate_fixture(
+                store.path(),
+                evidence.path(),
+                &expected,
+                migration_id,
+                u8::try_from(0xc0 + index).unwrap_or_else(|_| panic!("retry token index must fit")),
+                RuntimeCommitFailpoint::None,
+            )
+            .unwrap_or_else(|error| panic!("post-publish resume failed: {error}"));
+            assert_eq!(
+                resumed.disposition,
+                RuntimeStoreMigrationDisposition::AlreadyMigrated
+            );
+            assert_eq!(decode_active(store.path()), expected);
+        }
+    }
+
+    #[test]
+    fn source_and_receipt_evidence_failpoints_are_bounded_and_crash_retryable() {
+        let pre_rename = [
+            RuntimeCommitFailpoint::BeforeTempCreate,
+            RuntimeCommitFailpoint::AfterTempCreate,
+            RuntimeCommitFailpoint::AfterPartialWrite,
+            RuntimeCommitFailpoint::BeforeFileSync,
+            RuntimeCommitFailpoint::AfterFileSync,
+            RuntimeCommitFailpoint::BeforeRename,
+        ];
+        let post_rename = [
+            RuntimeCommitFailpoint::AfterRename,
+            RuntimeCommitFailpoint::BeforeDirectorySync,
+            RuntimeCommitFailpoint::AfterDirectorySyncBeforeReturn,
+        ];
+        for kind in [
+            MigrationEvidenceKind::Source,
+            MigrationEvidenceKind::Receipt,
+        ] {
+            for (index, failpoint) in pre_rename.into_iter().chain(post_rename).enumerate() {
+                let expected = sequence_one_snapshot(0xe8, 0xe9);
+                let legacy = expected
+                    .legacy_payload_v3_wire_for_test()
+                    .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+                let store = TestDirectory::new();
+                let evidence = TestDirectory::new();
+                install_store_bytes(store.path(), &legacy);
+                let migration_id = [0xea; 32];
+                let mut failpoints = RuntimeMigrationFailpoints::NONE;
+                match kind {
+                    MigrationEvidenceKind::Source => {
+                        failpoints.source_evidence = failpoint;
+                    }
+                    MigrationEvidenceKind::Receipt => {
+                        failpoints.receipt_evidence = failpoint;
+                    }
+                }
+                let result = migrate_fixture_with_failpoints(
+                    store.path(),
+                    evidence.path(),
+                    &expected,
+                    migration_id,
+                    u8::try_from(0x20 + index)
+                        .unwrap_or_else(|_| panic!("evidence token index must fit")),
+                    failpoints,
+                );
+                if index < pre_rename.len() {
+                    assert!(matches!(
+                        result,
+                        Err(RuntimeStoreMigrationError::EvidencePublish(
+                            RuntimePublishFailure::RejectedBeforePublish(_)
+                        ))
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(RuntimeStoreMigrationError::EvidencePublish(
+                            RuntimePublishFailure::UncertainAfterPublish(_)
+                        ))
+                    ));
+                }
+                assert_eq!(
+                    fs::read(store.path().join(ACTIVE_FILE_NAME))
+                        .unwrap_or_else(|error| panic!("evidence failure active read: {error}")),
+                    legacy,
+                    "evidence publication must complete before active replacement"
+                );
+                let resumed = migrate_fixture(
+                    store.path(),
+                    evidence.path(),
+                    &expected,
+                    migration_id,
+                    u8::try_from(0x40 + index)
+                        .unwrap_or_else(|_| panic!("evidence retry token index must fit")),
+                    RuntimeCommitFailpoint::None,
+                )
+                .unwrap_or_else(|error| panic!("evidence retry failed: {error}"));
+                assert_eq!(
+                    resumed.disposition,
+                    RuntimeStoreMigrationDisposition::Migrated
+                );
+                assert_eq!(decode_active(store.path()), expected);
+                assert_eq!(
+                    fs::read(
+                        evidence
+                            .path()
+                            .join(migration_source_file_name(migration_id))
+                    )
+                    .unwrap_or_else(|error| panic!("source evidence read failed: {error}")),
+                    legacy
+                );
+                let receipt = fs::read(
+                    evidence
+                        .path()
+                        .join(migration_receipt_file_name(migration_id)),
+                )
+                .unwrap_or_else(|error| panic!("receipt evidence read failed: {error}"));
+                RuntimeStoreMigrationReceipt::decode(&receipt)
+                    .unwrap_or_else(|error| panic!("receipt evidence invalid: {error}"));
+                assert_eq!(
+                    fs::read_dir(evidence.path())
+                        .unwrap_or_else(|error| panic!("evidence scan failed: {error}"))
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(super::MIGRATION_EVIDENCE_TEMP_PREFIX)
+                        })
+                        .count(),
+                    0,
+                    "retry must remove its bounded orphan evidence temp"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn post_rename_verification_failures_are_explicitly_uncertain_or_unverified() {
+        for kind in [
+            MigrationEvidenceKind::Source,
+            MigrationEvidenceKind::Receipt,
+        ] {
+            let expected = sequence_one_snapshot(0xee, 0xef);
+            let legacy = expected
+                .legacy_payload_v3_wire_for_test()
+                .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+            let store = TestDirectory::new();
+            let evidence = TestDirectory::new();
+            install_store_bytes(store.path(), &legacy);
+            let migration_id = [0xf0; 32];
+            let mut failpoints = RuntimeMigrationFailpoints::NONE;
+            match kind {
+                MigrationEvidenceKind::Source => {
+                    failpoints.source_evidence =
+                        RuntimeCommitFailpoint::MigrationEvidenceReadBackFailure;
+                }
+                MigrationEvidenceKind::Receipt => {
+                    failpoints.receipt_evidence =
+                        RuntimeCommitFailpoint::MigrationEvidenceReadBackFailure;
+                }
+            }
+            assert!(matches!(
+                migrate_fixture_with_failpoints(
+                    store.path(),
+                    evidence.path(),
+                    &expected,
+                    migration_id,
+                    0x63,
+                    failpoints,
+                ),
+                Err(RuntimeStoreMigrationError::EvidencePublish(
+                    RuntimePublishFailure::UncertainAfterPublish(fault)
+                )) if fault.stage == RuntimeFileStage::ReadBackMigrationEvidence
+            ));
+            assert_eq!(
+                fs::read(store.path().join(ACTIVE_FILE_NAME))
+                    .unwrap_or_else(|error| panic!("evidence readback active failed: {error}")),
+                legacy
+            );
+            let completed = migrate_fixture(
+                store.path(),
+                evidence.path(),
+                &expected,
+                migration_id,
+                0x64,
+                RuntimeCommitFailpoint::None,
+            )
+            .unwrap_or_else(|error| panic!("evidence readback retry failed: {error}"));
+            assert_eq!(
+                completed.disposition,
+                RuntimeStoreMigrationDisposition::Migrated
+            );
+            assert_eq!(decode_active(store.path()), expected);
+        }
+
+        for (failpoint, expected_stage) in [
+            (
+                RuntimeCommitFailpoint::MigrationActiveReadBackFailure,
+                RuntimeFileStage::ReadBackPublished,
+            ),
+            (
+                RuntimeCommitFailpoint::MigrationPostPublishEvidenceFailure,
+                RuntimeFileStage::ReadBackMigrationEvidence,
+            ),
+        ] {
+            let expected = sequence_one_snapshot(0xf1, 0xf2);
+            let legacy = expected
+                .legacy_payload_v3_wire_for_test()
+                .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+            let store = TestDirectory::new();
+            let evidence = TestDirectory::new();
+            install_store_bytes(store.path(), &legacy);
+            let migration_id = [0xf3; 32];
+            assert_eq!(
+                migrate_fixture(
+                    store.path(),
+                    evidence.path(),
+                    &expected,
+                    migration_id,
+                    0x65,
+                    failpoint,
+                ),
+                Err(RuntimeStoreMigrationError::PublishedButUnverified(
+                    expected_stage,
+                ))
+            );
+            assert_eq!(
+                decode_active(store.path()),
+                expected,
+                "post-publish verification failure must leave exact v4 active"
+            );
+            let resumed = migrate_fixture(
+                store.path(),
+                evidence.path(),
+                &expected,
+                migration_id,
+                0x66,
+                RuntimeCommitFailpoint::None,
+            )
+            .unwrap_or_else(|error| panic!("post-publish verification retry failed: {error}"));
+            assert_eq!(
+                resumed.disposition,
+                RuntimeStoreMigrationDisposition::AlreadyMigrated
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_excess_migration_evidence_temps_fail_before_cleanup_or_mutation() {
+        let expected = sequence_one_snapshot(0xeb, 0xec);
+        let legacy = expected
+            .legacy_payload_v3_wire_for_test()
+            .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+        let migration_id = [0xed; 32];
+
+        let malformed_store = TestDirectory::new();
+        let malformed_evidence = TestDirectory::new();
+        install_store_bytes(malformed_store.path(), &legacy);
+        let mut malformed = super::migration_evidence_temp_prefix(migration_id);
+        malformed.push_str("source-not-hex");
+        install_private_file(&malformed_evidence.path().join(&malformed), b"partial");
+        assert_eq!(
+            migrate_fixture(
+                malformed_store.path(),
+                malformed_evidence.path(),
+                &expected,
+                migration_id,
+                0x51,
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeStoreMigrationError::UnknownEvidenceEntry)
+        );
+        assert!(malformed_evidence.path().join(malformed).is_file());
+        assert_eq!(
+            fs::read(malformed_store.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("malformed active read failed: {error}")),
+            legacy
+        );
+
+        let overflow_store = TestDirectory::new();
+        let overflow_evidence = TestDirectory::new();
+        install_store_bytes(overflow_store.path(), &legacy);
+        let mut orphans = Vec::new();
+        for index in 0..=MAX_MIGRATION_EVIDENCE_ORPHAN_TEMPS {
+            let mut token = [0_u8; TEMP_TOKEN_BYTES];
+            token[14..].copy_from_slice(
+                &u16::try_from(index + 1)
+                    .unwrap_or_else(|_| panic!("orphan index must fit"))
+                    .to_be_bytes(),
+            );
+            let path = overflow_evidence.path().join(migration_evidence_temp_name(
+                migration_id,
+                MigrationEvidenceKind::Source,
+                token,
+            ));
+            install_private_file(&path, b"partial");
+            orphans.push(path);
+        }
+        assert_eq!(
+            migrate_fixture(
+                overflow_store.path(),
+                overflow_evidence.path(),
+                &expected,
+                migration_id,
+                0x52,
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeStoreMigrationError::TooManyEvidenceTemps)
+        );
+        assert!(orphans.iter().all(|path| path.is_file()));
+        assert_eq!(
+            fs::read(overflow_store.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("overflow active read failed: {error}")),
+            legacy
+        );
+
+        let two_phase_store = TestDirectory::new();
+        let two_phase_evidence = TestDirectory::new();
+        install_store_bytes(two_phase_store.path(), &legacy);
+        let valid = two_phase_evidence.path().join(migration_evidence_temp_name(
+            migration_id,
+            MigrationEvidenceKind::Source,
+            [0x61; TEMP_TOKEN_BYTES],
+        ));
+        let invalid = two_phase_evidence.path().join(migration_evidence_temp_name(
+            migration_id,
+            MigrationEvidenceKind::Receipt,
+            [0x62; TEMP_TOKEN_BYTES],
+        ));
+        install_private_file(&valid, b"valid-orphan");
+        install_private_file(&invalid, b"unsafe-orphan");
+        set_mode(&invalid, 0o644);
+        assert_eq!(
+            migrate_fixture(
+                two_phase_store.path(),
+                two_phase_evidence.path(),
+                &expected,
+                migration_id,
+                0x53,
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeStoreMigrationError::UnsafeEvidenceMode)
+        );
+        assert!(
+            valid.is_file(),
+            "validation failure must not delete an earlier valid orphan"
+        );
+        assert!(
+            invalid.is_file(),
+            "validation failure must preserve the invalid candidate"
+        );
+        assert_eq!(
+            fs::read(two_phase_store.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("two-phase active read failed: {error}")),
+            legacy
+        );
+
+        let total_bound_store = TestDirectory::new();
+        let total_bound_evidence = TestDirectory::new();
+        install_store_bytes(total_bound_store.path(), &legacy);
+        for index in 0..=MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES {
+            install_private_file(
+                &total_bound_evidence
+                    .path()
+                    .join(format!("unrelated-audit-{index:03}")),
+                b"unrelated",
+            );
+        }
+        assert_eq!(
+            migrate_fixture(
+                total_bound_store.path(),
+                total_bound_evidence.path(),
+                &expected,
+                migration_id,
+                0x54,
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeStoreMigrationError::TooManyEvidenceDirectoryEntries)
+        );
+        assert_eq!(
+            fs::read_dir(total_bound_evidence.path())
+                .unwrap_or_else(|error| panic!("total-bound evidence scan failed: {error}"))
+                .count(),
+            MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES + 1
+        );
+        assert_eq!(
+            fs::read(total_bound_store.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("total-bound active read failed: {error}")),
+            legacy
+        );
+    }
+
+    #[test]
+    fn migration_subprocess_crashes_resume_from_only_strict_old_or_exact_new_active() {
+        let cases = [
+            ("temp-create", false),
+            ("partial-write", false),
+            ("before-file-fsync", false),
+            ("file-fsync", false),
+            ("rename", true),
+            ("directory-fsync", true),
+            ("durable-commit-before-return", true),
+        ];
+        for (point, published) in cases {
+            let expected = sequence_one_snapshot(0xe4, 0xe5);
+            let legacy = expected
+                .legacy_payload_v3_wire_for_test()
+                .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+            let store = TestDirectory::new();
+            let evidence = TestDirectory::new();
+            install_store_bytes(store.path(), &legacy);
+            let status = Command::new(
+                std::env::current_exe()
+                    .unwrap_or_else(|error| panic!("test executable lookup failed: {error}")),
+            )
+            .args([
+                "--exact",
+                "runtime_store::tests::subprocess_runtime_migration_crash_child",
+                "--nocapture",
+            ])
+            .env("PARAEGOX_TEST_RUNTIME_MIGRATION_STORE", store.path())
+            .env("PARAEGOX_TEST_RUNTIME_MIGRATION_EVIDENCE", evidence.path())
+            .env("PARAEGOX_TEST_RUNTIME_MIGRATION_CRASH_POINT", point)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|error| panic!("migration crash child spawn failed: {error}"));
+            assert!(!status.success(), "migration child returned at {point}");
+
+            let active = fs::read(store.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("post-crash active read failed: {error}"));
+            if published {
+                assert_eq!(
+                    RuntimeJournalSnapshot::decode(&active),
+                    Ok(expected.clone()),
+                    "{point} must leave exact v4 active"
+                );
+            } else {
+                assert_eq!(active, legacy, "{point} must leave exact v3 active");
+            }
+            assert_eq!(
+                fs::read(evidence.path().join(migration_source_file_name([0xe6; 32])))
+                    .unwrap_or_else(|error| panic!("post-crash source evidence failed: {error}")),
+                legacy,
+                "{point} must retain exact source evidence before active publication"
+            );
+            let receipt = fs::read(
+                evidence
+                    .path()
+                    .join(migration_receipt_file_name([0xe6; 32])),
+            )
+            .unwrap_or_else(|error| panic!("post-crash receipt read failed: {error}"));
+            RuntimeStoreMigrationReceipt::decode(&receipt)
+                .unwrap_or_else(|error| panic!("post-crash receipt invalid at {point}: {error}"));
+
+            let resumed = migrate_fixture(
+                store.path(),
+                evidence.path(),
+                &expected,
+                [0xe6; 32],
+                0xe7,
+                RuntimeCommitFailpoint::None,
+            )
+            .unwrap_or_else(|error| panic!("post-crash resume failed at {point}: {error}"));
+            assert_eq!(
+                resumed.disposition,
+                if published {
+                    RuntimeStoreMigrationDisposition::AlreadyMigrated
+                } else {
+                    RuntimeStoreMigrationDisposition::Migrated
+                }
+            );
+            assert_eq!(decode_active(store.path()), expected);
+            assert_eq!(orphan_count(store.path()), 0);
+        }
+    }
+
+    #[test]
+    fn source_and_receipt_evidence_subprocess_crashes_leave_retryable_old_active() {
+        for (location, point) in [
+            ("source", "file-fsync"),
+            ("source", "rename"),
+            ("source", "directory-fsync"),
+            ("receipt", "file-fsync"),
+            ("receipt", "rename"),
+            ("receipt", "directory-fsync"),
+        ] {
+            let expected = sequence_one_snapshot(0xe4, 0xe5);
+            let legacy = expected
+                .legacy_payload_v3_wire_for_test()
+                .unwrap_or_else(|error| panic!("legacy fixture failed: {error}"));
+            let store = TestDirectory::new();
+            let evidence = TestDirectory::new();
+            install_store_bytes(store.path(), &legacy);
+            let status = Command::new(
+                std::env::current_exe()
+                    .unwrap_or_else(|error| panic!("test executable lookup failed: {error}")),
+            )
+            .args([
+                "--exact",
+                "runtime_store::tests::subprocess_runtime_migration_crash_child",
+                "--nocapture",
+            ])
+            .env("PARAEGOX_TEST_RUNTIME_MIGRATION_STORE", store.path())
+            .env("PARAEGOX_TEST_RUNTIME_MIGRATION_EVIDENCE", evidence.path())
+            .env("PARAEGOX_TEST_RUNTIME_MIGRATION_CRASH_POINT", point)
+            .env("PARAEGOX_TEST_RUNTIME_MIGRATION_CRASH_LOCATION", location)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|error| panic!("evidence crash child spawn failed: {error}"));
+            assert!(
+                !status.success(),
+                "{location} evidence child returned at {point}"
+            );
+            assert_eq!(
+                fs::read(store.path().join(ACTIVE_FILE_NAME))
+                    .unwrap_or_else(|error| panic!("post-crash active read failed: {error}")),
+                legacy,
+                "evidence must be durable before active publication"
+            );
+            let resumed = migrate_fixture(
+                store.path(),
+                evidence.path(),
+                &expected,
+                [0xe6; 32],
+                0xe7,
+                RuntimeCommitFailpoint::None,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{location} evidence resume failed at {point}: {error}")
+            });
+            assert_eq!(
+                resumed.disposition,
+                RuntimeStoreMigrationDisposition::Migrated
+            );
+            assert_eq!(decode_active(store.path()), expected);
+            assert_eq!(
+                fs::read_dir(evidence.path())
+                    .unwrap_or_else(|error| panic!("evidence scan failed: {error}"))
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(super::MIGRATION_EVIDENCE_TEMP_PREFIX))
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn subprocess_runtime_migration_crash_child() {
+        let Some(store) = std::env::var_os("PARAEGOX_TEST_RUNTIME_MIGRATION_STORE") else {
+            return;
+        };
+        let evidence = std::env::var_os("PARAEGOX_TEST_RUNTIME_MIGRATION_EVIDENCE")
+            .unwrap_or_else(|| panic!("migration evidence path missing"));
+        let point = std::env::var("PARAEGOX_TEST_RUNTIME_MIGRATION_CRASH_POINT")
+            .unwrap_or_else(|error| panic!("migration crash point missing: {error}"));
+        let failpoint = match point.as_str() {
+            "temp-create" => RuntimeCommitFailpoint::AbortAfterTempCreate,
+            "partial-write" => RuntimeCommitFailpoint::AbortAfterPartialWrite,
+            "before-file-fsync" => RuntimeCommitFailpoint::AbortBeforeFileSync,
+            "file-fsync" => RuntimeCommitFailpoint::AbortAfterFileSync,
+            "rename" => RuntimeCommitFailpoint::AbortAfterRename,
+            "directory-fsync" => RuntimeCommitFailpoint::AbortAfterDirectorySync,
+            "durable-commit-before-return" => {
+                RuntimeCommitFailpoint::AbortAfterDurableCommitBeforeReturn
+            }
+            _ => panic!("unknown Runtime migration crash point"),
+        };
+        let location = std::env::var("PARAEGOX_TEST_RUNTIME_MIGRATION_CRASH_LOCATION")
+            .unwrap_or_else(|_| "active".to_owned());
+        let mut failpoints = RuntimeMigrationFailpoints::NONE;
+        match location.as_str() {
+            "active" => failpoints.active_snapshot = failpoint,
+            "source" => failpoints.source_evidence = failpoint,
+            "receipt" => failpoints.receipt_evidence = failpoint,
+            _ => panic!("unknown Runtime migration crash location"),
+        }
+        let expected = sequence_one_snapshot(0xe4, 0xe5);
+        let result = migrate_fixture_with_failpoints(
+            Path::new(&store),
+            Path::new(&evidence),
+            &expected,
+            [0xe6; 32],
+            0xd0,
+            failpoints,
+        );
+        panic!("Runtime migration crash failpoint unexpectedly returned: {result:?}");
     }
 
     #[test]

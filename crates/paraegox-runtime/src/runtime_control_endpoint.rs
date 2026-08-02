@@ -1,11 +1,11 @@
 #![cfg(unix)]
 
-//! Authenticated S7-E Runtime bootstrap and PXAR apply endpoint.
+//! Authenticated S7-E/S7-F Runtime bootstrap, query, and PXAR apply endpoint.
 //!
-//! One identity-bound local channel carries only canonical PXBR bootstrap reads
-//! and canonical PXAR v5 applies. Apply success is represented exclusively by
-//! the canonical PXRT v1 terminal Receipt; no transport ACK or private status
-//! byte exists.
+//! One identity-bound local channel carries canonical PXBR bootstrap reads,
+//! read-only PXQR operation/live queries, and canonical PXAR v5 applies. Apply
+//! success is represented exclusively by the canonical PXRT v1 terminal
+//! Receipt; no transport ACK or private status byte exists.
 
 use core::{fmt, future::Future, time::Duration};
 use std::ffi::OsStr;
@@ -37,19 +37,25 @@ use paraegox_runtime_contracts::{
     apply::ExpectedActive,
     installation::{
         RuntimeCompiledInstallationFactsV1, RuntimeInstallationError,
-        VerifiedRuntimeInstallationV1, verify_immutable_manifest_ingress, verify_pinned_startup,
+        VerifiedRuntimeInstallationV1, VerifiedRuntimeManifestIngressV1,
+        verify_immutable_manifest_ingress, verify_pinned_startup,
     },
-    provenance::TargetSliceDigest,
+    provenance::{SourcePlanRevision, TargetSliceDigest},
     reference_control::{
         MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES,
-        MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES, MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES,
-        ReferenceApplyRequestV1, ReferenceApplyTerminalReceiptV1,
+        MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES, MAX_REFERENCE_QUERY_REQUEST_BYTES,
+        MAX_REFERENCE_QUERY_RESPONSE_BYTES, MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES,
+        ReferenceApplyRequestV1, ReferenceApplyTerminalReceiptV1, ReferenceAssemblyModeV1,
         ReferenceBootstrapCompatibilityV1, ReferenceBootstrapFactsV1, ReferenceBootstrapRequestV1,
         ReferenceBootstrapResponseAuthClaimV1, ReferenceBootstrapResponseDraftV1,
         ReferenceBootstrapServingIdentityV1, ReferenceBootstrapStateV1, ReferenceChannelBindingV1,
-        ReferenceControlError, ReferenceOperationalReasonV1,
+        ReferenceControlError, ReferenceOperationalReasonV1, ReferenceQueryDesiredHeadV1,
+        ReferenceQueryDesiredStateV1, ReferenceQueryDurablePhaseV1, ReferenceQueryFactsV1,
+        ReferenceQueryLiveFactsV1, ReferenceQueryLiveStateV1, ReferenceQueryOperationLookupV1,
+        ReferenceQueryOperationStateV1, ReferenceQueryOwnerStateV1, ReferenceQueryRequestV1,
+        ReferenceQueryResponseAuthClaimV1, ReferenceQueryResponseDraftV1,
         reference_local_control_endpoint_identity_digest_v1,
-        reference_runtime_peer_credentials_digest_v1,
+        reference_runtime_peer_credentials_digest_v1, verify_reference_durable_slice_v1,
     },
     wire::ApplyAuthAlgorithm,
 };
@@ -76,6 +82,7 @@ use crate::{
         runtime_reference_owner::RuntimeFixedReferenceMaterializationOwner,
     },
     runtime_journal::{
+        DesiredHeadKind, ExpectedActiveCas, LiveMaterialization, PreparedPhase, ResourcePhase,
         RuntimeDeadlineObservation, RuntimeJournalSnapshot, StorePinnedBuildIdentity,
     },
     runtime_provisioning::{
@@ -88,21 +95,25 @@ use crate::{
 const ED25519_SIGNATURE_BYTES: usize = 64;
 const CONTROL_FRAME_HEADER_BYTES: usize = 4;
 const BOOTSTRAP_REQUEST_MAGIC: &[u8; 4] = b"PXBR";
+const QUERY_REQUEST_MAGIC: &[u8; 4] = b"PXQR";
 const APPLY_REQUEST_MAGIC: &[u8; 4] = b"PXAR";
 const MODE_MASK: u32 = 0o7777;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CONTROL_REQUEST_BYTES: usize =
-    if MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES > MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES {
-        MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES
-    } else {
-        MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES
-    };
-const MAX_CONTROL_RESPONSE_BYTES: usize =
-    if MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES > MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES {
-        MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES
-    } else {
-        MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES
-    };
+const MAX_CONTROL_REQUEST_BYTES: usize = maximum_three(
+    MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES,
+    MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES,
+    MAX_REFERENCE_QUERY_REQUEST_BYTES,
+);
+const MAX_CONTROL_RESPONSE_BYTES: usize = maximum_three(
+    MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES,
+    MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES,
+    MAX_REFERENCE_QUERY_RESPONSE_BYTES,
+);
+
+const fn maximum_three(first: usize, second: usize, third: usize) -> usize {
+    let pair = if first > second { first } else { second };
+    if pair > third { pair } else { third }
+}
 
 fn validate_snapshot_pins(
     provisioning: &RuntimeProvisioningV1,
@@ -144,10 +155,45 @@ fn authenticate_request(
         .map_err(|_| RuntimeBootstrapRequestError::InvalidSignature)
 }
 
+fn authenticate_query_request(
+    provisioning: &RuntimeProvisioningV1,
+    snapshot: &RuntimeJournalSnapshot,
+    request: &ReferenceQueryRequestV1,
+) -> Result<(), RuntimeQueryRequestError> {
+    let claim = request.authentication().claim();
+    if request.target() != provisioning.target()
+        || request.source_scope() != provisioning.source_scope()
+        || claim.principal() != provisioning.controller_principal()
+        || claim.key() != provisioning.controller_request_key_ref()
+        || claim.algorithm().value() != ED25519_ALGORITHM
+        || claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+    {
+        return Err(RuntimeQueryRequestError::Unauthorized);
+    }
+    request
+        .validate_expected_store(*snapshot.store_instance_id())
+        .map_err(|_| RuntimeQueryRequestError::StoreMismatch)?;
+    let signature = parse_query_signature(request.authentication().signature())?;
+    let transcript = request
+        .signing_transcript()
+        .map_err(|_| RuntimeQueryRequestError::InvalidCanonicalRequest)?;
+    provisioning
+        .controller_key()
+        .verify_strict(transcript.as_bytes(), &signature)
+        .map_err(|_| RuntimeQueryRequestError::InvalidSignature)
+}
+
 fn parse_signature(signature: &[u8]) -> Result<Signature, RuntimeBootstrapRequestError> {
     let bytes: &[u8; ED25519_SIGNATURE_BYTES] = signature
         .try_into()
         .map_err(|_| RuntimeBootstrapRequestError::InvalidSignature)?;
+    Ok(Signature::from_bytes(bytes))
+}
+
+fn parse_query_signature(signature: &[u8]) -> Result<Signature, RuntimeQueryRequestError> {
+    let bytes: &[u8; ED25519_SIGNATURE_BYTES] = signature
+        .try_into()
+        .map_err(|_| RuntimeQueryRequestError::InvalidSignature)?;
     Ok(Signature::from_bytes(bytes))
 }
 
@@ -194,6 +240,8 @@ where
         let previous = store.snapshot()?.clone();
         let installation = verify_startup_installation(&previous, provisioning.target(), compiled)?;
         validate_snapshot_pins(&provisioning, &previous)?;
+        let manifest = installation.immutable_manifest_ingress()?;
+        validate_startup_durable_control_state(&previous, &manifest, compiled, &provisioning)?;
         let compatibility = ReferenceBootstrapCompatibilityV1::try_from_verified_installation(
             &installation,
             compiled,
@@ -308,6 +356,8 @@ where
         }
         if frame.starts_with(BOOTSTRAP_REQUEST_MAGIC) {
             self.handle_bootstrap(frame).map(Some)
+        } else if frame.starts_with(QUERY_REQUEST_MAGIC) {
+            self.handle_query(frame).map(Some)
         } else if frame.starts_with(APPLY_REQUEST_MAGIC) {
             self.handle_apply(frame)
         } else {
@@ -336,6 +386,73 @@ where
             ),
             _ => RuntimeControlRequestError::Rejected,
         })
+    }
+
+    fn handle_query(&self, frame: &[u8]) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if frame.is_empty() || frame.len() > MAX_REFERENCE_QUERY_REQUEST_BYTES {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let request = ReferenceQueryRequestV1::decode(frame)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        validate_snapshot_pins(&self.provisioning, self.apply.snapshot())
+            .map_err(RuntimeControlRequestError::Internal)?;
+        RuntimeControlState::try_from_started_snapshot(self.apply.snapshot()).map_err(|error| {
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ControlState(error))
+        })?;
+        authenticate_query_request(&self.provisioning, self.apply.snapshot(), &request)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        let facts = runtime_query_facts(
+            self.apply.snapshot(),
+            &self.provisioning,
+            self.clock,
+            &request,
+        )
+        .map_err(RuntimeControlRequestError::Internal)?;
+        let auth_claim = ReferenceQueryResponseAuthClaimV1::try_new(
+            self.channel,
+            self.provisioning.runtime_response_key_ref(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM).map_err(|_| {
+                RuntimeControlRequestError::Internal(
+                    RuntimeBootstrapEndpointError::InvalidStartedState,
+                )
+            })?,
+            ED25519_ALGORITHM_VERSION,
+        )
+        .map_err(|_| {
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::InvalidStartedState)
+        })?;
+        let draft =
+            ReferenceQueryResponseDraftV1::try_new(&request, facts, self.channel, auth_claim)
+                .map_err(|_| {
+                    RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::InvalidStartedState,
+                    )
+                })?;
+        let signature = self
+            .provisioning
+            .response_signer()
+            .sign(
+                draft
+                    .signing_transcript()
+                    .map_err(|_| {
+                        RuntimeControlRequestError::Internal(
+                            RuntimeBootstrapEndpointError::InvalidStartedState,
+                        )
+                    })?
+                    .as_bytes(),
+            )
+            .to_bytes();
+        let response = draft
+            .finalize(&signature)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        let wire = response.canonical_wire();
+        if wire.is_empty()
+            || wire.len() > MAX_REFERENCE_QUERY_RESPONSE_BYTES
+            || wire.len() > request.max_response_bytes() as usize
+        {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        Ok(wire.into())
     }
 
     fn handle_apply(
@@ -393,6 +510,332 @@ where
             RuntimeReferenceApplyOutcome::TenureOnlyDurable => Ok(None),
         }
     }
+}
+
+fn runtime_query_facts(
+    snapshot: &RuntimeJournalSnapshot,
+    provisioning: &RuntimeProvisioningV1,
+    clock: RuntimeClock,
+    request: &ReferenceQueryRequestV1,
+) -> Result<ReferenceQueryFactsV1, RuntimeBootstrapEndpointError> {
+    let control = RuntimeControlState::try_from_started_snapshot(snapshot)?;
+    let bootstrap = control.bootstrap_facts()?;
+    let serving = ReferenceBootstrapServingIdentityV1::try_new(
+        provisioning.target(),
+        bootstrap.store_instance_id(),
+        bootstrap.snapshot_sequence(),
+        bootstrap.runtime_host_epoch(),
+        ClockDomainRef::from_bytes(bootstrap.clock_domain()),
+        ClockGeneration::try_new(bootstrap.clock_generation())
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?,
+    )?;
+    let reading = clock
+        .reading()
+        .map_err(|_| RuntimeBootstrapEndpointError::RuntimeClock)?;
+    if reading.generation().value() != bootstrap.clock_generation() {
+        return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+    }
+
+    let owner = query_owner_projection(bootstrap.readiness(), bootstrap.reason());
+    let lookup = if let Some(reason) = owner.indeterminate_reason {
+        ReferenceQueryOperationLookupV1::Indeterminate { reason }
+    } else {
+        query_operation_lookup(snapshot, request)?
+    };
+    let operation = ReferenceQueryOperationStateV1::try_new(owner.state, owner.reason, lookup)?;
+    let desired = query_desired_projection(snapshot, request)?;
+    let live = query_live_projection(snapshot, reading.now().value())?;
+    ReferenceQueryFactsV1::try_new(serving, operation, desired, live).map_err(Into::into)
+}
+
+#[derive(Clone, Copy)]
+struct QueryOwnerProjection {
+    state: ReferenceQueryOwnerStateV1,
+    reason: Option<ReferenceOperationalReasonV1>,
+    indeterminate_reason: Option<ReferenceOperationalReasonV1>,
+}
+
+fn query_owner_projection(
+    readiness: RuntimeJournalBootstrapState,
+    reason: Option<RuntimeJournalBootstrapReason>,
+) -> QueryOwnerProjection {
+    match (readiness, reason) {
+        (RuntimeJournalBootstrapState::ReadyForApply, None) => QueryOwnerProjection {
+            state: ReferenceQueryOwnerStateV1::Operational,
+            reason: None,
+            indeterminate_reason: None,
+        },
+        (
+            RuntimeJournalBootstrapState::NotReadyRecovering,
+            Some(RuntimeJournalBootstrapReason::Recovering),
+        ) => QueryOwnerProjection {
+            state: ReferenceQueryOwnerStateV1::ApplyDisabled,
+            reason: Some(ReferenceOperationalReasonV1::Recovering),
+            indeterminate_reason: None,
+        },
+        (
+            RuntimeJournalBootstrapState::RecoveryFailedNotReady,
+            Some(RuntimeJournalBootstrapReason::RecoveryFailed),
+        ) => QueryOwnerProjection {
+            state: ReferenceQueryOwnerStateV1::ApplyDisabled,
+            reason: Some(ReferenceOperationalReasonV1::RecoveryFailed),
+            indeterminate_reason: None,
+        },
+        (
+            RuntimeJournalBootstrapState::NotReadyBusy,
+            Some(RuntimeJournalBootstrapReason::RuntimeBusy),
+        ) => QueryOwnerProjection {
+            state: ReferenceQueryOwnerStateV1::ApplyDisabled,
+            reason: Some(ReferenceOperationalReasonV1::RuntimeBusy),
+            indeterminate_reason: None,
+        },
+        (
+            RuntimeJournalBootstrapState::ValidatedOperationalQuarantine,
+            Some(RuntimeJournalBootstrapReason::OwnershipUncertain),
+        ) => QueryOwnerProjection {
+            state: ReferenceQueryOwnerStateV1::OwnershipUncertain,
+            reason: Some(ReferenceOperationalReasonV1::OwnershipUncertain),
+            indeterminate_reason: Some(ReferenceOperationalReasonV1::OwnershipUncertain),
+        },
+        _ => QueryOwnerProjection {
+            state: ReferenceQueryOwnerStateV1::OwnershipUncertain,
+            reason: Some(ReferenceOperationalReasonV1::HistoryUnavailable),
+            indeterminate_reason: Some(ReferenceOperationalReasonV1::HistoryUnavailable),
+        },
+    }
+}
+
+fn query_operation_lookup(
+    snapshot: &RuntimeJournalSnapshot,
+    request: &ReferenceQueryRequestV1,
+) -> Result<ReferenceQueryOperationLookupV1, RuntimeBootstrapEndpointError> {
+    let requested_scope = *request.source_scope().as_bytes();
+    let requested_operation = *request.requested_operation_id().as_bytes();
+    if let Some(prepared) = snapshot.state().prepared.as_ref().filter(|prepared| {
+        prepared.source_scope == requested_scope && prepared.operation_id == requested_operation
+    }) {
+        return Ok(query_known_or_conflict(
+            request.expected_request_digest(),
+            prepared.request.digest,
+            query_prepared_phase(prepared.phase, prepared.retiring.is_some()),
+            None,
+        ));
+    }
+    if let Some(terminal) = snapshot
+        .state()
+        .terminal_operations
+        .iter()
+        .find(|terminal| {
+            terminal.source_scope == requested_scope && terminal.operation_id == requested_operation
+        })
+    {
+        let receipt =
+            ReferenceApplyTerminalReceiptV1::decode(&terminal.canonical_response.canonical_bytes)
+                .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        return Ok(query_known_or_conflict(
+            request.expected_request_digest(),
+            terminal.request_digest,
+            ReferenceQueryDurablePhaseV1::Terminal,
+            Some(receipt.facts().terminal_result_ref()),
+        ));
+    }
+    Ok(ReferenceQueryOperationLookupV1::Unknown)
+}
+
+fn query_known_or_conflict(
+    expected: Option<Digest32>,
+    existing: Digest32,
+    durable_phase: ReferenceQueryDurablePhaseV1,
+    terminal_result: Option<
+        paraegox_runtime_contracts::reference_control::ReferenceApplyTerminalResultRefV1,
+    >,
+) -> ReferenceQueryOperationLookupV1 {
+    if expected.is_some_and(|expected| expected != existing) {
+        ReferenceQueryOperationLookupV1::Conflict {
+            existing_request_digest: existing,
+        }
+    } else {
+        ReferenceQueryOperationLookupV1::Known {
+            request_digest: existing,
+            durable_phase,
+            terminal_result,
+        }
+    }
+}
+
+const fn query_prepared_phase(
+    phase: PreparedPhase,
+    is_head_first_retire: bool,
+) -> ReferenceQueryDurablePhaseV1 {
+    match phase {
+        PreparedPhase::PreparedNoEffects
+        | PreparedPhase::SupersededBeforeEffects
+        | PreparedPhase::StartupExpiredNoEffects => ReferenceQueryDurablePhaseV1::PreparedNoEffects,
+        PreparedPhase::FirstActionIntent => ReferenceQueryDurablePhaseV1::FirstActionIntent,
+        PreparedPhase::SupersededReconcileRequired | PreparedPhase::StartupReconcileRequired => {
+            if is_head_first_retire {
+                ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld
+            } else {
+                ReferenceQueryDurablePhaseV1::FirstActionIntent
+            }
+        }
+        PreparedPhase::HeadCommittedRetiringOld => {
+            ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld
+        }
+    }
+}
+
+fn query_desired_projection(
+    snapshot: &RuntimeJournalSnapshot,
+    request: &ReferenceQueryRequestV1,
+) -> Result<ReferenceQueryDesiredStateV1, RuntimeBootstrapEndpointError> {
+    let requested_scope = *request.source_scope().as_bytes();
+    let high_water = match snapshot.state().source_revision_high_water {
+        Some(high_water) if high_water.source_scope == requested_scope => high_water.revision,
+        Some(_) => return Err(RuntimeBootstrapEndpointError::InvalidStartedState),
+        None => 0,
+    };
+    let head = match snapshot.state().active_desired.as_ref() {
+        Some(active) if active.source_scope != requested_scope => {
+            return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+        }
+        Some(active) => {
+            let facts = {
+                let source_revision = SourcePlanRevision::new(active.source_revision);
+                let target_slice_digest = active.slice_provenance.target_slice_digest;
+                let manifest_digest = active.manifest_digest;
+                (source_revision, target_slice_digest, manifest_digest)
+            };
+            match active.kind {
+                DesiredHeadKind::OneSourceLoop => ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                    source_revision: facts.0,
+                    target_slice_digest: facts.1,
+                    manifest_digest: facts.2,
+                },
+                DesiredHeadKind::EmptyDeactivate => ReferenceQueryDesiredHeadV1::EmptyDeactivate {
+                    source_revision: facts.0,
+                    target_slice_digest: facts.1,
+                    manifest_digest: facts.2,
+                },
+            }
+        }
+        None => ReferenceQueryDesiredHeadV1::None,
+    };
+    ReferenceQueryDesiredStateV1::try_new(head, SourcePlanRevision::new(high_water))
+        .map_err(Into::into)
+}
+
+fn query_live_projection(
+    snapshot: &RuntimeJournalSnapshot,
+    measured_at: u64,
+) -> Result<ReferenceQueryLiveFactsV1, RuntimeBootstrapEndpointError> {
+    let state = snapshot.state();
+    let census = snapshot
+        .resource_census_digest()
+        .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+    let nonterminal_generation = state
+        .owned_resources
+        .iter()
+        .filter(|resource| resource.phase != ResourcePhase::Terminal)
+        .map(|resource| resource.generation)
+        .max()
+        .unwrap_or(0);
+    let (live, generation, recorded_census) = match state.live_materialization {
+        LiveMaterialization::None => (
+            if state.prepared.is_some() {
+                ReferenceQueryLiveStateV1::NotReady
+            } else {
+                ReferenceQueryLiveStateV1::ExactZero
+            },
+            0,
+            census,
+        ),
+        LiveMaterialization::StartupInvalidated {
+            recovery_eligibility,
+            resource_census_digest,
+            ..
+        } => match recovery_eligibility {
+            crate::runtime_journal::StartupRecoveryEligibility::NoActiveHead
+            | crate::runtime_journal::StartupRecoveryEligibility::CanonicalEmptyExactZero => (
+                ReferenceQueryLiveStateV1::ExactZero,
+                0,
+                resource_census_digest,
+            ),
+            crate::runtime_journal::StartupRecoveryEligibility::EligibleOneSourceLoop => (
+                ReferenceQueryLiveStateV1::Recovering,
+                nonterminal_generation,
+                resource_census_digest,
+            ),
+            crate::runtime_journal::StartupRecoveryEligibility::RecoveryFailureLatched => (
+                ReferenceQueryLiveStateV1::RecoveryFailedNotReady,
+                0,
+                resource_census_digest,
+            ),
+            crate::runtime_journal::StartupRecoveryEligibility::ReconcileRequired => (
+                if nonterminal_generation == 0 {
+                    ReferenceQueryLiveStateV1::ValidatedOperationalQuarantine
+                } else {
+                    ReferenceQueryLiveStateV1::Uncertain
+                },
+                nonterminal_generation,
+                resource_census_digest,
+            ),
+        },
+        LiveMaterialization::Recovering {
+            resource_generation,
+            resource_census_digest,
+            ..
+        } => (
+            ReferenceQueryLiveStateV1::Recovering,
+            resource_generation,
+            resource_census_digest,
+        ),
+        LiveMaterialization::LiveReady {
+            resource_generation,
+            resource_census_digest,
+            ..
+        } => (
+            ReferenceQueryLiveStateV1::LiveReady,
+            resource_generation,
+            resource_census_digest,
+        ),
+        LiveMaterialization::RecoveryFailedNotReady {
+            resource_census_digest,
+            ..
+        } => (
+            ReferenceQueryLiveStateV1::RecoveryFailedNotReady,
+            0,
+            resource_census_digest,
+        ),
+        LiveMaterialization::Draining {
+            retiring_generation,
+            resource_census_digest,
+            ..
+        } => (
+            ReferenceQueryLiveStateV1::Draining,
+            retiring_generation,
+            resource_census_digest,
+        ),
+        LiveMaterialization::ExactZero { census_digest, .. } => {
+            (ReferenceQueryLiveStateV1::ExactZero, 0, census_digest)
+        }
+        LiveMaterialization::Quarantined {
+            resource_census_digest,
+            ..
+        } => (
+            if nonterminal_generation == 0 {
+                ReferenceQueryLiveStateV1::ValidatedOperationalQuarantine
+            } else {
+                ReferenceQueryLiveStateV1::Uncertain
+            },
+            nonterminal_generation,
+            resource_census_digest,
+        ),
+    };
+    if recorded_census != census {
+        return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+    }
+    ReferenceQueryLiveFactsV1::try_new(live, generation, measured_at, census).map_err(Into::into)
 }
 
 fn terminal_response_wire(
@@ -1108,6 +1551,219 @@ fn verify_startup_installation(
     Ok(installation)
 }
 
+fn validate_startup_durable_control_state(
+    snapshot: &RuntimeJournalSnapshot,
+    manifest: &VerifiedRuntimeManifestIngressV1,
+    compiled: RuntimeCompiledInstallationFactsV1,
+    provisioning: &RuntimeProvisioningV1,
+) -> Result<(), RuntimeBootstrapEndpointError> {
+    let state = snapshot.state();
+    let expected_scope = *provisioning.source_scope().as_bytes();
+    if state
+        .writer_fence
+        .is_some_and(|fence| fence.source_scope != expected_scope)
+        || state
+            .source_revision_high_water
+            .is_some_and(|high_water| high_water.source_scope != expected_scope)
+        || state
+            .active_desired
+            .as_ref()
+            .is_some_and(|active| active.source_scope != expected_scope)
+    {
+        return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+    }
+
+    if let Some(prepared) = state.prepared.as_ref() {
+        let request = ReferenceApplyRequestV1::decode(&prepared.request.canonical_bytes)
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        let authenticated = provisioning
+            .admission_policy()
+            .authenticate_reference_apply_request(&request)
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        request
+            .validate_expected_store(*snapshot.store_instance_id())
+            .and_then(|()| request.validate_manifest(manifest))
+            .and_then(|()| {
+                request
+                    .target_execution()
+                    .validate_compiled_fixture(compiled)
+            })
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let temporal = request.temporal();
+        let identities = authenticated.identities();
+        let expected_active_matches = match (control.expected_active(), prepared.expected_active) {
+            (ExpectedActive::None, ExpectedActiveCas::None) => true,
+            (ExpectedActive::Exact(left), ExpectedActiveCas::Exact(right)) => left == right,
+            _ => false,
+        };
+        let mode_matches = matches!(
+            (request.target_execution().mode(), prepared.incoming_kind),
+            (
+                ReferenceAssemblyModeV1::OneSourceLoop,
+                DesiredHeadKind::OneSourceLoop
+            ) | (
+                ReferenceAssemblyModeV1::EmptyDeactivate,
+                DesiredHeadKind::EmptyDeactivate
+            )
+        );
+        if request.canonical_wire() != prepared.request.canonical_bytes.as_ref()
+            || request.envelope_request_digest() != prepared.request.digest
+            || request.target() != provisioning.target()
+            || provenance != prepared.slice_provenance.plan_provenance()
+            || request.assignment_digest() != prepared.slice_provenance.assignment_digest
+            || request.target_slice_digest() != prepared.slice_provenance.target_slice_digest
+            || request.target_slice_digest() != prepared.incoming_slice_digest
+            || request.target_execution().manifest_digest() != prepared.manifest_digest
+            || control.operation_id().as_bytes() != &prepared.operation_id
+            || !expected_active_matches
+            || !mode_matches
+            || identities.request_nonce_identity() != prepared.request_nonce_identity
+            || identities.temporal_lineage_digest() != prepared.temporal_lineage_digest
+            || temporal.constraint_id().as_bytes() != &prepared.temporal_constraint_id
+            || temporal.target_clock_domain().as_bytes() != &state.host.clock_domain
+            || temporal.target_clock_generation().value() != prepared.installed_clock_generation
+            || state.writer_fence.is_none_or(|fence| {
+                identities.tenure_nonce_identity() != fence.tenure_nonce_identity
+            })
+        {
+            return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+        }
+        if let Some(retiring) = prepared.retiring.as_ref() {
+            validate_startup_durable_slice(
+                &retiring.old_slice.canonical_bytes,
+                retiring.old_slice_provenance,
+                DesiredHeadKind::OneSourceLoop,
+                manifest,
+                compiled,
+            )?;
+        }
+    }
+
+    if let Some(active) = state.active_desired.as_ref() {
+        validate_startup_durable_slice(
+            &active.slice.canonical_bytes,
+            active.slice_provenance,
+            active.kind,
+            manifest,
+            compiled,
+        )?;
+    }
+
+    if let Some(recovery) = state.recovery_action {
+        let active = state
+            .active_desired
+            .as_ref()
+            .ok_or(RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        if recovery.source_scope != expected_scope
+            || recovery.slice_provenance != active.slice_provenance
+            || recovery.active_slice_digest != active.slice_provenance.target_slice_digest
+            || recovery.manifest_digest != manifest.manifest_digest()
+        {
+            return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+        }
+    }
+    for terminal in &state.recovery_terminals {
+        let recovery = terminal.recovery;
+        if recovery.source_scope != expected_scope
+            || recovery.slice_provenance.target != *provisioning.target().as_bytes()
+            || recovery.slice_provenance.source_scope != recovery.source_scope
+            || recovery.slice_provenance.source_revision != recovery.source_revision
+            || recovery.slice_provenance.source_plan_digest != recovery.source_plan_digest
+            || recovery.slice_provenance.target_slice_digest != recovery.active_slice_digest
+            || recovery.manifest_digest != manifest.manifest_digest()
+        {
+            return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+        }
+    }
+    for terminal in &state.terminal_operations {
+        if terminal.source_scope != expected_scope
+            || terminal.slice_provenance.target != *provisioning.target().as_bytes()
+            || terminal.slice_provenance.source_scope != terminal.source_scope
+            || terminal.slice_provenance.source_revision != terminal.source_revision
+            || terminal.slice_provenance.source_plan_digest != terminal.source_plan_digest
+            || terminal.slice_provenance.target_slice_digest != terminal.target_slice_digest
+        {
+            return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+        }
+        validate_startup_terminal_producer(snapshot, terminal, provisioning)?;
+    }
+    Ok(())
+}
+
+fn validate_startup_durable_slice(
+    canonical_slice: &[u8],
+    provenance: crate::runtime_journal::DurableSliceProvenance,
+    expected_kind: DesiredHeadKind,
+    manifest: &VerifiedRuntimeManifestIngressV1,
+    compiled: RuntimeCompiledInstallationFactsV1,
+) -> Result<(), RuntimeBootstrapEndpointError> {
+    let execution = verify_reference_durable_slice_v1(
+        canonical_slice,
+        provenance.plan_provenance(),
+        provenance.target_slice_digest,
+        manifest,
+    )
+    .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+    execution
+        .validate_compiled_fixture(compiled)
+        .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+    let mode_matches = matches!(
+        (execution.mode(), expected_kind),
+        (
+            ReferenceAssemblyModeV1::OneSourceLoop,
+            DesiredHeadKind::OneSourceLoop
+        ) | (
+            ReferenceAssemblyModeV1::EmptyDeactivate,
+            DesiredHeadKind::EmptyDeactivate
+        )
+    );
+    if !mode_matches {
+        return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+    }
+    Ok(())
+}
+
+fn validate_startup_terminal_producer(
+    snapshot: &RuntimeJournalSnapshot,
+    terminal: &crate::runtime_journal::TerminalOperationRecord,
+    provisioning: &RuntimeProvisioningV1,
+) -> Result<(), RuntimeBootstrapEndpointError> {
+    let receipt =
+        ReferenceApplyTerminalReceiptV1::decode(&terminal.canonical_response.canonical_bytes)
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+    if receipt.canonical_wire() != terminal.canonical_response.canonical_bytes.as_ref()
+        || receipt.target() != provisioning.target()
+        || receipt.runtime_store_instance_id() != *snapshot.store_instance_id()
+        || receipt.source_scope().as_bytes() != &terminal.source_scope
+        || receipt.operation_id().as_bytes() != &terminal.operation_id
+        || receipt.request_digest() != terminal.request_digest
+        || receipt.authentication_runtime_peer() != provisioning.runtime_principal()
+        || receipt.authentication_key() != provisioning.runtime_response_key_ref()
+        || receipt.authentication_algorithm().value() != ED25519_ALGORITHM
+        || receipt.authentication_algorithm_version() != ED25519_ALGORITHM_VERSION
+    {
+        return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+    }
+    let signature = parse_terminal_signature(receipt.authentication_signature())?;
+    let transcript = receipt
+        .signing_transcript()
+        .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+    provisioning
+        .response_signer()
+        .verifying_key()
+        .verify_strict(transcript.as_bytes(), &signature)
+        .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)
+}
+
+fn parse_terminal_signature(signature: &[u8]) -> Result<Signature, RuntimeBootstrapEndpointError> {
+    let bytes: &[u8; ED25519_SIGNATURE_BYTES] = signature
+        .try_into()
+        .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+    Ok(Signature::from_bytes(bytes))
+}
+
 fn map_bootstrap_state(state: RuntimeJournalBootstrapState) -> ReferenceBootstrapStateV1 {
     match state {
         RuntimeJournalBootstrapState::ReadyForApply => ReferenceBootstrapStateV1::ReadyForApply,
@@ -1197,6 +1853,14 @@ enum RuntimeBootstrapRequestError {
     InvalidSignature,
     ResponseBoundExceeded,
     InternalContract,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeQueryRequestError {
+    InvalidCanonicalRequest,
+    Unauthorized,
+    StoreMismatch,
+    InvalidSignature,
 }
 
 /// Fail-closed Runtime bootstrap startup/service error.
@@ -1315,7 +1979,8 @@ mod tests {
         reference_control::{
             ReferenceApplyRequestDraftV1, ReferenceApplyTerminalOutcomeV1, ReferenceAssemblyModeV1,
             ReferenceBootstrapRequestDraftV1, ReferenceBootstrapRequestIdV1,
-            ReferenceBootstrapResponseV1, ReferenceTargetExecutionPlanV4,
+            ReferenceBootstrapResponseV1, ReferenceQueryIdV1, ReferenceQueryRequestDraftV1,
+            ReferenceQueryResponseV1, ReferenceQuerySelectorV1, ReferenceTargetExecutionPlanV4,
             ValidatedReferenceLifecycleBudgetsV1,
         },
         temporal::{ApplyTemporalConstraint, TemporalConstraintId},
@@ -1330,7 +1995,7 @@ mod tests {
     use crate::runtime_journal::{
         JournalActionRef, LiveMaterialization, OpaqueCanonicalValue, RuntimeJournalSequenceOne,
         RuntimeOneSourceOwnershipInput, RuntimeOneSourceResourceRefs,
-        RuntimeOneSourceTombstonesInput, StorePinnedBuildIdentity,
+        RuntimeOneSourceTombstonesInput, RuntimeTenureAdmissionInput, StorePinnedBuildIdentity,
     };
     use crate::runtime_provisioning::RuntimeProvisioningInputV1;
 
@@ -1643,6 +2308,141 @@ mod tests {
         .unwrap_or_else(|error| panic!("startup rejected: {error}"))
     }
 
+    fn head_first_retiring_service(
+        socket_path: PathBuf,
+    ) -> (
+        RuntimeControlService<MockStore, FailingRetireOwner>,
+        ReferenceApplyRequestV1,
+        ReferenceChannelBindingV1,
+    ) {
+        let started = started_service(socket_path.clone());
+        let initial = started.state.snapshot().clone();
+        let active_request = signed_apply_request(
+            &initial,
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                request_nonce: b"query-draining-active-nonce",
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xe1),
+            digest(0xe2),
+        )
+        .unwrap_or_else(|error| panic!("draining channel rejected: {error}"));
+        let mut active_service = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("draining control service rejected: {error}"));
+        let active_pxrt = active_service
+            .handle_request(active_request.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("draining active apply rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("draining active apply returned no PXRT"));
+        let active_receipt = ReferenceApplyTerminalReceiptV1::decode(&active_pxrt)
+            .unwrap_or_else(|error| panic!("draining active PXRT decode failed: {error}"));
+        assert_eq!(
+            active_receipt.facts().outcome(),
+            ReferenceApplyTerminalOutcomeV1::OneSourceLoopActive
+        );
+
+        let active_snapshot = active_service.apply.snapshot().clone();
+        let (active_slice_digest, resource_generation) =
+            match active_snapshot.state().live_materialization {
+                LiveMaterialization::LiveReady {
+                    active_slice_digest,
+                    resource_generation,
+                    ..
+                } => (active_slice_digest, resource_generation),
+                other => panic!("draining fixture did not become LiveReady: {other:?}"),
+            };
+        let budgets = active_request
+            .target_execution()
+            .loop_facts()
+            .unwrap_or_else(|| panic!("draining active request lost loop facts"))
+            .budgets();
+        let compiled = active_service.compiled;
+        let compatibility = active_service.compatibility.clone();
+        let clock = active_service.clock;
+        drop(active_service);
+
+        let provisioning = provisioning(socket_path.clone());
+        let signer = RuntimeReferenceApplySigner::try_new(
+            provisioning.response_signer().clone(),
+            provisioning.runtime_response_key_ref(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("draining response algorithm failed: {error}")),
+            ED25519_ALGORITHM_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("draining response signer failed: {error:?}"));
+        let owner = FailingRetireOwner {
+            active_slice_digest,
+            resource_generation,
+            plan: RuntimeEmptyRetireOwnerPlan {
+                action_id: [0xe3; 16],
+                signed_budgets: budgets,
+            },
+        };
+        let apply = RuntimeReferenceApplyCore::try_new_with_owner(
+            MockStore {
+                snapshot: active_snapshot.clone(),
+                commit_attempts: Rc::new(Cell::new(0)),
+                fail_commit: false,
+                socket_path,
+            },
+            RuntimeEndpointApplyClock { clock },
+            owner,
+            signer,
+            channel,
+        )
+        .unwrap_or_else(|error| panic!("draining apply core rejected: {error:?}"));
+        let mut service = RuntimeControlService {
+            apply,
+            clock,
+            compiled,
+            compatibility,
+            provisioning,
+            channel,
+        };
+        let retire_request = signed_apply_request(
+            &active_snapshot,
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::EmptyDeactivate,
+                operation: 0xe4,
+                request_nonce: b"query-draining-retire-nonce",
+                tenure_nonce: b"query-draining-retire-tenure",
+                writer_epoch: 2,
+                supersedes_epoch: 1,
+                source_revision: 2,
+                temporal_constraint: 0xe5,
+                expected_active: ExpectedActive::Exact(active_slice_digest),
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        assert!(matches!(
+            service.handle_request(retire_request.canonical_wire(), channel),
+            Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::Apply(RuntimeReferenceApplyError::Owner(
+                    RuntimeReferenceMaterializationOwnerError::CallbackFailed
+                ))
+            ))
+        ));
+        let prepared = service
+            .apply
+            .snapshot()
+            .state()
+            .prepared
+            .as_ref()
+            .unwrap_or_else(|| panic!("draining fixture lost prepared operation"));
+        assert_eq!(prepared.phase, PreparedPhase::HeadCommittedRetiringOld);
+        assert!(prepared.retiring.is_some());
+        assert!(matches!(
+            service.apply.snapshot().state().live_materialization,
+            LiveMaterialization::Draining { .. }
+        ));
+        (service, retire_request, channel)
+    }
+
     fn signed_bootstrap_request(
         target: RuntimeHostId,
         scope: SourceScopeRef,
@@ -1678,6 +2478,114 @@ mod tests {
         draft
             .finalize(&signature)
             .unwrap_or_else(|error| panic!("request finalization failed: {error}"))
+    }
+
+    #[derive(Clone, Copy)]
+    struct QueryRequestFixture {
+        query: u8,
+        target: RuntimeHostId,
+        scope: SourceScopeRef,
+        store: [u8; 32],
+        operation: u8,
+        expected_request_digest: Option<Digest32>,
+        nonce: &'static [u8],
+        controller_seed: [u8; 32],
+        max_response_bytes: u32,
+    }
+
+    impl QueryRequestFixture {
+        fn fresh(operation: u8) -> Self {
+            Self {
+                query: 0x81,
+                target: TARGET,
+                scope: SOURCE_SCOPE,
+                store: STORE_INSTANCE_ID,
+                operation,
+                expected_request_digest: None,
+                nonce: b"endpoint-query-nonce",
+                controller_seed: CONTROLLER_SEED,
+                max_response_bytes: u32::try_from(MAX_REFERENCE_QUERY_RESPONSE_BYTES)
+                    .unwrap_or_else(|_| panic!("query response bound exceeds u32")),
+            }
+        }
+    }
+
+    fn signed_query_request(fixture: QueryRequestFixture) -> ReferenceQueryRequestV1 {
+        let selector = ReferenceQuerySelectorV1::try_new(
+            ReferenceQueryIdV1::from_bytes([fixture.query; 16]),
+            fixture.target,
+            fixture.scope,
+            fixture.store,
+            ApplyOperationId::from_bytes([fixture.operation; 16]),
+            fixture.expected_request_digest,
+        )
+        .unwrap_or_else(|error| panic!("query selector rejected: {error}"));
+        let claim = ApplyRequestAuthClaim::try_new(
+            CONTROLLER_PRINCIPAL,
+            CONTROLLER_KEY_REF,
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("query algorithm rejected: {error}")),
+            ED25519_ALGORITHM_VERSION,
+            fixture.nonce,
+        )
+        .unwrap_or_else(|error| panic!("query claim rejected: {error}"));
+        let draft =
+            ReferenceQueryRequestDraftV1::try_new(selector, claim, fixture.max_response_bytes)
+                .unwrap_or_else(|error| panic!("query draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&fixture.controller_seed)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("query transcript failed: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("query finalization failed: {error}"))
+    }
+
+    fn independent_query_serving(
+        snapshot: &RuntimeJournalSnapshot,
+    ) -> ReferenceBootstrapServingIdentityV1 {
+        ReferenceBootstrapServingIdentityV1::try_new(
+            TARGET,
+            *snapshot.store_instance_id(),
+            snapshot.sequence(),
+            snapshot.state().host.runtime_host_epoch_high_water,
+            ClockDomainRef::from_bytes(snapshot.state().host.clock_domain),
+            ClockGeneration::try_new(snapshot.state().host.clock_generation_high_water)
+                .unwrap_or_else(|error| panic!("query baseline clock rejected: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("query serving baseline rejected: {error}"))
+    }
+
+    fn decode_verify_query_response(
+        response_wire: &[u8],
+        request: &ReferenceQueryRequestV1,
+        channel: ReferenceChannelBindingV1,
+        expected_serving: ReferenceBootstrapServingIdentityV1,
+    ) -> (ReferenceQueryResponseV1, ReferenceQueryFactsV1) {
+        let response = ReferenceQueryResponseV1::decode(response_wire)
+            .unwrap_or_else(|error| panic!("PXQS decode failed: {error}"));
+        let signature: [u8; ED25519_SIGNATURE_BYTES] = response
+            .authentication_signature()
+            .try_into()
+            .unwrap_or_else(|_| panic!("PXQS signature width changed"));
+        SigningKey::from_bytes(&RESPONSE_SEED)
+            .verifying_key()
+            .verify_strict(
+                response
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("PXQS transcript failed: {error}"))
+                    .as_bytes(),
+                &Signature::from_bytes(&signature),
+            )
+            .unwrap_or_else(|error| panic!("PXQS signature failed: {error}"));
+        let facts = response
+            .validate_against_request(request, channel, expected_serving)
+            .unwrap_or_else(|error| panic!("PXQS correlation failed: {error}"));
+        (response, facts)
     }
 
     #[derive(Clone, Copy)]
@@ -1946,6 +2854,208 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_query_returns_fresh_unknown_exact_zero_without_snapshot_mutation() {
+        let started = started_service(PathBuf::from("/tmp/paraegox-query-core-test.sock"));
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x76),
+            digest(0x77),
+        )
+        .unwrap_or_else(|error| panic!("query channel rejected: {error}"));
+        let mut control = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("query control service rejected: {error}"));
+        let request = signed_query_request(QueryRequestFixture::fresh(0x82));
+        let before = control.apply.snapshot().canonical_wire().to_vec();
+        let expected_serving = independent_query_serving(control.apply.snapshot());
+        let response_wire = control
+            .handle_request(request.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("fresh query rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("fresh query returned no PXQS"));
+        assert_eq!(&response_wire[..4], b"PXQS");
+        let (response, facts) =
+            decode_verify_query_response(&response_wire, &request, channel, expected_serving);
+        assert_eq!(facts.serving().target(), TARGET);
+        assert_eq!(
+            facts.serving().runtime_store_instance_id(),
+            STORE_INSTANCE_ID
+        );
+        assert_eq!(
+            facts.operation().owner_state(),
+            ReferenceQueryOwnerStateV1::Operational
+        );
+        assert_eq!(
+            facts.operation().lookup(),
+            ReferenceQueryOperationLookupV1::Unknown
+        );
+        assert_eq!(facts.desired().head(), ReferenceQueryDesiredHeadV1::None);
+        assert_eq!(facts.desired().source_revision_high_water().value(), 0);
+        assert_eq!(facts.live().state(), ReferenceQueryLiveStateV1::ExactZero);
+        assert_eq!(facts.live().resource_generation(), 0);
+        assert_eq!(control.apply.snapshot().canonical_wire(), before);
+        let wrong_epoch_serving = ReferenceBootstrapServingIdentityV1::try_new(
+            TARGET,
+            STORE_INSTANCE_ID,
+            control.apply.snapshot().sequence(),
+            control
+                .apply
+                .snapshot()
+                .state()
+                .host
+                .runtime_host_epoch_high_water
+                + 1,
+            ClockDomainRef::from_bytes(CLOCK_DOMAIN),
+            ClockGeneration::try_new(
+                control
+                    .apply
+                    .snapshot()
+                    .state()
+                    .host
+                    .clock_generation_high_water,
+            )
+            .unwrap_or_else(|error| panic!("wrong-epoch query clock rejected: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("wrong-epoch query baseline rejected: {error}"));
+        assert!(
+            response
+                .validate_against_request(&request, channel, wrong_epoch_serving)
+                .is_err()
+        );
+
+        let invalid = [
+            QueryRequestFixture {
+                scope: SourceScopeRef::from_bytes([0x83; 16]),
+                ..QueryRequestFixture::fresh(0x82)
+            },
+            QueryRequestFixture {
+                target: RuntimeHostId::from_bytes([0x84; 16]),
+                ..QueryRequestFixture::fresh(0x82)
+            },
+            QueryRequestFixture {
+                store: [0x85; 32],
+                ..QueryRequestFixture::fresh(0x82)
+            },
+            QueryRequestFixture {
+                controller_seed: [0x86; 32],
+                ..QueryRequestFixture::fresh(0x82)
+            },
+            QueryRequestFixture {
+                max_response_bytes: 1,
+                ..QueryRequestFixture::fresh(0x82)
+            },
+        ];
+        for fixture in invalid {
+            let invalid = signed_query_request(fixture);
+            assert!(matches!(
+                control.handle_request(invalid.canonical_wire(), channel),
+                Err(RuntimeControlRequestError::Rejected)
+            ));
+            assert_eq!(control.apply.snapshot().canonical_wire(), before);
+        }
+        let wrong_channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x87),
+            digest(0x88),
+        )
+        .unwrap_or_else(|error| panic!("wrong query channel rejected: {error}"));
+        assert!(matches!(
+            control.handle_request(request.canonical_wire(), wrong_channel),
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        let mut trailing = request.canonical_wire().to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            control.handle_request(&trailing, channel),
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        let mut oversized = vec![0_u8; MAX_REFERENCE_QUERY_REQUEST_BYTES + 1];
+        oversized[..4].copy_from_slice(QUERY_REQUEST_MAGIC);
+        assert!(matches!(
+            control.handle_request(&oversized, channel),
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        assert_eq!(control.apply.snapshot().canonical_wire(), before);
+    }
+
+    #[test]
+    fn validated_operational_quarantine_returns_only_typed_indeterminate() {
+        let socket_path = PathBuf::from("/tmp/paraegox-query-quarantine-test.sock");
+        let provisioning = provisioning(socket_path.clone());
+        let (sequence_one, compiled) = installed_snapshot(&provisioning);
+        let started_once = sequence_one
+            .try_startup_invalidation_successor()
+            .unwrap_or_else(|error| panic!("first startup invalidation failed: {error:?}"));
+        let census = started_once
+            .resource_census_digest()
+            .unwrap_or_else(|error| panic!("quarantine census failed: {error:?}"));
+        let mut quarantined_state = started_once.state().clone();
+        quarantined_state.last_transaction =
+            crate::runtime_journal::RuntimeJournalTransaction::Quarantine;
+        quarantined_state.live_materialization = LiveMaterialization::Quarantined {
+            active_slice_digest: None,
+            reason_digest: digest(0x78),
+            resource_census_digest: census,
+        };
+        let quarantined = RuntimeJournalSnapshot::try_new(
+            *started_once.store_instance_id(),
+            *started_once.owner_target_fingerprint(),
+            started_once.sequence() + 1,
+            quarantined_state,
+        )
+        .unwrap_or_else(|error| panic!("validated quarantine snapshot failed: {error:?}"));
+        let started = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: quarantined,
+                commit_attempts: Rc::new(Cell::new(0)),
+                fail_commit: false,
+                socket_path,
+            },
+            compiled,
+            provisioning,
+        )
+        .unwrap_or_else(|error| panic!("validated quarantine startup failed: {error}"));
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x79),
+            digest(0x7a),
+        )
+        .unwrap_or_else(|error| panic!("quarantine query channel rejected: {error}"));
+        let mut control = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("quarantine control service rejected: {error}"));
+        let query = signed_query_request(QueryRequestFixture::fresh(0x7b));
+        let before = control.apply.snapshot().canonical_wire().to_vec();
+        let expected_serving = independent_query_serving(control.apply.snapshot());
+        let response = control
+            .handle_request(query.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("quarantine query rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("quarantine query returned no PXQS"));
+        let (_, facts) = decode_verify_query_response(&response, &query, channel, expected_serving);
+        assert_eq!(
+            facts.operation().owner_state(),
+            ReferenceQueryOwnerStateV1::OwnershipUncertain
+        );
+        assert_eq!(
+            facts.operation().reason(),
+            Some(ReferenceOperationalReasonV1::OwnershipUncertain)
+        );
+        assert_eq!(
+            facts.operation().lookup(),
+            ReferenceQueryOperationLookupV1::Indeterminate {
+                reason: ReferenceOperationalReasonV1::OwnershipUncertain,
+            }
+        );
+        assert_eq!(
+            facts.live().state(),
+            ReferenceQueryLiveStateV1::ValidatedOperationalQuarantine
+        );
+        assert_eq!(control.apply.snapshot().canonical_wire(), before);
+    }
+
+    #[test]
     fn signed_empty_pxar_returns_only_correlated_runtime_signed_pxrt_and_exact_replay() {
         let socket_path = PathBuf::from("/tmp/paraegox-apply-core-test.sock");
         let started = started_service(socket_path.clone());
@@ -2039,6 +3149,509 @@ mod tests {
             .unwrap_or_else(|| panic!("historical replay returned no PXRT"));
         assert_eq!(historical, response);
         assert_eq!(restarted.apply.snapshot().sequence(), restarted_sequence);
+    }
+
+    #[test]
+    fn query_reports_terminal_known_conflict_unknown_and_current_live_ready() {
+        let socket_path = PathBuf::from("/tmp/paraegox-query-terminal-test.sock");
+        let started = started_service(socket_path);
+        let initial = started.state.snapshot().clone();
+        let apply = signed_apply_request(
+            &initial,
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                operation: 0x88,
+                request_nonce: b"queried-active-nonce",
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x89),
+            digest(0x8a),
+        )
+        .unwrap_or_else(|error| panic!("query terminal channel rejected: {error}"));
+        let mut control = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("query terminal control rejected: {error}"));
+        control
+            .handle_request(apply.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("queried apply rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("queried apply returned no PXRT"));
+        let terminal_wire = control.apply.snapshot().canonical_wire().to_vec();
+        let expected_serving = independent_query_serving(control.apply.snapshot());
+
+        let exact = signed_query_request(QueryRequestFixture {
+            expected_request_digest: Some(apply.envelope_request_digest()),
+            ..QueryRequestFixture::fresh(0x88)
+        });
+        let exact_response = control
+            .handle_request(exact.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("exact terminal query rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("exact terminal query returned no PXQS"));
+        let (_, exact_facts) =
+            decode_verify_query_response(&exact_response, &exact, channel, expected_serving);
+        assert!(matches!(
+            exact_facts.operation().lookup(),
+            ReferenceQueryOperationLookupV1::Known {
+                request_digest,
+                durable_phase: ReferenceQueryDurablePhaseV1::Terminal,
+                terminal_result: Some(_),
+            } if request_digest == apply.envelope_request_digest()
+        ));
+        assert!(matches!(
+            exact_facts.desired().head(),
+            ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                source_revision,
+                target_slice_digest,
+                ..
+            } if source_revision.value() == 1 && target_slice_digest == apply.target_slice_digest()
+        ));
+        assert_eq!(
+            exact_facts.live().state(),
+            ReferenceQueryLiveStateV1::LiveReady
+        );
+        assert!(exact_facts.live().resource_generation() > 0);
+
+        let conflict = signed_query_request(QueryRequestFixture {
+            query: 0x8b,
+            expected_request_digest: Some(digest(0x8c)),
+            ..QueryRequestFixture::fresh(0x88)
+        });
+        let conflict_response = control
+            .handle_request(conflict.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("conflict query rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("conflict query returned no PXQS"));
+        let (_, conflict_facts) =
+            decode_verify_query_response(&conflict_response, &conflict, channel, expected_serving);
+        assert_eq!(
+            conflict_facts.operation().lookup(),
+            ReferenceQueryOperationLookupV1::Conflict {
+                existing_request_digest: apply.envelope_request_digest(),
+            }
+        );
+
+        let unknown = signed_query_request(QueryRequestFixture {
+            query: 0x8d,
+            ..QueryRequestFixture::fresh(0x8e)
+        });
+        let unknown_response = control
+            .handle_request(unknown.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("unknown query rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("unknown query returned no PXQS"));
+        let (_, unknown_facts) =
+            decode_verify_query_response(&unknown_response, &unknown, channel, expected_serving);
+        assert_eq!(
+            unknown_facts.operation().lookup(),
+            ReferenceQueryOperationLookupV1::Unknown
+        );
+        assert_eq!(control.apply.snapshot().canonical_wire(), terminal_wire);
+    }
+
+    #[test]
+    fn query_reports_durable_prepared_without_advancing_the_operation() {
+        let socket_path = PathBuf::from("/tmp/paraegox-query-prepared-test.sock");
+        let started = started_service(socket_path.clone());
+        let request = signed_apply_request(
+            started.state.snapshot(),
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                operation: 0x8f,
+                request_nonce: b"queried-prepared-nonce",
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x90),
+            digest(0x91),
+        )
+        .unwrap_or_else(|error| panic!("prepared query channel rejected: {error}"));
+        let journal = started
+            .state
+            .bootstrap_facts()
+            .unwrap_or_else(|error| panic!("started facts rejected: {error:?}"));
+        let generation = ClockGeneration::try_new(journal.clock_generation())
+            .unwrap_or_else(|error| panic!("prepared clock rejected: {error}"));
+        let clock = RuntimeClock::new(
+            ClockDomainRef::from_bytes(journal.clock_domain()),
+            generation,
+            1,
+        );
+        let signer = RuntimeReferenceApplySigner::try_new(
+            started.provisioning.response_signer().clone(),
+            started.provisioning.runtime_response_key_ref(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("prepared signer algorithm failed: {error}")),
+            ED25519_ALGORITHM_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("prepared signer rejected: {error:?}"));
+        let budgets = request
+            .target_execution()
+            .loop_facts()
+            .unwrap_or_else(|| panic!("prepared request lost loop facts"))
+            .budgets();
+        let owner = FailingRetireOwner {
+            active_slice_digest: TargetSliceDigest::new(digest(0x92)),
+            resource_generation: 1,
+            plan: RuntimeEmptyRetireOwnerPlan {
+                action_id: [0x93; 16],
+                signed_budgets: budgets,
+            },
+        };
+        let apply = RuntimeReferenceApplyCore::try_new_with_owner(
+            started.store,
+            RuntimeEndpointApplyClock { clock },
+            owner,
+            signer,
+            channel,
+        )
+        .unwrap_or_else(|error| panic!("prepared apply core rejected: {error:?}"));
+        let mut control = RuntimeControlService {
+            apply,
+            clock,
+            compiled: started.compiled,
+            compatibility: started.compatibility,
+            provisioning: started.provisioning,
+            channel,
+        };
+        assert!(matches!(
+            control.handle_request(request.canonical_wire(), channel),
+            Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::Apply(RuntimeReferenceApplyError::Owner(
+                    RuntimeReferenceMaterializationOwnerError::Unavailable
+                ))
+            ))
+        ));
+        let prepared_wire = control.apply.snapshot().canonical_wire().to_vec();
+        let query = signed_query_request(QueryRequestFixture {
+            expected_request_digest: Some(request.envelope_request_digest()),
+            ..QueryRequestFixture::fresh(0x8f)
+        });
+        let expected_serving = independent_query_serving(control.apply.snapshot());
+        let response = control
+            .handle_request(query.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("prepared query rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("prepared query returned no PXQS"));
+        let (_, facts) = decode_verify_query_response(&response, &query, channel, expected_serving);
+        assert_eq!(
+            facts.operation().lookup(),
+            ReferenceQueryOperationLookupV1::Known {
+                request_digest: request.envelope_request_digest(),
+                durable_phase: ReferenceQueryDurablePhaseV1::PreparedNoEffects,
+                terminal_result: None,
+            }
+        );
+        assert_eq!(facts.live().state(), ReferenceQueryLiveStateV1::NotReady);
+        assert_eq!(control.apply.snapshot().canonical_wire(), prepared_wire);
+
+        // A structurally valid PXAR signed by the wrong Controller key can be
+        // represented by the owner journal, but startup must authenticate it
+        // before advancing the host generation or exposing a listener.
+        let invalid_request = signed_apply_request(
+            control.apply.snapshot(),
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                operation: 0x8f,
+                request_nonce: b"queried-prepared-nonce",
+                controller_seed: [0x94; 32],
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let old_digest = request.envelope_request_digest();
+        let mut invalid_state = control.apply.snapshot().state().clone();
+        invalid_state
+            .prepared
+            .as_mut()
+            .unwrap_or_else(|| panic!("prepared state disappeared"))
+            .request = OpaqueCanonicalValue::try_request_or_slice(
+            invalid_request.canonical_wire(),
+            invalid_request.envelope_request_digest(),
+        )
+        .unwrap_or_else(|error| panic!("invalid signed request pin failed: {error:?}"));
+        invalid_state
+            .host
+            .request_nonces
+            .iter_mut()
+            .find(|record| record.value_digest == old_digest)
+            .unwrap_or_else(|| panic!("prepared request nonce record disappeared"))
+            .value_digest = invalid_request.envelope_request_digest();
+        let invalid_snapshot = RuntimeJournalSnapshot::try_new(
+            *control.apply.snapshot().store_instance_id(),
+            *control.apply.snapshot().owner_target_fingerprint(),
+            control.apply.snapshot().sequence(),
+            invalid_state,
+        )
+        .unwrap_or_else(|error| {
+            panic!("structural invalid-signature snapshot rejected: {error:?}")
+        });
+        let attempts = Rc::new(Cell::new(0));
+        let result = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: invalid_snapshot,
+                commit_attempts: Rc::clone(&attempts),
+                fail_commit: false,
+                socket_path: socket_path.clone(),
+            },
+            compiled_facts(),
+            provisioning(socket_path.clone()),
+        );
+        assert!(matches!(
+            result,
+            Err(RuntimeBootstrapEndpointError::InvalidStartedState)
+        ));
+        assert_eq!(attempts.get(), 0);
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn query_phase_projection_preserves_the_durable_effect_boundary() {
+        for (phase, is_head_first_retire, expected) in [
+            (
+                PreparedPhase::PreparedNoEffects,
+                false,
+                ReferenceQueryDurablePhaseV1::PreparedNoEffects,
+            ),
+            (
+                PreparedPhase::SupersededBeforeEffects,
+                false,
+                ReferenceQueryDurablePhaseV1::PreparedNoEffects,
+            ),
+            (
+                PreparedPhase::StartupExpiredNoEffects,
+                false,
+                ReferenceQueryDurablePhaseV1::PreparedNoEffects,
+            ),
+            (
+                PreparedPhase::FirstActionIntent,
+                false,
+                ReferenceQueryDurablePhaseV1::FirstActionIntent,
+            ),
+            (
+                PreparedPhase::SupersededReconcileRequired,
+                false,
+                ReferenceQueryDurablePhaseV1::FirstActionIntent,
+            ),
+            (
+                PreparedPhase::StartupReconcileRequired,
+                false,
+                ReferenceQueryDurablePhaseV1::FirstActionIntent,
+            ),
+            (
+                PreparedPhase::HeadCommittedRetiringOld,
+                true,
+                ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld,
+            ),
+            (
+                PreparedPhase::SupersededReconcileRequired,
+                true,
+                ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld,
+            ),
+            (
+                PreparedPhase::StartupReconcileRequired,
+                true,
+                ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld,
+            ),
+        ] {
+            assert_eq!(query_prepared_phase(phase, is_head_first_retire), expected);
+        }
+    }
+
+    #[test]
+    fn query_preserves_head_committed_phase_after_higher_tenure_takeover() {
+        let socket_path = PathBuf::from("/tmp/paraegox-query-takeover-draining-test.sock");
+        let (service, retire_request, channel) = head_first_retiring_service(socket_path.clone());
+        let RuntimeControlService {
+            apply,
+            clock,
+            compiled,
+            compatibility,
+            provisioning,
+            channel: service_channel,
+        } = service;
+        let current = apply.snapshot().clone();
+        let current_fence = current
+            .state()
+            .writer_fence
+            .unwrap_or_else(|| panic!("draining takeover lost writer fence"));
+        let takeover_epoch = current_fence
+            .epoch
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("draining takeover epoch overflow"));
+        let takeover = current
+            .try_tenure_only_successor(RuntimeTenureAdmissionInput {
+                expected_store_instance_id: *current.store_instance_id(),
+                owner_target_fingerprint: *current.owner_target_fingerprint(),
+                source_scope: current_fence.source_scope,
+                writer: current_fence.writer,
+                epoch: takeover_epoch,
+                supersedes_through_epoch: current_fence.epoch,
+                proof_envelope_digest: digest(0xe6),
+                tenure_nonce_identity: digest(0xe7),
+                principal: current_fence.principal,
+            })
+            .unwrap_or_else(|error| panic!("draining takeover successor failed: {error:?}"));
+        let takeover_prepared = takeover
+            .state()
+            .prepared
+            .as_ref()
+            .unwrap_or_else(|| panic!("draining takeover lost prepared operation"));
+        assert_eq!(
+            takeover_prepared.phase,
+            PreparedPhase::SupersededReconcileRequired
+        );
+        assert!(takeover_prepared.retiring.is_some());
+        assert_eq!(
+            RuntimeJournalSnapshot::decode(takeover.canonical_wire())
+                .unwrap_or_else(|error| panic!("draining takeover did not reopen: {error:?}")),
+            takeover
+        );
+        let mut non_superseded = takeover.state().clone();
+        let non_superseded_prepared = non_superseded
+            .prepared
+            .as_mut()
+            .unwrap_or_else(|| panic!("takeover corruption fixture lost prepared operation"));
+        non_superseded_prepared.phase = PreparedPhase::HeadCommittedRetiringOld;
+        non_superseded_prepared.raw_outcome = current
+            .state()
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.raw_outcome);
+        assert!(matches!(
+            RuntimeJournalSnapshot::try_new(
+                *takeover.store_instance_id(),
+                *takeover.owner_target_fingerprint(),
+                takeover.sequence(),
+                non_superseded,
+            ),
+            Err(crate::runtime_journal::RuntimeJournalError::InvalidStateInvariant)
+        ));
+
+        let (mut store, apply_clock, owner, signer, apply_channel) =
+            apply.into_test_recovery_parts();
+        assert_eq!(apply_channel, channel);
+        store.snapshot = takeover;
+        let apply = RuntimeReferenceApplyCore::try_new_with_owner(
+            store,
+            apply_clock,
+            owner,
+            signer,
+            apply_channel,
+        )
+        .unwrap_or_else(|error| panic!("takeover apply core rejected: {error:?}"));
+        let mut service = RuntimeControlService {
+            apply,
+            clock,
+            compiled,
+            compatibility,
+            provisioning,
+            channel: service_channel,
+        };
+        let query = signed_query_request(QueryRequestFixture {
+            query: 0xe8,
+            expected_request_digest: Some(retire_request.envelope_request_digest()),
+            ..QueryRequestFixture::fresh(0xe4)
+        });
+        let before = service.apply.snapshot().canonical_wire().to_vec();
+        let expected_serving = independent_query_serving(service.apply.snapshot());
+        let response = service
+            .handle_request(query.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("takeover draining query rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("takeover draining query returned no PXQS"));
+        let (_, facts) = decode_verify_query_response(&response, &query, channel, expected_serving);
+        assert_eq!(
+            facts.operation().lookup(),
+            ReferenceQueryOperationLookupV1::Known {
+                request_digest: retire_request.envelope_request_digest(),
+                durable_phase: ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld,
+                terminal_result: None,
+            }
+        );
+        assert_eq!(
+            facts.operation().owner_state(),
+            ReferenceQueryOwnerStateV1::ApplyDisabled
+        );
+        assert_eq!(facts.live().state(), ReferenceQueryLiveStateV1::Draining);
+        assert_eq!(service.apply.snapshot().canonical_wire(), before);
+    }
+
+    #[test]
+    fn restart_keeps_head_committed_truth_while_pxqs_reports_ownership_uncertain() {
+        let socket_path = PathBuf::from("/tmp/paraegox-query-restart-draining-test.sock");
+        let (service, retire_request, _) = head_first_retiring_service(socket_path.clone());
+        let RuntimeControlService {
+            apply,
+            compiled,
+            provisioning,
+            ..
+        } = service;
+        let pre_restart = apply.snapshot().clone();
+        drop(apply);
+        let restarted = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: pre_restart,
+                commit_attempts: Rc::new(Cell::new(0)),
+                fail_commit: false,
+                socket_path,
+            },
+            compiled,
+            provisioning,
+        )
+        .unwrap_or_else(|error| panic!("draining restart rejected: {error}"));
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xe9),
+            digest(0xea),
+        )
+        .unwrap_or_else(|error| panic!("draining restart channel rejected: {error}"));
+        let mut service = restarted
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("draining restart control rejected: {error}"));
+        let restarted_prepared = service
+            .apply
+            .snapshot()
+            .state()
+            .prepared
+            .as_ref()
+            .unwrap_or_else(|| panic!("draining restart lost prepared operation"));
+        assert_eq!(
+            restarted_prepared.phase,
+            PreparedPhase::StartupReconcileRequired
+        );
+        assert!(restarted_prepared.retiring.is_some());
+
+        let query = signed_query_request(QueryRequestFixture {
+            query: 0xeb,
+            expected_request_digest: Some(retire_request.envelope_request_digest()),
+            ..QueryRequestFixture::fresh(0xe4)
+        });
+        assert_eq!(
+            query_operation_lookup(service.apply.snapshot(), &query)
+                .unwrap_or_else(|error| panic!("restart durable lookup failed: {error}")),
+            ReferenceQueryOperationLookupV1::Known {
+                request_digest: retire_request.envelope_request_digest(),
+                durable_phase: ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld,
+                terminal_result: None,
+            }
+        );
+        let before = service.apply.snapshot().canonical_wire().to_vec();
+        let expected_serving = independent_query_serving(service.apply.snapshot());
+        let response = service
+            .handle_request(query.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("restart draining query rejected: {error:?}"))
+            .unwrap_or_else(|| panic!("restart draining query returned no PXQS"));
+        let (_, facts) = decode_verify_query_response(&response, &query, channel, expected_serving);
+        assert_eq!(
+            facts.operation().lookup(),
+            ReferenceQueryOperationLookupV1::Indeterminate {
+                reason: ReferenceOperationalReasonV1::OwnershipUncertain,
+            }
+        );
+        assert_eq!(facts.live().state(), ReferenceQueryLiveStateV1::Uncertain);
+        assert_eq!(service.apply.snapshot().canonical_wire(), before);
     }
 
     #[test]

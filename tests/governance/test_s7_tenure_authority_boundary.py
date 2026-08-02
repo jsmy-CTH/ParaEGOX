@@ -248,9 +248,11 @@ def test_exact_process_binaries_are_thin_and_runtime_control_stays_behind_runtim
     assert "run_runtime_bootstrap_process" in runtime_control
     assert "ReferenceApplyRequestV1" in runtime_control
     assert "ReferenceApplyTerminalReceiptV1" in runtime_control
+    assert "ReferenceQueryRequestV1" in runtime_control
+    assert "ReferenceQueryResponseV1" in runtime_control
 
 
-def test_s7_e_runtime_store_and_initializer_stay_private_behind_real_install_entrypoint() -> None:
+def test_s7_runtime_store_query_and_migration_stay_private_behind_real_entrypoint() -> None:
     runtime_library = _read_required(RUNTIME_SRC / "lib.rs")
     private_modules = (
         "runtime_journal",
@@ -289,18 +291,38 @@ def test_s7_e_runtime_store_and_initializer_stay_private_behind_real_install_ent
     runtime_package = runtime_packages[0]
     assert "crates/paraegox-runtime/src/runtime_journal.rs" in runtime_package["first_tests"]
     assert "crates/paraegox-runtime/src/runtime_store.rs" in runtime_package["first_tests"]
-    assert "real one-shot Runtime initializer" in runtime_package["responsibility"]
+    assert "one-shot initializer" in runtime_package["responsibility"]
     assert "release-descriptor-v1" in runtime_package["responsibility"]
     assert "install-v1" in runtime_package["responsibility"]
-    assert "same four-byte-framed channel" in runtime_package["responsibility"]
-    assert "canonical PXBR bootstrap and PXAR v5 apply requests" in runtime_package[
+    assert "migrate-journal-v3-to-v4-v1" in runtime_package["responsibility"]
+    assert "payload v4 persists complete contract-owned Slice provenance" in runtime_package[
         "responsibility"
     ]
+    assert "same bounded four-byte-framed channel" in runtime_package["responsibility"]
+    assert "canonical PXBR bootstrap, PXQR query, and PXAR v5 apply requests" in runtime_package[
+        "responsibility"
+    ]
+    assert "Runtime-signed and request-correlated PXQS" in runtime_package["responsibility"]
     assert "canonical Runtime-signed PXRT terminal Receipt" in runtime_package["responsibility"]
-    assert "Runtime query, production restart reassembly/recovery" in runtime_package[
+    assert "Controller query/reconciliation, production restart reassembly/recovery" in runtime_package[
         "responsibility"
     ]
     assert "remain unimplemented" in runtime_package["responsibility"]
+
+    runtime_cli = next(
+        row
+        for row in governance["public_apis"]
+        if row["module"] == "paraegox-runtime-host CLI"
+    )
+    assert runtime_cli["symbols"] == [
+        "release-descriptor-v1",
+        "install-v1",
+        "serve-bootstrap-v1",
+        "migrate-journal-v3-to-v4-v1",
+    ]
+    assert "authenticated local PXBR/PXQR/PXAR endpoint" in runtime_cli["compatibility"]
+    assert "canonical PXMR receipt" in runtime_cli["compatibility"]
+    assert "migration is neither rollback nor recovery" in runtime_cli["compatibility"]
 
     public_symbols = {str(symbol) for row in governance["public_apis"] for symbol in row["symbols"]}
     assert public_symbols.isdisjoint(

@@ -10,17 +10,19 @@ use paraegox_runtime_contracts::{
     installation::verify_immutable_manifest_ingress,
     reference_control::{
         ReferenceApplyRequestV1, ReferenceAssemblyModeV1, ValidatedReferenceLifecycleBudgetsV1,
+        reference_apply_ingress_identities_v1,
     },
 };
 
 use crate::runtime_journal::{
-    DesiredHeadKind, ExpectedActiveCas, LiveMaterialization, OpaqueCanonicalValue,
-    RuntimeApplyAdmissionInput, RuntimeDeadlineObservation, RuntimeEmptyRetireInput,
-    RuntimeJournalError, RuntimeJournalSnapshot, RuntimeJournalState, RuntimeJournalTransaction,
-    RuntimeOneSourceCallbackSuccessInput, RuntimeOneSourceOwnershipInput,
-    RuntimeOneSourceResourceRefs, RuntimeOneSourceTombstonesInput, RuntimeRetiringLifecycleBudgets,
-    RuntimeStartActionInput, RuntimeTemporalAdmissionInput, RuntimeTenureAdmissionInput,
-    RuntimeTerminalInput, StartupRecoveryEligibility, StorePinnedBuildIdentity,
+    DesiredHeadKind, DurableSliceProvenance, ExpectedActiveCas, LiveMaterialization,
+    OpaqueCanonicalValue, RuntimeApplyAdmissionInput, RuntimeDeadlineObservation,
+    RuntimeEmptyRetireInput, RuntimeJournalError, RuntimeJournalSnapshot, RuntimeJournalState,
+    RuntimeJournalTransaction, RuntimeOneSourceCallbackSuccessInput,
+    RuntimeOneSourceOwnershipInput, RuntimeOneSourceResourceRefs, RuntimeOneSourceTombstonesInput,
+    RuntimeRetiringLifecycleBudgets, RuntimeStartActionInput, RuntimeTemporalAdmissionInput,
+    RuntimeTenureAdmissionInput, RuntimeTerminalInput, StartupRecoveryEligibility,
+    StorePinnedBuildIdentity,
 };
 
 // Kept as children of the control-state owner after the authenticated endpoint
@@ -464,6 +466,16 @@ impl RuntimeControlState {
         let temporal = request.temporal();
         let authentication = request.authentication().claim();
         let execution = request.target_execution();
+        let ingress_identities = reference_apply_ingress_identities_v1(request)
+            .map_err(|_| RuntimeControlStateError::PreflightRejected)?;
+
+        #[cfg(not(test))]
+        if preflight.tenure_nonce_identity != ingress_identities.tenure_nonce_identity()
+            || preflight.request_nonce_identity != ingress_identities.request_nonce_identity()
+            || preflight.temporal_lineage_digest != ingress_identities.temporal_lineage_digest()
+        {
+            return Err(RuntimeControlStateError::PreflightRejected);
+        }
 
         let manifest = verify_immutable_manifest_ingress(
             &state.host.singleton_manifest.canonical_bytes,
@@ -519,15 +531,21 @@ impl RuntimeControlState {
                 epoch: writer.epoch().value(),
                 supersedes_through_epoch: claim.supersedes_through_epoch().value(),
                 proof_envelope_digest,
-                tenure_nonce_identity: preflight.tenure_nonce_identity,
+                tenure_nonce_identity: ingress_identities.tenure_nonce_identity(),
                 principal: *authentication.principal().as_bytes(),
             },
             request: OpaqueCanonicalValue::try_request_or_slice(
                 request.canonical_wire(),
                 request.envelope_request_digest(),
             )?,
-            request_nonce_identity: preflight.request_nonce_identity,
+            request_nonce_identity: ingress_identities.request_nonce_identity(),
             operation_id: *control.operation_id().as_bytes(),
+            slice_provenance: DurableSliceProvenance::try_new(
+                request.target(),
+                provenance,
+                request.assignment_digest(),
+                request.target_slice_digest(),
+            )?,
             source_revision: provenance.source_revision().value(),
             source_plan_digest: provenance.source_plan_digest(),
             incoming_slice_digest: request.target_slice_digest(),
@@ -540,7 +558,7 @@ impl RuntimeControlState {
                 remaining_budget_nanos,
                 installed_clock_generation: temporal.target_clock_generation().value(),
                 installed_deadline_nanos,
-                lineage_digest: preflight.temporal_lineage_digest,
+                lineage_digest: ingress_identities.temporal_lineage_digest(),
             },
         })
     }
@@ -561,7 +579,7 @@ impl RuntimeControlState {
         {
             return Err(RuntimeControlStateError::PreflightRejected);
         }
-        Ok(OpaqueCanonicalValue::try_request_or_slice(
+        Ok(OpaqueCanonicalValue::try_runtime_slice(
             request.canonical_slice_wire(),
             *request.target_slice_digest().value(),
         )?)
@@ -628,6 +646,7 @@ fn full_admission_status(
     let exact_prepared = state.prepared.as_ref().is_some_and(|prepared| {
         prepared.source_scope == input.tenure.source_scope
             && prepared.operation_id == input.operation_id
+            && prepared.slice_provenance == input.slice_provenance
             && prepared.source_revision == input.source_revision
             && prepared.request == input.request
             && prepared.request_nonce_identity == input.request_nonce_identity
@@ -644,6 +663,7 @@ fn full_admission_status(
     let exact_terminal = state.terminal_operations.iter().any(|terminal| {
         terminal.source_scope == input.tenure.source_scope
             && terminal.operation_id == input.operation_id
+            && terminal.slice_provenance == input.slice_provenance
             && terminal.request_digest == input.request.digest
             && terminal.request_nonce_identity == input.request_nonce_identity
             && terminal.source_revision == input.source_revision
@@ -1407,6 +1427,9 @@ mod tests {
         .expect("startup");
         let request = apply_request(&ingress, 7, 1, 0, 0x54, 0x63, b"apply-nonce");
         let original = preflight(0x74, 0x75, 0x76, 1_000);
+        let exact_input = started
+            .try_reference_admission_input(&request, original)
+            .expect("strict reference admission input");
         let (tenured, _, prepared) = started
             .try_reference_tenure_only(&request, original)
             .expect("tenure commit")
@@ -1442,6 +1465,18 @@ mod tests {
             1
         );
 
+        let mut different_provenance = exact_input;
+        different_provenance.slice_provenance.source_plan = [0xfa; 16];
+        assert_eq!(
+            full_admission_status(replay.state().snapshot().state(), &different_provenance),
+            AdmissionMutationStatus::Conflict
+        );
+        assert_eq!(
+            replay.state().snapshot().sequence(),
+            4,
+            "provenance conflict must not mutate the journal"
+        );
+
         let renewed = RuntimeReferenceApplyPreflight {
             admitted_at_nanos: 100_000,
             ..original
@@ -1449,6 +1484,87 @@ mod tests {
         assert_eq!(
             replay.state().try_reference_tenure_only(&request, renewed),
             Err(RuntimeControlStateError::PreflightRejected)
+        );
+    }
+
+    #[test]
+    fn real_prepared_v3_layout_migrates_and_v4_pxar_cross_field_tamper_fails_closed() {
+        let (installation, compiled) = installation();
+        let ingress = installation
+            .immutable_manifest_ingress()
+            .expect("manifest ingress");
+        let started = RuntimeControlState::try_start(&installed_sequence_one(
+            &installation,
+            compiled,
+            installation.manifest_canonical_wire(),
+            installation.manifest_digest(),
+        ))
+        .expect("startup");
+        let request = apply_request(&ingress, 7, 1, 0, 0x54, 0x63, b"apply-nonce");
+        let evidence = preflight(0x74, 0x75, 0x76, 1_000);
+        let (tenured, _, prepared) = started
+            .try_reference_tenure_only(&request, evidence)
+            .expect("tenure commit")
+            .into_parts();
+        let (fully_admitted, _, _) = tenured
+            .try_reference_full_admission(prepared.expect("capability"))
+            .expect("full admission")
+            .into_parts();
+        let snapshot = fully_admitted.snapshot();
+        let original_wire = snapshot.canonical_wire().to_vec();
+
+        let legacy_wire = snapshot
+            .legacy_payload_v3_wire_for_test()
+            .expect("real prepared v3 layout");
+        assert_eq!(&legacy_wire[8..10], &3_u16.to_be_bytes());
+        assert_eq!(
+            RuntimeJournalSnapshot::decode(&legacy_wire),
+            Err(RuntimeJournalError::UnsupportedPayloadVersion)
+        );
+        let migration = RuntimeJournalSnapshot::migrate_payload_v3_with_metadata(&legacy_wire)
+            .expect("strict prepared PXAR must supply complete v4 provenance");
+        assert_eq!(migration.source_payload_version(), 3);
+        assert_eq!(
+            migration.source_store_instance_id(),
+            snapshot.store_instance_id()
+        );
+        assert_eq!(
+            migration.source_target_fingerprint(),
+            *snapshot.owner_target_fingerprint()
+        );
+        assert_eq!(migration.source_sequence(), snapshot.sequence());
+        assert_ne!(migration.source_checksum(), Digest32::from_bytes([0; 32]));
+        let migrated = migration.into_snapshot();
+        assert_eq!(migrated.state(), snapshot.state());
+        assert_eq!(&migrated.canonical_wire()[8..10], &4_u16.to_be_bytes());
+
+        let mut tampered = snapshot.state().clone();
+        tampered
+            .prepared
+            .as_mut()
+            .expect("fully admitted prepared operation")
+            .operation_id = [0xee; 16];
+        let legacy_cross_field_tamper = snapshot
+            .legacy_payload_v3_wire_for_state_for_test(&tampered)
+            .expect("test-only checksum-valid v3 frame");
+        let legacy_cross_field_before = legacy_cross_field_tamper.clone();
+        assert_eq!(
+            RuntimeJournalSnapshot::migrate_payload_v3(&legacy_cross_field_tamper),
+            Err(RuntimeJournalError::LegacyProvenanceUnavailable)
+        );
+        assert_eq!(legacy_cross_field_tamper, legacy_cross_field_before);
+
+        let checksum_valid_tamper = snapshot
+            .resealed_v4_wire_for_test(&tampered)
+            .expect("test-only checksum-valid frame");
+        assert_eq!(
+            RuntimeJournalSnapshot::decode(&checksum_valid_tamper),
+            Err(RuntimeJournalError::InvalidStateInvariant)
+        );
+        assert_eq!(snapshot.canonical_wire(), original_wire);
+        assert_eq!(
+            RuntimeJournalSnapshot::decode(&original_wire),
+            Ok(snapshot.clone())
         );
     }
 
@@ -1480,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn same_request_nonce_with_different_pxar_is_rejected_without_mutation() {
+    fn caller_supplied_replay_ids_cannot_alias_a_different_pxar_or_mutate_state() {
         let (installation, compiled) = installation();
         let ingress = installation
             .immutable_manifest_ingress()
@@ -1504,13 +1620,17 @@ mod tests {
             .into_parts();
         let different = apply_request(&ingress, 8, 1, 0, 0x55, 0x65, b"different-nonce");
 
+        let retry = fully_admitted
+            .try_reference_tenure_only(&different, evidence)
+            .expect("canonical request identities ignore caller-supplied aliases");
         assert_eq!(
-            fully_admitted.try_reference_tenure_only(&different, evidence),
-            Err(RuntimeControlStateError::PreflightRejected)
+            retry.disposition(),
+            RuntimeAdmissionDisposition::AlreadyDurable
         );
-        assert_eq!(fully_admitted.snapshot().sequence(), 4);
+        assert!(retry.prepared_admission().is_none());
+        assert_eq!(retry.state().snapshot().sequence(), 4);
         assert_eq!(
-            fully_admitted.snapshot().state().host.request_nonces.len(),
+            retry.state().snapshot().state().host.request_nonces.len(),
             1
         );
     }
@@ -2042,6 +2162,11 @@ mod tests {
             installation.manifest_digest(),
         ))
         .expect("startup");
+        let request = empty_apply_request(&ingress, 7, 1, 0, 0x54, 0x63, b"empty-apply-nonce");
+        let evidence = preflight(0x74, 0x75, 0x76, 1_000);
+        let exact_input = started
+            .try_reference_admission_input(&request, evidence)
+            .expect("strict reference admission input");
         let commits = Rc::new(Cell::new(0));
         let store = FakeApplyStore {
             snapshot: started.snapshot().clone(),
@@ -2057,8 +2182,6 @@ mod tests {
             channel,
         )
         .expect("apply core");
-        let request = empty_apply_request(&ingress, 7, 1, 0, 0x54, 0x63, b"empty-apply-nonce");
-        let evidence = preflight(0x74, 0x75, 0x76, 1_000);
 
         let first = core.try_apply(&request, evidence).unwrap_or_else(|error| {
             panic!(
@@ -2088,6 +2211,14 @@ mod tests {
         };
         assert_eq!(replay.canonical_wire(), first_wire);
         assert_eq!(commits.get(), 3, "replay must not mutate the journal");
+
+        let mut different_provenance = exact_input;
+        different_provenance.slice_provenance.source_plan = [0xfb; 16];
+        assert_eq!(
+            full_admission_status(core.snapshot().state(), &different_provenance),
+            AdmissionMutationStatus::Conflict
+        );
+        assert_eq!(commits.get(), 3, "provenance conflict must not commit");
 
         let terminal = core.snapshot().state().terminal_operations[0].clone();
         let decoded = decode_and_validate_terminal_receipt(STORE, &terminal)
