@@ -304,9 +304,10 @@ def test_s7_runtime_store_query_and_migration_stay_private_behind_real_entrypoin
     ]
     assert "Runtime-signed and request-correlated PXQS" in runtime_package["responsibility"]
     assert "canonical Runtime-signed PXRT terminal Receipt" in runtime_package["responsibility"]
-    assert "Controller query/reconciliation, production restart reassembly/recovery" in runtime_package[
-        "responsibility"
-    ]
+    assert (
+        "Controller query/reconciliation, production restart reassembly/recovery"
+        in runtime_package["responsibility"]
+    )
     assert "remain unimplemented" in runtime_package["responsibility"]
 
     runtime_cli = next(
