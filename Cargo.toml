@@ -16,10 +16,11 @@ license = "Apache-2.0"
 repository = "https://github.com/jsmy-CTH/ParaEGOX"
 
 [workspace.dependencies]
-ed25519-dalek = { version = "=3.0.0", default-features = false }
-nix = { version = "=0.31.3", default-features = false, features = ["fs", "process", "signal"] }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
+nix = { version = "=0.31.3", default-features = false, features = ["dir", "fs", "process", "signal", "user"] }
 sha2 = { version = "0.11.0", default-features = false }
 tokio = { version = "=1.53.1", default-features = false, features = ["io-util", "net", "rt", "signal", "sync", "time"] }
+zeroize = { version = "=1.8.2", default-features = false, features = ["alloc"] }
 paraegox-kernel = { path = "crates/paraegox-kernel" }
 paraegox-runtime-contracts = { path = "crates/paraegox-runtime-contracts" }
 

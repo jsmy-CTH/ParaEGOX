@@ -72,7 +72,7 @@ pub(crate) enum PreviousTargetEligibility {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OpaqueManifestProjectionIngress<'a> {
     canonical_projection: &'a [u8],
-    manifest_digest: Digest32,
+    manifest_digest: PlanManifestDigest,
     target: RuntimeHostId,
     profile_fingerprint: Digest32,
     canonical_empty_config_digest: Digest32,
@@ -311,6 +311,29 @@ pub(crate) struct StableAllocationRecord {
 }
 
 impl StableAllocationRecord {
+    pub(crate) fn try_from_persisted(
+        target: RuntimeHostId,
+        key: [u8; 16],
+        ordinal: u64,
+        instance: [u8; 16],
+        domain: [u8; 16],
+        state: AllocationState,
+    ) -> Result<Self, PlannerError> {
+        if ordinal == 0
+            || derive_id(INSTANCE_ALLOCATION_DOMAIN, target, &key, ordinal)? != instance
+            || derive_id(DOMAIN_ALLOCATION_DOMAIN, target, &key, ordinal)? != domain
+        {
+            return Err(PlannerError::InvalidAllocationSnapshot);
+        }
+        Ok(Self {
+            key,
+            ordinal,
+            instance: InstanceRef::from_bytes(instance),
+            domain: DomainRef::from_bytes(domain),
+            state,
+        })
+    }
+
     #[must_use]
     pub(crate) const fn key(&self) -> &[u8; 16] {
         &self.key
@@ -353,6 +376,9 @@ impl StableAllocationSnapshot {
         high_water: u64,
         mut records: Vec<StableAllocationRecord>,
     ) -> Result<Self, PlannerError> {
+        if target.as_bytes().iter().all(|byte| *byte == 0) {
+            return Err(PlannerError::InvalidAllocationSnapshot);
+        }
         if records.len() > MAX_STABLE_ALLOCATION_RECORDS {
             return Err(PlannerError::AllocationCapacityExceeded);
         }
@@ -369,6 +395,7 @@ impl StableAllocationSnapshot {
             .iter()
             .map(|record| *record.domain.as_bytes())
             .collect::<BTreeSet<_>>();
+        let maximum_ordinal = records.iter().map(|record| record.ordinal).max();
         if records.windows(2).any(|pair| pair[0].key == pair[1].key)
             || records
                 .iter()
@@ -376,6 +403,12 @@ impl StableAllocationSnapshot {
             || unique_ordinals.len() != records.len()
             || unique_instances.len() != records.len()
             || unique_domains.len() != records.len()
+            || match maximum_ordinal {
+                None => generation != 0 || high_water != 0,
+                Some(maximum) => {
+                    generation == 0 || generation < high_water || high_water != maximum
+                }
+            }
         {
             return Err(PlannerError::InvalidAllocationSnapshot);
         }
@@ -425,6 +458,140 @@ impl StableAllocationSnapshot {
     pub(crate) fn records(&self) -> &[StableAllocationRecord] {
         &self.records
     }
+
+    /// Applies only a Planner-owned delta to the persisted allocation snapshot.
+    ///
+    /// This is the single transition authority shared with the Controller
+    /// journal. Callers cannot supply arbitrary derived instance/domain IDs,
+    /// skip generations, reuse ordinals, or silently remove historical rows.
+    pub(crate) fn apply_delta(&self, delta: &StableAllocationDelta) -> Result<Self, PlannerError> {
+        if delta.base_generation != self.generation || delta.resulting_high_water < self.high_water
+        {
+            return Err(PlannerError::PreviousAllocationMismatch);
+        }
+
+        let mut records = self
+            .records
+            .iter()
+            .map(|record| (*record.key(), *record))
+            .collect::<BTreeMap<_, _>>();
+        let mut changed_keys = BTreeSet::new();
+        let mut previous_key = None;
+        let mut next_ordinal = self.high_water;
+        for change in &delta.records {
+            if previous_key.is_some_and(|key| key >= *change.key())
+                || !changed_keys.insert(*change.key())
+            {
+                return Err(PlannerError::InvalidAllocationSnapshot);
+            }
+            previous_key = Some(*change.key());
+            let validated = StableAllocationRecord::try_from_persisted(
+                self.target,
+                *change.key(),
+                change.ordinal(),
+                *change.instance().as_bytes(),
+                *change.domain().as_bytes(),
+                change.state(),
+            )?;
+            match records.get(change.key()).copied() {
+                None => {
+                    next_ordinal = next_ordinal
+                        .checked_add(1)
+                        .ok_or(PlannerError::AllocationExhausted)?;
+                    if validated.state != AllocationState::Active
+                        || validated.ordinal != next_ordinal
+                    {
+                        return Err(PlannerError::InvalidAllocationSnapshot);
+                    }
+                }
+                Some(previous)
+                    if previous.ordinal == validated.ordinal
+                        && previous.instance == validated.instance
+                        && previous.domain == validated.domain =>
+                {
+                    if previous.state != AllocationState::Active
+                        || validated.state != AllocationState::Tombstone
+                    {
+                        return Err(PlannerError::InvalidAllocationSnapshot);
+                    }
+                }
+                Some(previous) => {
+                    next_ordinal = next_ordinal
+                        .checked_add(1)
+                        .ok_or(PlannerError::AllocationExhausted)?;
+                    if previous.state != AllocationState::Tombstone
+                        || validated.state != AllocationState::Active
+                        || validated.ordinal != next_ordinal
+                    {
+                        return Err(PlannerError::InvalidAllocationSnapshot);
+                    }
+                }
+            }
+            records.insert(*change.key(), validated);
+        }
+
+        if next_ordinal != delta.resulting_high_water {
+            return Err(PlannerError::InvalidAllocationSnapshot);
+        }
+        let expected_generation = if delta.records.is_empty() {
+            self.generation
+        } else {
+            self.generation
+                .checked_add(1)
+                .ok_or(PlannerError::AllocationExhausted)?
+        };
+        if delta.next_generation != expected_generation {
+            return Err(PlannerError::PreviousAllocationMismatch);
+        }
+        Self::try_new(
+            self.target,
+            delta.next_generation,
+            delta.resulting_high_water,
+            records.into_values().collect(),
+        )
+    }
+
+    /// Proves that a decoded persisted snapshot is exactly one legal
+    /// Planner-allocation successor of `previous`.
+    pub(crate) fn validate_successor_of(&self, previous: &Self) -> Result<(), PlannerError> {
+        if self.target != previous.target || self.high_water < previous.high_water {
+            return Err(PlannerError::PreviousAllocationMismatch);
+        }
+        let current = self
+            .records
+            .iter()
+            .map(|record| (*record.key(), *record))
+            .collect::<BTreeMap<_, _>>();
+        if previous
+            .records
+            .iter()
+            .any(|record| !current.contains_key(record.key()))
+        {
+            return Err(PlannerError::PreviousAllocationMismatch);
+        }
+        let changes = self
+            .records
+            .iter()
+            .filter(|record| {
+                previous
+                    .records
+                    .iter()
+                    .find(|candidate| candidate.key() == record.key())
+                    != Some(*record)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let delta = StableAllocationDelta {
+            base_generation: previous.generation,
+            next_generation: self.generation,
+            resulting_high_water: self.high_water,
+            records: changes.into_boxed_slice(),
+        };
+        if previous.apply_delta(&delta)? != *self {
+            return Err(PlannerError::PreviousAllocationMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Atomic allocation changes committed beside a future plan revision.
@@ -459,14 +626,155 @@ impl StableAllocationDelta {
 }
 
 /// Digest-covered target desired content.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PlanManifestDigest(Digest32);
+
+impl PlanManifestDigest {
+    pub(crate) fn try_new(value: Digest32) -> Result<Self, PlannerError> {
+        if value.as_bytes().iter().all(|byte| *byte == 0) {
+            return Err(PlannerError::InvalidManifestDigest);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub(crate) const fn value(self) -> Digest32 {
+        self.0
+    }
+}
+
+/// Digest-covered target desired content.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PlanContent {
     target: RuntimeHostId,
     shape: TargetIntent,
+    manifest_digest: PlanManifestDigest,
+    stable_allocation_subject: Option<(CardUseKey, InstanceRef, DomainRef)>,
     canonical_bytes: Box<[u8]>,
 }
 
 impl PlanContent {
+    /// Strictly reconstructs Planner-owned committed content from canonical
+    /// bytes. The journal uses this instead of accepting an untyped byte body.
+    pub(crate) fn try_from_persisted(
+        expected_target: RuntimeHostId,
+        canonical_bytes: &[u8],
+    ) -> Result<Self, PlannerError> {
+        let mut reader = PersistedPlanContentReader::new(canonical_bytes);
+        if reader.take(PLAN_CONTENT_MAGIC.len())? != PLAN_CONTENT_MAGIC {
+            return Err(PlannerError::InvalidPersistedPlanContent);
+        }
+        if reader.u16()? != PLAN_CONTENT_VERSION {
+            return Err(PlannerError::InvalidPersistedPlanContent);
+        }
+        let shape = match reader.u8()? {
+            1 => TargetIntent::OneSourceLoop,
+            2 => TargetIntent::EmptyTarget,
+            _ => return Err(PlannerError::InvalidPersistedPlanContent),
+        };
+        let target = reader.array::<16>()?;
+        if target != *expected_target.as_bytes() {
+            return Err(PlannerError::InvalidPersistedPlanContent);
+        }
+        let profile_fingerprint = reader.array::<32>()?;
+        let manifest_digest =
+            PlanManifestDigest::try_new(Digest32::from_bytes(reader.array::<32>()?))?;
+        let projection_length =
+            usize::try_from(reader.u64()?).map_err(|_| PlannerError::CanonicalLengthOverflow)?;
+        let projection = reader.take(projection_length)?;
+        let fixture_definition = reader.array::<16>()?;
+        let fixture_implementation = reader.array::<16>()?;
+        let fixture_export = reader.array::<16>()?;
+        let fixture_definition_digest = reader.array::<32>()?;
+        let fixture_artifact_digest = reader.array::<32>()?;
+
+        let (stable_allocation_subject, loop_fields) = if shape == TargetIntent::OneSourceLoop {
+            let deck_lock_digest = reader.array::<32>()?;
+            let key = reader.array::<16>()?;
+            let instance = reader.array::<16>()?;
+            let domain = reader.array::<16>()?;
+            let lifecycle = [reader.u64()?, reader.u64()?, reader.u64()?];
+            // The exact upper bound remains owned by the private Runtime
+            // reference contract and is consumed through the future validated
+            // adapter. The persisted Planner value can still prove the
+            // constructor-level nonzero invariant without duplicating that
+            // protocol constant in this crate.
+            if lifecycle.contains(&0) {
+                return Err(PlannerError::InvalidPersistedPlanContent);
+            }
+            let config_digest = reader.array::<32>()?;
+            (
+                Some((
+                    CardUseKey::from_bytes(key),
+                    InstanceRef::from_bytes(instance),
+                    DomainRef::from_bytes(domain),
+                )),
+                Some((
+                    deck_lock_digest,
+                    key,
+                    instance,
+                    domain,
+                    lifecycle,
+                    config_digest,
+                )),
+            )
+        } else {
+            (None, None)
+        };
+        if reader.remaining() != 0 {
+            return Err(PlannerError::InvalidPersistedPlanContent);
+        }
+
+        // Rebuild every parseable field through the sole canonical layout and
+        // demand byte equality. The manifest projection body remains opaque;
+        // its exact bytes and explicit length are nevertheless preserved.
+        let mut rebuilt = Vec::with_capacity(canonical_bytes.len());
+        rebuilt.extend_from_slice(PLAN_CONTENT_MAGIC);
+        rebuilt.extend_from_slice(&PLAN_CONTENT_VERSION.to_be_bytes());
+        rebuilt.push(match shape {
+            TargetIntent::OneSourceLoop => 1,
+            TargetIntent::EmptyTarget => 2,
+            TargetIntent::Omitted => unreachable!("persisted PlanContent cannot be omitted"),
+        });
+        rebuilt.extend_from_slice(&target);
+        rebuilt.extend_from_slice(&profile_fingerprint);
+        rebuilt.extend_from_slice(manifest_digest.value().as_bytes());
+        rebuilt.extend_from_slice(
+            &u64::try_from(projection.len())
+                .map_err(|_| PlannerError::CanonicalLengthOverflow)?
+                .to_be_bytes(),
+        );
+        rebuilt.extend_from_slice(projection);
+        rebuilt.extend_from_slice(&fixture_definition);
+        rebuilt.extend_from_slice(&fixture_implementation);
+        rebuilt.extend_from_slice(&fixture_export);
+        rebuilt.extend_from_slice(&fixture_definition_digest);
+        rebuilt.extend_from_slice(&fixture_artifact_digest);
+        if let Some((deck_lock_digest, key, instance, domain, lifecycle, config_digest)) =
+            loop_fields
+        {
+            rebuilt.extend_from_slice(&deck_lock_digest);
+            rebuilt.extend_from_slice(&key);
+            rebuilt.extend_from_slice(&instance);
+            rebuilt.extend_from_slice(&domain);
+            for budget in lifecycle {
+                rebuilt.extend_from_slice(&budget.to_be_bytes());
+            }
+            rebuilt.extend_from_slice(&config_digest);
+        }
+        if rebuilt != canonical_bytes {
+            return Err(PlannerError::InvalidPersistedPlanContent);
+        }
+
+        Ok(Self {
+            target: expected_target,
+            shape,
+            manifest_digest,
+            stable_allocation_subject,
+            canonical_bytes: canonical_bytes.into(),
+        })
+    }
+
     #[must_use]
     pub(crate) const fn target(&self) -> RuntimeHostId {
         self.target
@@ -478,8 +786,65 @@ impl PlanContent {
     }
 
     #[must_use]
+    pub(crate) const fn manifest_digest(&self) -> PlanManifestDigest {
+        self.manifest_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn stable_allocation_subject(
+        &self,
+    ) -> Option<(CardUseKey, InstanceRef, DomainRef)> {
+        self.stable_allocation_subject
+    }
+
+    #[must_use]
     pub(crate) fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
+    }
+}
+
+struct PersistedPlanContentReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> PersistedPlanContentReader<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    const fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], PlannerError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(PlannerError::CanonicalLengthOverflow)?;
+        let Some(value) = self.bytes.get(self.offset..end) else {
+            return Err(PlannerError::InvalidPersistedPlanContent);
+        };
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], PlannerError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| PlannerError::InvalidPersistedPlanContent)
+    }
+
+    fn u8(&mut self) -> Result<u8, PlannerError> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, PlannerError> {
+        Ok(u16::from_be_bytes(self.array::<2>()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, PlannerError> {
+        Ok(u64::from_be_bytes(self.array::<8>()?))
     }
 }
 
@@ -488,6 +853,17 @@ impl PlanContent {
 pub(crate) struct PlanContentDigest(Digest32);
 
 impl PlanContentDigest {
+    #[must_use]
+    pub(crate) const fn from_stored(value: Digest32) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn try_for_content(content: &PlanContent) -> Result<Self, PlannerError> {
+        let mut builder = Digest32Builder::try_new(PLAN_CONTENT_DIGEST_DOMAIN)?;
+        builder.field_bytes(content.canonical_bytes())?;
+        Ok(Self(builder.finish()))
+    }
+
     #[must_use]
     pub(crate) const fn value(self) -> Digest32 {
         self.0
@@ -535,7 +911,7 @@ impl DeploymentPlanCandidate {
 /// Omitted has no candidate and cannot be committed as canonical empty.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PlannerOutcome {
-    Candidate(DeploymentPlanCandidate),
+    Candidate(Box<DeploymentPlanCandidate>),
     Omitted,
 }
 
@@ -568,6 +944,7 @@ pub(crate) enum PlannerError {
     MissingManifestProjection,
     ManifestTargetMismatch,
     ManifestFixtureMismatch,
+    InvalidManifestDigest,
     ConfigMismatch,
     AllocationTargetMismatch,
     PreviousAllocationMismatch,
@@ -588,6 +965,8 @@ pub(crate) enum PlannerError {
     PreviousTargetNotTerminal,
     PreviousTargetBusy,
     PreviousTargetIneligible,
+    InvalidLifecycleBudget,
+    InvalidPersistedPlanContent,
     CanonicalLengthOverflow,
     Digest(DigestBuildError),
 }
@@ -617,6 +996,7 @@ impl fmt::Display for PlannerError {
             Self::MissingManifestProjection => "manifest projection is required",
             Self::ManifestTargetMismatch => "manifest projection target mismatch",
             Self::ManifestFixtureMismatch => "manifest fixture mismatch",
+            Self::InvalidManifestDigest => "manifest digest must be nonzero",
             Self::ConfigMismatch => "reference config digest mismatch",
             Self::AllocationTargetMismatch => "allocation snapshot target mismatch",
             Self::PreviousAllocationMismatch => {
@@ -645,6 +1025,8 @@ impl fmt::Display for PlannerError {
             }
             Self::PreviousTargetBusy => "previous target has a nonterminal Runtime action",
             Self::PreviousTargetIneligible => "previous target state is ineligible for planning",
+            Self::InvalidLifecycleBudget => "invalid reference lifecycle budget",
+            Self::InvalidPersistedPlanContent => "invalid persisted PlanContent",
             Self::CanonicalLengthOverflow => "PlanContent canonical length overflow",
             Self::Digest(_) => "PlanContent digest construction failed",
         })
@@ -744,11 +1126,11 @@ impl DeploymentPlanner {
             Some((card.key(), allocation.instance, allocation.domain)),
             Some((lifecycle, config_digest)),
         )?;
-        Ok(PlannerOutcome::Candidate(candidate(
+        Ok(PlannerOutcome::Candidate(Box::new(candidate(
             content,
             delta,
             diagnostics,
-        )?))
+        )?)))
     }
 
     fn plan_empty(
@@ -785,11 +1167,11 @@ impl DeploymentPlanner {
             None,
             None,
         )?;
-        Ok(PlannerOutcome::Candidate(candidate(
+        Ok(PlannerOutcome::Candidate(Box::new(candidate(
             content,
             delta,
             diagnostics,
-        )?))
+        )?)))
     }
 }
 
@@ -1019,7 +1401,7 @@ fn build_content(
     });
     bytes.extend_from_slice(target.as_bytes());
     bytes.extend_from_slice(manifest.profile_fingerprint.as_bytes());
-    bytes.extend_from_slice(manifest.manifest_digest.as_bytes());
+    bytes.extend_from_slice(manifest.manifest_digest.value().as_bytes());
     let projection_length = u64::try_from(manifest.canonical_projection.len())
         .map_err(|_| PlannerError::CanonicalLengthOverflow)?;
     bytes.extend_from_slice(&projection_length.to_be_bytes());
@@ -1041,6 +1423,9 @@ fn build_content(
             unreachable!("subject content always carries lifecycle/config facts");
         };
         for budget in lifecycle.values() {
+            if budget.value() == 0 {
+                return Err(PlannerError::InvalidLifecycleBudget);
+            }
             bytes.extend_from_slice(&budget.value().to_be_bytes());
         }
         bytes.extend_from_slice(config_digest.as_bytes());
@@ -1048,6 +1433,8 @@ fn build_content(
     Ok(PlanContent {
         target,
         shape,
+        manifest_digest: manifest.manifest_digest,
+        stable_allocation_subject: subject,
         canonical_bytes: bytes.into_boxed_slice(),
     })
 }
@@ -1057,9 +1444,7 @@ fn candidate(
     allocation_delta: StableAllocationDelta,
     diagnostics: Vec<PlannerDiagnostic>,
 ) -> Result<DeploymentPlanCandidate, PlannerError> {
-    let mut builder = Digest32Builder::try_new(PLAN_CONTENT_DIGEST_DOMAIN)?;
-    builder.field_bytes(content.canonical_bytes())?;
-    let content_digest = PlanContentDigest(builder.finish());
+    let content_digest = PlanContentDigest::try_for_content(&content)?;
     Ok(DeploymentPlanCandidate {
         content,
         allocation_delta,
@@ -1068,13 +1453,103 @@ fn candidate(
     })
 }
 
+/// Test-only typed Planner output used by the Controller journal model tests.
+/// Production code has no raw candidate constructor.
+#[cfg(test)]
+pub(crate) fn journal_test_candidate(
+    target: RuntimeHostId,
+    allocation: &StableAllocationSnapshot,
+    desired_key: Option<[u8; 16]>,
+    marker: u8,
+) -> Result<DeploymentPlanCandidate, PlannerError> {
+    let (shape, subject, delta, diagnostics) = if let Some(key) = desired_key {
+        let (selected, delta, diagnostics) =
+            allocate_active(target, CardUseKey::from_bytes(key), allocation)?;
+        (
+            TargetIntent::OneSourceLoop,
+            Some((
+                CardUseKey::from_bytes(key),
+                selected.instance(),
+                selected.domain(),
+            )),
+            delta,
+            diagnostics,
+        )
+    } else {
+        let changes = allocation
+            .records()
+            .iter()
+            .filter(|record| record.state() == AllocationState::Active)
+            .map(|record| StableAllocationRecord {
+                state: AllocationState::Tombstone,
+                ..*record
+            })
+            .collect::<Vec<_>>();
+        let changed = !changes.is_empty();
+        (
+            TargetIntent::EmptyTarget,
+            None,
+            StableAllocationDelta {
+                base_generation: allocation.generation(),
+                next_generation: advance_generation(allocation.generation(), changed)?,
+                resulting_high_water: allocation.high_water(),
+                records: changes.into_boxed_slice(),
+            },
+            Vec::new(),
+        )
+    };
+
+    let projection = [marker; 7];
+    let mut canonical_bytes = Vec::new();
+    canonical_bytes.extend_from_slice(PLAN_CONTENT_MAGIC);
+    canonical_bytes.extend_from_slice(&PLAN_CONTENT_VERSION.to_be_bytes());
+    canonical_bytes.push(match shape {
+        TargetIntent::OneSourceLoop => 1,
+        TargetIntent::EmptyTarget => 2,
+        TargetIntent::Omitted => unreachable!("test candidate never encodes Omitted"),
+    });
+    canonical_bytes.extend_from_slice(target.as_bytes());
+    canonical_bytes.extend_from_slice(&[marker.wrapping_add(1); 32]);
+    let manifest_digest =
+        PlanManifestDigest::try_new(Digest32::from_bytes([marker.wrapping_add(2); 32]))?;
+    canonical_bytes.extend_from_slice(manifest_digest.value().as_bytes());
+    canonical_bytes.extend_from_slice(&(projection.len() as u64).to_be_bytes());
+    canonical_bytes.extend_from_slice(&projection);
+    canonical_bytes.extend_from_slice(&[marker.wrapping_add(3); 16]);
+    canonical_bytes.extend_from_slice(&[marker.wrapping_add(4); 16]);
+    canonical_bytes.extend_from_slice(&[marker.wrapping_add(5); 16]);
+    canonical_bytes.extend_from_slice(&[marker.wrapping_add(6); 32]);
+    canonical_bytes.extend_from_slice(&[marker.wrapping_add(7); 32]);
+    if let Some((key, instance, domain)) = subject {
+        canonical_bytes.extend_from_slice(&[marker.wrapping_add(8); 32]);
+        canonical_bytes.extend_from_slice(key.as_bytes());
+        canonical_bytes.extend_from_slice(instance.as_bytes());
+        canonical_bytes.extend_from_slice(domain.as_bytes());
+        canonical_bytes.extend_from_slice(&1_u64.to_be_bytes());
+        canonical_bytes.extend_from_slice(&2_u64.to_be_bytes());
+        canonical_bytes.extend_from_slice(&3_u64.to_be_bytes());
+        canonical_bytes.extend_from_slice(&[marker.wrapping_add(9); 32]);
+    }
+    candidate(
+        PlanContent {
+            target,
+            shape,
+            manifest_digest,
+            stable_allocation_subject: subject,
+            canonical_bytes: canonical_bytes.into_boxed_slice(),
+        },
+        delta,
+        diagnostics,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AllocationState, DeploymentPlanner, ManifestFixtureFacts, OpaqueManifestProjectionIngress,
-        PlannerDesired, PlannerDiagnostic, PlannerError, PlannerInput, PlannerOutcome,
-        PreviousTargetEligibility, ServiceDependency, ServiceDependencyError, ServiceRef,
-        StableAllocationRecord, StableAllocationSnapshot, TargetIntent,
+        PlanManifestDigest, PlannerDesired, PlannerDiagnostic, PlannerError, PlannerInput,
+        PlannerOutcome, PreviousTargetEligibility, ServiceDependency, ServiceDependencyError,
+        ServiceRef, StableAllocationRecord, StableAllocationSnapshot, TargetIntent,
         ValidatedReferenceLifecycleBudgets, allocate_active, validate_service_dependencies,
         validate_transition,
     };
@@ -1320,7 +1795,8 @@ mod tests {
     fn manifest(target: RuntimeHostId) -> OpaqueManifestProjectionIngress<'static> {
         OpaqueManifestProjectionIngress {
             canonical_projection: b"opaque-validated-projection",
-            manifest_digest: digest(0x70),
+            manifest_digest: PlanManifestDigest::try_new(digest(0x70))
+                .expect("fixture manifest digest must validate"),
             target,
             profile_fingerprint: digest(0x71),
             canonical_empty_config_digest: digest(0x72),
@@ -1370,7 +1846,7 @@ mod tests {
         let PlannerOutcome::Candidate(candidate) = outcome else {
             panic!("expected candidate");
         };
-        candidate
+        *candidate
     }
 
     #[test]
@@ -1639,7 +2115,8 @@ mod tests {
         );
 
         let mut changed_manifest_digest = base_manifest;
-        changed_manifest_digest.manifest_digest = digest(0x73);
+        changed_manifest_digest.manifest_digest = PlanManifestDigest::try_new(digest(0x73))
+            .expect("changed manifest digest must validate");
         let manifest_digest_candidate = candidate_outcome(
             DeploymentPlanner::plan(&PlannerInput {
                 target: plan_target,
@@ -2500,7 +2977,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_forged_derived_ids_but_accepts_saturated_counters() {
+    fn snapshot_rejects_forged_ids_and_unreachable_counter_history() {
         let target = target(12);
         let mut forged = record(target, 1, 1, AllocationState::Active);
         forged.instance = InstanceRef::from_bytes([0xff; 16]);
@@ -2508,13 +2985,182 @@ mod tests {
             StableAllocationSnapshot::try_new(target, 1, 1, vec![forged]),
             Err(PlannerError::InvalidAllocationSnapshot)
         );
-        assert!(
-            StableAllocationSnapshot::try_new(target, u64::MAX, 0, Vec::new()).is_ok(),
-            "a saturated generation is readable until a delta must advance it"
+        assert_eq!(
+            StableAllocationSnapshot::try_new(target, u64::MAX, 0, Vec::new()),
+            Err(PlannerError::InvalidAllocationSnapshot),
+            "without compaction, nonzero generation cannot lose every tombstone"
+        );
+        assert_eq!(
+            StableAllocationSnapshot::try_new(
+                target,
+                1,
+                2,
+                vec![record(target, 1, 1, AllocationState::Tombstone)],
+            ),
+            Err(PlannerError::InvalidAllocationSnapshot),
+            "high-water must equal the retained maximum ordinal"
         );
         assert!(
-            StableAllocationSnapshot::try_new(target, 0, u64::MAX, Vec::new()).is_ok(),
-            "a saturated high-water is readable until a fresh ID is requested"
+            StableAllocationSnapshot::try_new(
+                target,
+                u64::MAX,
+                1,
+                vec![record(target, 1, 1, AllocationState::Tombstone)],
+            )
+            .is_ok(),
+            "a saturated generation with retained history remains readable"
+        );
+        assert!(
+            StableAllocationSnapshot::try_new(
+                target,
+                u64::MAX,
+                u64::MAX,
+                vec![record(target, 1, u64::MAX, AllocationState::Tombstone)],
+            )
+            .is_ok(),
+            "a saturated high-water with its retained tombstone remains readable"
+        );
+    }
+
+    #[test]
+    fn persisted_plan_content_rebuilds_exact_fields_and_rejects_bad_lifecycle() {
+        let target = target(24);
+        let allocation = empty_snapshot(target);
+        let candidate = super::journal_test_candidate(target, &allocation, Some([2; 16]), 0x51)
+            .expect("typed fixture candidate must validate");
+        let bytes = candidate.content().canonical_bytes();
+        let decoded = super::PlanContent::try_from_persisted(target, bytes)
+            .expect("canonical Planner content must decode");
+        assert_eq!(decoded, *candidate.content());
+        assert_eq!(
+            super::PlanContent::try_from_persisted(RuntimeHostId::from_bytes([0x99; 16]), bytes),
+            Err(PlannerError::InvalidPersistedPlanContent)
+        );
+        assert_eq!(
+            super::PlanContent::try_from_persisted(target, &bytes[..bytes.len() - 1]),
+            Err(PlannerError::InvalidPersistedPlanContent)
+        );
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            super::PlanContent::try_from_persisted(target, &trailing),
+            Err(PlannerError::InvalidPersistedPlanContent)
+        );
+
+        let mut zero_manifest = bytes.to_vec();
+        let manifest_offset = super::PLAN_CONTENT_MAGIC.len() + size_of::<u16>() + 1 + 16 + 32;
+        zero_manifest[manifest_offset..manifest_offset + 32].fill(0);
+        assert_eq!(
+            super::PlanContent::try_from_persisted(target, &zero_manifest),
+            Err(PlannerError::InvalidManifestDigest)
+        );
+
+        let mut zero_budget = bytes.to_vec();
+        let first_lifecycle_budget = zero_budget.len() - 32 - (3 * 8);
+        zero_budget[first_lifecycle_budget..first_lifecycle_budget + 8]
+            .copy_from_slice(&0_u64.to_be_bytes());
+        assert_eq!(
+            super::PlanContent::try_from_persisted(target, &zero_budget),
+            Err(PlannerError::InvalidPersistedPlanContent)
+        );
+
+        let deck = reference_deck(
+            DeckCardConfig::CanonicalEmpty,
+            DeckCardRole::ReferenceSubject,
+        );
+        let manifest = manifest(target);
+        assert_eq!(
+            DeploymentPlanner::plan(&PlannerInput {
+                target,
+                desired: PlannerDesired::OneSourceLoop {
+                    deck_lock: &deck,
+                    lifecycle: lifecycle(0, 2, 3),
+                    config_digest: digest(0x72),
+                },
+                previous: PreviousTargetEligibility::UninitializedNoneExactZero,
+                manifest: Some(&manifest),
+                allocation: &allocation,
+                service_dependencies: &[],
+            }),
+            Err(PlannerError::InvalidLifecycleBudget)
+        );
+    }
+
+    #[test]
+    fn allocation_delta_is_exact_one_generation_and_never_removes_history() {
+        let target = target(25);
+        let empty = empty_snapshot(target);
+        let active_candidate = super::journal_test_candidate(target, &empty, Some([2; 16]), 0x61)
+            .expect("fresh allocation candidate must validate");
+        let active = empty
+            .apply_delta(active_candidate.allocation_delta())
+            .expect("fresh delta must apply");
+        assert_eq!(active.generation(), 1);
+        assert_eq!(active.high_water(), 1);
+
+        let no_change = super::journal_test_candidate(target, &active, Some([2; 16]), 0x62)
+            .expect("stable allocation candidate must validate");
+        assert!(no_change.allocation_delta().records().is_empty());
+        assert_eq!(
+            active
+                .apply_delta(no_change.allocation_delta())
+                .expect("no-change delta must preserve generation"),
+            active
+        );
+
+        let mut skipped = active_candidate.allocation_delta().clone();
+        skipped.next_generation = 2;
+        assert_eq!(
+            empty.apply_delta(&skipped),
+            Err(PlannerError::PreviousAllocationMismatch)
+        );
+        let mut wrong_base = no_change.allocation_delta().clone();
+        wrong_base.base_generation = 0;
+        assert_eq!(
+            active.apply_delta(&wrong_base),
+            Err(PlannerError::PreviousAllocationMismatch)
+        );
+
+        let two_active = StableAllocationSnapshot::try_new(
+            target,
+            2,
+            2,
+            vec![
+                record(target, 1, 1, AllocationState::Active),
+                record(target, 2, 2, AllocationState::Active),
+            ],
+        )
+        .expect("structurally valid multi-active recovery input must validate");
+        let mut unordered = super::journal_test_candidate(target, &two_active, None, 0x63)
+            .expect("empty candidate must tombstone both records")
+            .allocation_delta()
+            .clone();
+        unordered.records.reverse();
+        assert_eq!(
+            two_active.apply_delta(&unordered),
+            Err(PlannerError::InvalidAllocationSnapshot)
+        );
+
+        let history = StableAllocationSnapshot::try_new(
+            target,
+            2,
+            2,
+            vec![
+                record(target, 1, 1, AllocationState::Tombstone),
+                record(target, 2, 2, AllocationState::Tombstone),
+            ],
+        )
+        .expect("retained history must validate");
+        let deleted = StableAllocationSnapshot::try_new(
+            target,
+            2,
+            2,
+            vec![record(target, 2, 2, AllocationState::Tombstone)],
+        )
+        .expect("the current snapshot is individually well formed");
+        assert_eq!(
+            deleted.validate_successor_of(&history),
+            Err(PlannerError::PreviousAllocationMismatch)
         );
     }
 
@@ -2522,14 +3168,14 @@ mod tests {
     fn saturated_counters_fail_only_when_the_requested_delta_advances_them() {
         let target = target(15);
         let manifest = manifest(target);
-        let saturated_record = record(target, 2, u64::MAX, AllocationState::Active);
+        let saturated_record = record(target, 9, u64::MAX, AllocationState::Tombstone);
         let high_water_snapshot =
-            StableAllocationSnapshot::try_new(target, 5, u64::MAX, vec![saturated_record])
-                .expect("saturated high-water snapshot must remain readable");
+            StableAllocationSnapshot::try_new(target, u64::MAX, u64::MAX, vec![saturated_record])
+                .expect("saturated counters with retained history must remain readable");
         let empty = PlannerInput {
             target,
             desired: PlannerDesired::EmptyTarget,
-            previous: PreviousTargetEligibility::OneSourceLoopLiveReady,
+            previous: PreviousTargetEligibility::EmptyDeactivateTerminalExactZero,
             manifest: Some(&manifest),
             allocation: &high_water_snapshot,
             service_dependencies: &[],
@@ -2542,18 +3188,16 @@ mod tests {
             candidate.allocation_delta().resulting_high_water(),
             u64::MAX
         );
-        assert_eq!(
-            candidate.allocation_delta().records()[0].state(),
-            AllocationState::Tombstone
-        );
+        assert!(candidate.allocation_delta().records().is_empty());
+        assert_eq!(candidate.allocation_delta().next_generation(), u64::MAX);
 
         let deck = reference_deck(
             DeckCardConfig::CanonicalEmpty,
             DeckCardRole::ReferenceSubject,
         );
         let exhausted_high_water =
-            StableAllocationSnapshot::try_new(target, 5, u64::MAX, Vec::new())
-                .expect("saturated high-water snapshot must remain readable");
+            StableAllocationSnapshot::try_new(target, u64::MAX, u64::MAX, vec![saturated_record])
+                .expect("saturated high-water snapshot must retain its tombstone");
         let fresh = PlannerInput {
             target,
             desired: loop_desired(&deck),
@@ -2576,6 +3220,7 @@ mod tests {
         .expect("saturated generation snapshot must remain readable");
         let generation_advance = PlannerInput {
             allocation: &generation_snapshot,
+            previous: PreviousTargetEligibility::OneSourceLoopLiveReady,
             ..empty
         };
         assert_eq!(
@@ -2592,8 +3237,13 @@ mod tests {
             DeckCardRole::ReferenceSubject,
         );
         let manifest = manifest(target);
-        let final_reserve = StableAllocationSnapshot::try_new(target, u64::MAX - 1, 0, Vec::new())
-            .expect("the final reserve snapshot must remain readable");
+        let final_reserve = StableAllocationSnapshot::try_new(
+            target,
+            u64::MAX - 1,
+            1,
+            vec![record(target, 9, 1, AllocationState::Tombstone)],
+        )
+        .expect("the final reserve snapshot must retain allocation history");
         let fresh_loop = PlannerInput {
             target,
             desired: loop_desired(&deck),
@@ -2663,7 +3313,7 @@ mod tests {
         let records = capacity_records(target);
         let full = StableAllocationSnapshot::try_new(
             target,
-            1,
+            super::MAX_STABLE_ALLOCATION_RECORDS as u64,
             super::MAX_STABLE_ALLOCATION_RECORDS as u64,
             records.clone(),
         )
@@ -2708,7 +3358,7 @@ mod tests {
         reusable[0] = record(target, 2, 1, AllocationState::Tombstone);
         let at_capacity_with_desired_tombstone = StableAllocationSnapshot::try_new(
             target,
-            1,
+            super::MAX_STABLE_ALLOCATION_RECORDS as u64,
             super::MAX_STABLE_ALLOCATION_RECORDS as u64,
             reusable,
         )

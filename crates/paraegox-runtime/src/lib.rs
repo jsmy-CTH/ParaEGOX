@@ -48,6 +48,8 @@ mod request;
 mod runtime_clock;
 mod runtime_host;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
+mod runtime_journal;
+#[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod runtime_ownership;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod task_registry;

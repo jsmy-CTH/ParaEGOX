@@ -168,7 +168,7 @@ def test_pure_compile_sources_do_not_reimplement_manifest_or_side_effects() -> N
             )
 
 
-def test_s7_c_adds_neither_public_api_nor_executable_surface() -> None:
+def test_s7_c_pure_compile_owners_remain_private_after_s7_d() -> None:
     governance = _load_toml(REPO_ROOT / "governance.toml")
     registry = governance["registry"]
 
@@ -179,15 +179,27 @@ def test_s7_c_adds_neither_public_api_nor_executable_surface() -> None:
     ]
     assert len(deployment_rows) == 1
     deployment_row = deployment_rows[0]
-    assert deployment_row["status"] == "enabler"
-    assert deployment_row["public_entrypoints"] == []
-    assert deployment_row["consumers"] == []
+    assert deployment_row["status"] == "experimental"
+    assert deployment_row["public_entrypoints"] == [
+        "paraegox_deployment::run_tenure_authority_process"
+    ]
+    assert deployment_row["consumers"] == ["paraegox-tenure-authority"]
 
     for api in registry["public_apis"]:
         module = str(api["module"]).replace("-", "_")
+        symbols = {str(symbol) for symbol in api["symbols"]}
+        if module == "paraegox_deployment":
+            assert symbols == {
+                "TenureAuthorityProcessError",
+                "run_tenure_authority_process",
+            }
+            continue
         assert not module.startswith(("paraegox_deployment", "paraegox_decks"))
 
     deployment_manifest = _load_toml(DEPLOYMENT_ROOT / "Cargo.toml")
     assert "bin" not in deployment_manifest
     assert not (DEPLOYMENT_SRC / "main.rs").exists()
-    assert not (DEPLOYMENT_SRC / "bin").exists()
+    executable_sources = sorted(
+        path.name for path in (DEPLOYMENT_SRC / "bin").glob("*.rs")
+    )
+    assert executable_sources == ["paraegox-tenure-authority.rs"]
