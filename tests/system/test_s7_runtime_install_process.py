@@ -790,7 +790,7 @@ def test_real_installed_runtime_process_initializes_sequence_one_exactly_once(
     )
     assert marker == b""
 
-    assert snapshot[:14] == b"PXJR\x00\x01\x00\x03\x00\x03\x00\x01\x00\x01"
+    assert snapshot[:14] == b"PXJR\x00\x01\x00\x03\x00\x04\x00\x01\x00\x01"
     assert snapshot[14:46] == receipt["store_instance_id"]
     assert snapshot[46:78] == _owner_target_fingerprint(runtime.provisioning)
     assert int.from_bytes(snapshot[78:86], "big") == 1
