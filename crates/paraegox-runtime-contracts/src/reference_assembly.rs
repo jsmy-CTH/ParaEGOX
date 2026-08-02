@@ -149,6 +149,8 @@ pub(crate) const MAX_TARGET_EXECUTION_PLAN_V4_BYTES: usize = 4
     + REFERENCE_LOOP_DOMAIN_BYTES
     + 1
     + REFERENCE_LOOP_SUBJECT_BYTES;
+pub(crate) const MAX_RUNTIME_PLAN_SLICE_V5_BYTES: usize =
+    ZERO_BINDING_PXTA_BYTES + MAX_TARGET_EXECUTION_PLAN_V4_BYTES;
 pub(crate) const MAX_RUNTIME_APPLY_REQUEST_V5_BYTES: usize = APPLY_REQUEST_V5_HEADER_BYTES
     + MAX_RUNTIME_APPLY_ENVELOPE_V2_BYTES
     + ZERO_BINDING_PXTA_BYTES
@@ -1086,6 +1088,62 @@ impl RuntimePlanSliceV5 {
         Ok(Self {
             commitment,
             assignments,
+        })
+    }
+
+    /// Strictly restores the durable `PXTA-zero || PXTE-v4` Slice body.
+    ///
+    /// Provenance and the expected Slice digest are journal-owned facts. The
+    /// PXTE target is decoded from the canonical body, then cross-checked
+    /// before the existing provenance commitment owner is used to rebuild the
+    /// exact Slice commitment.
+    pub(crate) fn decode_durable(
+        frame: &[u8],
+        target: RuntimeHostId,
+        provenance: PlanProvenance,
+        expected_target_slice_digest: TargetSliceDigest,
+    ) -> Result<Self, ReferenceWireError> {
+        if frame.len() > MAX_RUNTIME_PLAN_SLICE_V5_BYTES {
+            return Err(ReferenceWireError::new(
+                ReferenceWireErrorCode::FrameTooLarge,
+            ));
+        }
+        if frame.len() < ZERO_BINDING_PXTA_BYTES {
+            return Err(ReferenceWireError::new(ReferenceWireErrorCode::Truncated));
+        }
+
+        let (binding_frame, execution_frame) = frame.split_at(ZERO_BINDING_PXTA_BYTES);
+        if binding_frame != ZERO_BINDING_PXTA {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::BindingNotAllowed,
+                2,
+            ));
+        }
+        let bindings = TargetAssignments::decode(binding_frame)
+            .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::BindingNotAllowed, 2))?;
+        let execution = TargetExecutionPlanV4::decode(execution_frame)?;
+        if execution.projection().row().target() != target {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::TargetMismatch,
+                2,
+            ));
+        }
+        let assignments = TargetPlanAssignmentsV5::try_new(bindings, execution)
+            .map_err(|_| ReferenceWireError::new(ReferenceWireErrorCode::CrossReferenceMismatch))?;
+        let header = RuntimeSliceHeader::new(target, provenance, assignments.assignment_digest());
+        let commitment = RuntimeSliceCommitment::try_new(header)
+            .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::DigestMismatch, 8))?;
+        if commitment.target_slice_digest() != expected_target_slice_digest {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::DigestMismatch,
+                8,
+            ));
+        }
+        Self::try_new(commitment, assignments).map_err(|error| match error {
+            ReferenceContractError::TargetMismatch => {
+                ReferenceWireError::at(ReferenceWireErrorCode::TargetMismatch, 2)
+            }
+            _ => ReferenceWireError::at(ReferenceWireErrorCode::DigestMismatch, 7),
         })
     }
 
@@ -5153,6 +5211,36 @@ impl RuntimeQuerySelectorV1 {
             expected_request_digest,
         })
     }
+
+    #[must_use]
+    pub(crate) const fn query_id(self) -> RuntimeQueryId {
+        self.query_id
+    }
+
+    #[must_use]
+    pub(crate) const fn target(self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn source_scope(self) -> SourceScopeRef {
+        self.source_scope
+    }
+
+    #[must_use]
+    pub(crate) const fn expected_store_instance_id(self) -> RuntimeStoreInstanceId {
+        self.expected_store_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn requested_operation_id(self) -> ApplyOperationId {
+        self.requested_operation_id
+    }
+
+    #[must_use]
+    pub(crate) const fn expected_request_digest(self) -> Option<Digest32> {
+        self.expected_request_digest
+    }
 }
 
 /// Signature-independent authenticated operation/live query.
@@ -5247,6 +5335,11 @@ impl RuntimeQueryRequestV1 {
     }
 
     #[must_use]
+    pub(crate) const fn selector(&self) -> RuntimeQuerySelectorV1 {
+        self.selector
+    }
+
+    #[must_use]
     pub(crate) const fn query_id(&self) -> RuntimeQueryId {
         self.selector.query_id
     }
@@ -5254,6 +5347,11 @@ impl RuntimeQueryRequestV1 {
     #[must_use]
     pub(crate) const fn target(&self) -> RuntimeHostId {
         self.selector.target
+    }
+
+    #[must_use]
+    pub(crate) const fn source_scope(&self) -> SourceScopeRef {
+        self.selector.source_scope
     }
 
     #[must_use]
@@ -5640,6 +5738,16 @@ impl RuntimeDesiredStateV1 {
             source_revision_high_water,
         })
     }
+
+    #[must_use]
+    pub(crate) const fn head(self) -> RuntimeDesiredHeadV1 {
+        self.head
+    }
+
+    #[must_use]
+    pub(crate) const fn source_revision_high_water(self) -> SourcePlanRevision {
+        self.source_revision_high_water
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -5688,6 +5796,26 @@ impl RuntimeLiveFactsV1 {
             census_digest,
         })
     }
+
+    #[must_use]
+    pub(crate) const fn state(self) -> RuntimeLiveStateV1 {
+        self.state
+    }
+
+    #[must_use]
+    pub(crate) const fn resource_generation(self) -> u64 {
+        self.resource_generation
+    }
+
+    #[must_use]
+    pub(crate) const fn measured_at(self) -> u64 {
+        self.measured_at
+    }
+
+    #[must_use]
+    pub(crate) const fn census_digest(self) -> Digest32 {
+        self.census_digest
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -5719,6 +5847,21 @@ impl RuntimeQueryOperationStateV1 {
             reason,
             lookup,
         })
+    }
+
+    #[must_use]
+    pub(crate) const fn owner_state(self) -> RuntimeOwnerStateV1 {
+        self.owner_state
+    }
+
+    #[must_use]
+    pub(crate) const fn reason(self) -> Option<OperationalReasonV1> {
+        self.reason
+    }
+
+    #[must_use]
+    pub(crate) const fn lookup(self) -> RuntimeOperationLookupV1 {
+        self.lookup
     }
 }
 
@@ -5776,6 +5919,26 @@ impl RuntimeQueryFactsV1 {
             desired,
             live,
         })
+    }
+
+    #[must_use]
+    pub(crate) const fn serving(self) -> RuntimeBootstrapServingIdentityV1 {
+        self.serving
+    }
+
+    #[must_use]
+    pub(crate) const fn operation(self) -> RuntimeQueryOperationStateV1 {
+        self.operation
+    }
+
+    #[must_use]
+    pub(crate) const fn desired(self) -> RuntimeDesiredStateV1 {
+        self.desired
+    }
+
+    #[must_use]
+    pub(crate) const fn live(self) -> RuntimeLiveFactsV1 {
+        self.live
     }
 }
 
@@ -5996,6 +6159,21 @@ impl RuntimeQueryResponseV1 {
 
     pub(crate) fn decode(frame: &[u8]) -> Result<Self, ReferenceWireError> {
         decode_query_response(frame)
+    }
+
+    #[must_use]
+    pub(crate) const fn query_id(&self) -> RuntimeQueryId {
+        self.query_id
+    }
+
+    #[must_use]
+    pub(crate) const fn query_request_digest(&self) -> Digest32 {
+        self.query_request_digest
+    }
+
+    #[must_use]
+    pub(crate) fn client_nonce(&self) -> &[u8] {
+        &self.client_nonce
     }
 
     #[must_use]

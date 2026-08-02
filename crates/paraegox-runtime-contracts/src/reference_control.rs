@@ -1,11 +1,11 @@
-//! Public S7-E control facade for the narrow reference Runtime profile.
+//! Public S7-E/S7-F control facade for the narrow reference Runtime profile.
 //!
 //! This module promotes only the canonical `PXTE` v4 / `PXAR` v5 apply path
-//! and authenticated bootstrap/terminal-Receipt paths owned by the
+//! and authenticated bootstrap/query/terminal-Receipt paths owned by the
 //! crate-private reference assembly codec. It does not accept a raw manifest
-//! constructor, expose query (`S7-F`) contracts, verify signatures, or perform
-//! Runtime mutation. Signature verifiers consume the exact transcripts and
-//! authentication facts exposed here.
+//! constructor, verify signatures, or perform Runtime mutation. Signature
+//! verifiers consume the exact transcripts and authentication facts exposed
+//! here.
 
 use core::fmt;
 
@@ -14,8 +14,8 @@ use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
 
 use crate::apply::{
-    ApplyContractError, PlanWriterRef, RuntimeApplyControl, RuntimeApplyControlCommitment,
-    TenureAuthorityRef, TenureKeyRef,
+    ApplyContractError, ApplyOperationId, PlanWriterRef, RuntimeApplyControl,
+    RuntimeApplyControlCommitment, TenureAuthorityRef, TenureKeyRef,
 };
 use crate::assignment::InstanceRef;
 use crate::execution::{CardDefinitionRef, CardImplementationRef, DomainRef};
@@ -25,7 +25,7 @@ use crate::installation::{
 };
 use crate::provenance::{
     PlanProvenance, ProvenanceContractError, RuntimeSliceCommitment, RuntimeSliceHeader,
-    TargetAssignmentDigest, TargetSliceDigest,
+    SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest, TargetSliceDigest,
 };
 use crate::reference_assembly::{
     APPLY_REQUEST_SIGNING_TRANSCRIPT_V2_VERSION, APPLY_TERMINAL_RECEIPT_SIGNING_TRANSCRIPT_VERSION,
@@ -33,14 +33,16 @@ use crate::reference_assembly::{
     CONTROL_READ_SIGNING_TRANSCRIPT_VERSION, ControlReadSigningTranscriptV1, FixtureExportRef,
     LOCAL_CONTROL_CHANNEL_BINDING_VERSION, MAX_APPLY_AUTH_NONCE_V2_BYTES,
     MAX_APPLY_AUTH_SIGNATURE_V2_BYTES, MAX_CONTROL_READ_NONCE_BYTES,
-    MAX_CONTROL_READ_SIGNATURE_BYTES, MAX_REFERENCE_LIFECYCLE_BUDGET_NANOS,
+    MAX_CONTROL_READ_SIGNATURE_BYTES, MAX_QUERY_RECORD_COUNT, MAX_REFERENCE_LIFECYCLE_BUDGET_NANOS,
     MAX_RUNTIME_APPLY_ENVELOPE_V2_BYTES, MAX_RUNTIME_APPLY_REQUEST_V5_BYTES,
     MAX_RUNTIME_APPLY_TERMINAL_RECEIPT_BYTES, MAX_RUNTIME_BOOTSTRAP_REQUEST_BYTES,
-    MAX_RUNTIME_BOOTSTRAP_RESPONSE_BYTES, MAX_TARGET_EXECUTION_PLAN_V4_BYTES,
-    OperationalReasonV1 as CanonicalOperationalReasonV1, REFERENCE_ASSEMBLY_PROFILE_VERSION,
-    REFERENCE_BACKGROUND_TASK_SLOTS, REFERENCE_DISPATCH_SLOTS, REFERENCE_LIFECYCLE_CONCURRENCY,
-    REFERENCE_MAILBOX_SLOTS, RUNTIME_APPLY_ENVELOPE_V2_VERSION, RUNTIME_APPLY_REQUEST_V5_VERSION,
-    RUNTIME_APPLY_TERMINAL_RECEIPT_VERSION, RUNTIME_BOOTSTRAP_PROTOCOL_VERSION,
+    MAX_RUNTIME_BOOTSTRAP_RESPONSE_BYTES, MAX_RUNTIME_PLAN_SLICE_V5_BYTES,
+    MAX_RUNTIME_QUERY_REQUEST_BYTES, MAX_RUNTIME_QUERY_RESPONSE_BYTES,
+    MAX_TARGET_EXECUTION_PLAN_V4_BYTES, OperationalReasonV1 as CanonicalOperationalReasonV1,
+    REFERENCE_ASSEMBLY_PROFILE_VERSION, REFERENCE_BACKGROUND_TASK_SLOTS, REFERENCE_DISPATCH_SLOTS,
+    REFERENCE_LIFECYCLE_CONCURRENCY, REFERENCE_MAILBOX_SLOTS, RUNTIME_APPLY_ENVELOPE_V2_VERSION,
+    RUNTIME_APPLY_REQUEST_V5_VERSION, RUNTIME_APPLY_TERMINAL_RECEIPT_VERSION,
+    RUNTIME_BOOTSTRAP_PROTOCOL_VERSION, RUNTIME_QUERY_PROTOCOL_VERSION,
     ReferenceAssemblyModeV1 as CanonicalAssemblyModeV1, ReferenceContractError,
     ReferenceFixtureEntryV1, ReferenceLoopDomainSpecV1, ReferenceLoopSubjectSpecV1,
     ReferenceWireError, ReferenceWireErrorCode, RuntimeApplyEnvelopeV2Draft, RuntimeApplyRequestV5,
@@ -58,9 +60,21 @@ use crate::reference_assembly::{
     RuntimeBootstrapResponseV1 as CanonicalBootstrapResponseV1,
     RuntimeBootstrapServingIdentityV1 as CanonicalBootstrapServingIdentityV1,
     RuntimeBootstrapStateV1 as CanonicalBootstrapStateV1, RuntimeBuildDescriptorV1,
-    RuntimeBuildIdentityV1, RuntimeChannelBindingV1 as CanonicalChannelBindingV1, RuntimeHostEpoch,
-    RuntimePlanSliceV5, RuntimeResponseAuthClaimV1, RuntimeSnapshotSequence,
-    RuntimeStoreInstanceId, TARGET_EXECUTION_PLAN_V4_VERSION,
+    RuntimeBuildIdentityV1, RuntimeChannelBindingV1 as CanonicalChannelBindingV1,
+    RuntimeDesiredHeadV1 as CanonicalDesiredHeadV1,
+    RuntimeDesiredStateV1 as CanonicalDesiredStateV1, RuntimeHostEpoch,
+    RuntimeLiveFactsV1 as CanonicalLiveFactsV1, RuntimeLiveStateV1 as CanonicalLiveStateV1,
+    RuntimeOperationDurablePhaseV1 as CanonicalOperationDurablePhaseV1,
+    RuntimeOperationLookupV1 as CanonicalOperationLookupV1,
+    RuntimeOwnerStateV1 as CanonicalOwnerStateV1, RuntimePlanSliceV5,
+    RuntimeQueryFactsV1 as CanonicalQueryFactsV1, RuntimeQueryId,
+    RuntimeQueryOperationStateV1 as CanonicalQueryOperationStateV1,
+    RuntimeQueryRequestDraftV1 as CanonicalQueryRequestDraftV1,
+    RuntimeQueryRequestV1 as CanonicalQueryRequestV1,
+    RuntimeQueryResponseDraftV1 as CanonicalQueryResponseDraftV1,
+    RuntimeQueryResponseV1 as CanonicalQueryResponseV1,
+    RuntimeQuerySelectorV1 as CanonicalQuerySelectorV1, RuntimeResponseAuthClaimV1,
+    RuntimeSnapshotSequence, RuntimeStoreInstanceId, TARGET_EXECUTION_PLAN_V4_VERSION,
     TargetExecutionPlanV4 as CanonicalTargetExecutionPlanV4, TargetPlanAssignmentsV5,
     TerminalResultRef, reference_profile_fingerprint,
 };
@@ -104,6 +118,10 @@ pub const REFERENCE_BOOTSTRAP_VERSION: u16 = RUNTIME_BOOTSTRAP_PROTOCOL_VERSION;
 /// Canonical bootstrap signing-transcript version.
 pub const REFERENCE_BOOTSTRAP_SIGNING_TRANSCRIPT_VERSION: u16 =
     CONTROL_READ_SIGNING_TRANSCRIPT_VERSION;
+/// Canonical authenticated operation/live query protocol version.
+pub const REFERENCE_QUERY_VERSION: u16 = RUNTIME_QUERY_PROTOCOL_VERSION;
+/// Canonical query request/response signing-transcript version.
+pub const REFERENCE_QUERY_SIGNING_TRANSCRIPT_VERSION: u16 = CONTROL_READ_SIGNING_TRANSCRIPT_VERSION;
 /// Canonical Runtime apply terminal Receipt version.
 pub const REFERENCE_APPLY_TERMINAL_RECEIPT_VERSION: u16 = RUNTIME_APPLY_TERMINAL_RECEIPT_VERSION;
 /// Canonical Runtime apply terminal Receipt signing-transcript version.
@@ -116,6 +134,8 @@ pub const REFERENCE_PROFILE_VERSION: u16 = REFERENCE_ASSEMBLY_PROFILE_VERSION;
 pub const MAX_REFERENCE_TARGET_EXECUTION_BYTES: usize = MAX_TARGET_EXECUTION_PLAN_V4_BYTES;
 /// Maximum canonical PXAR v5 request size.
 pub const MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES: usize = MAX_RUNTIME_APPLY_REQUEST_V5_BYTES;
+/// Maximum canonical durable `PXTA-zero || PXTE-v4` Slice body size.
+pub const MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES: usize = MAX_RUNTIME_PLAN_SLICE_V5_BYTES;
 /// Maximum canonical apply-envelope v2 size.
 pub const MAX_REFERENCE_RUNTIME_APPLY_ENVELOPE_BYTES: usize = MAX_RUNTIME_APPLY_ENVELOPE_V2_BYTES;
 /// Maximum apply authentication nonce size.
@@ -126,6 +146,16 @@ pub const MAX_REFERENCE_APPLY_AUTH_SIGNATURE_BYTES: usize = MAX_APPLY_AUTH_SIGNA
 pub const MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES: usize = MAX_RUNTIME_BOOTSTRAP_REQUEST_BYTES;
 /// Maximum bootstrap response size.
 pub const MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES: usize = MAX_RUNTIME_BOOTSTRAP_RESPONSE_BYTES;
+/// Maximum canonical query request size.
+pub const MAX_REFERENCE_QUERY_REQUEST_BYTES: usize = MAX_RUNTIME_QUERY_REQUEST_BYTES;
+/// Maximum canonical query response size.
+pub const MAX_REFERENCE_QUERY_RESPONSE_BYTES: usize = MAX_RUNTIME_QUERY_RESPONSE_BYTES;
+/// Maximum query request/response nonce size.
+pub const MAX_REFERENCE_QUERY_NONCE_BYTES: usize = MAX_CONTROL_READ_NONCE_BYTES;
+/// Maximum query request/response signature size.
+pub const MAX_REFERENCE_QUERY_SIGNATURE_BYTES: usize = MAX_CONTROL_READ_SIGNATURE_BYTES;
+/// The fixed singleton operation record count carried by PXQR v1.
+pub const REFERENCE_QUERY_RECORD_COUNT: u16 = MAX_QUERY_RECORD_COUNT;
 /// Maximum bootstrap authentication nonce size.
 pub const MAX_REFERENCE_BOOTSTRAP_NONCE_BYTES: usize = MAX_CONTROL_READ_NONCE_BYTES;
 /// Maximum bootstrap authentication signature size.
@@ -1242,6 +1272,32 @@ impl ReferenceApplyRequestV1 {
     ) -> Result<(), ReferenceControlError> {
         self.target_execution().validate_manifest(manifest)
     }
+}
+
+/// Strictly restores and validates one journal-owned durable Slice body.
+///
+/// The body must be the exact canonical `PXTA-zero || PXTE-v4` bytes previously
+/// returned by [`ReferenceApplyRequestV1::canonical_slice_wire`]. The target is
+/// derived from immutable manifest ingress, while provenance and the expected
+/// Slice digest remain explicit journal commitments. On success the returned
+/// PXTE is already checked against the same immutable manifest.
+pub fn verify_reference_durable_slice_v1(
+    canonical_slice_wire: &[u8],
+    provenance: PlanProvenance,
+    expected_target_slice_digest: TargetSliceDigest,
+    manifest: &VerifiedRuntimeManifestIngressV1,
+) -> Result<ReferenceTargetExecutionPlanV4, ReferenceControlError> {
+    let slice = RuntimePlanSliceV5::decode_durable(
+        canonical_slice_wire,
+        manifest.target(),
+        provenance,
+        expected_target_slice_digest,
+    )?;
+    let execution = ReferenceTargetExecutionPlanV4 {
+        inner: slice.assignments().execution().clone(),
+    };
+    execution.validate_manifest(manifest)?;
+    Ok(execution)
 }
 
 /// Domain-separated durable replay identities derived from one sealed PXAR v5.
@@ -2728,6 +2784,853 @@ impl ReferenceBootstrapResponseV1 {
     }
 }
 
+/// Opaque identity of one authenticated operation/live query.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ReferenceQueryIdV1 {
+    inner: RuntimeQueryId,
+}
+
+impl ReferenceQueryIdV1 {
+    /// Creates a query identity from canonical bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self {
+            inner: RuntimeQueryId::from_bytes(bytes),
+        }
+    }
+
+    /// Returns canonical query identity bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        self.inner.as_bytes()
+    }
+}
+
+/// Fixed selector shared by the query draft and its strict decoder.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReferenceQuerySelectorV1 {
+    inner: CanonicalQuerySelectorV1,
+}
+
+impl ReferenceQuerySelectorV1 {
+    /// Selects one target-local operation and optional exact request identity.
+    pub fn try_new(
+        query_id: ReferenceQueryIdV1,
+        target: RuntimeHostId,
+        source_scope: SourceScopeRef,
+        expected_runtime_store_instance_id: [u8; 32],
+        requested_operation_id: ApplyOperationId,
+        expected_request_digest: Option<Digest32>,
+    ) -> Result<Self, ReferenceControlError> {
+        Ok(Self {
+            inner: CanonicalQuerySelectorV1::try_new(
+                query_id.inner,
+                target,
+                source_scope,
+                RuntimeStoreInstanceId::try_from_bytes(expected_runtime_store_instance_id)?,
+                requested_operation_id,
+                expected_request_digest,
+            )?,
+        })
+    }
+
+    /// Returns the query identity.
+    #[must_use]
+    pub const fn query_id(self) -> ReferenceQueryIdV1 {
+        ReferenceQueryIdV1 {
+            inner: self.inner.query_id(),
+        }
+    }
+
+    /// Returns the selected Runtime target.
+    #[must_use]
+    pub const fn target(self) -> RuntimeHostId {
+        self.inner.target()
+    }
+
+    /// Returns the selected desired-state source scope.
+    #[must_use]
+    pub const fn source_scope(self) -> SourceScopeRef {
+        self.inner.source_scope()
+    }
+
+    /// Returns the expected journal store identity.
+    #[must_use]
+    pub const fn expected_runtime_store_instance_id(self) -> [u8; 32] {
+        *self.inner.expected_store_instance_id().as_bytes()
+    }
+
+    /// Returns the selected apply operation identity.
+    #[must_use]
+    pub const fn requested_operation_id(self) -> ApplyOperationId {
+        self.inner.requested_operation_id()
+    }
+
+    /// Returns the optional exact request digest expectation.
+    #[must_use]
+    pub const fn expected_request_digest(self) -> Option<Digest32> {
+        self.inner.expected_request_digest()
+    }
+}
+
+/// Exact canonical query request or response signing transcript.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceQuerySigningTranscriptV1 {
+    inner: ControlReadSigningTranscriptV1,
+}
+
+impl ReferenceQuerySigningTranscriptV1 {
+    /// Returns the exact bytes a signer signs or a verifier verifies.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.inner.as_bytes()
+    }
+}
+
+/// Signature-independent authenticated operation/live query request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceQueryRequestDraftV1 {
+    inner: CanonicalQueryRequestDraftV1,
+}
+
+impl ReferenceQueryRequestDraftV1 {
+    /// Builds a bounded singleton query without advancing Runtime state.
+    pub fn try_new(
+        selector: ReferenceQuerySelectorV1,
+        auth_claim: ApplyRequestAuthClaim,
+        max_response_bytes: u32,
+    ) -> Result<Self, ReferenceControlError> {
+        Ok(Self {
+            inner: CanonicalQueryRequestDraftV1::try_new(
+                selector.inner,
+                auth_claim,
+                max_response_bytes,
+            )?,
+        })
+    }
+
+    /// Returns the exact Controller request-auth transcript.
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<ReferenceQuerySigningTranscriptV1, ReferenceControlError> {
+        Ok(ReferenceQuerySigningTranscriptV1 {
+            inner: self.inner.signing_transcript()?,
+        })
+    }
+
+    /// Finalizes the signed canonical PXQR v1 frame.
+    pub fn finalize(
+        self,
+        signature: &[u8],
+    ) -> Result<ReferenceQueryRequestV1, ReferenceControlError> {
+        Ok(ReferenceQueryRequestV1 {
+            inner: self.inner.finalize(signature)?,
+        })
+    }
+}
+
+/// Signed, strict, read-only PXQR v1 request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceQueryRequestV1 {
+    inner: CanonicalQueryRequestV1,
+}
+
+impl ReferenceQueryRequestV1 {
+    /// Strictly decodes exactly the PXQR v1 protocol.
+    pub fn decode(frame: &[u8]) -> Result<Self, ReferenceControlError> {
+        Ok(Self {
+            inner: CanonicalQueryRequestV1::decode(frame)?,
+        })
+    }
+
+    /// Returns the complete decoded selector.
+    #[must_use]
+    pub const fn selector(&self) -> ReferenceQuerySelectorV1 {
+        ReferenceQuerySelectorV1 {
+            inner: self.inner.selector(),
+        }
+    }
+
+    /// Returns the query identity.
+    #[must_use]
+    pub const fn query_id(&self) -> ReferenceQueryIdV1 {
+        ReferenceQueryIdV1 {
+            inner: self.inner.query_id(),
+        }
+    }
+
+    /// Returns the selected Runtime target.
+    #[must_use]
+    pub const fn target(&self) -> RuntimeHostId {
+        self.inner.target()
+    }
+
+    /// Returns the selected desired-state source scope.
+    #[must_use]
+    pub const fn source_scope(&self) -> SourceScopeRef {
+        self.inner.source_scope()
+    }
+
+    /// Returns the expected journal store identity.
+    #[must_use]
+    pub const fn expected_runtime_store_instance_id(&self) -> [u8; 32] {
+        *self.inner.expected_store_instance_id().as_bytes()
+    }
+
+    /// Returns the selected operation identity.
+    #[must_use]
+    pub const fn requested_operation_id(&self) -> ApplyOperationId {
+        self.inner.requested_operation_id()
+    }
+
+    /// Returns the optional exact request digest expectation.
+    #[must_use]
+    pub const fn expected_request_digest(&self) -> Option<Digest32> {
+        self.inner.expected_request_digest()
+    }
+
+    /// Returns the request authentication claim and opaque signature.
+    #[must_use]
+    pub const fn authentication(&self) -> &ApplyRequestAuthentication {
+        self.inner.authentication()
+    }
+
+    /// Returns the Controller-selected canonical response byte bound.
+    #[must_use]
+    pub const fn max_response_bytes(&self) -> u32 {
+        self.inner.max_response_bytes()
+    }
+
+    /// Returns exact canonical PXQR bytes.
+    #[must_use]
+    pub fn canonical_wire(&self) -> &[u8] {
+        self.inner.canonical_wire()
+    }
+
+    /// Returns the domain-separated exact request digest.
+    #[must_use]
+    pub const fn request_digest(&self) -> Digest32 {
+        self.inner.request_digest()
+    }
+
+    /// Reconstructs the exact Controller request-auth transcript.
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<ReferenceQuerySigningTranscriptV1, ReferenceControlError> {
+        Ok(ReferenceQuerySigningTranscriptV1 {
+            inner: self.inner.signing_transcript()?,
+        })
+    }
+
+    /// Fails closed unless the local journal store is the signed expected store.
+    pub fn validate_expected_store(
+        &self,
+        local_runtime_store_instance_id: [u8; 32],
+    ) -> Result<(), ReferenceControlError> {
+        let store = RuntimeStoreInstanceId::try_from_bytes(local_runtime_store_instance_id)?;
+        self.inner.validate_expected_store(store)?;
+        Ok(())
+    }
+}
+
+/// Runtime ownership/readiness state reported with a query result.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReferenceQueryOwnerStateV1 {
+    Operational,
+    ApplyDisabled,
+    OwnershipUncertain,
+}
+
+/// Durable progress marker for one known apply operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReferenceQueryDurablePhaseV1 {
+    PreparedNoEffects,
+    FirstActionIntent,
+    HeadCommittedRetiringOld,
+    Terminal,
+}
+
+/// Exact durable operation lookup result.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReferenceQueryOperationLookupV1 {
+    Known {
+        request_digest: Digest32,
+        durable_phase: ReferenceQueryDurablePhaseV1,
+        terminal_result: Option<ReferenceApplyTerminalResultRefV1>,
+    },
+    Conflict {
+        existing_request_digest: Digest32,
+    },
+    Unknown,
+    Indeterminate {
+        reason: ReferenceOperationalReasonV1,
+    },
+}
+
+/// Validated Runtime ownership state and operation lookup.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReferenceQueryOperationStateV1 {
+    inner: CanonicalQueryOperationStateV1,
+}
+
+impl ReferenceQueryOperationStateV1 {
+    /// Validates owner/reason and lookup/reason consistency.
+    pub fn try_new(
+        owner_state: ReferenceQueryOwnerStateV1,
+        reason: Option<ReferenceOperationalReasonV1>,
+        lookup: ReferenceQueryOperationLookupV1,
+    ) -> Result<Self, ReferenceControlError> {
+        Ok(Self {
+            inner: CanonicalQueryOperationStateV1::try_new(
+                canonical_query_owner_state(owner_state),
+                reason.map(canonical_operational_reason),
+                canonical_query_operation_lookup(lookup)?,
+            )?,
+        })
+    }
+
+    /// Returns Runtime ownership/readiness state.
+    #[must_use]
+    pub const fn owner_state(self) -> ReferenceQueryOwnerStateV1 {
+        public_query_owner_state(self.inner.owner_state())
+    }
+
+    /// Returns the optional stable operational reason.
+    #[must_use]
+    pub const fn reason(self) -> Option<ReferenceOperationalReasonV1> {
+        match self.inner.reason() {
+            Some(reason) => Some(public_operational_reason(reason)),
+            None => None,
+        }
+    }
+
+    /// Returns the exact operation lookup result.
+    #[must_use]
+    pub const fn lookup(self) -> ReferenceQueryOperationLookupV1 {
+        public_query_operation_lookup(self.inner.lookup())
+    }
+}
+
+/// Durable desired head, distinct from current live materialization.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReferenceQueryDesiredHeadV1 {
+    None,
+    OneSourceLoop {
+        source_revision: SourcePlanRevision,
+        target_slice_digest: TargetSliceDigest,
+        manifest_digest: Digest32,
+    },
+    EmptyDeactivate {
+        source_revision: SourcePlanRevision,
+        target_slice_digest: TargetSliceDigest,
+        manifest_digest: Digest32,
+    },
+}
+
+/// Validated desired head and source revision high-water mark.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReferenceQueryDesiredStateV1 {
+    inner: CanonicalDesiredStateV1,
+}
+
+impl ReferenceQueryDesiredStateV1 {
+    /// Validates the desired head and monotonic source revision bound.
+    pub fn try_new(
+        head: ReferenceQueryDesiredHeadV1,
+        source_revision_high_water: SourcePlanRevision,
+    ) -> Result<Self, ReferenceControlError> {
+        Ok(Self {
+            inner: CanonicalDesiredStateV1::try_new(
+                canonical_query_desired_head(head)?,
+                source_revision_high_water,
+            )?,
+        })
+    }
+
+    /// Returns the durable desired head.
+    #[must_use]
+    pub const fn head(self) -> ReferenceQueryDesiredHeadV1 {
+        public_query_desired_head(self.inner.head())
+    }
+
+    /// Returns the monotonic source revision high-water mark.
+    #[must_use]
+    pub const fn source_revision_high_water(self) -> SourcePlanRevision {
+        self.inner.source_revision_high_water()
+    }
+}
+
+/// Current target-local live materialization state.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReferenceQueryLiveStateV1 {
+    NotReady,
+    Recovering,
+    LiveReady,
+    Draining,
+    RecoveryFailedNotReady,
+    ExactZero,
+    ValidatedOperationalQuarantine,
+    Uncertain,
+}
+
+/// Validated live state, generation, observation time and resource census.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReferenceQueryLiveFactsV1 {
+    inner: CanonicalLiveFactsV1,
+}
+
+impl ReferenceQueryLiveFactsV1 {
+    /// Validates the live-state generation matrix and nonzero census digest.
+    pub fn try_new(
+        state: ReferenceQueryLiveStateV1,
+        resource_generation: u64,
+        measured_at: u64,
+        census_digest: Digest32,
+    ) -> Result<Self, ReferenceControlError> {
+        Ok(Self {
+            inner: CanonicalLiveFactsV1::try_new(
+                canonical_query_live_state(state),
+                resource_generation,
+                measured_at,
+                census_digest,
+            )?,
+        })
+    }
+
+    /// Returns the current live materialization state.
+    #[must_use]
+    pub const fn state(self) -> ReferenceQueryLiveStateV1 {
+        public_query_live_state(self.inner.state())
+    }
+
+    /// Returns the target-local resource generation.
+    #[must_use]
+    pub const fn resource_generation(self) -> u64 {
+        self.inner.resource_generation()
+    }
+
+    /// Returns the target-local observation timestamp.
+    #[must_use]
+    pub const fn measured_at(self) -> u64 {
+        self.inner.measured_at()
+    }
+
+    /// Returns the nonzero resource census digest.
+    #[must_use]
+    pub const fn census_digest(self) -> Digest32 {
+        self.inner.census_digest()
+    }
+}
+
+/// Complete validated query facts before response authentication.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReferenceQueryFactsV1 {
+    inner: CanonicalQueryFactsV1,
+}
+
+impl ReferenceQueryFactsV1 {
+    /// Validates cross-shape consistency across serving, operation, desired and live facts.
+    pub fn try_new(
+        serving: ReferenceBootstrapServingIdentityV1,
+        operation: ReferenceQueryOperationStateV1,
+        desired: ReferenceQueryDesiredStateV1,
+        live: ReferenceQueryLiveFactsV1,
+    ) -> Result<Self, ReferenceControlError> {
+        Ok(Self {
+            inner: CanonicalQueryFactsV1::try_new(
+                serving.inner,
+                operation.inner,
+                desired.inner,
+                live.inner,
+            )?,
+        })
+    }
+
+    /// Returns exact Runtime serving identity.
+    #[must_use]
+    pub const fn serving(self) -> ReferenceBootstrapServingIdentityV1 {
+        ReferenceBootstrapServingIdentityV1 {
+            inner: self.inner.serving(),
+        }
+    }
+
+    /// Returns operation lookup and ownership facts.
+    #[must_use]
+    pub const fn operation(self) -> ReferenceQueryOperationStateV1 {
+        ReferenceQueryOperationStateV1 {
+            inner: self.inner.operation(),
+        }
+    }
+
+    /// Returns durable desired-state facts.
+    #[must_use]
+    pub const fn desired(self) -> ReferenceQueryDesiredStateV1 {
+        ReferenceQueryDesiredStateV1 {
+            inner: self.inner.desired(),
+        }
+    }
+
+    /// Returns current live materialization facts.
+    #[must_use]
+    pub const fn live(self) -> ReferenceQueryLiveFactsV1 {
+        ReferenceQueryLiveFactsV1 {
+            inner: self.inner.live(),
+        }
+    }
+}
+
+/// Query responses use the same live-channel signer claim as bootstrap.
+pub type ReferenceQueryResponseAuthClaimV1 = ReferenceBootstrapResponseAuthClaimV1;
+
+/// Signature-independent authenticated PXQS v1 response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceQueryResponseDraftV1 {
+    inner: CanonicalQueryResponseDraftV1,
+}
+
+impl ReferenceQueryResponseDraftV1 {
+    /// Binds one query, validated facts, live channel and response signer.
+    pub fn try_new(
+        request: &ReferenceQueryRequestV1,
+        facts: ReferenceQueryFactsV1,
+        channel: ReferenceChannelBindingV1,
+        auth_claim: ReferenceQueryResponseAuthClaimV1,
+    ) -> Result<Self, ReferenceControlError> {
+        Ok(Self {
+            inner: CanonicalQueryResponseDraftV1::try_new(
+                &request.inner,
+                facts.inner,
+                channel.inner,
+                auth_claim.inner,
+            )?,
+        })
+    }
+
+    /// Returns the exact Runtime response-auth transcript.
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<ReferenceQuerySigningTranscriptV1, ReferenceControlError> {
+        Ok(ReferenceQuerySigningTranscriptV1 {
+            inner: self.inner.signing_transcript()?,
+        })
+    }
+
+    /// Finalizes the signed, response-bound canonical PXQS frame.
+    pub fn finalize(
+        self,
+        signature: &[u8],
+    ) -> Result<ReferenceQueryResponseV1, ReferenceControlError> {
+        Ok(ReferenceQueryResponseV1 {
+            inner: self.inner.finalize(signature)?,
+        })
+    }
+}
+
+/// Signed, strict authenticated PXQS v1 response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceQueryResponseV1 {
+    inner: CanonicalQueryResponseV1,
+}
+
+impl ReferenceQueryResponseV1 {
+    /// Strictly decodes exactly the PXQS v1 protocol.
+    pub fn decode(frame: &[u8]) -> Result<Self, ReferenceControlError> {
+        Ok(Self {
+            inner: CanonicalQueryResponseV1::decode(frame)?,
+        })
+    }
+
+    /// Returns the echoed query identity.
+    #[must_use]
+    pub const fn query_id(&self) -> ReferenceQueryIdV1 {
+        ReferenceQueryIdV1 {
+            inner: self.inner.query_id(),
+        }
+    }
+
+    /// Returns the echoed exact PXQR digest.
+    #[must_use]
+    pub const fn query_request_digest(&self) -> Digest32 {
+        self.inner.query_request_digest()
+    }
+
+    /// Returns the echoed Controller nonce.
+    #[must_use]
+    pub fn client_nonce(&self) -> &[u8] {
+        self.inner.client_nonce()
+    }
+
+    /// Returns decoded Runtime facts. Treat them as untrusted until signature
+    /// verification and `validate_against_request` both succeed.
+    #[must_use]
+    pub const fn facts(&self) -> ReferenceQueryFactsV1 {
+        ReferenceQueryFactsV1 {
+            inner: self.inner.facts(),
+        }
+    }
+
+    /// Returns the response signer Runtime peer.
+    #[must_use]
+    pub const fn authentication_runtime_peer(&self) -> PrincipalRef {
+        self.inner.authentication().claim().runtime_peer()
+    }
+
+    /// Returns the response live-channel binding digest.
+    #[must_use]
+    pub const fn authentication_channel_binding_digest(&self) -> Digest32 {
+        self.inner.authentication().claim().channel_binding_digest()
+    }
+
+    /// Returns the selected response verification-key reference.
+    #[must_use]
+    pub const fn authentication_key(&self) -> ApplyAuthKeyRef {
+        self.inner.authentication().claim().key()
+    }
+
+    /// Returns the response signature algorithm selector.
+    #[must_use]
+    pub const fn authentication_algorithm(&self) -> ApplyAuthAlgorithm {
+        self.inner.authentication().claim().algorithm()
+    }
+
+    /// Returns the response signature algorithm version.
+    #[must_use]
+    pub const fn authentication_algorithm_version(&self) -> u16 {
+        self.inner.authentication().claim().algorithm_version()
+    }
+
+    /// Returns the opaque Runtime response signature.
+    #[must_use]
+    pub fn authentication_signature(&self) -> &[u8] {
+        self.inner.authentication().signature()
+    }
+
+    /// Returns exact canonical PXQS bytes.
+    #[must_use]
+    pub fn canonical_wire(&self) -> &[u8] {
+        self.inner.canonical_wire()
+    }
+
+    /// Returns the domain-separated exact response digest.
+    #[must_use]
+    pub const fn response_digest(&self) -> Digest32 {
+        self.inner.response_digest()
+    }
+
+    /// Reconstructs the exact Runtime response-auth transcript.
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<ReferenceQuerySigningTranscriptV1, ReferenceControlError> {
+        Ok(ReferenceQuerySigningTranscriptV1 {
+            inner: self.inner.signing_transcript()?,
+        })
+    }
+
+    /// Validates echoes, target/store/channel correlation, response bound,
+    /// operation expectation and monotonic freshness against authenticated
+    /// bootstrap serving identity. Signature verification remains caller-owned.
+    pub fn validate_against_request(
+        &self,
+        request: &ReferenceQueryRequestV1,
+        channel: ReferenceChannelBindingV1,
+        serving_baseline: ReferenceBootstrapServingIdentityV1,
+    ) -> Result<ReferenceQueryFactsV1, ReferenceControlError> {
+        self.inner.validate_against_request(
+            &request.inner,
+            channel.inner,
+            serving_baseline.inner,
+        )?;
+        Ok(self.facts())
+    }
+}
+
+const fn canonical_query_owner_state(value: ReferenceQueryOwnerStateV1) -> CanonicalOwnerStateV1 {
+    match value {
+        ReferenceQueryOwnerStateV1::Operational => CanonicalOwnerStateV1::Operational,
+        ReferenceQueryOwnerStateV1::ApplyDisabled => CanonicalOwnerStateV1::ApplyDisabled,
+        ReferenceQueryOwnerStateV1::OwnershipUncertain => CanonicalOwnerStateV1::OwnershipUncertain,
+    }
+}
+
+const fn public_query_owner_state(value: CanonicalOwnerStateV1) -> ReferenceQueryOwnerStateV1 {
+    match value {
+        CanonicalOwnerStateV1::Operational => ReferenceQueryOwnerStateV1::Operational,
+        CanonicalOwnerStateV1::ApplyDisabled => ReferenceQueryOwnerStateV1::ApplyDisabled,
+        CanonicalOwnerStateV1::OwnershipUncertain => ReferenceQueryOwnerStateV1::OwnershipUncertain,
+    }
+}
+
+const fn canonical_query_durable_phase(
+    value: ReferenceQueryDurablePhaseV1,
+) -> CanonicalOperationDurablePhaseV1 {
+    match value {
+        ReferenceQueryDurablePhaseV1::PreparedNoEffects => {
+            CanonicalOperationDurablePhaseV1::PreparedNoEffects
+        }
+        ReferenceQueryDurablePhaseV1::FirstActionIntent => {
+            CanonicalOperationDurablePhaseV1::FirstActionIntent
+        }
+        ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld => {
+            CanonicalOperationDurablePhaseV1::HeadCommittedRetiringOld
+        }
+        ReferenceQueryDurablePhaseV1::Terminal => CanonicalOperationDurablePhaseV1::Terminal,
+    }
+}
+
+const fn public_query_durable_phase(
+    value: CanonicalOperationDurablePhaseV1,
+) -> ReferenceQueryDurablePhaseV1 {
+    match value {
+        CanonicalOperationDurablePhaseV1::PreparedNoEffects => {
+            ReferenceQueryDurablePhaseV1::PreparedNoEffects
+        }
+        CanonicalOperationDurablePhaseV1::FirstActionIntent => {
+            ReferenceQueryDurablePhaseV1::FirstActionIntent
+        }
+        CanonicalOperationDurablePhaseV1::HeadCommittedRetiringOld => {
+            ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld
+        }
+        CanonicalOperationDurablePhaseV1::Terminal => ReferenceQueryDurablePhaseV1::Terminal,
+    }
+}
+
+fn canonical_query_operation_lookup(
+    value: ReferenceQueryOperationLookupV1,
+) -> Result<CanonicalOperationLookupV1, ReferenceControlError> {
+    Ok(match value {
+        ReferenceQueryOperationLookupV1::Known {
+            request_digest,
+            durable_phase,
+            terminal_result,
+        } => CanonicalOperationLookupV1::try_known(
+            request_digest,
+            canonical_query_durable_phase(durable_phase),
+            terminal_result.map(|reference| reference.inner),
+        )?,
+        ReferenceQueryOperationLookupV1::Conflict {
+            existing_request_digest,
+        } => CanonicalOperationLookupV1::try_conflict(existing_request_digest)?,
+        ReferenceQueryOperationLookupV1::Unknown => CanonicalOperationLookupV1::Unknown,
+        ReferenceQueryOperationLookupV1::Indeterminate { reason } => {
+            CanonicalOperationLookupV1::indeterminate(canonical_operational_reason(reason))
+        }
+    })
+}
+
+const fn public_query_operation_lookup(
+    value: CanonicalOperationLookupV1,
+) -> ReferenceQueryOperationLookupV1 {
+    match value {
+        CanonicalOperationLookupV1::Known {
+            request_digest,
+            durable_phase,
+            terminal_result,
+        } => ReferenceQueryOperationLookupV1::Known {
+            request_digest,
+            durable_phase: public_query_durable_phase(durable_phase),
+            terminal_result: match terminal_result {
+                Some(inner) => Some(ReferenceApplyTerminalResultRefV1 { inner }),
+                None => None,
+            },
+        },
+        CanonicalOperationLookupV1::Conflict {
+            existing_request_digest,
+        } => ReferenceQueryOperationLookupV1::Conflict {
+            existing_request_digest,
+        },
+        CanonicalOperationLookupV1::Unknown => ReferenceQueryOperationLookupV1::Unknown,
+        CanonicalOperationLookupV1::Indeterminate { reason } => {
+            ReferenceQueryOperationLookupV1::Indeterminate {
+                reason: public_operational_reason(reason),
+            }
+        }
+    }
+}
+
+fn canonical_query_desired_head(
+    value: ReferenceQueryDesiredHeadV1,
+) -> Result<CanonicalDesiredHeadV1, ReferenceControlError> {
+    Ok(match value {
+        ReferenceQueryDesiredHeadV1::None => CanonicalDesiredHeadV1::None,
+        ReferenceQueryDesiredHeadV1::OneSourceLoop {
+            source_revision,
+            target_slice_digest,
+            manifest_digest,
+        } => CanonicalDesiredHeadV1::try_one_source_loop(
+            source_revision,
+            *target_slice_digest.value(),
+            manifest_digest,
+        )?,
+        ReferenceQueryDesiredHeadV1::EmptyDeactivate {
+            source_revision,
+            target_slice_digest,
+            manifest_digest,
+        } => CanonicalDesiredHeadV1::try_empty_deactivate(
+            source_revision,
+            *target_slice_digest.value(),
+            manifest_digest,
+        )?,
+    })
+}
+
+const fn public_query_desired_head(value: CanonicalDesiredHeadV1) -> ReferenceQueryDesiredHeadV1 {
+    match value {
+        CanonicalDesiredHeadV1::None => ReferenceQueryDesiredHeadV1::None,
+        CanonicalDesiredHeadV1::OneSourceLoop {
+            source_revision,
+            target_slice_digest,
+            manifest_digest,
+        } => ReferenceQueryDesiredHeadV1::OneSourceLoop {
+            source_revision,
+            target_slice_digest: TargetSliceDigest::new(target_slice_digest),
+            manifest_digest,
+        },
+        CanonicalDesiredHeadV1::EmptyDeactivate {
+            source_revision,
+            target_slice_digest,
+            manifest_digest,
+        } => ReferenceQueryDesiredHeadV1::EmptyDeactivate {
+            source_revision,
+            target_slice_digest: TargetSliceDigest::new(target_slice_digest),
+            manifest_digest,
+        },
+    }
+}
+
+const fn canonical_query_live_state(value: ReferenceQueryLiveStateV1) -> CanonicalLiveStateV1 {
+    match value {
+        ReferenceQueryLiveStateV1::NotReady => CanonicalLiveStateV1::NotReady,
+        ReferenceQueryLiveStateV1::Recovering => CanonicalLiveStateV1::Recovering,
+        ReferenceQueryLiveStateV1::LiveReady => CanonicalLiveStateV1::LiveReady,
+        ReferenceQueryLiveStateV1::Draining => CanonicalLiveStateV1::Draining,
+        ReferenceQueryLiveStateV1::RecoveryFailedNotReady => {
+            CanonicalLiveStateV1::RecoveryFailedNotReady
+        }
+        ReferenceQueryLiveStateV1::ExactZero => CanonicalLiveStateV1::ExactZero,
+        ReferenceQueryLiveStateV1::ValidatedOperationalQuarantine => {
+            CanonicalLiveStateV1::ValidatedOperationalQuarantine
+        }
+        ReferenceQueryLiveStateV1::Uncertain => CanonicalLiveStateV1::Uncertain,
+    }
+}
+
+const fn public_query_live_state(value: CanonicalLiveStateV1) -> ReferenceQueryLiveStateV1 {
+    match value {
+        CanonicalLiveStateV1::NotReady => ReferenceQueryLiveStateV1::NotReady,
+        CanonicalLiveStateV1::Recovering => ReferenceQueryLiveStateV1::Recovering,
+        CanonicalLiveStateV1::LiveReady => ReferenceQueryLiveStateV1::LiveReady,
+        CanonicalLiveStateV1::Draining => ReferenceQueryLiveStateV1::Draining,
+        CanonicalLiveStateV1::RecoveryFailedNotReady => {
+            ReferenceQueryLiveStateV1::RecoveryFailedNotReady
+        }
+        CanonicalLiveStateV1::ExactZero => ReferenceQueryLiveStateV1::ExactZero,
+        CanonicalLiveStateV1::ValidatedOperationalQuarantine => {
+            ReferenceQueryLiveStateV1::ValidatedOperationalQuarantine
+        }
+        CanonicalLiveStateV1::Uncertain => ReferenceQueryLiveStateV1::Uncertain,
+    }
+}
+
 const fn canonical_bootstrap_state(value: ReferenceBootstrapStateV1) -> CanonicalBootstrapStateV1 {
     match value {
         ReferenceBootstrapStateV1::ReadyForApply => CanonicalBootstrapStateV1::ReadyForApply,
@@ -2850,6 +3753,17 @@ mod tests {
         RuntimeCompiledInstallationFactsV1,
     ) {
         let compiled = compiled_facts();
+        installation_for(TARGET, compiled)
+    }
+
+    fn installation_for(
+        target: RuntimeHostId,
+        compiled: RuntimeCompiledInstallationFactsV1,
+    ) -> (
+        VerifiedRuntimeInstallationV1,
+        VerifiedRuntimeManifestIngressV1,
+        RuntimeCompiledInstallationFactsV1,
+    ) {
         let artifact = InstalledRuntimeArtifactObservationV1::try_new(
             1_048_576,
             Digest32::from_bytes([0x47; 32]),
@@ -2861,7 +3775,7 @@ mod tests {
         let installation = generate_manifest(
             descriptor.canonical_wire(),
             descriptor.descriptor_digest(),
-            TARGET,
+            target,
             &artifact,
             compiled,
         )
@@ -3012,6 +3926,9 @@ mod tests {
         assert_eq!(REFERENCE_RUNTIME_APPLY_REQUEST_VERSION, 5);
         assert_eq!(REFERENCE_RUNTIME_APPLY_ENVELOPE_VERSION, 2);
         assert_eq!(REFERENCE_BOOTSTRAP_VERSION, 1);
+        assert_eq!(REFERENCE_QUERY_VERSION, 1);
+        assert_eq!(REFERENCE_QUERY_SIGNING_TRANSCRIPT_VERSION, 1);
+        assert_eq!(REFERENCE_QUERY_RECORD_COUNT, 1);
         assert_eq!(REFERENCE_APPLY_TERMINAL_RECEIPT_VERSION, 1);
         assert_eq!(
             REFERENCE_APPLY_TERMINAL_RECEIPT_SIGNING_TRANSCRIPT_VERSION,
@@ -3022,6 +3939,10 @@ mod tests {
         assert_eq!(MAX_REFERENCE_APPLY_AUTH_SIGNATURE_BYTES, 512);
         assert_eq!(MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES, 1024);
         assert_eq!(MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES, 2048);
+        assert_eq!(MAX_REFERENCE_QUERY_REQUEST_BYTES, 1024);
+        assert_eq!(MAX_REFERENCE_QUERY_RESPONSE_BYTES, 2048);
+        assert_eq!(MAX_REFERENCE_QUERY_NONCE_BYTES, 64);
+        assert_eq!(MAX_REFERENCE_QUERY_SIGNATURE_BYTES, 512);
         assert_eq!(MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, 2048);
         assert_eq!(MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_SIGNATURE_BYTES, 512);
         assert_eq!(REFERENCE_PROFILE_LIFECYCLE_CONCURRENCY, 1);
@@ -3770,5 +4691,546 @@ mod tests {
         )
         .expect("wrong channel");
         assert_ne!(channel.binding_digest(), wrong_channel.binding_digest());
+    }
+
+    #[test]
+    fn durable_slice_restores_only_with_exact_journal_provenance_and_manifest() {
+        let (_, ingress, _) = installation();
+        let request = apply_request(
+            ReferenceAssemblyModeV1::OneSourceLoop,
+            b"durable-slice-request",
+        );
+        let durable_bytes = request.canonical_slice_wire().to_vec();
+        let restored = verify_reference_durable_slice_v1(
+            &durable_bytes,
+            request.provenance(),
+            request.target_slice_digest(),
+            &ingress,
+        )
+        .expect("strict durable Slice restore");
+        assert_eq!(restored, request.target_execution());
+        assert_eq!(durable_bytes, request.canonical_slice_wire());
+
+        let wrong_provenance = PlanProvenance::new(
+            SCOPE,
+            SourcePlanRef::from_bytes([0xee; 16]),
+            SourcePlanRevision::new(7),
+            SourcePlanDigest::new(Digest32::from_bytes([0x62; 32])),
+        );
+        assert_eq!(
+            verify_reference_durable_slice_v1(
+                &durable_bytes,
+                wrong_provenance,
+                request.target_slice_digest(),
+                &ingress,
+            ),
+            Err(ReferenceControlError::Wire(ReferenceControlWireError {
+                code: ReferenceControlWireErrorCode::DigestMismatch,
+                detail: Some(8),
+            }))
+        );
+
+        let mut wrong_binding = durable_bytes.clone();
+        wrong_binding[0] ^= 1;
+        assert_eq!(
+            verify_reference_durable_slice_v1(
+                &wrong_binding,
+                request.provenance(),
+                request.target_slice_digest(),
+                &ingress,
+            ),
+            Err(ReferenceControlError::Wire(ReferenceControlWireError {
+                code: ReferenceControlWireErrorCode::BindingNotAllowed,
+                detail: Some(2),
+            }))
+        );
+        assert!(matches!(
+            verify_reference_durable_slice_v1(
+                &durable_bytes[..9],
+                request.provenance(),
+                request.target_slice_digest(),
+                &ingress,
+            ),
+            Err(ReferenceControlError::Wire(ReferenceControlWireError {
+                code: ReferenceControlWireErrorCode::Truncated,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            verify_reference_durable_slice_v1(
+                &durable_bytes,
+                request.provenance(),
+                TargetSliceDigest::new(Digest32::from_bytes([0xef; 32])),
+                &ingress,
+            ),
+            Err(ReferenceControlError::Wire(ReferenceControlWireError {
+                code: ReferenceControlWireErrorCode::DigestMismatch,
+                detail: Some(8),
+            }))
+        ));
+
+        // PXTA/PXTE deliberately carries no SourcePlanRef. A journal migration
+        // missing complete provenance must fail closed instead of synthesizing it.
+        let missing_provenance_substitute = PlanProvenance::new(
+            SourceScopeRef::from_bytes([0; 16]),
+            SourcePlanRef::from_bytes([0; 16]),
+            SourcePlanRevision::new(0),
+            SourcePlanDigest::new(Digest32::from_bytes([0; 32])),
+        );
+        assert!(
+            verify_reference_durable_slice_v1(
+                &durable_bytes,
+                missing_provenance_substitute,
+                request.target_slice_digest(),
+                &ingress,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn durable_slice_empty_restore_and_public_maximum_are_exact() {
+        let (_, ingress, _) = installation();
+        let empty = apply_request(
+            ReferenceAssemblyModeV1::EmptyDeactivate,
+            b"durable-empty-request",
+        );
+        let restored = verify_reference_durable_slice_v1(
+            empty.canonical_slice_wire(),
+            empty.provenance(),
+            empty.target_slice_digest(),
+            &ingress,
+        )
+        .expect("strict empty durable Slice restore");
+        assert_eq!(restored.mode(), ReferenceAssemblyModeV1::EmptyDeactivate);
+        assert_eq!(restored.loop_facts(), None);
+
+        let maximal = apply_request(
+            ReferenceAssemblyModeV1::OneSourceLoop,
+            b"durable-max-request",
+        );
+        let execution_bytes = maximal.target_execution().canonical_wire().len();
+        let zero_pxta_bytes = maximal.canonical_slice_wire().len() - execution_bytes;
+        assert_eq!(execution_bytes, MAX_REFERENCE_TARGET_EXECUTION_BYTES);
+        assert_eq!(
+            MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES,
+            zero_pxta_bytes + MAX_REFERENCE_TARGET_EXECUTION_BYTES
+        );
+        assert_eq!(
+            maximal.canonical_slice_wire().len(),
+            MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES
+        );
+        assert!(empty.canonical_slice_wire().len() < MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES);
+    }
+
+    #[test]
+    fn durable_slice_rejects_wrong_target_manifest_identity_and_profile() {
+        let (_, ingress, _) = installation();
+        let request = apply_request(
+            ReferenceAssemblyModeV1::OneSourceLoop,
+            b"durable-manifest-request",
+        );
+
+        let wrong_target = RuntimeHostId::from_bytes([0xf1; 16]);
+        let (_, wrong_target_ingress, _) = installation_for(wrong_target, compiled_facts());
+        assert_eq!(
+            verify_reference_durable_slice_v1(
+                request.canonical_slice_wire(),
+                request.provenance(),
+                request.target_slice_digest(),
+                &wrong_target_ingress,
+            ),
+            Err(ReferenceControlError::Wire(ReferenceControlWireError {
+                code: ReferenceControlWireErrorCode::TargetMismatch,
+                detail: Some(2),
+            }))
+        );
+
+        let identity_compiled = RuntimeCompiledInstallationFactsV1::try_new(
+            [0xf2; 32],
+            CardDefinitionRef::from_bytes([0x42; 16]),
+            CardImplementationRef::from_bytes([0x43; 16]),
+            [0x44; 16],
+            Digest32::from_bytes([0x45; 32]),
+            Digest32::from_bytes([0x46; 32]),
+        )
+        .expect("alternate build identity");
+        let (_, wrong_identity_ingress, _) = installation_for(TARGET, identity_compiled);
+        assert_ne!(
+            wrong_identity_ingress.manifest_digest(),
+            ingress.manifest_digest()
+        );
+        assert_eq!(
+            wrong_identity_ingress.profile_fingerprint(),
+            ingress.profile_fingerprint()
+        );
+        assert_eq!(
+            verify_reference_durable_slice_v1(
+                request.canonical_slice_wire(),
+                request.provenance(),
+                request.target_slice_digest(),
+                &wrong_identity_ingress,
+            ),
+            Err(ReferenceControlError::Contract(
+                ReferenceControlContractErrorCode::InvalidCompatibility
+            ))
+        );
+
+        let profile_compiled = RuntimeCompiledInstallationFactsV1::try_new(
+            [0x41; 32],
+            CardDefinitionRef::from_bytes([0xf3; 16]),
+            CardImplementationRef::from_bytes([0x43; 16]),
+            [0x44; 16],
+            Digest32::from_bytes([0x45; 32]),
+            Digest32::from_bytes([0x46; 32]),
+        )
+        .expect("alternate fixture profile");
+        let (_, wrong_profile_ingress, _) = installation_for(TARGET, profile_compiled);
+        assert_ne!(
+            wrong_profile_ingress.profile_fingerprint(),
+            ingress.profile_fingerprint()
+        );
+        assert_eq!(
+            verify_reference_durable_slice_v1(
+                request.canonical_slice_wire(),
+                request.provenance(),
+                request.target_slice_digest(),
+                &wrong_profile_ingress,
+            ),
+            Err(ReferenceControlError::Contract(
+                ReferenceControlContractErrorCode::InvalidCompatibility
+            ))
+        );
+    }
+
+    #[test]
+    fn durable_slice_multi_invalid_precedence_is_frozen() {
+        let (_, ingress, _) = installation();
+        let (_, wrong_target_ingress, _) =
+            installation_for(RuntimeHostId::from_bytes([0xf4; 16]), compiled_facts());
+        let request = apply_request(
+            ReferenceAssemblyModeV1::EmptyDeactivate,
+            b"durable-precedence-request",
+        );
+        let canonical = request.canonical_slice_wire().to_vec();
+        let wrong_digest = TargetSliceDigest::new(Digest32::from_bytes([0xf5; 32]));
+
+        let mut binding_target_digest_trailing = canonical.clone();
+        binding_target_digest_trailing[0] ^= 1;
+        binding_target_digest_trailing.push(0);
+        let mut target_digest_trailing = canonical.clone();
+        target_digest_trailing.push(0);
+        let mut binding_digest = canonical.clone();
+        binding_digest[0] ^= 1;
+
+        let cases = [
+            (
+                "binding precedes target, digest, and trailing",
+                binding_target_digest_trailing.as_slice(),
+                &wrong_target_ingress,
+                wrong_digest,
+                ReferenceControlWireErrorCode::BindingNotAllowed,
+                Some(2),
+            ),
+            (
+                "trailing precedes target and digest",
+                target_digest_trailing.as_slice(),
+                &wrong_target_ingress,
+                wrong_digest,
+                ReferenceControlWireErrorCode::TrailingBytes,
+                None,
+            ),
+            (
+                "target precedes digest",
+                canonical.as_slice(),
+                &wrong_target_ingress,
+                wrong_digest,
+                ReferenceControlWireErrorCode::TargetMismatch,
+                Some(2),
+            ),
+            (
+                "binding precedes digest",
+                binding_digest.as_slice(),
+                &ingress,
+                wrong_digest,
+                ReferenceControlWireErrorCode::BindingNotAllowed,
+                Some(2),
+            ),
+            (
+                "digest is reported after canonical body and target",
+                canonical.as_slice(),
+                &ingress,
+                wrong_digest,
+                ReferenceControlWireErrorCode::DigestMismatch,
+                Some(8),
+            ),
+        ];
+
+        for (name, frame, manifest, digest, code, detail) in cases {
+            assert_eq!(
+                verify_reference_durable_slice_v1(frame, request.provenance(), digest, manifest,),
+                Err(ReferenceControlError::Wire(ReferenceControlWireError {
+                    code,
+                    detail,
+                })),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_query_facade_round_trips_and_validates_freshness() {
+        let (_, ingress, _) = installation();
+        let apply = apply_request(ReferenceAssemblyModeV1::OneSourceLoop, b"queried-apply");
+        let expected_request_digest = apply.envelope_request_digest();
+        let selector = ReferenceQuerySelectorV1::try_new(
+            ReferenceQueryIdV1::from_bytes([0xd1; 16]),
+            TARGET,
+            SCOPE,
+            STORE,
+            ApplyOperationId::from_bytes([0x54; 16]),
+            Some(expected_request_digest),
+        )
+        .expect("query selector");
+        let request_draft = ReferenceQueryRequestDraftV1::try_new(
+            selector,
+            request_auth(b"query-client-nonce"),
+            MAX_REFERENCE_QUERY_RESPONSE_BYTES as u32,
+        )
+        .expect("query request draft");
+        let request_transcript = request_draft
+            .signing_transcript()
+            .expect("query request transcript")
+            .as_bytes()
+            .to_vec();
+        let request = request_draft
+            .finalize(b"controller-query-signature")
+            .expect("query request");
+        let decoded_request =
+            ReferenceQueryRequestV1::decode(request.canonical_wire()).expect("strict PXQR decode");
+        assert_eq!(decoded_request.selector(), selector);
+        assert_eq!(decoded_request.source_scope(), SCOPE);
+        assert_eq!(decoded_request.expected_runtime_store_instance_id(), STORE);
+        assert_eq!(
+            decoded_request.expected_request_digest(),
+            Some(expected_request_digest)
+        );
+        assert_eq!(
+            decoded_request.authentication().signature(),
+            b"controller-query-signature"
+        );
+        assert_eq!(
+            decoded_request
+                .signing_transcript()
+                .expect("decoded PXQR transcript")
+                .as_bytes(),
+            request_transcript
+        );
+        decoded_request
+            .validate_expected_store(STORE)
+            .expect("query expected store");
+
+        let clock_domain = ClockDomainRef::from_bytes([0xd2; 16]);
+        let clock_generation = ClockGeneration::try_new(5).expect("query clock generation");
+        let serving = ReferenceBootstrapServingIdentityV1::try_new(
+            TARGET,
+            STORE,
+            11,
+            12,
+            clock_domain,
+            clock_generation,
+        )
+        .expect("query serving identity");
+        let operation = ReferenceQueryOperationStateV1::try_new(
+            ReferenceQueryOwnerStateV1::Operational,
+            None,
+            ReferenceQueryOperationLookupV1::Known {
+                request_digest: expected_request_digest,
+                durable_phase: ReferenceQueryDurablePhaseV1::FirstActionIntent,
+                terminal_result: None,
+            },
+        )
+        .expect("query operation state");
+        let desired = ReferenceQueryDesiredStateV1::try_new(
+            ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                source_revision: SourcePlanRevision::new(7),
+                target_slice_digest: apply.target_slice_digest(),
+                manifest_digest: ingress.manifest_digest(),
+            },
+            SourcePlanRevision::new(8),
+        )
+        .expect("query desired state");
+        let live = ReferenceQueryLiveFactsV1::try_new(
+            ReferenceQueryLiveStateV1::LiveReady,
+            4,
+            50_000,
+            Digest32::from_bytes([0xd3; 32]),
+        )
+        .expect("query live facts");
+        let facts = ReferenceQueryFactsV1::try_new(serving, operation, desired, live)
+            .expect("complete query facts");
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            PrincipalRef::from_bytes([0xd4; 16]),
+            Digest32::from_bytes([0xd5; 32]),
+            Digest32::from_bytes([0xd6; 32]),
+        )
+        .expect("query channel");
+        let response_claim = ReferenceQueryResponseAuthClaimV1::try_new(
+            channel,
+            ApplyAuthKeyRef::from_bytes([0xd7; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("query response algorithm"),
+            1,
+        )
+        .expect("query response claim");
+        let response_draft = ReferenceQueryResponseDraftV1::try_new(
+            &decoded_request,
+            facts,
+            channel,
+            response_claim,
+        )
+        .expect("query response draft");
+        let response_transcript = response_draft
+            .signing_transcript()
+            .expect("query response transcript")
+            .as_bytes()
+            .to_vec();
+        let response = response_draft
+            .finalize(b"runtime-query-signature")
+            .expect("query response");
+        let decoded = ReferenceQueryResponseV1::decode(response.canonical_wire())
+            .expect("strict PXQS decode");
+        assert_eq!(decoded.query_id(), selector.query_id());
+        assert_eq!(
+            decoded.query_request_digest(),
+            decoded_request.request_digest()
+        );
+        assert_eq!(decoded.client_nonce(), b"query-client-nonce");
+        assert_eq!(
+            decoded.authentication_signature(),
+            b"runtime-query-signature"
+        );
+        assert_eq!(
+            decoded
+                .signing_transcript()
+                .expect("decoded PXQS transcript")
+                .as_bytes(),
+            response_transcript
+        );
+        let verified = decoded
+            .validate_against_request(&decoded_request, channel, serving)
+            .expect("query echo, channel, expectation and freshness");
+        assert_eq!(verified.operation(), operation);
+        assert_eq!(verified.desired(), desired);
+        assert_eq!(verified.live(), live);
+
+        let newer_baseline = ReferenceBootstrapServingIdentityV1::try_new(
+            TARGET,
+            STORE,
+            12,
+            12,
+            clock_domain,
+            clock_generation,
+        )
+        .expect("newer baseline");
+        assert!(matches!(
+            decoded.validate_against_request(&decoded_request, channel, newer_baseline),
+            Err(ReferenceControlError::Wire(ReferenceControlWireError {
+                code: ReferenceControlWireErrorCode::CrossReferenceMismatch,
+                detail: Some(6),
+            }))
+        ));
+    }
+
+    #[test]
+    fn query_public_constructors_reject_invalid_operation_and_live_shapes() {
+        let zero = Digest32::from_bytes([0; 32]);
+        assert!(
+            ReferenceQuerySelectorV1::try_new(
+                ReferenceQueryIdV1::from_bytes([0xe1; 16]),
+                TARGET,
+                SCOPE,
+                STORE,
+                ApplyOperationId::from_bytes([0xe2; 16]),
+                Some(zero),
+            )
+            .is_err()
+        );
+        assert!(
+            ReferenceQueryOperationStateV1::try_new(
+                ReferenceQueryOwnerStateV1::Operational,
+                None,
+                ReferenceQueryOperationLookupV1::Known {
+                    request_digest: Digest32::from_bytes([0xe3; 32]),
+                    durable_phase: ReferenceQueryDurablePhaseV1::Terminal,
+                    terminal_result: None,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            ReferenceQueryOperationStateV1::try_new(
+                ReferenceQueryOwnerStateV1::Operational,
+                Some(ReferenceOperationalReasonV1::Recovering),
+                ReferenceQueryOperationLookupV1::Unknown,
+            )
+            .is_err()
+        );
+        assert!(
+            ReferenceQueryLiveFactsV1::try_new(
+                ReferenceQueryLiveStateV1::LiveReady,
+                0,
+                1,
+                Digest32::from_bytes([0xe4; 32]),
+            )
+            .is_err()
+        );
+        assert!(
+            ReferenceQueryLiveFactsV1::try_new(
+                ReferenceQueryLiveStateV1::ExactZero,
+                1,
+                1,
+                Digest32::from_bytes([0xe5; 32]),
+            )
+            .is_err()
+        );
+
+        let serving = ReferenceBootstrapServingIdentityV1::try_new(
+            TARGET,
+            STORE,
+            1,
+            1,
+            ClockDomainRef::from_bytes([0xe6; 16]),
+            ClockGeneration::try_new(1).expect("clock generation"),
+        )
+        .expect("serving");
+        let operation = ReferenceQueryOperationStateV1::try_new(
+            ReferenceQueryOwnerStateV1::Operational,
+            None,
+            ReferenceQueryOperationLookupV1::Unknown,
+        )
+        .expect("operation");
+        let desired = ReferenceQueryDesiredStateV1::try_new(
+            ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                source_revision: SourcePlanRevision::new(1),
+                target_slice_digest: TargetSliceDigest::new(Digest32::from_bytes([0xe7; 32])),
+                manifest_digest: Digest32::from_bytes([0xe8; 32]),
+            },
+            SourcePlanRevision::new(1),
+        )
+        .expect("desired");
+        let exact_zero = ReferenceQueryLiveFactsV1::try_new(
+            ReferenceQueryLiveStateV1::ExactZero,
+            0,
+            1,
+            Digest32::from_bytes([0xe9; 32]),
+        )
+        .expect("exact-zero facts");
+        assert_eq!(
+            ReferenceQueryFactsV1::try_new(serving, operation, desired, exact_zero),
+            Err(ReferenceControlError::Contract(
+                ReferenceControlContractErrorCode::InvalidShape
+            ))
+        );
     }
 }

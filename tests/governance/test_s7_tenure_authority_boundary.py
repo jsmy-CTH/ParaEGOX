@@ -197,6 +197,35 @@ def test_authority_cli_has_no_environment_secret_or_production_test_backdoor() -
     assert "AcquireTenureResponseV1" not in binary
 
 
+def test_s7_f_query_contracts_are_registered_without_claiming_an_endpoint() -> None:
+    governance = _load_toml(REPO_ROOT / "governance.toml")["registry"]
+    package = next(
+        package
+        for package in governance["packages"]
+        if package.get("cargo_package") == "paraegox-runtime-contracts"
+    )
+    assert "canonical authenticated PXQR/PXQS query owner" in package["responsibility"]
+    assert "never infers a missing `SourcePlanRef`" in package["responsibility"]
+    assert "do not by themselves create a Runtime query endpoint" in package["responsibility"]
+
+    api = next(
+        row
+        for row in governance["public_apis"]
+        if row["module"] == "paraegox_runtime_contracts::reference_control"
+    )
+    symbols = {str(symbol) for symbol in api["symbols"]}
+    assert {
+        "REFERENCE_QUERY_VERSION",
+        "MAX_REFERENCE_RUNTIME_PLAN_SLICE_BYTES",
+        "verify_reference_durable_slice_v1",
+        "ReferenceQueryRequestV1",
+        "ReferenceQueryResponseV1",
+        "ReferenceQueryFactsV1",
+    }.issubset(symbols)
+    assert "cannot recover or fabricate missing provenance" in api["compatibility"]
+    assert "do not claim that a Runtime endpoint" in api["compatibility"]
+
+
 def test_exact_process_binaries_are_thin_and_runtime_control_stays_behind_runtimehost() -> None:
     binaries = sorted(path.name for path in (DEPLOYMENT_SRC / "bin").glob("*.rs"))
     assert binaries == ["paraegox-deploymentd.rs", "paraegox-tenure-authority.rs"]
