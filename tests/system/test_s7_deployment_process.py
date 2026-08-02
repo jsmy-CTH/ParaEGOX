@@ -54,6 +54,7 @@ OPERATION_ID = bytes.fromhex("76" * 16)
 AUTHORITY_SERVICE_PRINCIPAL = bytes.fromhex("77" * 16)
 AUTHORITY_OWNER_ID = bytes.fromhex("78" * 16)
 EMPTY_OPERATION_ID = bytes.fromhex("7b" * 16)
+REFERENCE_LIFECYCLE_BUDGET_NANOS = 1_000_000_000
 
 
 @dataclass(frozen=True)
@@ -124,9 +125,9 @@ class InstalledControllerProfile:
             CARD_USE_KEY.hex(),
             str(definition_version),
             operation_id.hex(),
-            "10",
-            "20",
-            "30",
+            str(REFERENCE_LIFECYCLE_BUDGET_NANOS),
+            str(REFERENCE_LIFECYCLE_BUDGET_NANOS),
+            str(REFERENCE_LIFECYCLE_BUDGET_NANOS),
         ]
 
     def bootstrap_command(self, store_instance_id: bytes) -> list[str]:
@@ -893,9 +894,9 @@ def test_real_deployment_process_initializes_commits_replays_and_rejects_conflic
     assert initialized_snapshot[14:46] == store_instance_id
     assert int.from_bytes(initialized_snapshot[78:86], "big") == 1
 
-    committed = _run_controller(
-        profile.commit_command(store_instance_id, definition_version=7), profile
-    )
+    commit_command = profile.commit_command(store_instance_id, definition_version=7)
+    assert commit_command[-3:] == [str(REFERENCE_LIFECYCLE_BUDGET_NANOS)] * 3
+    committed = _run_controller(commit_command, profile)
     assert committed.returncode == 0, committed.stdout + committed.stderr
     assert committed.stderr == ""
     commit = _receipt(committed.stdout, "controller_commit_reference_loop_v1")

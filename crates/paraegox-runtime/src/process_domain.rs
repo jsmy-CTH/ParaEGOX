@@ -2097,6 +2097,19 @@ mod tests {
                 side_effect,
                 WorkerRuntimeKind::Python,
                 RuntimeVersionRange::try_new(3, 11, 3, 14).expect("runtime range"),
+                100,
+            )
+        }
+
+        fn new_with_cleanup_budget(
+            side_effect: SideEffectClass,
+            cleanup_budget_milliseconds: u64,
+        ) -> Self {
+            Self::new_for_runtime(
+                side_effect,
+                WorkerRuntimeKind::Python,
+                RuntimeVersionRange::try_new(3, 11, 3, 14).expect("runtime range"),
+                cleanup_budget_milliseconds,
             )
         }
 
@@ -2104,6 +2117,7 @@ mod tests {
             side_effect: SideEffectClass,
             runtime_kind: WorkerRuntimeKind,
             runtime_versions: RuntimeVersionRange,
+            cleanup_budget_milliseconds: u64,
         ) -> Self {
             let domain = ProcessDomainRef::from_bytes([0x71; 16]);
             let profiles = ProcessProfileSelections::new(
@@ -2133,7 +2147,7 @@ mod tests {
                 duration_ms(100),
                 duration_ms(30),
                 duration_ms(500),
-                duration_ms(100),
+                duration_ms(cleanup_budget_milliseconds),
             )
             .expect("shutdown budgets");
             let desired = ProcessDomainSpec::try_new(
@@ -2484,6 +2498,7 @@ mod tests {
             side_effect,
             WorkerRuntimeKind::NativeExecutable,
             RuntimeVersionRange::try_new(1, 0, 1, 0).expect("native runtime range"),
+            100,
         );
         fixture.worker_digest = Digest32::from_bytes([0x52; 32]);
         fixture
@@ -2807,7 +2822,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn idle_process_loss_is_detected_and_effect_free_domain_restarts_fresh() {
         let area = TestArea::create();
-        let fixture = DomainFixture::new(SideEffectClass::EffectFree);
+        // This scenario proves loss detection and fresh-generation restart. Give
+        // filesystem cleanup a host-load-tolerant envelope; deadline rejection
+        // remains covered by `terminal_payload_owner_blocks_exact_zero_until_dropped`.
+        let fixture = DomainFixture::new_with_cleanup_budget(SideEffectClass::EffectFree, 1_000);
         let mut domain =
             ProcessDomain::start(fixture.start(&area, WorkerDialogue::HeartbeatThenKilled))
                 .await
@@ -2843,10 +2861,11 @@ mod tests {
             .shutdown(StopReason::ProtocolFailure)
             .await
             .expect("lost generation should clean before restart");
-        assert!(matches!(
-            domain.recovery().phase(),
-            RecoveryPhase::Backoff { .. }
-        ));
+        assert!(
+            matches!(domain.recovery().phase(), RecoveryPhase::Backoff { .. }),
+            "cleaned effect-free generation should enter backoff, got {:?}",
+            domain.recovery().phase()
+        );
 
         let next_identity = ProcessGenerationIdentity::new(
             fixture.identity.runtime_host(),
