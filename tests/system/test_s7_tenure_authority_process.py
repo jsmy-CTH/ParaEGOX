@@ -44,6 +44,9 @@ REQUEST_FIELD_COUNT = 12
 RESPONSE_FIELD_COUNT = 15
 MIN_RESPONSE_PAYLOAD_BYTES = 301
 MAX_RESPONSE_PAYLOAD_BYTES = 938
+# Rust bounds an in-flight Authority request at 5 seconds; shutdown gets a
+# three-second harness margin beyond that production I/O deadline.
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 8
 
 REQUEST_TRANSCRIPT_MAGIC = b"ParaEGOX\0acquire-tenure-request-auth"
 REQUEST_TRANSCRIPT_DOMAIN = b"paraegox.deployment.acquire-tenure.request-auth.ed25519.v1"
@@ -320,6 +323,8 @@ class InstalledAuthority:
     common_arguments: list[str]
     command_prefix: tuple[str, ...]
     restrictive_umask: bool
+    authority_uid: int
+    authority_gid: int
     store_id: bytes | None = None
 
     def serve_arguments(self) -> list[str]:
@@ -332,6 +337,12 @@ class InstalledAuthority:
             "--private-seed",
             os.fspath(self.private_seed_path),
         ]
+
+
+@dataclass
+class AuthorityServer:
+    process: subprocess.Popen[bytes]
+    force_killed: bool = False
 
 
 def _run_checked(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -544,6 +555,8 @@ def _install(
         common_arguments=common_arguments,
         command_prefix=tuple(command_prefix),
         restrictive_umask=restrictive_umask,
+        authority_uid=authority_uid,
+        authority_gid=authority_gid,
     )
 
 
@@ -631,8 +644,107 @@ def _wait_for_socket(process: subprocess.Popen[bytes], path: Path) -> None:
     pytest.fail("Authority socket did not become ready")
 
 
+def _wait_for_socket_removal(path: Path, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return not path.exists()
+
+
+def _assert_linux_authority_process_group(
+    process: subprocess.Popen[bytes], fixture: InstalledAuthority
+) -> None:
+    assert sys.platform == "linux"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(3)
+        stream.connect(os.fspath(fixture.socket_path))
+        credentials = stream.getsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_PEERCRED,
+            struct.calcsize("3i"),
+        )
+    authority_pid, authority_uid, authority_gid = struct.unpack("3i", credentials)
+    assert authority_uid == fixture.authority_uid
+    assert authority_gid == fixture.authority_gid
+    assert os.getpgid(authority_pid) == process.pid
+
+
+def _signal_server_process_group(
+    process: subprocess.Popen[bytes],
+    fixture: InstalledAuthority,
+    requested_signal: signal.Signals,
+) -> None:
+    if fixture.command_prefix:
+        # The Popen handle belongs to sudo, while the Authority runs as the
+        # fixture's service identity. Signal from that identity so the group
+        # member which owns the SocketGuard receives graceful shutdown.
+        try:
+            completed = subprocess.run(
+                [
+                    *fixture.command_prefix,
+                    "/bin/kill",
+                    "-s",
+                    requested_signal.name,
+                    "--",
+                    f"-{process.pid}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            # A wedged signal launcher must not bypass cleanup and leave the
+            # different-UID Authority running in the CI job. The fixture has
+            # already proved passwordless root sudo while selecting the
+            # service account, so use it only as an emergency teardown path.
+            emergency_result = "emergency signal launcher timed out"
+            try:
+                emergency = subprocess.run(
+                    [
+                        "sudo",
+                        "-n",
+                        "/bin/kill",
+                        "-s",
+                        signal.SIGKILL.name,
+                        "--",
+                        f"-{process.pid}",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                emergency_result = (
+                    f"emergency cleanup returned {emergency.returncode}: "
+                    f"{emergency.stdout}{emergency.stderr}"
+                )
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+            pytest.fail(
+                f"timed out launching {requested_signal.name} for Authority "
+                f"process group {process.pid}; {emergency_result}"
+            )
+        if completed.returncode != 0 and not _wait_for_socket_removal(
+            fixture.socket_path, timeout=GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+        ):
+            pytest.fail(
+                f"failed to signal Authority process group {process.pid} with "
+                f"{requested_signal.name}: {completed.stdout}{completed.stderr}"
+            )
+        return
+    try:
+        os.killpg(process.pid, requested_signal)
+    except ProcessLookupError:
+        pass
+
+
 @contextmanager
-def _server(binary: Path, fixture: InstalledAuthority) -> Iterator[subprocess.Popen[bytes]]:
+def _server(binary: Path, fixture: InstalledAuthority) -> Iterator[AuthorityServer]:
     process = subprocess.Popen(
         _authority_command(
             binary,
@@ -646,29 +758,57 @@ def _server(binary: Path, fixture: InstalledAuthority) -> Iterator[subprocess.Po
         start_new_session=True,
         close_fds=True,
     )
+    server = AuthorityServer(process)
     try:
         _wait_for_socket(process, fixture.socket_path)
-        yield process
+        if fixture.command_prefix:
+            _assert_linux_authority_process_group(process, fixture)
+        yield server
     finally:
-        if process.poll() is None:
-            process.terminate()
+        if server.force_killed:
+            assert process.returncode is not None
+        elif process.returncode is not None:
+            assert _wait_for_socket_removal(
+                fixture.socket_path, timeout=GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+            ), "Authority wrapper exited without cleaning its socket"
+        else:
+            _signal_server_process_group(process, fixture, signal.SIGTERM)
+            if not _wait_for_socket_removal(
+                fixture.socket_path, timeout=GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+            ):
+                _signal_server_process_group(process, fixture, signal.SIGKILL)
+                process.wait(timeout=5)
+                pytest.fail(
+                    "Authority required SIGKILL after its graceful shutdown deadline"
+                )
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                _signal_server_process_group(process, fixture, signal.SIGKILL)
+                process.kill()
                 process.wait(timeout=5)
+                pytest.fail("Authority wrapper remained after socket cleanup")
 
 
-def _kill_server(process: subprocess.Popen[bytes]) -> None:
-    os.killpg(process.pid, signal.SIGKILL)
-    process.wait(timeout=5)
+def _kill_server(server: AuthorityServer, fixture: InstalledAuthority) -> None:
+    try:
+        _signal_server_process_group(server.process, fixture, signal.SIGKILL)
+    finally:
+        # The signal helper's emergency path reaps the wrapper before raising.
+        # Preserve that fact so context-manager teardown cannot mask the
+        # original diagnostic with a stale-socket assertion.
+        if server.process.returncode is not None:
+            server.force_killed = True
+    server.process.wait(timeout=5)
+    server.force_killed = True
 
 
 def _wait_for_snapshot_replacement(
-    process: subprocess.Popen[bytes],
+    server: AuthorityServer,
     path: Path,
     previous_identity: tuple[int, int, int],
 ) -> None:
+    process = server.process
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -1003,7 +1143,7 @@ def test_real_authority_process_commits_replays_locks_and_recovers(
         assert "stage=acquire_lock" in contender_stderr
         assert "path_role=lock" in contender_stderr
 
-        _kill_server(first_server)
+        _kill_server(first_server, fixture)
         assert fixture.socket_path.exists()
 
     with _server(root_controlled_authority_binary, fixture):
