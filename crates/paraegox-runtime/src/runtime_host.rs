@@ -1135,7 +1135,7 @@ mod tests {
     use crate::admission::{
         AdmissionState, AdmissionStateLimits, ApplyAdmission, ApplyAdmissionPolicy,
         ED25519_ALGORITHM, ED25519_ALGORITHM_VERSION, TrustedApplyIdentity, TrustedApplyKey,
-        TrustedTenureKey,
+        TrustedTenureIdentity, TrustedTenureKey,
     };
     use crate::card_executor::{
         CardStartOutcome, CooperativeLoopImplementation, TrustedCardImplementation,
@@ -1467,8 +1467,13 @@ mod tests {
             .verifying_key()
             .to_bytes();
         let tenure = TrustedTenureKey::try_new(
-            scope,
-            TenureAuthorityRef::from_bytes([0x07; 16]),
+            TrustedTenureIdentity::new(
+                scope,
+                PrincipalRef::from_bytes([0x06; 16]),
+                1_001,
+                1_002,
+                TenureAuthorityRef::from_bytes([0x07; 16]),
+            ),
             TenureKeyRef::from_bytes([0x08; 16]),
             tenure_algorithm,
             ED25519_ALGORITHM_VERSION,

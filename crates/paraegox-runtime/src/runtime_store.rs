@@ -2,10 +2,11 @@
 
 //! Owner-private POSIX snapshot store for the Runtime journal.
 //!
-//! This module owns only the RuntimeHost filesystem transaction boundary. It
-//! deliberately does not initialize a store, decode installer artifacts, or
-//! abstract storage for another journal owner. A missing or invalid active
-//! snapshot is never reconstructed from a temporary file.
+//! This module owns only the RuntimeHost filesystem transaction boundary. Its
+//! linear initializer guard can publish one already validated typed sequence-one
+//! snapshot, but it does not decode installer artifacts or abstract storage for
+//! another journal owner. A missing or invalid active snapshot is never
+//! reconstructed from a temporary file.
 
 use core::fmt;
 use std::fs::{self, File, Metadata, TryLockError};
@@ -18,6 +19,8 @@ use std::path::{Component, Path, PathBuf};
 
 use nix::dir::Dir;
 use nix::fcntl::{OFlag, open, openat, renameat};
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+use nix::fcntl::{RenameFlags, renameat2};
 use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
 use paraegox_kernel::digest::Digest32;
@@ -29,7 +32,7 @@ use crate::runtime_journal::{
 const LOCK_FILE_NAME: &str = "runtime.lock";
 const ACTIVE_FILE_NAME: &str = "runtime.snapshot";
 const TEMP_FILE_PREFIX: &str = ".runtime.snapshot.tmp-";
-const TEMP_TOKEN_BYTES: usize = 16;
+pub(crate) const TEMP_TOKEN_BYTES: usize = 16;
 const TEMP_HEX_BYTES: usize = TEMP_TOKEN_BYTES * 2;
 const MAX_ORPHAN_TEMP_FILES: usize = 32;
 const STATE_DIRECTORY_MODE_BITS: u32 = 0o700;
@@ -72,12 +75,28 @@ impl FileIdentity {
     }
 }
 
-struct RuntimeDirectory {
+pub(crate) struct RuntimeDirectory {
     path: PathBuf,
     file: File,
     identity: FileIdentity,
     owner_uid: u32,
     owner_gid: u32,
+}
+
+/// Read-only proof that the configured Runtime directory is safe, supported,
+/// and fresh at the start of one initialization attempt. Entropy can be
+/// obtained after this preflight without having created the durable marker.
+pub(crate) struct RuntimeInitializerPreflight {
+    directory: RuntimeDirectory,
+}
+
+impl fmt::Debug for RuntimeInitializerPreflight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeInitializerPreflight")
+            .field("directory", &self.directory)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for RuntimeDirectory {
@@ -106,6 +125,48 @@ struct ActiveSnapshot {
 enum RuntimeStoreState {
     Operational,
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimePublishMode {
+    RequireMissing,
+    ReplaceExisting(FileIdentity),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeInitializerState {
+    Fresh,
+    Published,
+    Stopped,
+}
+
+/// Linear, owner-private capability for exactly one Runtime sequence-one
+/// publication. Holding this value proves the durable marker is installed and
+/// its exclusive writer lock remains owned by this initializer.
+pub(crate) struct RuntimeInitializerGuard {
+    directory: RuntimeDirectory,
+    lock_file: File,
+    lock_identity: FileIdentity,
+    state: RuntimeInitializerState,
+}
+
+impl fmt::Debug for RuntimeInitializerGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeInitializerGuard")
+            .field("directory", &self.directory)
+            .field("lock_identity", &self.lock_identity)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for RuntimeInitializerGuard {
+    fn drop(&mut self) {
+        // Match RuntimeStore's restart guarantee: a fork-like descriptor clone
+        // must not keep the initializer lock alive after normal owner drop.
+        let _ = self.lock_file.unlock();
+    }
 }
 
 /// The single-writer, owner-private Runtime snapshot store.
@@ -289,7 +350,7 @@ impl RuntimeStore {
         if let Err(error) = publish_atomic(
             &self.directory,
             next.canonical_wire(),
-            self.active.identity,
+            RuntimePublishMode::ReplaceExisting(self.active.identity),
             token,
             failpoint,
         ) {
@@ -332,6 +393,7 @@ fn open_runtime_directory(
     validate_lexical_absolute_path(path)?;
     let owner_uid = geteuid().as_raw();
     let owner_gid = getegid().as_raw();
+    validate_runtime_service_identity(owner_uid, owner_gid, filesystem_policy)?;
     validate_trusted_ancestor_chain(path, owner_uid)?;
     let before = fs::symlink_metadata(path).map_err(|error| {
         RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
@@ -368,6 +430,284 @@ fn open_runtime_directory(
         owner_uid,
         owner_gid,
     })
+}
+
+fn validate_runtime_service_identity(
+    owner_uid: u32,
+    owner_gid: u32,
+    filesystem_policy: RuntimeFilesystemPolicy,
+) -> Result<(), RuntimeStoreOpenError> {
+    #[cfg(test)]
+    if filesystem_policy == RuntimeFilesystemPolicy::ExplicitFixture {
+        return Ok(());
+    }
+    let _ = filesystem_policy;
+    if owner_uid == 0 || owner_gid == 0 {
+        return Err(RuntimeStoreOpenError::UnsafeServiceIdentity);
+    }
+    Ok(())
+}
+
+/// Proves that no prior Runtime initialization marker or other state exists.
+fn ensure_fresh_runtime_directory(
+    directory: &RuntimeDirectory,
+) -> Result<(), RuntimeStoreOpenError> {
+    match openat(
+        &directory.file,
+        LOCK_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(existing) => {
+            drop(existing);
+            return Err(RuntimeStoreOpenError::InitializerMarkerAlreadyPresent);
+        }
+        Err(nix::errno::Errno::ENOENT) => {}
+        Err(nix::errno::Errno::ELOOP) => {
+            return Err(RuntimeStoreOpenError::InitializerMarkerAlreadyPresent);
+        }
+        Err(error) => {
+            return Err(RuntimeStoreOpenError::Io(nix_failure(
+                RuntimeFileStage::InspectInitializerMarker,
+                error,
+            )));
+        }
+    }
+    let mut entries = duplicate_directory_stream(directory)?;
+    for entry in entries.iter() {
+        let entry = entry.map_err(|error| {
+            RuntimeStoreOpenError::Io(nix_failure(RuntimeFileStage::ScanDirectory, error))
+        })?;
+        if !is_dot_entry(entry.file_name().to_bytes()) {
+            return Err(RuntimeStoreOpenError::DirectoryNotFresh);
+        }
+    }
+    Ok(())
+}
+
+fn create_and_lock_runtime_initializer_lock(
+    directory: &RuntimeDirectory,
+) -> Result<(File, FileIdentity), RuntimeInitializerLockFailure> {
+    let owned = openat(
+        &directory.file,
+        LOCK_FILE_NAME,
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        PRIVATE_FILE_MODE,
+    )
+    .map_err(|error| {
+        let failure = RuntimeStoreOpenError::Io(nix_failure(RuntimeFileStage::CreateLock, error));
+        if error == nix::errno::Errno::EEXIST {
+            RuntimeInitializerLockFailure::MarkerConsumed(failure)
+        } else {
+            RuntimeInitializerLockFailure::RejectedBeforeMarker(failure)
+        }
+    })?;
+    let lock_file = File::from(owned);
+    // Acquire ownership immediately after O_EXCL creates the marker. Normal
+    // Runtime startup can no longer win the lock during marker durability work.
+    lock_file.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => {
+            RuntimeInitializerLockFailure::MarkerConsumed(RuntimeStoreOpenError::LockContended)
+        }
+        TryLockError::Error(error) => {
+            runtime_marker_consumed_io(RuntimeFileStage::AcquireLock, &error)
+        }
+    })?;
+    fchmod(&lock_file, PRIVATE_FILE_MODE)
+        .map_err(|error| runtime_marker_consumed_nix(RuntimeFileStage::CreateLock, error))?;
+    let lock_metadata = lock_file
+        .metadata()
+        .map_err(|error| runtime_marker_consumed_io(RuntimeFileStage::CreateLock, &error))?;
+    validate_regular_file(&lock_metadata, directory.owner_uid, directory.owner_gid)
+        .map_err(RuntimeInitializerLockFailure::MarkerConsumed)?;
+    let lock_identity = FileIdentity::from_metadata(&lock_metadata);
+    lock_file.sync_all().map_err(|error| {
+        runtime_marker_consumed_io(RuntimeFileStage::SyncInitializerMarker, &error)
+    })?;
+    directory.file.sync_all().map_err(|error| {
+        runtime_marker_consumed_io(RuntimeFileStage::SyncInitializerMarkerDirectory, &error)
+    })?;
+    validate_runtime_initializer_lock_is_only_entry(directory, &lock_file)
+        .map_err(RuntimeInitializerLockFailure::MarkerConsumed)?;
+    Ok((lock_file, lock_identity))
+}
+
+fn runtime_marker_consumed_io(
+    stage: RuntimeFileStage,
+    error: &io::Error,
+) -> RuntimeInitializerLockFailure {
+    RuntimeInitializerLockFailure::MarkerConsumed(RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+        stage, error,
+    )))
+}
+
+fn runtime_marker_consumed_nix(
+    stage: RuntimeFileStage,
+    error: nix::errno::Errno,
+) -> RuntimeInitializerLockFailure {
+    RuntimeInitializerLockFailure::MarkerConsumed(RuntimeStoreOpenError::Io(nix_failure(
+        stage, error,
+    )))
+}
+
+fn validate_runtime_initializer_lock_is_only_entry(
+    directory: &RuntimeDirectory,
+    initializer_lock: &File,
+) -> Result<(), RuntimeStoreOpenError> {
+    let expected = initializer_lock.metadata().map_err(|error| {
+        RuntimeStoreOpenError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::ValidateInitializerMarker,
+            &error,
+        ))
+    })?;
+    validate_regular_file(&expected, directory.owner_uid, directory.owner_gid)?;
+    let installed = open_existing_regular(
+        directory,
+        LOCK_FILE_NAME,
+        OFlag::O_RDONLY,
+        RuntimeFileStage::ValidateInitializerMarker,
+    )?;
+    if FileIdentity::from_metadata(&expected) != installed.identity {
+        return Err(RuntimeStoreOpenError::InitializerMarkerIdentityChanged);
+    }
+
+    let mut entries = duplicate_directory_stream(directory)?;
+    let mut marker_entries = 0_usize;
+    for entry in entries.iter() {
+        let entry = entry.map_err(|error| {
+            RuntimeStoreOpenError::Io(nix_failure(
+                RuntimeFileStage::ValidateInitializerMarker,
+                error,
+            ))
+        })?;
+        let name = entry.file_name().to_bytes();
+        if is_dot_entry(name) {
+            continue;
+        }
+        if name != LOCK_FILE_NAME.as_bytes() {
+            return Err(RuntimeStoreOpenError::DirectoryNotFresh);
+        }
+        marker_entries += 1;
+    }
+    if marker_entries != 1 {
+        return Err(RuntimeStoreOpenError::InitializerMarkerIdentityChanged);
+    }
+    Ok(())
+}
+
+impl RuntimeInitializerGuard {
+    pub(crate) fn begin(directory: &Path) -> Result<Self, RuntimeInitializerBeginError> {
+        RuntimeInitializerPreflight::open(directory)?.acquire()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_fixture(directory: &Path) -> Result<Self, RuntimeInitializerBeginError> {
+        RuntimeInitializerPreflight::open_fixture(directory)?.acquire()
+    }
+
+    fn begin_with_policy(
+        path: &Path,
+        filesystem_policy: RuntimeFilesystemPolicy,
+    ) -> Result<Self, RuntimeInitializerBeginError> {
+        RuntimeInitializerPreflight::open_with_policy(path, filesystem_policy)?.acquire()
+    }
+
+    pub(crate) fn publish_sequence_one(
+        &mut self,
+        snapshot: RuntimeJournalSnapshot,
+        temp_token: [u8; TEMP_TOKEN_BYTES],
+    ) -> Result<(), RuntimeInitializerPublishError> {
+        self.publish_sequence_one_with(snapshot, temp_token, RuntimeCommitFailpoint::None)
+    }
+
+    fn publish_sequence_one_with(
+        &mut self,
+        snapshot: RuntimeJournalSnapshot,
+        temp_token: [u8; TEMP_TOKEN_BYTES],
+        failpoint: RuntimeCommitFailpoint,
+    ) -> Result<(), RuntimeInitializerPublishError> {
+        if self.state != RuntimeInitializerState::Fresh {
+            return Err(RuntimeInitializerPublishError::Stopped);
+        }
+        if snapshot.sequence() != 1 {
+            return Err(RuntimeInitializerPublishError::NotSequenceOne);
+        }
+        if validate_runtime_directory_handle(&self.directory).is_err()
+            || validate_held_lock(&self.directory, &self.lock_file, self.lock_identity).is_err()
+            || validate_runtime_initializer_lock_is_only_entry(&self.directory, &self.lock_file)
+                .is_err()
+        {
+            self.state = RuntimeInitializerState::Stopped;
+            return Err(RuntimeInitializerPublishError::LockOrDirectoryIdentityChanged);
+        }
+        if let Err(error) = publish_atomic(
+            &self.directory,
+            snapshot.canonical_wire(),
+            RuntimePublishMode::RequireMissing,
+            temp_token,
+            failpoint,
+        ) {
+            self.state = RuntimeInitializerState::Stopped;
+            return Err(RuntimeInitializerPublishError::Publish(error));
+        }
+        let read_back = read_active_snapshot(&self.directory).map_err(|error| {
+            self.state = RuntimeInitializerState::Stopped;
+            RuntimeInitializerPublishError::PublishedButUnverified(error)
+        })?;
+        if read_back.snapshot != snapshot {
+            self.state = RuntimeInitializerState::Stopped;
+            return Err(RuntimeInitializerPublishError::PublishedSnapshotMismatch);
+        }
+        self.state = RuntimeInitializerState::Published;
+        Ok(())
+    }
+}
+
+impl RuntimeInitializerPreflight {
+    pub(crate) fn open(path: &Path) -> Result<Self, RuntimeInitializerBeginError> {
+        Self::open_with_policy(path, RuntimeFilesystemPolicy::ProductionReference)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_fixture(path: &Path) -> Result<Self, RuntimeInitializerBeginError> {
+        Self::open_with_policy(path, RuntimeFilesystemPolicy::ExplicitFixture)
+    }
+
+    fn open_with_policy(
+        path: &Path,
+        filesystem_policy: RuntimeFilesystemPolicy,
+    ) -> Result<Self, RuntimeInitializerBeginError> {
+        let directory = open_runtime_directory(path, filesystem_policy)
+            .map_err(RuntimeInitializerBeginError::Store)?;
+        match ensure_fresh_runtime_directory(&directory) {
+            Ok(()) => {}
+            Err(error @ RuntimeStoreOpenError::InitializerMarkerAlreadyPresent) => {
+                return Err(RuntimeInitializerBeginError::MarkerConsumed(error));
+            }
+            Err(error) => return Err(RuntimeInitializerBeginError::Store(error)),
+        }
+        Ok(Self { directory })
+    }
+
+    pub(crate) fn acquire(self) -> Result<RuntimeInitializerGuard, RuntimeInitializerBeginError> {
+        let Self { directory } = self;
+        let (lock_file, lock_identity) = match create_and_lock_runtime_initializer_lock(&directory)
+        {
+            Ok(lock) => lock,
+            Err(RuntimeInitializerLockFailure::RejectedBeforeMarker(error)) => {
+                return Err(RuntimeInitializerBeginError::Store(error));
+            }
+            Err(RuntimeInitializerLockFailure::MarkerConsumed(error)) => {
+                return Err(RuntimeInitializerBeginError::MarkerConsumed(error));
+            }
+        };
+        Ok(RuntimeInitializerGuard {
+            directory,
+            lock_file,
+            lock_identity,
+            state: RuntimeInitializerState::Fresh,
+        })
+    }
 }
 
 fn validate_runtime_directory_handle(
@@ -671,7 +1011,7 @@ fn is_dot_entry(name: &[u8]) -> bool {
 fn publish_atomic(
     directory: &RuntimeDirectory,
     encoded: &[u8],
-    expected_active_identity: FileIdentity,
+    mode: RuntimePublishMode,
     token: [u8; TEMP_TOKEN_BYTES],
     failpoint: RuntimeCommitFailpoint,
 ) -> Result<(), RuntimePublishFailure> {
@@ -681,13 +1021,7 @@ fn publish_atomic(
     if failpoint == RuntimeCommitFailpoint::BeforeTempCreate {
         return Err(rejected_injected(RuntimeFileStage::CreateTemp));
     }
-    validate_named_file_identity(
-        directory,
-        ACTIVE_FILE_NAME,
-        expected_active_identity,
-        RuntimeFileStage::ValidateActiveIdentity,
-    )
-    .map_err(|error| rejected_open_error(RuntimeFileStage::ValidateActiveIdentity, error))?;
+    validate_runtime_publish_precondition(directory, mode)?;
 
     let temp_name = temp_name(token);
     let owned = openat(
@@ -776,25 +1110,15 @@ fn publish_atomic(
     ) {
         return Err(rejected_injected(RuntimeFileStage::Rename));
     }
-    validate_named_file_identity(
-        directory,
-        ACTIVE_FILE_NAME,
-        expected_active_identity,
-        RuntimeFileStage::ValidateActiveIdentity,
-    )
-    .map_err(|error| rejected_open_error(RuntimeFileStage::ValidateActiveIdentity, error))?;
-    renameat(
-        &directory.file,
-        temp_name.as_str(),
-        &directory.file,
-        ACTIVE_FILE_NAME,
-    )
-    .map_err(|error| {
-        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
-            RuntimeFileStage::Rename,
-            error,
-        ))
-    })?;
+    validate_runtime_publish_precondition(directory, mode)?;
+    #[cfg(test)]
+    if failpoint == RuntimeCommitFailpoint::InstallCompetingActiveBeforeRename {
+        if mode != RuntimePublishMode::RequireMissing {
+            return Err(rejected_injected(RuntimeFileStage::RequireMissingActive));
+        }
+        install_competing_active_for_test(directory)?;
+    }
+    publish_temp_name(directory, temp_name.as_str(), mode)?;
     #[cfg(test)]
     if failpoint == RuntimeCommitFailpoint::AbortAfterRename {
         std::process::abort();
@@ -823,6 +1147,142 @@ fn publish_atomic(
         return Err(uncertain_injected(RuntimeFileStage::ReturnDurableCommit));
     }
     Ok(())
+}
+
+fn publish_temp_name(
+    directory: &RuntimeDirectory,
+    temp_name: &str,
+    mode: RuntimePublishMode,
+) -> Result<(), RuntimePublishFailure> {
+    match mode {
+        RuntimePublishMode::RequireMissing => {
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            {
+                // The precondition check is diagnostic only. RENAME_NOREPLACE
+                // is the operation that makes a concurrent active install
+                // impossible at the actual publication boundary.
+                renameat2(
+                    &directory.file,
+                    temp_name,
+                    &directory.file,
+                    ACTIVE_FILE_NAME,
+                    RenameFlags::RENAME_NOREPLACE,
+                )
+                .map_err(|error| {
+                    RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
+                        RuntimeFileStage::RequireMissingActive,
+                        error,
+                    ))
+                })
+            }
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            {
+                // Non-Linux production filesystems are rejected before this
+                // point. This fallback exists only so explicit test fixtures
+                // can exercise the rest of the transaction on development
+                // hosts while PC1/PC2 remain unadmitted.
+                renameat(
+                    &directory.file,
+                    temp_name,
+                    &directory.file,
+                    ACTIVE_FILE_NAME,
+                )
+                .map_err(|error| {
+                    RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
+                        RuntimeFileStage::Rename,
+                        error,
+                    ))
+                })
+            }
+        }
+        RuntimePublishMode::ReplaceExisting(_) => renameat(
+            &directory.file,
+            temp_name,
+            &directory.file,
+            ACTIVE_FILE_NAME,
+        )
+        .map_err(|error| {
+            RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
+                RuntimeFileStage::Rename,
+                error,
+            ))
+        }),
+    }
+}
+
+#[cfg(test)]
+fn install_competing_active_for_test(
+    directory: &RuntimeDirectory,
+) -> Result<(), RuntimePublishFailure> {
+    let owned = openat(
+        &directory.file,
+        ACTIVE_FILE_NAME,
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        PRIVATE_FILE_MODE,
+    )
+    .map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
+            RuntimeFileStage::RequireMissingActive,
+            error,
+        ))
+    })?;
+    let mut active = File::from(owned);
+    active.write_all(b"competing-active").map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::io(
+            RuntimeFileStage::RequireMissingActive,
+            &error,
+        ))
+    })?;
+    active.sync_all().map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::io(
+            RuntimeFileStage::RequireMissingActive,
+            &error,
+        ))
+    })?;
+    directory.file.sync_all().map_err(|error| {
+        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::io(
+            RuntimeFileStage::RequireMissingActive,
+            &error,
+        ))
+    })
+}
+
+fn validate_runtime_publish_precondition(
+    directory: &RuntimeDirectory,
+    mode: RuntimePublishMode,
+) -> Result<(), RuntimePublishFailure> {
+    match mode {
+        RuntimePublishMode::RequireMissing => ensure_runtime_active_missing(directory),
+        RuntimePublishMode::ReplaceExisting(expected_active_identity) => {
+            validate_named_file_identity(
+                directory,
+                ACTIVE_FILE_NAME,
+                expected_active_identity,
+                RuntimeFileStage::ValidateActiveIdentity,
+            )
+            .map_err(|error| rejected_open_error(RuntimeFileStage::ValidateActiveIdentity, error))
+        }
+    }
+}
+
+fn ensure_runtime_active_missing(
+    directory: &RuntimeDirectory,
+) -> Result<(), RuntimePublishFailure> {
+    match openat(
+        &directory.file,
+        ACTIVE_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(active) => {
+            drop(active);
+            Err(rejected_injected(RuntimeFileStage::RequireMissingActive))
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(()),
+        Err(error) => Err(RuntimePublishFailure::RejectedBeforePublish(
+            RuntimePublishFault::nix(RuntimeFileStage::RequireMissingActive, error),
+        )),
+    }
 }
 
 fn system_random_token() -> Result<[u8; TEMP_TOKEN_BYTES], io::Error> {
@@ -875,12 +1335,20 @@ fn verify_filesystem(
     let stat = nix::sys::statfs::fstatfs(directory).map_err(|error| {
         RuntimeStoreOpenError::Io(nix_failure(RuntimeFileStage::InspectFilesystem, error))
     })?;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         if stat.filesystem_type() != nix::sys::statfs::EXT4_SUPER_MAGIC {
             return Err(RuntimeStoreOpenError::UnsupportedFilesystem);
         }
         verify_linux_ext4_mount(directory).map_err(|_| RuntimeStoreOpenError::UnsupportedFilesystem)
+    }
+    #[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+    {
+        // nix exposes the reviewed renameat2 no-replace wrapper only for the
+        // GNU Linux target. Other libc profiles stay fail-closed until PC0
+        // admits an equally exact backend.
+        let _ = stat;
+        Err(RuntimeStoreOpenError::UnsupportedFilesystem)
     }
     #[cfg(target_os = "macos")]
     {
@@ -1188,6 +1656,8 @@ pub(crate) enum RuntimeCommitFailpoint {
     BeforeFileSync,
     AfterFileSync,
     BeforeRename,
+    #[cfg(test)]
+    InstallCompetingActiveBeforeRename,
     AfterRename,
     BeforeDirectorySync,
     AfterDirectorySyncBeforeReturn,
@@ -1216,8 +1686,13 @@ pub(crate) enum RuntimeFileStage {
     InspectFilesystem,
     ScanDirectory,
     OpenLock,
+    CreateLock,
     AcquireLock,
     ValidateLockIdentity,
+    InspectInitializerMarker,
+    ValidateInitializerMarker,
+    SyncInitializerMarker,
+    SyncInitializerMarkerDirectory,
     OpenActive,
     ReadActive,
     ValidateActiveIdentity,
@@ -1226,6 +1701,7 @@ pub(crate) enum RuntimeFileStage {
     SyncOrphanCleanup,
     GenerateTempName,
     ValidateEncodedSnapshot,
+    RequireMissingActive,
     CreateTemp,
     InspectTemp,
     WriteTemp,
@@ -1290,9 +1766,32 @@ pub(crate) enum RuntimePublishFailure {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeInitializerLockFailure {
+    RejectedBeforeMarker(RuntimeStoreOpenError),
+    MarkerConsumed(RuntimeStoreOpenError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeInitializerBeginError {
+    Store(RuntimeStoreOpenError),
+    MarkerConsumed(RuntimeStoreOpenError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeInitializerPublishError {
+    Stopped,
+    NotSequenceOne,
+    LockOrDirectoryIdentityChanged,
+    Publish(RuntimePublishFailure),
+    PublishedButUnverified(RuntimeStoreOpenError),
+    PublishedSnapshotMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeStoreOpenError {
     InvalidExpectedStoreInstanceId,
     InvalidExpectedTargetFingerprint,
+    UnsafeServiceIdentity,
     PathMustBeAbsolute,
     UnsafeDirectoryPath,
     UnsafeAncestorType,
@@ -1306,6 +1805,9 @@ pub(crate) enum RuntimeStoreOpenError {
     UnsafeFileMode,
     FileOwnerMismatch,
     NamedFileIdentityChanged,
+    DirectoryNotFresh,
+    InitializerMarkerAlreadyPresent,
+    InitializerMarkerIdentityChanged,
     UnknownDirectoryEntry,
     TooManyOrphanTemps,
     LockContended,
@@ -1337,6 +1839,22 @@ impl fmt::Display for RuntimeStoreOpenError {
 
 impl std::error::Error for RuntimeStoreOpenError {}
 
+impl fmt::Display for RuntimeInitializerBeginError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Runtime initializer cannot begin: {self:?}")
+    }
+}
+
+impl std::error::Error for RuntimeInitializerBeginError {}
+
+impl fmt::Display for RuntimeInitializerPublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Runtime initializer cannot publish: {self:?}")
+    }
+}
+
+impl std::error::Error for RuntimeInitializerPublishError {}
+
 impl fmt::Display for RuntimeStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "Runtime store stopped: {self:?}")
@@ -1349,7 +1867,7 @@ impl std::error::Error for RuntimeStoreError {}
 mod tests {
     use std::cell::Cell;
     use std::fs::{self, OpenOptions};
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1361,15 +1879,17 @@ mod tests {
         ACTIVE_FILE_NAME, LOCK_FILE_NAME, LinuxMountEvidenceError, MAX_LINUX_FDINFO_BYTES,
         MAX_LINUX_FDINFO_LINE_BYTES, MAX_LINUX_FDINFO_RECORDS, MAX_LINUX_MOUNTINFO_BYTES,
         MAX_LINUX_MOUNTINFO_LINE_BYTES, MAX_LINUX_MOUNTINFO_RECORDS, MAX_ORPHAN_TEMP_FILES,
-        MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, RuntimeCommitFailpoint, RuntimeFileStage,
-        RuntimeFilesystemPolicy, RuntimePublishFailure, RuntimeStore, RuntimeStoreError,
-        RuntimeStoreOpenError, TEMP_FILE_PREFIX, parse_linux_fdinfo_mount_id,
-        parse_linux_mountinfo_exact_ext4, temp_name,
+        MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, PRIVATE_FILE_MODE_BITS, PRIVATE_FILE_MODE_MASK,
+        RuntimeCommitFailpoint, RuntimeFileStage, RuntimeFilesystemPolicy,
+        RuntimeInitializerBeginError, RuntimeInitializerGuard, RuntimeInitializerPreflight,
+        RuntimeInitializerPublishError, RuntimePublishFailure, RuntimeStore, RuntimeStoreError,
+        RuntimeStoreOpenError, TEMP_FILE_PREFIX, TEMP_TOKEN_BYTES, parse_linux_fdinfo_mount_id,
+        parse_linux_mountinfo_exact_ext4, temp_name, validate_runtime_service_identity,
     };
     use crate::runtime_journal::{
         HostClockAdmissionState, LiveMaterialization, OpaqueCanonicalValue, ReplayLedgerRecord,
         RuntimeJournalError, RuntimeJournalSnapshot, RuntimeJournalState,
-        RuntimeJournalTransaction, WriterFenceRecord,
+        RuntimeJournalTransaction, StorePinnedBuildIdentity, WriterFenceRecord,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -1474,6 +1994,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_reference_requires_a_non_root_runtime_service_identity() {
+        assert_eq!(
+            validate_runtime_service_identity(
+                0,
+                1000,
+                RuntimeFilesystemPolicy::ProductionReference
+            ),
+            Err(RuntimeStoreOpenError::UnsafeServiceIdentity)
+        );
+        assert_eq!(
+            validate_runtime_service_identity(
+                1000,
+                0,
+                RuntimeFilesystemPolicy::ProductionReference
+            ),
+            Err(RuntimeStoreOpenError::UnsafeServiceIdentity)
+        );
+        assert_eq!(
+            validate_runtime_service_identity(
+                1000,
+                1000,
+                RuntimeFilesystemPolicy::ProductionReference,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_runtime_service_identity(0, 0, RuntimeFilesystemPolicy::ExplicitFixture),
+            Ok(())
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn production_reference_rejects_dev_shm_tmpfs() {
@@ -1559,7 +2111,13 @@ mod tests {
                 clock_generation_high_water: 0,
                 build_descriptor: pinned(b"descriptor-v1", 0x44),
                 singleton_manifest: pinned(b"manifest-v1", 0x55),
-                store_pinned_build_identity: pinned(b"build-identity-v1", 0x56),
+                store_pinned_build_identity: StorePinnedBuildIdentity::try_new(
+                    [0x57; 32],
+                    digest(0x44),
+                    digest(0x56),
+                    digest(0x58),
+                )
+                .unwrap_or_else(|error| panic!("fixture build identity failed: {error}")),
                 compiled_build_instance_id: [0x57; 32],
                 compiled_compatibility_digest: digest(0x58),
                 admission_policy_fingerprint: digest(0x66),
@@ -1685,6 +2243,207 @@ mod tests {
         let raw_flags = fcntl(file, FcntlArg::F_GETFD)
             .unwrap_or_else(|error| panic!("F_GETFD failed: {error}"));
         assert!(FdFlag::from_bits_truncate(raw_flags).contains(FdFlag::FD_CLOEXEC));
+    }
+
+    #[test]
+    fn fresh_initializer_marker_publishes_sequence_one_exactly_once() {
+        let directory = TestDirectory::new();
+        let mut initializer = RuntimeInitializerGuard::begin_with_policy(
+            directory.path(),
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+        .unwrap_or_else(|error| panic!("initializer begin failed: {error}"));
+        assert_cloexec(&initializer.lock_file);
+
+        let snapshot = sequence_one_snapshot(0x11, 0x22);
+        initializer
+            .publish_sequence_one_with(
+                snapshot.clone(),
+                [0x31; TEMP_TOKEN_BYTES],
+                RuntimeCommitFailpoint::None,
+            )
+            .unwrap_or_else(|error| panic!("initial publish failed: {error}"));
+        assert_eq!(decode_active(directory.path()), snapshot);
+        assert!(matches!(
+            RuntimeInitializerGuard::begin_with_policy(
+                directory.path(),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            ),
+            Err(RuntimeInitializerBeginError::MarkerConsumed(_))
+        ));
+
+        drop(initializer);
+        let opened = open_fixture(directory.path(), &snapshot)
+            .unwrap_or_else(|error| panic!("initialized store did not reopen: {error}"));
+        assert_eq!(opened.snapshot(), Ok(&snapshot));
+    }
+
+    #[test]
+    fn initializer_rejects_preexisting_state_before_consuming_marker() {
+        let directory = TestDirectory::new();
+        install_private_file(&directory.path().join("unexpected"), b"not-runtime-state");
+
+        assert_eq!(
+            RuntimeInitializerGuard::begin_with_policy(
+                directory.path(),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            )
+            .err(),
+            Some(RuntimeInitializerBeginError::Store(
+                RuntimeStoreOpenError::DirectoryNotFresh,
+            ))
+        );
+        assert!(!directory.path().join(LOCK_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn initializer_preflight_is_read_only_and_later_race_consumes_marker() {
+        let directory = TestDirectory::new();
+        let preflight = RuntimeInitializerPreflight::open_fixture(directory.path())
+            .unwrap_or_else(|error| panic!("initializer preflight failed: {error}"));
+        assert!(!directory.path().join(LOCK_FILE_NAME).exists());
+
+        install_private_file(&directory.path().join("unexpected"), b"racing-state");
+        assert_eq!(
+            preflight.acquire().err(),
+            Some(RuntimeInitializerBeginError::MarkerConsumed(
+                RuntimeStoreOpenError::DirectoryNotFresh,
+            ))
+        );
+        assert!(directory.path().join(LOCK_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn failed_initial_publish_cannot_be_reset_or_replace_existing_active() {
+        let directory = TestDirectory::new();
+        let mut initializer = RuntimeInitializerGuard::begin_with_policy(
+            directory.path(),
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+        .unwrap_or_else(|error| panic!("initializer begin failed: {error}"));
+        let snapshot = sequence_one_snapshot(0x11, 0x22);
+
+        assert!(matches!(
+            initializer.publish_sequence_one_with(
+                snapshot.clone(),
+                [0x32; TEMP_TOKEN_BYTES],
+                RuntimeCommitFailpoint::AfterPartialWrite,
+            ),
+            Err(RuntimeInitializerPublishError::Publish(
+                RuntimePublishFailure::RejectedBeforePublish(_)
+            ))
+        ));
+        assert_eq!(
+            initializer.publish_sequence_one(snapshot.clone(), [0x33; TEMP_TOKEN_BYTES]),
+            Err(RuntimeInitializerPublishError::Stopped)
+        );
+        assert!(!directory.path().join(ACTIVE_FILE_NAME).exists());
+        drop(initializer);
+        assert!(matches!(
+            RuntimeInitializerGuard::begin_with_policy(
+                directory.path(),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            ),
+            Err(RuntimeInitializerBeginError::MarkerConsumed(_))
+        ));
+
+        let competing = TestDirectory::new();
+        let mut initializer = RuntimeInitializerGuard::begin_with_policy(
+            competing.path(),
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+        .unwrap_or_else(|error| panic!("competing initializer begin failed: {error}"));
+        install_private_file(
+            &competing.path().join(ACTIVE_FILE_NAME),
+            b"preexisting-active",
+        );
+        assert!(matches!(
+            initializer.publish_sequence_one_with(
+                snapshot,
+                [0x34; TEMP_TOKEN_BYTES],
+                RuntimeCommitFailpoint::None,
+            ),
+            Err(RuntimeInitializerPublishError::LockOrDirectoryIdentityChanged)
+        ));
+        assert_eq!(
+            fs::read(competing.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("competing active read failed: {error}")),
+            b"preexisting-active"
+        );
+    }
+
+    #[test]
+    fn initializer_drop_unlocks_while_a_fork_like_descriptor_reference_survives() {
+        let directory = TestDirectory::new();
+        let snapshot = sequence_one_snapshot(0x15, 0x25);
+        let mut initializer = RuntimeInitializerGuard::begin_with_policy(
+            directory.path(),
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+        .unwrap_or_else(|error| panic!("initializer begin failed: {error}"));
+        let inherited = initializer
+            .lock_file
+            .try_clone()
+            .unwrap_or_else(|error| panic!("initializer lock clone failed: {error}"));
+        initializer
+            .publish_sequence_one(snapshot.clone(), [0x35; TEMP_TOKEN_BYTES])
+            .unwrap_or_else(|error| panic!("initial publish failed: {error}"));
+
+        drop(initializer);
+        let reopened = open_fixture(directory.path(), &snapshot).unwrap_or_else(|error| {
+            panic!("initializer drop left restart blocked by cloned descriptor: {error}")
+        });
+        assert_eq!(reopened.snapshot(), Ok(&snapshot));
+        drop(reopened);
+        drop(inherited);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn initializer_no_replace_is_atomic_against_a_last_moment_active_install() {
+        let directory = TestDirectory::new();
+        let snapshot = sequence_one_snapshot(0x16, 0x26);
+        let mut initializer = RuntimeInitializerGuard::begin_with_policy(
+            directory.path(),
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+        .unwrap_or_else(|error| panic!("initializer begin failed: {error}"));
+
+        assert!(matches!(
+            initializer.publish_sequence_one_with(
+                snapshot.clone(),
+                [0x36; TEMP_TOKEN_BYTES],
+                RuntimeCommitFailpoint::InstallCompetingActiveBeforeRename,
+            ),
+            Err(RuntimeInitializerPublishError::Publish(
+                RuntimePublishFailure::RejectedBeforePublish(fault)
+            )) if fault.stage == RuntimeFileStage::RequireMissingActive
+                && fault.kind == Some(std::io::ErrorKind::AlreadyExists)
+        ));
+        assert_eq!(
+            initializer.publish_sequence_one(snapshot.clone(), [0x37; TEMP_TOKEN_BYTES]),
+            Err(RuntimeInitializerPublishError::Stopped)
+        );
+        assert_eq!(
+            fs::read(directory.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("competing active read failed: {error}")),
+            b"competing-active"
+        );
+        assert!(directory.path().join(LOCK_FILE_NAME).is_file());
+        let candidate = directory.path().join(temp_name([0x36; TEMP_TOKEN_BYTES]));
+        assert_eq!(
+            fs::read(candidate)
+                .unwrap_or_else(|error| panic!("candidate temp read failed: {error}")),
+            snapshot.canonical_wire()
+        );
+        drop(initializer);
+        assert!(matches!(
+            RuntimeInitializerGuard::begin_with_policy(
+                directory.path(),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            ),
+            Err(RuntimeInitializerBeginError::MarkerConsumed(_))
+        ));
     }
 
     #[test]
@@ -2194,6 +2953,135 @@ mod tests {
             Some(RuntimeStoreOpenError::TooManyOrphanTemps)
         );
         assert!(orphans.iter().all(|path| path.is_file()));
+    }
+
+    #[test]
+    fn initializer_subprocess_crashes_consume_marker_and_never_invent_active_state() {
+        let cases = [
+            ("temp-create", false, Some(0_usize)),
+            ("partial-write", false, None),
+            ("before-file-fsync", false, None),
+            ("file-fsync", false, None),
+            ("rename", true, None),
+            ("directory-fsync", true, None),
+            ("durable-commit-before-return", true, None),
+        ];
+        for (point, published, fixed_temp_length) in cases {
+            let directory = TestDirectory::new();
+            let expected = sequence_one_snapshot(0xb3, 0xb4);
+            let status = Command::new(
+                std::env::current_exe()
+                    .unwrap_or_else(|error| panic!("test executable lookup failed: {error}")),
+            )
+            .args([
+                "--exact",
+                "runtime_store::tests::subprocess_initializer_crash_child",
+                "--nocapture",
+            ])
+            .env(
+                "PARAEGOX_TEST_RUNTIME_INITIALIZER_CRASH_STORE",
+                directory.path(),
+            )
+            .env("PARAEGOX_TEST_RUNTIME_INITIALIZER_CRASH_POINT", point)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|error| panic!("initializer crash child spawn failed: {error}"));
+            assert!(
+                !status.success(),
+                "initializer crash child returned at {point}"
+            );
+
+            let marker = fs::symlink_metadata(directory.path().join(LOCK_FILE_NAME))
+                .unwrap_or_else(|error| panic!("initializer marker metadata failed: {error}"));
+            assert!(marker.file_type().is_file());
+            assert_eq!(
+                marker.mode() & PRIVATE_FILE_MODE_MASK,
+                PRIVATE_FILE_MODE_BITS
+            );
+            assert_eq!(marker.nlink(), 1);
+            assert!(matches!(
+                RuntimeInitializerGuard::begin_with_policy(
+                    directory.path(),
+                    RuntimeFilesystemPolicy::ExplicitFixture,
+                ),
+                Err(RuntimeInitializerBeginError::MarkerConsumed(_))
+            ));
+            if published {
+                assert_eq!(decode_active(directory.path()), expected);
+                assert!(
+                    !directory
+                        .path()
+                        .join(temp_name([0x72; TEMP_TOKEN_BYTES]))
+                        .exists()
+                );
+                let recovered = open_fixture(directory.path(), &expected).unwrap_or_else(|error| {
+                    panic!("published initializer state did not reopen at {point}: {error}")
+                });
+                assert_eq!(recovered.snapshot(), Ok(&expected));
+                assert_eq!(orphan_count(directory.path()), 0);
+            } else {
+                assert!(!directory.path().join(ACTIVE_FILE_NAME).exists());
+                let candidate = directory.path().join(temp_name([0x72; TEMP_TOKEN_BYTES]));
+                let candidate_bytes = fs::read(&candidate).unwrap_or_else(|error| {
+                    panic!("initializer candidate read failed at {point}: {error}")
+                });
+                let expected_bytes = match point {
+                    "temp-create" => &[][..],
+                    "partial-write" => {
+                        &expected.canonical_wire()[..expected.canonical_wire().len() - 1]
+                    }
+                    "before-file-fsync" | "file-fsync" => expected.canonical_wire(),
+                    _ => panic!("missing initializer temp bytes for {point}"),
+                };
+                assert_eq!(candidate_bytes, expected_bytes);
+                assert_eq!(
+                    candidate_bytes.len(),
+                    fixed_temp_length.unwrap_or(expected_bytes.len())
+                );
+                assert_eq!(orphan_count(directory.path()), 1);
+                assert!(matches!(
+                    open_fixture(directory.path(), &expected),
+                    Err(RuntimeStoreOpenError::Io(failure))
+                        if failure.stage == RuntimeFileStage::OpenActive
+                            && failure.kind == std::io::ErrorKind::NotFound
+                ));
+                assert!(candidate.is_file());
+                assert_eq!(orphan_count(directory.path()), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn subprocess_initializer_crash_child() {
+        let Some(store) = std::env::var_os("PARAEGOX_TEST_RUNTIME_INITIALIZER_CRASH_STORE") else {
+            return;
+        };
+        let point = std::env::var("PARAEGOX_TEST_RUNTIME_INITIALIZER_CRASH_POINT")
+            .unwrap_or_else(|error| panic!("initializer crash point missing: {error}"));
+        let failpoint = match point.as_str() {
+            "temp-create" => RuntimeCommitFailpoint::AbortAfterTempCreate,
+            "partial-write" => RuntimeCommitFailpoint::AbortAfterPartialWrite,
+            "before-file-fsync" => RuntimeCommitFailpoint::AbortBeforeFileSync,
+            "file-fsync" => RuntimeCommitFailpoint::AbortAfterFileSync,
+            "rename" => RuntimeCommitFailpoint::AbortAfterRename,
+            "directory-fsync" => RuntimeCommitFailpoint::AbortAfterDirectorySync,
+            "durable-commit-before-return" => {
+                RuntimeCommitFailpoint::AbortAfterDurableCommitBeforeReturn
+            }
+            _ => panic!("unknown Runtime initializer crash point"),
+        };
+        let mut initializer = RuntimeInitializerGuard::begin_with_policy(
+            Path::new(&store),
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+        .unwrap_or_else(|error| panic!("crash child initializer begin failed: {error}"));
+        let result = initializer.publish_sequence_one_with(
+            sequence_one_snapshot(0xb3, 0xb4),
+            [0x72; TEMP_TOKEN_BYTES],
+            failpoint,
+        );
+        panic!("Runtime initializer crash failpoint unexpectedly returned: {result:?}");
     }
 
     #[test]

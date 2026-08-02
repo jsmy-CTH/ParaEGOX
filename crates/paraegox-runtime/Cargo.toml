@@ -11,6 +11,7 @@ publish = false
 ed25519-dalek.workspace = true
 paraegox-kernel.workspace = true
 paraegox-runtime-contracts.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 
 [target.'cfg(unix)'.dependencies]

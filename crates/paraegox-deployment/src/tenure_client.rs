@@ -18,6 +18,7 @@ use std::time::Duration;
 use ed25519_dalek::{Signature, VerifyingKey};
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
+use paraegox_kernel::digest::{Digest32, Digest32Builder};
 use paraegox_runtime_contracts::apply::TenureProofAuthority;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -33,6 +34,8 @@ use crate::tenure_protocol::{
 
 const AUTHORITY_SOCKET_MODE: u32 = 0o660;
 const AUTHORITY_SOCKET_DIRECTORY_MODE: u32 = 0o2750;
+const AUTHORITY_DOMAIN_FINGERPRINT_DOMAIN: &[u8] =
+    b"paraegox.deployment.tenure-authority-client.domain.sha256.v1";
 pub(crate) const MAX_TENURE_CLIENT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Exact caller-owned request material awaiting the Controller signature.
@@ -78,6 +81,18 @@ pub(crate) struct PreparedAcquireTenureRequest {
 }
 
 impl PreparedAcquireTenureRequest {
+    /// Reconstructs the exact request frame from durable canonical request
+    /// bytes. Recovery deliberately performs no signing or identity
+    /// allocation; a stored request is either canonical and replayable or the
+    /// caller must fail closed.
+    pub(crate) fn try_from_canonical_request_bytes(
+        canonical_request: &[u8],
+    ) -> Result<Self, AcquireTenureProtocolError> {
+        let request = AcquireTenureRequestV1::decode(canonical_request)?;
+        let frame = encode_acquire_tenure_request_frame(&request);
+        Ok(Self { request, frame })
+    }
+
     #[must_use]
     pub(crate) const fn request(&self) -> &AcquireTenureRequestV1 {
         &self.request
@@ -204,6 +219,7 @@ impl AuthorityProofVerifier {
 pub(crate) struct UnixTenureAuthorityClient {
     endpoint: UnixAuthorityEndpoint,
     proof_verifier: AuthorityProofVerifier,
+    authority_domain_fingerprint: Digest32,
     exchange_timeout: Duration,
 }
 
@@ -216,11 +232,21 @@ impl UnixTenureAuthorityClient {
         if exchange_timeout.is_zero() || exchange_timeout > MAX_TENURE_CLIENT_EXCHANGE_TIMEOUT {
             return Err(TenureClientConfigurationError::InvalidExchangeTimeout);
         }
+        let authority_domain_fingerprint =
+            derive_authority_domain_fingerprint(&endpoint, &proof_verifier)?;
         Ok(Self {
             endpoint,
             proof_verifier,
+            authority_domain_fingerprint,
             exchange_timeout,
         })
+    }
+
+    /// Returns the sealed identity of the exact Authority transport and proof
+    /// verification domain selected by this client.
+    #[must_use]
+    pub(crate) const fn authority_domain_fingerprint(&self) -> Digest32 {
+        self.authority_domain_fingerprint
     }
 
     /// Performs exactly one exchange. Any returned failure after write begins
@@ -325,6 +351,30 @@ impl UnixTenureAuthorityClient {
     }
 }
 
+fn derive_authority_domain_fingerprint(
+    endpoint: &UnixAuthorityEndpoint,
+    proof_verifier: &AuthorityProofVerifier,
+) -> Result<Digest32, TenureClientConfigurationError> {
+    let authority = proof_verifier.authority;
+    let mut builder = Digest32Builder::try_new(AUTHORITY_DOMAIN_FINGERPRINT_DOMAIN)
+        .map_err(|_| TenureClientConfigurationError::AuthorityDomainFingerprint)?;
+    builder
+        .field_bytes(endpoint.socket_path.as_os_str().as_bytes())
+        .and_then(|builder| builder.field_u64(u64::from(endpoint.socket_acl.authority_uid)))
+        .and_then(|builder| builder.field_u64(u64::from(endpoint.socket_acl.controller_gid)))
+        .and_then(|builder| builder.field_u64(u64::from(AUTHORITY_SOCKET_DIRECTORY_MODE)))
+        .and_then(|builder| builder.field_u64(u64::from(AUTHORITY_SOCKET_MODE)))
+        .and_then(|builder| builder.field_u64(u64::from(endpoint.server_credentials.uid)))
+        .and_then(|builder| builder.field_u64(u64::from(endpoint.server_credentials.gid)))
+        .and_then(|builder| builder.field_bytes(authority.authority().as_bytes()))
+        .and_then(|builder| builder.field_bytes(authority.key().as_bytes()))
+        .and_then(|builder| builder.field_u16(authority.algorithm().value()))
+        .and_then(|builder| builder.field_u16(authority.algorithm_version()))
+        .and_then(|builder| builder.field_bytes(proof_verifier.verifying_key.as_bytes()))
+        .map_err(|_| TenureClientConfigurationError::AuthorityDomainFingerprint)?;
+    Ok(builder.finish())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TenureClientConfigurationError {
     RelativeSocketPath,
@@ -332,6 +382,7 @@ pub(crate) enum TenureClientConfigurationError {
     InvalidExchangeTimeout,
     UnsupportedProofProfile,
     WeakAuthorityKey,
+    AuthorityDomainFingerprint,
 }
 
 impl fmt::Display for TenureClientConfigurationError {
@@ -342,6 +393,9 @@ impl fmt::Display for TenureClientConfigurationError {
             Self::InvalidExchangeTimeout => "Authority exchange timeout is outside its bound",
             Self::UnsupportedProofProfile => "Authority proof profile is not Ed25519 v1",
             Self::WeakAuthorityKey => "Authority verification key is weak",
+            Self::AuthorityDomainFingerprint => {
+                "Authority transport and proof domain fingerprint is invalid"
+            }
         })
     }
 }
@@ -967,6 +1021,68 @@ mod tests {
             .unwrap_or_else(|error| panic!("proof verifier failed: {error}"))
     }
 
+    #[derive(Clone, Copy)]
+    struct AuthorityDomainFixture {
+        socket_path: &'static str,
+        authority_uid: u32,
+        controller_gid: u32,
+        server_uid: u32,
+        server_gid: u32,
+        authority_ref_byte: u8,
+        key_ref_byte: u8,
+        verifying_seed_byte: u8,
+    }
+
+    impl AuthorityDomainFixture {
+        fn endpoint(self) -> UnixAuthorityEndpoint {
+            UnixAuthorityEndpoint::try_new(
+                PathBuf::from(self.socket_path),
+                AuthoritySocketAcl::new(self.authority_uid, self.controller_gid),
+                UnixCredentials::new(self.server_uid, self.server_gid),
+            )
+            .unwrap_or_else(|error| panic!("domain endpoint failed: {error}"))
+        }
+
+        fn authority(self, algorithm: u16, algorithm_version: u16) -> TenureProofAuthority {
+            TenureProofAuthority::try_new(
+                TenureAuthorityRef::from_bytes([self.authority_ref_byte; 16]),
+                TenureKeyRef::from_bytes([self.key_ref_byte; 16]),
+                TenureProofAlgorithm::try_new(algorithm)
+                    .unwrap_or_else(|error| panic!("domain algorithm failed: {error}")),
+                algorithm_version,
+            )
+            .unwrap_or_else(|error| panic!("domain proof authority failed: {error}"))
+        }
+
+        fn fingerprint(self) -> paraegox_kernel::digest::Digest32 {
+            let verifier = AuthorityProofVerifier::try_new(
+                self.authority(
+                    super::ACQUIRE_TENURE_ED25519_ALGORITHM,
+                    super::ACQUIRE_TENURE_ED25519_ALGORITHM_VERSION,
+                ),
+                SigningKey::from_bytes(&[self.verifying_seed_byte; 32]).verifying_key(),
+            )
+            .unwrap_or_else(|error| panic!("domain verifier failed: {error}"));
+            UnixTenureAuthorityClient::try_new(self.endpoint(), verifier, Duration::from_secs(1))
+                .unwrap_or_else(|error| panic!("domain client failed: {error}"))
+                .authority_domain_fingerprint()
+        }
+
+        fn fingerprint_with_unvalidated_profile(
+            self,
+            algorithm: u16,
+            algorithm_version: u16,
+        ) -> paraegox_kernel::digest::Digest32 {
+            let verifier = AuthorityProofVerifier {
+                authority: self.authority(algorithm, algorithm_version),
+                verifying_key: SigningKey::from_bytes(&[self.verifying_seed_byte; 32])
+                    .verifying_key(),
+            };
+            super::derive_authority_domain_fingerprint(&self.endpoint(), &verifier)
+                .unwrap_or_else(|error| panic!("domain fingerprint failed: {error}"))
+        }
+    }
+
     fn client_for_endpoint(
         endpoint: UnixAuthorityEndpoint,
         timeout_value: Duration,
@@ -1059,6 +1175,113 @@ mod tests {
                 Err(expected)
             );
         }
+    }
+
+    #[test]
+    fn authority_domain_fingerprint_is_stable_and_binds_every_security_field() {
+        let fixture = AuthorityDomainFixture {
+            socket_path: "/var/run/paraegox/authority.sock",
+            authority_uid: 2_001,
+            controller_gid: 3_001,
+            server_uid: 2_001,
+            server_gid: 2_002,
+            authority_ref_byte: 0x61,
+            key_ref_byte: 0x62,
+            verifying_seed_byte: 0x63,
+        };
+        let base = fixture.fingerprint();
+        assert_eq!(base, fixture.fingerprint());
+        let changed = [
+            AuthorityDomainFixture {
+                socket_path: "/var/run/paraegox/authority-next.sock",
+                ..fixture
+            }
+            .fingerprint(),
+            AuthorityDomainFixture {
+                authority_uid: 2_003,
+                ..fixture
+            }
+            .fingerprint(),
+            AuthorityDomainFixture {
+                controller_gid: 3_002,
+                ..fixture
+            }
+            .fingerprint(),
+            AuthorityDomainFixture {
+                server_uid: 2_003,
+                ..fixture
+            }
+            .fingerprint(),
+            AuthorityDomainFixture {
+                server_gid: 2_003,
+                ..fixture
+            }
+            .fingerprint(),
+            AuthorityDomainFixture {
+                authority_ref_byte: 0x64,
+                ..fixture
+            }
+            .fingerprint(),
+            AuthorityDomainFixture {
+                key_ref_byte: 0x64,
+                ..fixture
+            }
+            .fingerprint(),
+            AuthorityDomainFixture {
+                verifying_seed_byte: 0x64,
+                ..fixture
+            }
+            .fingerprint(),
+            fixture.fingerprint_with_unvalidated_profile(2, 1),
+            fixture.fingerprint_with_unvalidated_profile(1, 2),
+        ];
+        assert!(changed.iter().all(|fingerprint| *fingerprint != base));
+        assert_eq!(
+            changed
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            changed.len(),
+            "each Authority security-domain field must have independent digest influence"
+        );
+
+        let unsupported = TenureProofAuthority::try_new(
+            TenureAuthorityRef::from_bytes([0x71; 16]),
+            TenureKeyRef::from_bytes([0x72; 16]),
+            TenureProofAlgorithm::try_new(2)
+                .unwrap_or_else(|error| panic!("unsupported algorithm fixture failed: {error}")),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("unsupported authority fixture failed: {error}"));
+        assert_eq!(
+            AuthorityProofVerifier::try_new(
+                unsupported,
+                SigningKey::from_bytes(&AUTHORITY_SEED).verifying_key(),
+            )
+            .expect_err("unsupported profile must fail before domain construction"),
+            TenureClientConfigurationError::UnsupportedProofProfile
+        );
+        let unsupported_version = fixture.authority(1, 2);
+        assert_eq!(
+            AuthorityProofVerifier::try_new(
+                unsupported_version,
+                SigningKey::from_bytes(&AUTHORITY_SEED).verifying_key(),
+            )
+            .expect_err("unsupported version must fail before domain construction"),
+            TenureClientConfigurationError::UnsupportedProofProfile
+        );
+
+        let mut weak_bytes = [0_u8; 32];
+        weak_bytes[0] = 1;
+        let weak = ed25519_dalek::VerifyingKey::from_bytes(&weak_bytes)
+            .unwrap_or_else(|error| panic!("weak key fixture failed: {error}"));
+        assert!(weak.is_weak());
+        assert_eq!(
+            AuthorityProofVerifier::try_new(proof_authority(0x73), weak)
+                .expect_err("weak key must fail before domain construction"),
+            TenureClientConfigurationError::WeakAuthorityKey
+        );
     }
 
     #[test]

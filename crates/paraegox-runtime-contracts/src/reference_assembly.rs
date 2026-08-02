@@ -40,6 +40,7 @@ const RUNTIME_BOOTSTRAP_REQUEST_MAGIC: &[u8; 4] = b"PXBR";
 const RUNTIME_BOOTSTRAP_RESPONSE_MAGIC: &[u8; 4] = b"PXBS";
 const RUNTIME_QUERY_REQUEST_MAGIC: &[u8; 4] = b"PXQR";
 const RUNTIME_QUERY_RESPONSE_MAGIC: &[u8; 4] = b"PXQS";
+const RUNTIME_APPLY_TERMINAL_RECEIPT_MAGIC: &[u8; 4] = b"PXRT";
 const APPLY_ENVELOPE_MAGIC: &[u8] = b"ParaEGOX\0runtime-apply-envelope";
 const SIGNING_TRANSCRIPT_MAGIC: &[u8] = b"ParaEGOX\0canonical-signing-transcript";
 
@@ -70,6 +71,12 @@ const QUERY_REQUEST_SIGNING_DOMAIN: &[u8] = b"paraegox.runtime.query.request-aut
 const QUERY_REQUEST_DIGEST_DOMAIN: &[u8] = b"paraegox.runtime.query.request.sha256.v1";
 const QUERY_RESPONSE_SIGNING_DOMAIN: &[u8] = b"paraegox.runtime.query.response-auth.signing.v1";
 const QUERY_RESPONSE_DIGEST_DOMAIN: &[u8] = b"paraegox.runtime.query.response.sha256.v1";
+const APPLY_TERMINAL_RECEIPT_SIGNING_DOMAIN: &[u8] =
+    b"paraegox.runtime.apply-terminal-receipt.response-auth.signing.v1";
+const APPLY_TERMINAL_RECEIPT_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.apply-terminal-receipt.sha256.v1";
+const APPLY_TERMINAL_RESULT_REF_DOMAIN: &[u8] =
+    b"paraegox.runtime.apply-terminal-result-ref.sha256.v1";
 
 pub(crate) const RUNTIME_BUILD_DESCRIPTOR_VERSION: u16 = 1;
 pub(crate) const RUNTIME_ARTIFACT_COMPATIBILITY_MANIFEST_VERSION: u16 = 1;
@@ -83,6 +90,8 @@ pub(crate) const LOCAL_CONTROL_CHANNEL_BINDING_VERSION: u16 = 1;
 pub(crate) const RUNTIME_BOOTSTRAP_PROTOCOL_VERSION: u16 = 1;
 pub(crate) const RUNTIME_QUERY_PROTOCOL_VERSION: u16 = 1;
 pub(crate) const CONTROL_READ_SIGNING_TRANSCRIPT_VERSION: u16 = 1;
+pub(crate) const RUNTIME_APPLY_TERMINAL_RECEIPT_VERSION: u16 = 1;
+pub(crate) const APPLY_TERMINAL_RECEIPT_SIGNING_TRANSCRIPT_VERSION: u16 = 1;
 
 pub(crate) const REFERENCE_LIFECYCLE_CONCURRENCY: u16 = 1;
 pub(crate) const REFERENCE_MAILBOX_SLOTS: u16 = 0;
@@ -101,6 +110,7 @@ pub(crate) const MAX_RUNTIME_BOOTSTRAP_REQUEST_BYTES: usize = 1024;
 pub(crate) const MAX_RUNTIME_BOOTSTRAP_RESPONSE_BYTES: usize = 2048;
 pub(crate) const MAX_RUNTIME_QUERY_REQUEST_BYTES: usize = 1024;
 pub(crate) const MAX_RUNTIME_QUERY_RESPONSE_BYTES: usize = 2048;
+pub(crate) const MAX_RUNTIME_APPLY_TERMINAL_RECEIPT_BYTES: usize = 2048;
 pub(crate) const MAX_QUERY_RECORD_COUNT: u16 = 1;
 
 const BUILD_ID_BYTES: usize = 32;
@@ -108,7 +118,7 @@ const STORE_ID_BYTES: usize = 32;
 const FIXTURE_ENTRY_BYTES: usize = 112;
 const BUILD_IDENTITY_BYTES: usize = 128;
 const MANIFEST_TARGET_ROW_BYTES: usize = 16 + BUILD_IDENTITY_BYTES + 2 + 2 + FIXTURE_ENTRY_BYTES;
-const COMPATIBILITY_MANIFEST_BYTES: usize = 4 + 2 + MANIFEST_TARGET_ROW_BYTES;
+pub(crate) const COMPATIBILITY_MANIFEST_BYTES: usize = 4 + 2 + MANIFEST_TARGET_ROW_BYTES;
 const COMPATIBILITY_PROJECTION_BYTES: usize = 4 + 2 + 32 + MANIFEST_TARGET_ROW_BYTES;
 const REFERENCE_LOOP_DOMAIN_BYTES: usize = 16 + 8 + 8 + 8;
 const REFERENCE_LOOP_SUBJECT_BYTES: usize = 16 + 16 + FIXTURE_ENTRY_BYTES + 32;
@@ -125,6 +135,8 @@ const QUERY_REQUEST_FIELD_COUNT: u16 = 15;
 const QUERY_REQUEST_SIGNING_FIELD_COUNT: u16 = 14;
 const QUERY_RESPONSE_FIELD_COUNT: u16 = 32;
 const QUERY_RESPONSE_SIGNING_FIELD_COUNT: u16 = 31;
+const APPLY_TERMINAL_RECEIPT_FIELD_COUNT: u16 = 23;
+const APPLY_TERMINAL_RECEIPT_SIGNING_FIELD_COUNT: u16 = 22;
 
 pub(crate) const MAX_RUNTIME_BUILD_DESCRIPTOR_BYTES: usize =
     4 + 2 + BUILD_ID_BYTES + 8 + 32 + 2 + MAX_TARGET_TRIPLE_BYTES + 32;
@@ -319,6 +331,31 @@ opaque_ref!(
     TerminalResultRef,
     "Runtime-owned reference to one canonical terminal result."
 );
+
+impl TerminalResultRef {
+    fn derive_for_apply(
+        target: RuntimeHostId,
+        store: RuntimeStoreInstanceId,
+        source_scope: SourceScopeRef,
+        operation_id: ApplyOperationId,
+        request_digest: Digest32,
+    ) -> Result<Self, ReferenceContractError> {
+        let mut builder = Digest32Builder::try_new(APPLY_TERMINAL_RESULT_REF_DOMAIN)?;
+        builder.field_u16(RUNTIME_APPLY_TERMINAL_RECEIPT_VERSION)?;
+        builder.field_bytes(target.as_bytes())?;
+        builder.field_bytes(store.as_bytes())?;
+        builder.field_bytes(source_scope.as_bytes())?;
+        builder.field_bytes(operation_id.as_bytes())?;
+        builder.field_digest(&request_digest)?;
+        let digest = builder.finish();
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        if all_zero(&bytes) {
+            return Err(ReferenceContractError::InvalidCompatibility);
+        }
+        Ok(Self::from_bytes(bytes))
+    }
+}
 
 /// Nonzero release-pipeline identity embedded into one Runtime binary.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -668,7 +705,7 @@ impl RuntimeArtifactCompatibilityManifestV1 {
         Self::from_row(row)
     }
 
-    fn from_row(
+    pub(crate) fn from_row(
         row: RuntimeArtifactCompatibilityTargetRowV1,
     ) -> Result<Self, ReferenceContractError> {
         let canonical_wire = build_manifest_wire(row);
@@ -1063,7 +1100,7 @@ impl RuntimePlanSliceV5 {
     }
 }
 
-fn compiled_reference_compatibility_digest(
+pub(crate) fn compiled_reference_compatibility_digest(
     fixture: ReferenceFixtureEntryV1,
 ) -> Result<Digest32, DigestBuildError> {
     let mut builder = Digest32Builder::try_new(COMPILED_REFERENCE_COMPATIBILITY_DIGEST_DOMAIN)?;
@@ -1113,7 +1150,7 @@ fn compiled_reference_compatibility_digest(
     Ok(builder.finish())
 }
 
-fn reference_empty_config_digest() -> Result<Digest32, DigestBuildError> {
+pub(crate) fn reference_empty_config_digest() -> Result<Digest32, DigestBuildError> {
     Ok(Digest32Builder::try_new(REFERENCE_EMPTY_CONFIG_DIGEST_DOMAIN)?.finish())
 }
 
@@ -1973,6 +2010,16 @@ impl RuntimeApplyRequestV5 {
     pub(crate) fn canonical_wire(&self) -> &[u8] {
         &self.canonical_wire
     }
+
+    /// Returns the exact nested RuntimePlanSlice v5 bytes (`PXTA || PXTE`).
+    ///
+    /// The PXAR v5 codec owns this range calculation. Facades and Runtime
+    /// consumers must not parse outer-frame offsets independently.
+    #[must_use]
+    pub(crate) fn canonical_slice_wire(&self) -> &[u8] {
+        let slice_offset = APPLY_REQUEST_V5_HEADER_BYTES + self.envelope.canonical_wire().len();
+        &self.canonical_wire[slice_offset..]
+    }
 }
 
 fn validate_v2_auth_claim(claim: &ApplyRequestAuthClaim) -> Result<(), ReferenceContractError> {
@@ -2648,7 +2695,7 @@ impl RuntimeChannelBindingV1 {
     }
 }
 
-fn reference_profile_fingerprint(
+pub(crate) fn reference_profile_fingerprint(
     fixture: ReferenceFixtureEntryV1,
 ) -> Result<Digest32, DigestBuildError> {
     let empty_config = reference_empty_config_digest()?;
@@ -3209,6 +3256,36 @@ impl RuntimeBootstrapServingIdentityV1 {
             clock_generation,
         }
     }
+
+    #[must_use]
+    pub(crate) const fn target(self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn store_instance_id(self) -> RuntimeStoreInstanceId {
+        self.store_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn snapshot_sequence(self) -> RuntimeSnapshotSequence {
+        self.snapshot_sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_host_epoch(self) -> RuntimeHostEpoch {
+        self.runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_domain(self) -> ClockDomainRef {
+        self.clock_domain
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> ClockGeneration {
+        self.clock_generation
+    }
 }
 
 /// Separately reported compiled actual and store-pinned compatibility tuple.
@@ -3276,6 +3353,36 @@ impl RuntimeBootstrapCompatibilityV1 {
             admission_policy_fingerprint,
         })
     }
+
+    #[must_use]
+    pub(crate) const fn compiled_build_instance_id(self) -> RuntimeBuildInstanceId {
+        self.compiled_build_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn compiled_compatibility_digest(self) -> Digest32 {
+        self.compiled_compatibility_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn store_pinned_build_identity(self) -> RuntimeBuildIdentityV1 {
+        self.store_pinned_build_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn manifest_digest(self) -> Digest32 {
+        self.manifest_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn profile_fingerprint(self) -> Digest32 {
+        self.profile_fingerprint
+    }
+
+    #[must_use]
+    pub(crate) const fn admission_policy_fingerprint(self) -> Digest32 {
+        self.admission_policy_fingerprint
+    }
 }
 
 /// Strictly validated facts returned by the minimal bootstrap read.
@@ -3333,6 +3440,76 @@ impl RuntimeBootstrapFactsV1 {
             self.clock_domain,
             self.clock_generation,
         )
+    }
+
+    #[must_use]
+    pub(crate) const fn target(self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn store_instance_id(self) -> RuntimeStoreInstanceId {
+        self.store_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn snapshot_sequence(self) -> RuntimeSnapshotSequence {
+        self.snapshot_sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_host_epoch(self) -> RuntimeHostEpoch {
+        self.runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_domain(self) -> ClockDomainRef {
+        self.clock_domain
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> ClockGeneration {
+        self.clock_generation
+    }
+
+    #[must_use]
+    pub(crate) const fn compiled_build_instance_id(self) -> RuntimeBuildInstanceId {
+        self.compiled_build_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn compiled_compatibility_digest(self) -> Digest32 {
+        self.compiled_compatibility_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn store_pinned_build_identity(self) -> RuntimeBuildIdentityV1 {
+        self.store_pinned_build_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn manifest_digest(self) -> Digest32 {
+        self.manifest_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn profile_fingerprint(self) -> Digest32 {
+        self.profile_fingerprint
+    }
+
+    #[must_use]
+    pub(crate) const fn admission_policy_fingerprint(self) -> Digest32 {
+        self.admission_policy_fingerprint
+    }
+
+    #[must_use]
+    pub(crate) const fn state(self) -> RuntimeBootstrapStateV1 {
+        self.state
+    }
+
+    #[must_use]
+    pub(crate) const fn reason(self) -> Option<OperationalReasonV1> {
+        self.reason
     }
 }
 
@@ -3491,6 +3668,21 @@ impl RuntimeBootstrapResponseV1 {
 
     pub(crate) fn decode(frame: &[u8]) -> Result<Self, ReferenceWireError> {
         decode_bootstrap_response(frame)
+    }
+
+    #[must_use]
+    pub(crate) const fn request_id(&self) -> BootstrapRequestId {
+        self.request_id
+    }
+
+    #[must_use]
+    pub(crate) const fn request_digest(&self) -> Digest32 {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub(crate) fn client_nonce(&self) -> &[u8] {
+        &self.client_nonce
     }
 
     #[must_use]
@@ -3937,6 +4129,996 @@ fn decode_operational_reason(
         }
     };
     Ok(Some(reason))
+}
+
+/// Exact terminal result selected by the Runtime apply state machine.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u16)]
+pub(crate) enum RuntimeApplyTerminalOutcomeV1 {
+    OneSourceLoopActive = 1,
+    EmptyDeactivateExactZero = 2,
+    StartTimedOutBeforeIntentNoEffects = 3,
+    StopTimedOutBeforeHeadCommitNoEffects = 4,
+    StartFailedBeforeHeadCommitExactZero = 5,
+    StartTimedOutBeforeHeadCommitExactZero = 6,
+    StopFailedButExactZero = 7,
+    TimedOutButExactZero = 8,
+    AbortedBeforeIntentNoEffects = 9,
+    AbortedBeforeHeadCommitExactZero = 10,
+    SupersededAfterIntentExactZero = 11,
+    InterruptedButNowExactZero = 12,
+}
+
+/// Whether lifecycle execution is proven absent or may have crossed its boundary.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u16)]
+pub(crate) enum RuntimeApplyTerminalLifecycleEffectV1 {
+    ProvenNotStarted = 1,
+    MayHaveStarted = 2,
+}
+
+/// Desired-head state atomically associated with one terminal operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RuntimeApplyTerminalHeadV1 {
+    PreservedNone,
+    PreservedExisting(TargetSliceDigest),
+    CommittedIncoming(TargetSliceDigest),
+}
+
+impl RuntimeApplyTerminalHeadV1 {
+    const fn disposition(self) -> u16 {
+        match self {
+            Self::PreservedNone => 1,
+            Self::PreservedExisting(_) => 2,
+            Self::CommittedIncoming(_) => 3,
+        }
+    }
+
+    const fn desired_head_digest(self) -> Option<TargetSliceDigest> {
+        match self {
+            Self::PreservedNone => None,
+            Self::PreservedExisting(digest) | Self::CommittedIncoming(digest) => Some(digest),
+        }
+    }
+
+    const fn commits_incoming(self) -> bool {
+        matches!(self, Self::CommittedIncoming(_))
+    }
+}
+
+/// Immutable terminal facts owned by one canonical apply Receipt.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RuntimeApplyTerminalFactsV1 {
+    outcome: RuntimeApplyTerminalOutcomeV1,
+    lifecycle_effect: RuntimeApplyTerminalLifecycleEffectV1,
+    head: RuntimeApplyTerminalHeadV1,
+    resource_census_digest: Digest32,
+    raw_outcome_digest: Digest32,
+    completion_runtime_host_epoch: RuntimeHostEpoch,
+    completion_snapshot_sequence: RuntimeSnapshotSequence,
+    selection_clock_generation: ClockGeneration,
+    selection_observed_at_nanos: u64,
+    terminal_result_ref: TerminalResultRef,
+}
+
+impl RuntimeApplyTerminalFactsV1 {
+    #[allow(clippy::too_many_arguments)] // GOV-WAIVER-0010
+    pub(crate) fn try_new(
+        request: &RuntimeApplyRequestV5,
+        outcome: RuntimeApplyTerminalOutcomeV1,
+        lifecycle_effect: RuntimeApplyTerminalLifecycleEffectV1,
+        head: RuntimeApplyTerminalHeadV1,
+        resource_census_digest: Digest32,
+        raw_outcome_digest: Digest32,
+        completion_runtime_host_epoch: RuntimeHostEpoch,
+        completion_snapshot_sequence: RuntimeSnapshotSequence,
+        selection_clock_generation: ClockGeneration,
+        selection_observed_at_nanos: u64,
+    ) -> Result<Self, ReferenceContractError> {
+        let binding = apply_terminal_request_binding(request);
+        validate_apply_terminal_shape(
+            outcome,
+            lifecycle_effect,
+            head,
+            Some(binding.mode),
+            Some(binding.incoming_slice_digest),
+        )?;
+        if digest_is_zero(&resource_census_digest)
+            || digest_is_zero(&raw_outcome_digest)
+            || selection_observed_at_nanos == 0
+            || selection_clock_generation.value()
+                < request
+                    .envelope()
+                    .temporal()
+                    .target_clock_generation()
+                    .value()
+        {
+            return Err(ReferenceContractError::InvalidShape);
+        }
+        let terminal_result_ref = derive_apply_terminal_result_ref(binding)?;
+        Ok(Self {
+            outcome,
+            lifecycle_effect,
+            head,
+            resource_census_digest,
+            raw_outcome_digest,
+            completion_runtime_host_epoch,
+            completion_snapshot_sequence,
+            selection_clock_generation,
+            selection_observed_at_nanos,
+            terminal_result_ref,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn outcome(self) -> RuntimeApplyTerminalOutcomeV1 {
+        self.outcome
+    }
+
+    #[must_use]
+    pub(crate) const fn lifecycle_effect(self) -> RuntimeApplyTerminalLifecycleEffectV1 {
+        self.lifecycle_effect
+    }
+
+    #[must_use]
+    pub(crate) const fn head(self) -> RuntimeApplyTerminalHeadV1 {
+        self.head
+    }
+
+    #[must_use]
+    pub(crate) const fn resource_census_digest(self) -> Digest32 {
+        self.resource_census_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn raw_outcome_digest(self) -> Digest32 {
+        self.raw_outcome_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn completion_runtime_host_epoch(self) -> RuntimeHostEpoch {
+        self.completion_runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn completion_snapshot_sequence(self) -> RuntimeSnapshotSequence {
+        self.completion_snapshot_sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn selection_clock_generation(self) -> ClockGeneration {
+        self.selection_clock_generation
+    }
+
+    #[must_use]
+    pub(crate) const fn selection_observed_at_nanos(self) -> u64 {
+        self.selection_observed_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn terminal_result_ref(self) -> TerminalResultRef {
+        self.terminal_result_ref
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ApplyTerminalRequestBinding<'a> {
+    target: RuntimeHostId,
+    store: RuntimeStoreInstanceId,
+    source_scope: SourceScopeRef,
+    operation_id: ApplyOperationId,
+    request_digest: Digest32,
+    request_nonce: &'a [u8],
+    mode: ReferenceAssemblyModeV1,
+    incoming_slice_digest: TargetSliceDigest,
+}
+
+fn apply_terminal_request_binding(
+    request: &RuntimeApplyRequestV5,
+) -> ApplyTerminalRequestBinding<'_> {
+    let commitment = request.envelope().control_commitment();
+    ApplyTerminalRequestBinding {
+        target: commitment.slice().header().target(),
+        store: request.envelope().expected_runtime_store_instance_id(),
+        source_scope: commitment.slice().header().provenance().source_scope(),
+        operation_id: commitment.control().operation_id(),
+        request_digest: request.envelope().request_digest(),
+        request_nonce: request.envelope().authentication().claim().nonce(),
+        mode: request.slice().assignments().execution().profile().mode(),
+        incoming_slice_digest: commitment.slice().target_slice_digest(),
+    }
+}
+
+fn derive_apply_terminal_result_ref(
+    binding: ApplyTerminalRequestBinding<'_>,
+) -> Result<TerminalResultRef, ReferenceContractError> {
+    TerminalResultRef::derive_for_apply(
+        binding.target,
+        binding.store,
+        binding.source_scope,
+        binding.operation_id,
+        binding.request_digest,
+    )
+}
+
+const fn apply_terminal_outcome_accepts_mode(
+    outcome: RuntimeApplyTerminalOutcomeV1,
+    mode: ReferenceAssemblyModeV1,
+) -> bool {
+    match mode {
+        ReferenceAssemblyModeV1::OneSourceLoop => matches!(
+            outcome,
+            RuntimeApplyTerminalOutcomeV1::OneSourceLoopActive
+                | RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeIntentNoEffects
+                | RuntimeApplyTerminalOutcomeV1::StartFailedBeforeHeadCommitExactZero
+                | RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeHeadCommitExactZero
+                | RuntimeApplyTerminalOutcomeV1::AbortedBeforeIntentNoEffects
+                | RuntimeApplyTerminalOutcomeV1::AbortedBeforeHeadCommitExactZero
+                | RuntimeApplyTerminalOutcomeV1::SupersededAfterIntentExactZero
+        ),
+        ReferenceAssemblyModeV1::EmptyDeactivate => matches!(
+            outcome,
+            RuntimeApplyTerminalOutcomeV1::EmptyDeactivateExactZero
+                | RuntimeApplyTerminalOutcomeV1::StopTimedOutBeforeHeadCommitNoEffects
+                | RuntimeApplyTerminalOutcomeV1::StopFailedButExactZero
+                | RuntimeApplyTerminalOutcomeV1::TimedOutButExactZero
+                | RuntimeApplyTerminalOutcomeV1::AbortedBeforeIntentNoEffects
+                | RuntimeApplyTerminalOutcomeV1::SupersededAfterIntentExactZero
+                | RuntimeApplyTerminalOutcomeV1::InterruptedButNowExactZero
+        ),
+    }
+}
+
+const fn apply_terminal_outcome_commits_incoming(
+    outcome: RuntimeApplyTerminalOutcomeV1,
+    mode: ReferenceAssemblyModeV1,
+) -> bool {
+    match mode {
+        ReferenceAssemblyModeV1::OneSourceLoop => {
+            matches!(outcome, RuntimeApplyTerminalOutcomeV1::OneSourceLoopActive)
+        }
+        ReferenceAssemblyModeV1::EmptyDeactivate => matches!(
+            outcome,
+            RuntimeApplyTerminalOutcomeV1::EmptyDeactivateExactZero
+                | RuntimeApplyTerminalOutcomeV1::StopFailedButExactZero
+                | RuntimeApplyTerminalOutcomeV1::TimedOutButExactZero
+                | RuntimeApplyTerminalOutcomeV1::SupersededAfterIntentExactZero
+                | RuntimeApplyTerminalOutcomeV1::InterruptedButNowExactZero
+        ),
+    }
+}
+
+const fn apply_terminal_lifecycle_is_valid(
+    outcome: RuntimeApplyTerminalOutcomeV1,
+    lifecycle: RuntimeApplyTerminalLifecycleEffectV1,
+) -> bool {
+    match outcome {
+        RuntimeApplyTerminalOutcomeV1::OneSourceLoopActive
+        | RuntimeApplyTerminalOutcomeV1::StartFailedBeforeHeadCommitExactZero
+        | RuntimeApplyTerminalOutcomeV1::StopFailedButExactZero => {
+            matches!(
+                lifecycle,
+                RuntimeApplyTerminalLifecycleEffectV1::MayHaveStarted
+            )
+        }
+        RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeIntentNoEffects
+        | RuntimeApplyTerminalOutcomeV1::StopTimedOutBeforeHeadCommitNoEffects
+        | RuntimeApplyTerminalOutcomeV1::AbortedBeforeIntentNoEffects => matches!(
+            lifecycle,
+            RuntimeApplyTerminalLifecycleEffectV1::ProvenNotStarted
+        ),
+        RuntimeApplyTerminalOutcomeV1::EmptyDeactivateExactZero
+        | RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeHeadCommitExactZero
+        | RuntimeApplyTerminalOutcomeV1::TimedOutButExactZero
+        | RuntimeApplyTerminalOutcomeV1::AbortedBeforeHeadCommitExactZero
+        | RuntimeApplyTerminalOutcomeV1::SupersededAfterIntentExactZero
+        | RuntimeApplyTerminalOutcomeV1::InterruptedButNowExactZero => true,
+    }
+}
+
+const fn apply_terminal_head_is_potentially_valid(
+    outcome: RuntimeApplyTerminalOutcomeV1,
+    commits_incoming: bool,
+) -> bool {
+    match outcome {
+        RuntimeApplyTerminalOutcomeV1::OneSourceLoopActive
+        | RuntimeApplyTerminalOutcomeV1::EmptyDeactivateExactZero
+        | RuntimeApplyTerminalOutcomeV1::StopFailedButExactZero
+        | RuntimeApplyTerminalOutcomeV1::TimedOutButExactZero
+        | RuntimeApplyTerminalOutcomeV1::InterruptedButNowExactZero => commits_incoming,
+        RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeIntentNoEffects
+        | RuntimeApplyTerminalOutcomeV1::StopTimedOutBeforeHeadCommitNoEffects
+        | RuntimeApplyTerminalOutcomeV1::StartFailedBeforeHeadCommitExactZero
+        | RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeHeadCommitExactZero
+        | RuntimeApplyTerminalOutcomeV1::AbortedBeforeIntentNoEffects
+        | RuntimeApplyTerminalOutcomeV1::AbortedBeforeHeadCommitExactZero => !commits_incoming,
+        RuntimeApplyTerminalOutcomeV1::SupersededAfterIntentExactZero => true,
+    }
+}
+
+fn validate_apply_terminal_shape(
+    outcome: RuntimeApplyTerminalOutcomeV1,
+    lifecycle: RuntimeApplyTerminalLifecycleEffectV1,
+    head: RuntimeApplyTerminalHeadV1,
+    mode: Option<ReferenceAssemblyModeV1>,
+    incoming_slice_digest: Option<TargetSliceDigest>,
+) -> Result<(), ReferenceContractError> {
+    if !apply_terminal_lifecycle_is_valid(outcome, lifecycle)
+        || !apply_terminal_head_is_potentially_valid(outcome, head.commits_incoming())
+        || head
+            .desired_head_digest()
+            .is_some_and(|digest| digest_is_zero(digest.value()))
+    {
+        return Err(ReferenceContractError::InvalidShape);
+    }
+    if let Some(mode) = mode {
+        if !apply_terminal_outcome_accepts_mode(outcome, mode)
+            || apply_terminal_outcome_commits_incoming(outcome, mode) != head.commits_incoming()
+        {
+            return Err(ReferenceContractError::InvalidShape);
+        }
+        if let RuntimeApplyTerminalHeadV1::CommittedIncoming(committed) = head
+            && incoming_slice_digest != Some(committed)
+        {
+            return Err(ReferenceContractError::InvalidShape);
+        }
+    }
+    Ok(())
+}
+
+/// Exact bytes authenticated by the Runtime terminal-Receipt signer.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ApplyTerminalReceiptSigningTranscriptV1(Box<[u8]>);
+
+impl ApplyTerminalReceiptSigningTranscriptV1 {
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Signature-independent terminal Receipt bound to one exact PXAR request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeApplyTerminalReceiptDraftV1 {
+    target: RuntimeHostId,
+    store: RuntimeStoreInstanceId,
+    source_scope: SourceScopeRef,
+    operation_id: ApplyOperationId,
+    request_digest: Digest32,
+    request_nonce: Box<[u8]>,
+    facts: RuntimeApplyTerminalFactsV1,
+    auth_claim: RuntimeResponseAuthClaimV1,
+}
+
+impl RuntimeApplyTerminalReceiptDraftV1 {
+    pub(crate) fn try_new(
+        request: &RuntimeApplyRequestV5,
+        facts: RuntimeApplyTerminalFactsV1,
+        channel: RuntimeChannelBindingV1,
+        auth_claim: RuntimeResponseAuthClaimV1,
+    ) -> Result<Self, ReferenceContractError> {
+        let binding = apply_terminal_request_binding(request);
+        validate_apply_terminal_shape(
+            facts.outcome,
+            facts.lifecycle_effect,
+            facts.head,
+            Some(binding.mode),
+            Some(binding.incoming_slice_digest),
+        )?;
+        if facts.terminal_result_ref != derive_apply_terminal_result_ref(binding)?
+            || binding.target != channel.target()
+            || auth_claim.runtime_peer() != channel.runtime_peer()
+            || auth_claim.channel_binding_digest() != channel.binding_digest()
+        {
+            return Err(ReferenceContractError::TargetMismatch);
+        }
+        Ok(Self {
+            target: binding.target,
+            store: binding.store,
+            source_scope: binding.source_scope,
+            operation_id: binding.operation_id,
+            request_digest: binding.request_digest,
+            request_nonce: binding.request_nonce.into(),
+            facts,
+            auth_claim,
+        })
+    }
+
+    pub(crate) fn signing_transcript(
+        &self,
+    ) -> Result<ApplyTerminalReceiptSigningTranscriptV1, ReferenceContractError> {
+        build_apply_terminal_receipt_signing_transcript(
+            self.target,
+            self.store,
+            self.source_scope,
+            self.operation_id,
+            self.request_digest,
+            &self.request_nonce,
+            self.facts,
+            self.auth_claim,
+        )
+    }
+
+    pub(crate) fn finalize(
+        self,
+        signature: &[u8],
+    ) -> Result<RuntimeApplyTerminalReceiptV1, ReferenceContractError> {
+        let authentication = RuntimeResponseAuthenticationV1::try_new(self.auth_claim, signature)?;
+        RuntimeApplyTerminalReceiptV1::try_new(
+            self.target,
+            self.store,
+            self.source_scope,
+            self.operation_id,
+            self.request_digest,
+            &self.request_nonce,
+            self.facts,
+            authentication,
+        )
+    }
+}
+
+/// Signed canonical terminal Receipt for one exact Runtime apply operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeApplyTerminalReceiptV1 {
+    target: RuntimeHostId,
+    store: RuntimeStoreInstanceId,
+    source_scope: SourceScopeRef,
+    operation_id: ApplyOperationId,
+    request_digest: Digest32,
+    request_nonce: Box<[u8]>,
+    facts: RuntimeApplyTerminalFactsV1,
+    authentication: RuntimeResponseAuthenticationV1,
+    canonical_wire: Box<[u8]>,
+    receipt_digest: Digest32,
+}
+
+impl RuntimeApplyTerminalReceiptV1 {
+    #[allow(clippy::too_many_arguments)] // GOV-WAIVER-0010
+    fn try_new(
+        target: RuntimeHostId,
+        store: RuntimeStoreInstanceId,
+        source_scope: SourceScopeRef,
+        operation_id: ApplyOperationId,
+        request_digest: Digest32,
+        request_nonce: &[u8],
+        facts: RuntimeApplyTerminalFactsV1,
+        authentication: RuntimeResponseAuthenticationV1,
+    ) -> Result<Self, ReferenceContractError> {
+        validate_nonce(request_nonce, MAX_APPLY_AUTH_NONCE_V2_BYTES)?;
+        validate_apply_terminal_shape(
+            facts.outcome,
+            facts.lifecycle_effect,
+            facts.head,
+            None,
+            None,
+        )?;
+        if digest_is_zero(&request_digest)
+            || digest_is_zero(&facts.resource_census_digest)
+            || digest_is_zero(&facts.raw_outcome_digest)
+            || facts.selection_observed_at_nanos == 0
+        {
+            return Err(ReferenceContractError::InvalidShape);
+        }
+        let expected_result_ref = TerminalResultRef::derive_for_apply(
+            target,
+            store,
+            source_scope,
+            operation_id,
+            request_digest,
+        )?;
+        if facts.terminal_result_ref != expected_result_ref
+            || all_zero(facts.terminal_result_ref.as_bytes())
+        {
+            return Err(ReferenceContractError::InvalidCompatibility);
+        }
+        let canonical_wire = build_apply_terminal_receipt_wire(
+            target,
+            store,
+            source_scope,
+            operation_id,
+            request_digest,
+            request_nonce,
+            facts,
+            &authentication,
+        );
+        if canonical_wire.len() > MAX_RUNTIME_APPLY_TERMINAL_RECEIPT_BYTES {
+            return Err(ReferenceContractError::RequestFrameTooLarge);
+        }
+        let receipt_digest = digest_wire(APPLY_TERMINAL_RECEIPT_DIGEST_DOMAIN, &canonical_wire)?;
+        Ok(Self {
+            target,
+            store,
+            source_scope,
+            operation_id,
+            request_digest,
+            request_nonce: request_nonce.into(),
+            facts,
+            authentication,
+            canonical_wire: canonical_wire.into_boxed_slice(),
+            receipt_digest,
+        })
+    }
+
+    pub(crate) fn decode(frame: &[u8]) -> Result<Self, ReferenceWireError> {
+        decode_apply_terminal_receipt(frame)
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn store(&self) -> RuntimeStoreInstanceId {
+        self.store
+    }
+
+    #[must_use]
+    pub(crate) const fn source_scope(&self) -> SourceScopeRef {
+        self.source_scope
+    }
+
+    #[must_use]
+    pub(crate) const fn operation_id(&self) -> ApplyOperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub(crate) const fn request_digest(&self) -> Digest32 {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub(crate) fn request_nonce(&self) -> &[u8] {
+        &self.request_nonce
+    }
+
+    #[must_use]
+    pub(crate) const fn facts(&self) -> RuntimeApplyTerminalFactsV1 {
+        self.facts
+    }
+
+    #[must_use]
+    pub(crate) const fn authentication(&self) -> &RuntimeResponseAuthenticationV1 {
+        &self.authentication
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_wire(&self) -> &[u8] {
+        &self.canonical_wire
+    }
+
+    #[must_use]
+    pub(crate) const fn receipt_digest(&self) -> Digest32 {
+        self.receipt_digest
+    }
+
+    pub(crate) fn signing_transcript(
+        &self,
+    ) -> Result<ApplyTerminalReceiptSigningTranscriptV1, ReferenceContractError> {
+        build_apply_terminal_receipt_signing_transcript(
+            self.target,
+            self.store,
+            self.source_scope,
+            self.operation_id,
+            self.request_digest,
+            &self.request_nonce,
+            self.facts,
+            self.authentication.claim(),
+        )
+    }
+
+    pub(crate) fn validate_against_request(
+        &self,
+        request: &RuntimeApplyRequestV5,
+        channel: RuntimeChannelBindingV1,
+    ) -> Result<(), ReferenceWireError> {
+        let binding = apply_terminal_request_binding(request);
+        if self.target != binding.target || channel.target() != binding.target {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::TargetMismatch,
+                1,
+            ));
+        }
+        if self.store != binding.store {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::RuntimeStoreMismatch,
+                2,
+            ));
+        }
+        if self.source_scope != binding.source_scope {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::CrossReferenceMismatch,
+                3,
+            ));
+        }
+        if self.operation_id != binding.operation_id {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::CrossReferenceMismatch,
+                4,
+            ));
+        }
+        if self.request_digest != binding.request_digest {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::CrossReferenceMismatch,
+                5,
+            ));
+        }
+        if self.request_nonce.as_ref() != binding.request_nonce {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::CrossReferenceMismatch,
+                6,
+            ));
+        }
+        validate_apply_terminal_shape(
+            self.facts.outcome,
+            self.facts.lifecycle_effect,
+            self.facts.head,
+            Some(binding.mode),
+            Some(binding.incoming_slice_digest),
+        )
+        .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::CrossReferenceMismatch, 7))?;
+        if self.facts.selection_clock_generation.value()
+            < request
+                .envelope()
+                .temporal()
+                .target_clock_generation()
+                .value()
+        {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::CrossReferenceMismatch,
+                15,
+            ));
+        }
+        if self.facts.terminal_result_ref
+            != derive_apply_terminal_result_ref(binding)
+                .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::DigestMismatch, 17))?
+        {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::DigestMismatch,
+                17,
+            ));
+        }
+        if self.authentication.claim().runtime_peer() != channel.runtime_peer() {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::TargetMismatch,
+                18,
+            ));
+        }
+        if self.authentication.claim().channel_binding_digest() != channel.binding_digest() {
+            return Err(ReferenceWireError::at(
+                ReferenceWireErrorCode::TargetMismatch,
+                19,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // GOV-WAIVER-0010
+fn build_apply_terminal_receipt_signing_transcript(
+    target: RuntimeHostId,
+    store: RuntimeStoreInstanceId,
+    source_scope: SourceScopeRef,
+    operation_id: ApplyOperationId,
+    request_digest: Digest32,
+    request_nonce: &[u8],
+    facts: RuntimeApplyTerminalFactsV1,
+    auth_claim: RuntimeResponseAuthClaimV1,
+) -> Result<ApplyTerminalReceiptSigningTranscriptV1, ReferenceContractError> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(SIGNING_TRANSCRIPT_MAGIC);
+    encoded.extend_from_slice(&APPLY_TERMINAL_RECEIPT_SIGNING_TRANSCRIPT_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&(APPLY_TERMINAL_RECEIPT_SIGNING_DOMAIN.len() as u16).to_be_bytes());
+    encoded.extend_from_slice(APPLY_TERMINAL_RECEIPT_SIGNING_DOMAIN);
+    encoded.extend_from_slice(&APPLY_TERMINAL_RECEIPT_SIGNING_FIELD_COUNT.to_be_bytes());
+    append_apply_terminal_receipt_fields(
+        &mut encoded,
+        target,
+        store,
+        source_scope,
+        operation_id,
+        request_digest,
+        request_nonce,
+        facts,
+        auth_claim,
+        None,
+    );
+    if encoded.len() > MAX_RUNTIME_APPLY_TERMINAL_RECEIPT_BYTES {
+        return Err(ReferenceContractError::RequestFrameTooLarge);
+    }
+    Ok(ApplyTerminalReceiptSigningTranscriptV1(
+        encoded.into_boxed_slice(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)] // GOV-WAIVER-0010
+fn build_apply_terminal_receipt_wire(
+    target: RuntimeHostId,
+    store: RuntimeStoreInstanceId,
+    source_scope: SourceScopeRef,
+    operation_id: ApplyOperationId,
+    request_digest: Digest32,
+    request_nonce: &[u8],
+    facts: RuntimeApplyTerminalFactsV1,
+    authentication: &RuntimeResponseAuthenticationV1,
+) -> Vec<u8> {
+    let mut encoded = begin_tlv_frame(
+        RUNTIME_APPLY_TERMINAL_RECEIPT_MAGIC,
+        RUNTIME_APPLY_TERMINAL_RECEIPT_VERSION,
+        APPLY_TERMINAL_RECEIPT_FIELD_COUNT,
+    );
+    append_apply_terminal_receipt_fields(
+        &mut encoded,
+        target,
+        store,
+        source_scope,
+        operation_id,
+        request_digest,
+        request_nonce,
+        facts,
+        authentication.claim(),
+        Some(authentication.signature()),
+    );
+    encoded
+}
+
+#[allow(clippy::too_many_arguments)] // GOV-WAIVER-0010
+fn append_apply_terminal_receipt_fields(
+    encoded: &mut Vec<u8>,
+    target: RuntimeHostId,
+    store: RuntimeStoreInstanceId,
+    source_scope: SourceScopeRef,
+    operation_id: ApplyOperationId,
+    request_digest: Digest32,
+    request_nonce: &[u8],
+    facts: RuntimeApplyTerminalFactsV1,
+    auth_claim: RuntimeResponseAuthClaimV1,
+    signature: Option<&[u8]>,
+) {
+    let desired_head_digest = facts
+        .head
+        .desired_head_digest()
+        .map_or(Digest32::from_bytes([0; 32]), |digest| *digest.value());
+    append_tlv(encoded, 1, target.as_bytes());
+    append_tlv(encoded, 2, store.as_bytes());
+    append_tlv(encoded, 3, source_scope.as_bytes());
+    append_tlv(encoded, 4, operation_id.as_bytes());
+    append_tlv(encoded, 5, request_digest.as_bytes());
+    append_tlv(encoded, 6, request_nonce);
+    append_tlv(encoded, 7, &(facts.outcome as u16).to_be_bytes());
+    append_tlv(encoded, 8, &(facts.lifecycle_effect as u16).to_be_bytes());
+    append_tlv(encoded, 9, &facts.head.disposition().to_be_bytes());
+    append_tlv(encoded, 10, desired_head_digest.as_bytes());
+    append_tlv(encoded, 11, facts.resource_census_digest.as_bytes());
+    append_tlv(encoded, 12, facts.raw_outcome_digest.as_bytes());
+    append_tlv(
+        encoded,
+        13,
+        &facts.completion_runtime_host_epoch.value().to_be_bytes(),
+    );
+    append_tlv(
+        encoded,
+        14,
+        &facts.completion_snapshot_sequence.value().to_be_bytes(),
+    );
+    append_tlv(
+        encoded,
+        15,
+        &facts.selection_clock_generation.value().to_be_bytes(),
+    );
+    append_tlv(
+        encoded,
+        16,
+        &facts.selection_observed_at_nanos.to_be_bytes(),
+    );
+    append_tlv(encoded, 17, facts.terminal_result_ref.as_bytes());
+    append_tlv(encoded, 18, auth_claim.runtime_peer().as_bytes());
+    append_tlv(encoded, 19, auth_claim.channel_binding_digest().as_bytes());
+    append_tlv(encoded, 20, auth_claim.key().as_bytes());
+    append_tlv(encoded, 21, &auth_claim.algorithm().value().to_be_bytes());
+    append_tlv(encoded, 22, &auth_claim.algorithm_version().to_be_bytes());
+    if let Some(signature) = signature {
+        append_tlv(encoded, 23, signature);
+    }
+}
+
+fn decode_apply_terminal_receipt(
+    frame: &[u8],
+) -> Result<RuntimeApplyTerminalReceiptV1, ReferenceWireError> {
+    let fields = parse_tlv_frame(
+        frame,
+        RUNTIME_APPLY_TERMINAL_RECEIPT_MAGIC,
+        RUNTIME_APPLY_TERMINAL_RECEIPT_VERSION,
+        APPLY_TERMINAL_RECEIPT_FIELD_COUNT,
+        MAX_RUNTIME_APPLY_TERMINAL_RECEIPT_BYTES,
+        valid_apply_terminal_receipt_field_length,
+    )?;
+    let store = RuntimeStoreInstanceId::try_from_bytes(fields.array(2)?)
+        .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::InvalidFieldValue, 2))?;
+    let request_digest = Digest32::from_bytes(fields.array(5)?);
+    if digest_is_zero(&request_digest) {
+        return Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidFieldValue,
+            5,
+        ));
+    }
+    let outcome = decode_apply_terminal_outcome(fields.u16(7)?)?;
+    let lifecycle_effect = decode_apply_terminal_lifecycle(fields.u16(8)?)?;
+    let head = decode_apply_terminal_head(fields.u16(9)?, fields.array(10)?)?;
+    validate_apply_terminal_shape(outcome, lifecycle_effect, head, None, None)
+        .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::InvalidFieldValue, 7))?;
+    let resource_census_digest = Digest32::from_bytes(fields.array(11)?);
+    if digest_is_zero(&resource_census_digest) {
+        return Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidFieldValue,
+            11,
+        ));
+    }
+    let raw_outcome_digest = Digest32::from_bytes(fields.array(12)?);
+    if digest_is_zero(&raw_outcome_digest) {
+        return Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidFieldValue,
+            12,
+        ));
+    }
+    let completion_runtime_host_epoch = RuntimeHostEpoch::try_new(fields.u64(13)?)
+        .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::InvalidFieldValue, 13))?;
+    let completion_snapshot_sequence = RuntimeSnapshotSequence::try_new(fields.u64(14)?)
+        .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::InvalidFieldValue, 14))?;
+    let selection_clock_generation = ClockGeneration::try_new(fields.u64(15)?)
+        .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::InvalidFieldValue, 15))?;
+    let selection_observed_at_nanos = fields.u64(16)?;
+    if selection_observed_at_nanos == 0 {
+        return Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidFieldValue,
+            16,
+        ));
+    }
+    let target = RuntimeHostId::from_bytes(fields.array(1)?);
+    let source_scope = SourceScopeRef::from_bytes(fields.array(3)?);
+    let operation_id = ApplyOperationId::from_bytes(fields.array(4)?);
+    let terminal_result_ref = TerminalResultRef::derive_for_apply(
+        target,
+        store,
+        source_scope,
+        operation_id,
+        request_digest,
+    )
+    .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::DigestMismatch, 17))?;
+    if terminal_result_ref.as_bytes() != fields.get(17) {
+        return Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::DigestMismatch,
+            17,
+        ));
+    }
+    let facts = RuntimeApplyTerminalFactsV1 {
+        outcome,
+        lifecycle_effect,
+        head,
+        resource_census_digest,
+        raw_outcome_digest,
+        completion_runtime_host_epoch,
+        completion_snapshot_sequence,
+        selection_clock_generation,
+        selection_observed_at_nanos,
+        terminal_result_ref,
+    };
+    let channel_binding_digest = Digest32::from_bytes(fields.array(19)?);
+    if digest_is_zero(&channel_binding_digest) {
+        return Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidFieldValue,
+            19,
+        ));
+    }
+    let algorithm = ApplyAuthAlgorithm::try_new(fields.u16(21)?)
+        .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::InvalidFieldValue, 21))?;
+    let algorithm_version = fields.u16(22)?;
+    if algorithm_version == 0 {
+        return Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidFieldValue,
+            22,
+        ));
+    }
+    let auth_claim = RuntimeResponseAuthClaimV1::try_new(
+        PrincipalRef::from_bytes(fields.array(18)?),
+        channel_binding_digest,
+        ApplyAuthKeyRef::from_bytes(fields.array(20)?),
+        algorithm,
+        algorithm_version,
+    )
+    .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::InvalidFieldValue, 22))?;
+    let authentication = RuntimeResponseAuthenticationV1::try_new(auth_claim, fields.get(23))
+        .map_err(|_| ReferenceWireError::at(ReferenceWireErrorCode::InvalidSignatureField, 23))?;
+    let decoded = RuntimeApplyTerminalReceiptV1::try_new(
+        target,
+        store,
+        source_scope,
+        operation_id,
+        request_digest,
+        fields.get(6),
+        facts,
+        authentication,
+    )
+    .map_err(|_| ReferenceWireError::new(ReferenceWireErrorCode::InvalidFieldValue))?;
+    if decoded.canonical_wire() != frame {
+        return Err(ReferenceWireError::new(
+            ReferenceWireErrorCode::NonCanonicalFrame,
+        ));
+    }
+    Ok(decoded)
+}
+
+fn valid_apply_terminal_receipt_field_length(tag: u16, length: usize) -> bool {
+    match tag {
+        1 | 3 | 4 | 17 | 18 | 20 => length == 16,
+        2 | 5 | 10..=12 | 19 => length == 32,
+        6 => (1..=MAX_APPLY_AUTH_NONCE_V2_BYTES).contains(&length),
+        7..=9 | 21 | 22 => length == 2,
+        13..=16 => length == 8,
+        23 => (1..=MAX_CONTROL_READ_SIGNATURE_BYTES).contains(&length),
+        _ => false,
+    }
+}
+
+fn decode_apply_terminal_outcome(
+    value: u16,
+) -> Result<RuntimeApplyTerminalOutcomeV1, ReferenceWireError> {
+    match value {
+        1 => Ok(RuntimeApplyTerminalOutcomeV1::OneSourceLoopActive),
+        2 => Ok(RuntimeApplyTerminalOutcomeV1::EmptyDeactivateExactZero),
+        3 => Ok(RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeIntentNoEffects),
+        4 => Ok(RuntimeApplyTerminalOutcomeV1::StopTimedOutBeforeHeadCommitNoEffects),
+        5 => Ok(RuntimeApplyTerminalOutcomeV1::StartFailedBeforeHeadCommitExactZero),
+        6 => Ok(RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeHeadCommitExactZero),
+        7 => Ok(RuntimeApplyTerminalOutcomeV1::StopFailedButExactZero),
+        8 => Ok(RuntimeApplyTerminalOutcomeV1::TimedOutButExactZero),
+        9 => Ok(RuntimeApplyTerminalOutcomeV1::AbortedBeforeIntentNoEffects),
+        10 => Ok(RuntimeApplyTerminalOutcomeV1::AbortedBeforeHeadCommitExactZero),
+        11 => Ok(RuntimeApplyTerminalOutcomeV1::SupersededAfterIntentExactZero),
+        12 => Ok(RuntimeApplyTerminalOutcomeV1::InterruptedButNowExactZero),
+        _ => Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidFieldValue,
+            7,
+        )),
+    }
+}
+
+fn decode_apply_terminal_lifecycle(
+    value: u16,
+) -> Result<RuntimeApplyTerminalLifecycleEffectV1, ReferenceWireError> {
+    match value {
+        1 => Ok(RuntimeApplyTerminalLifecycleEffectV1::ProvenNotStarted),
+        2 => Ok(RuntimeApplyTerminalLifecycleEffectV1::MayHaveStarted),
+        _ => Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidFieldValue,
+            8,
+        )),
+    }
+}
+
+fn decode_apply_terminal_head(
+    disposition: u16,
+    digest_bytes: [u8; 32],
+) -> Result<RuntimeApplyTerminalHeadV1, ReferenceWireError> {
+    let digest = Digest32::from_bytes(digest_bytes);
+    match disposition {
+        1 if digest_is_zero(&digest) => Ok(RuntimeApplyTerminalHeadV1::PreservedNone),
+        2 if !digest_is_zero(&digest) => Ok(RuntimeApplyTerminalHeadV1::PreservedExisting(
+            TargetSliceDigest::new(digest),
+        )),
+        3 if !digest_is_zero(&digest) => Ok(RuntimeApplyTerminalHeadV1::CommittedIncoming(
+            TargetSliceDigest::new(digest),
+        )),
+        1..=3 => Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidPresence,
+            9,
+        )),
+        _ => Err(ReferenceWireError::at(
+            ReferenceWireErrorCode::InvalidFieldValue,
+            9,
+        )),
+    }
 }
 
 /// Fixed selector shared by query draft, signing transcript, and strict decoder.
@@ -6434,10 +7616,22 @@ mod tests {
     }
 
     fn apply_request_fixture() -> (RuntimeApplyRequestV5, RuntimeStoreInstanceId) {
+        apply_request_fixture_for_mode(ReferenceAssemblyModeV1::OneSourceLoop)
+    }
+
+    fn apply_request_fixture_for_mode(
+        mode: ReferenceAssemblyModeV1,
+    ) -> (RuntimeApplyRequestV5, RuntimeStoreInstanceId) {
         let release = release_fixture();
-        let assignments =
-            TargetPlanAssignmentsV5::try_from_execution(one_source_execution(&release))
-                .unwrap_or_else(|error| panic!("assignment fixture failed: {error}"));
+        let execution = match mode {
+            ReferenceAssemblyModeV1::OneSourceLoop => one_source_execution(&release),
+            ReferenceAssemblyModeV1::EmptyDeactivate => {
+                TargetExecutionPlanV4::try_empty_deactivate(release.projection.clone())
+                    .unwrap_or_else(|error| panic!("empty execution fixture failed: {error}"))
+            }
+        };
+        let assignments = TargetPlanAssignmentsV5::try_from_execution(execution)
+            .unwrap_or_else(|error| panic!("assignment fixture failed: {error}"));
         let provenance = PlanProvenance::new(
             SourceScopeRef::from_bytes([0x01; 16]),
             SourcePlanRef::from_bytes([0x02; 16]),
@@ -6509,6 +7703,68 @@ mod tests {
             .unwrap_or_else(|error| panic!("v5 request failed: {error}"));
         (request, store)
     }
+
+    fn apply_terminal_channel(request: &RuntimeApplyRequestV5) -> RuntimeChannelBindingV1 {
+        RuntimeChannelBindingV1::try_new(
+            request.slice().commitment().header().target(),
+            PrincipalRef::from_bytes([0xd1; 16]),
+            Digest32::from_bytes([0xd2; 32]),
+            Digest32::from_bytes([0xd3; 32]),
+        )
+        .unwrap_or_else(|error| panic!("terminal channel fixture failed: {error}"))
+    }
+
+    fn apply_terminal_auth_claim(channel: RuntimeChannelBindingV1) -> RuntimeResponseAuthClaimV1 {
+        RuntimeResponseAuthClaimV1::try_new(
+            channel.runtime_peer(),
+            channel.binding_digest(),
+            ApplyAuthKeyRef::from_bytes([0xd4; 16]),
+            ApplyAuthAlgorithm::try_new(1)
+                .unwrap_or_else(|error| panic!("terminal algorithm failed: {error}")),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("terminal auth claim failed: {error}"))
+    }
+
+    fn apply_terminal_facts(
+        request: &RuntimeApplyRequestV5,
+        outcome: RuntimeApplyTerminalOutcomeV1,
+        lifecycle_effect: RuntimeApplyTerminalLifecycleEffectV1,
+        head: RuntimeApplyTerminalHeadV1,
+    ) -> Result<RuntimeApplyTerminalFactsV1, ReferenceContractError> {
+        RuntimeApplyTerminalFactsV1::try_new(
+            request,
+            outcome,
+            lifecycle_effect,
+            head,
+            Digest32::from_bytes([0xd5; 32]),
+            Digest32::from_bytes([0xd6; 32]),
+            RuntimeHostEpoch::try_new(7).expect("terminal host epoch"),
+            RuntimeSnapshotSequence::try_new(8).expect("terminal snapshot sequence"),
+            generation(3),
+            900,
+        )
+    }
+
+    const APPLY_TERMINAL_OUTCOMES: [RuntimeApplyTerminalOutcomeV1; 12] = [
+        RuntimeApplyTerminalOutcomeV1::OneSourceLoopActive,
+        RuntimeApplyTerminalOutcomeV1::EmptyDeactivateExactZero,
+        RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeIntentNoEffects,
+        RuntimeApplyTerminalOutcomeV1::StopTimedOutBeforeHeadCommitNoEffects,
+        RuntimeApplyTerminalOutcomeV1::StartFailedBeforeHeadCommitExactZero,
+        RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeHeadCommitExactZero,
+        RuntimeApplyTerminalOutcomeV1::StopFailedButExactZero,
+        RuntimeApplyTerminalOutcomeV1::TimedOutButExactZero,
+        RuntimeApplyTerminalOutcomeV1::AbortedBeforeIntentNoEffects,
+        RuntimeApplyTerminalOutcomeV1::AbortedBeforeHeadCommitExactZero,
+        RuntimeApplyTerminalOutcomeV1::SupersededAfterIntentExactZero,
+        RuntimeApplyTerminalOutcomeV1::InterruptedButNowExactZero,
+    ];
+
+    const APPLY_TERMINAL_LIFECYCLES: [RuntimeApplyTerminalLifecycleEffectV1; 2] = [
+        RuntimeApplyTerminalLifecycleEffectV1::ProvenNotStarted,
+        RuntimeApplyTerminalLifecycleEffectV1::MayHaveStarted,
+    ];
 
     fn assert_apply_fixture(expected: &str, mode_key: &str) {
         let mode = fixture_object(expected, mode_key);
@@ -8255,6 +9511,318 @@ mod tests {
                 .unwrap_or_else(|error| panic!("transcript failed: {error}"))
                 .as_bytes(),
             request.envelope().canonical_wire()
+        );
+    }
+
+    #[test]
+    fn apply_terminal_outcome_head_lifecycle_matrix_is_exact() {
+        for mode in [
+            ReferenceAssemblyModeV1::OneSourceLoop,
+            ReferenceAssemblyModeV1::EmptyDeactivate,
+        ] {
+            let (request, _) = apply_request_fixture_for_mode(mode);
+            let incoming = request.slice().commitment().target_slice_digest();
+            for outcome in APPLY_TERMINAL_OUTCOMES {
+                for lifecycle in APPLY_TERMINAL_LIFECYCLES {
+                    for head in [
+                        RuntimeApplyTerminalHeadV1::PreservedNone,
+                        RuntimeApplyTerminalHeadV1::PreservedExisting(TargetSliceDigest::new(
+                            Digest32::from_bytes([0xe1; 32]),
+                        )),
+                        RuntimeApplyTerminalHeadV1::CommittedIncoming(incoming),
+                    ] {
+                        let expected = apply_terminal_outcome_accepts_mode(outcome, mode)
+                            && apply_terminal_lifecycle_is_valid(outcome, lifecycle)
+                            && apply_terminal_outcome_commits_incoming(outcome, mode)
+                                == head.commits_incoming();
+                        assert_eq!(
+                            apply_terminal_facts(&request, outcome, lifecycle, head).is_ok(),
+                            expected,
+                            "unexpected matrix result for {mode:?}/{outcome:?}/{lifecycle:?}/{head:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let (empty, _) = apply_request_fixture_for_mode(ReferenceAssemblyModeV1::EmptyDeactivate);
+        assert_eq!(
+            apply_terminal_facts(
+                &empty,
+                RuntimeApplyTerminalOutcomeV1::SupersededAfterIntentExactZero,
+                RuntimeApplyTerminalLifecycleEffectV1::MayHaveStarted,
+                RuntimeApplyTerminalHeadV1::CommittedIncoming(TargetSliceDigest::new(
+                    Digest32::from_bytes([0xee; 32]),
+                )),
+            ),
+            Err(ReferenceContractError::InvalidShape)
+        );
+    }
+
+    #[test]
+    fn apply_terminal_receipt_round_trips_derives_stable_ref_and_authenticates_transcript() {
+        let (request, _) = apply_request_fixture();
+        let facts = apply_terminal_facts(
+            &request,
+            RuntimeApplyTerminalOutcomeV1::OneSourceLoopActive,
+            RuntimeApplyTerminalLifecycleEffectV1::MayHaveStarted,
+            RuntimeApplyTerminalHeadV1::CommittedIncoming(
+                request.slice().commitment().target_slice_digest(),
+            ),
+        )
+        .unwrap_or_else(|error| panic!("terminal facts failed: {error}"));
+        assert!(!all_zero(facts.terminal_result_ref().as_bytes()));
+        assert_eq!(
+            hex(facts.terminal_result_ref().as_bytes()),
+            "daeb87e4a09ad55da53d1b94d8e0d951"
+        );
+        let repeated = apply_terminal_facts(
+            &request,
+            RuntimeApplyTerminalOutcomeV1::OneSourceLoopActive,
+            RuntimeApplyTerminalLifecycleEffectV1::MayHaveStarted,
+            RuntimeApplyTerminalHeadV1::CommittedIncoming(
+                request.slice().commitment().target_slice_digest(),
+            ),
+        )
+        .unwrap_or_else(|error| panic!("repeated terminal facts failed: {error}"));
+        assert_eq!(facts.terminal_result_ref(), repeated.terminal_result_ref());
+
+        let channel = apply_terminal_channel(&request);
+        let claim = apply_terminal_auth_claim(channel);
+        let draft = RuntimeApplyTerminalReceiptDraftV1::try_new(&request, facts, channel, claim)
+            .unwrap_or_else(|error| panic!("terminal receipt draft failed: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("terminal transcript failed: {error}"))
+            .as_bytes()
+            .to_vec();
+        assert!(transcript.starts_with(SIGNING_TRANSCRIPT_MAGIC));
+        let base = SIGNING_TRANSCRIPT_MAGIC.len();
+        assert_eq!(
+            read_u16(&transcript[base..base + 2]),
+            APPLY_TERMINAL_RECEIPT_SIGNING_TRANSCRIPT_VERSION
+        );
+        let domain_length = usize::from(read_u16(&transcript[base + 2..base + 4]));
+        assert_eq!(
+            &transcript[base + 4..base + 4 + domain_length],
+            APPLY_TERMINAL_RECEIPT_SIGNING_DOMAIN
+        );
+        assert_eq!(
+            read_u16(&transcript[base + 4 + domain_length..base + 6 + domain_length]),
+            APPLY_TERMINAL_RECEIPT_SIGNING_FIELD_COUNT
+        );
+
+        let alternate = draft
+            .clone()
+            .finalize(&[0xa1; 64])
+            .unwrap_or_else(|error| panic!("alternate terminal receipt failed: {error}"));
+        let receipt = draft
+            .finalize(&[0xa2; 64])
+            .unwrap_or_else(|error| panic!("terminal receipt failed: {error}"));
+        let decoded = RuntimeApplyTerminalReceiptV1::decode(receipt.canonical_wire())
+            .unwrap_or_else(|error| panic!("terminal receipt decode failed: {error}"));
+        assert_eq!(decoded, receipt);
+        assert_eq!(decoded.canonical_wire(), receipt.canonical_wire());
+        assert_eq!(decoded.signing_transcript().unwrap().as_bytes(), transcript);
+        assert_eq!(
+            alternate.signing_transcript().unwrap().as_bytes(),
+            transcript
+        );
+        assert_ne!(alternate.receipt_digest(), receipt.receipt_digest());
+        assert_eq!(decoded.validate_against_request(&request, channel), Ok(()));
+
+        let (empty, _) = apply_request_fixture_for_mode(ReferenceAssemblyModeV1::EmptyDeactivate);
+        let empty_facts = apply_terminal_facts(
+            &empty,
+            RuntimeApplyTerminalOutcomeV1::SupersededAfterIntentExactZero,
+            RuntimeApplyTerminalLifecycleEffectV1::MayHaveStarted,
+            RuntimeApplyTerminalHeadV1::CommittedIncoming(
+                empty.slice().commitment().target_slice_digest(),
+            ),
+        )
+        .expect("head-first empty superseded terminal facts");
+        let empty_channel = apply_terminal_channel(&empty);
+        let empty_receipt = RuntimeApplyTerminalReceiptDraftV1::try_new(
+            &empty,
+            empty_facts,
+            empty_channel,
+            apply_terminal_auth_claim(empty_channel),
+        )
+        .and_then(|value| value.finalize(&[0xa3; 64]))
+        .expect("head-first empty superseded terminal receipt");
+        assert!(matches!(
+            empty_receipt.facts().head(),
+            RuntimeApplyTerminalHeadV1::CommittedIncoming(_)
+        ));
+        assert_eq!(
+            empty_receipt.validate_against_request(&empty, empty_channel),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn apply_terminal_receipt_strict_decode_and_transcript_fail_closed() {
+        let (request, _) = apply_request_fixture();
+        let facts = apply_terminal_facts(
+            &request,
+            RuntimeApplyTerminalOutcomeV1::StartTimedOutBeforeIntentNoEffects,
+            RuntimeApplyTerminalLifecycleEffectV1::ProvenNotStarted,
+            RuntimeApplyTerminalHeadV1::PreservedNone,
+        )
+        .expect("timeout terminal facts");
+        let channel = apply_terminal_channel(&request);
+        let draft = RuntimeApplyTerminalReceiptDraftV1::try_new(
+            &request,
+            facts,
+            channel,
+            apply_terminal_auth_claim(channel),
+        )
+        .expect("timeout terminal draft");
+        assert_eq!(
+            draft
+                .clone()
+                .finalize(&[0; MAX_CONTROL_READ_SIGNATURE_BYTES + 1]),
+            Err(ReferenceContractError::InvalidBound)
+        );
+        let receipt = draft.finalize(&[0xb1; 64]).expect("timeout receipt");
+        let wire = receipt.canonical_wire();
+
+        let mut bad_magic = wire.to_vec();
+        bad_magic[0] ^= 1;
+        assert_wire_error(
+            RuntimeApplyTerminalReceiptV1::decode(&bad_magic),
+            ReferenceWireErrorCode::InvalidMagic,
+            None,
+        );
+        let mut unknown_version = wire.to_vec();
+        unknown_version[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        assert_wire_error(
+            RuntimeApplyTerminalReceiptV1::decode(&unknown_version),
+            ReferenceWireErrorCode::UnsupportedVersion,
+            None,
+        );
+        let mut unknown_field = wire.to_vec();
+        unknown_field[6..8].copy_from_slice(&24_u16.to_be_bytes());
+        assert_wire_error(
+            RuntimeApplyTerminalReceiptV1::decode(&unknown_field),
+            ReferenceWireErrorCode::UnknownField,
+            Some(24),
+        );
+        for (tag, value, detail) in [(7, u16::MAX, 7), (8, u16::MAX, 8), (9, u16::MAX, 9)] {
+            assert_wire_error(
+                RuntimeApplyTerminalReceiptV1::decode(&mutated_tlv(
+                    wire,
+                    tag,
+                    &value.to_be_bytes(),
+                )),
+                ReferenceWireErrorCode::InvalidFieldValue,
+                Some(detail),
+            );
+        }
+        let mut flipped_ref = *facts.terminal_result_ref().as_bytes();
+        flipped_ref[0] ^= 1;
+        assert_wire_error(
+            RuntimeApplyTerminalReceiptV1::decode(&mutated_tlv(wire, 17, &flipped_ref)),
+            ReferenceWireErrorCode::DigestMismatch,
+            Some(17),
+        );
+        assert_wire_error(
+            RuntimeApplyTerminalReceiptV1::decode(&mutated_tlv(wire, 9, &2_u16.to_be_bytes())),
+            ReferenceWireErrorCode::InvalidPresence,
+            Some(9),
+        );
+        let mut trailing = wire.to_vec();
+        trailing.push(0);
+        assert_wire_error(
+            RuntimeApplyTerminalReceiptV1::decode(&trailing),
+            ReferenceWireErrorCode::TrailingBytes,
+            None,
+        );
+        assert_wire_error(
+            RuntimeApplyTerminalReceiptV1::decode(&vec![
+                0;
+                MAX_RUNTIME_APPLY_TERMINAL_RECEIPT_BYTES
+                    + 1
+            ]),
+            ReferenceWireErrorCode::FrameTooLarge,
+            None,
+        );
+
+        let original_transcript = receipt.signing_transcript().unwrap();
+        let mut changed_signature = tlv_value(wire, 23).to_vec();
+        changed_signature[0] ^= 1;
+        let changed_signature =
+            RuntimeApplyTerminalReceiptV1::decode(&mutated_tlv(wire, 23, &changed_signature))
+                .expect("opaque changed signature remains structurally canonical");
+        assert_eq!(
+            changed_signature.signing_transcript().unwrap(),
+            original_transcript
+        );
+        assert_ne!(changed_signature.receipt_digest(), receipt.receipt_digest());
+
+        let changed_census =
+            RuntimeApplyTerminalReceiptV1::decode(&mutated_tlv(wire, 11, &[0xc1; 32]))
+                .expect("changed signed fact remains structurally canonical");
+        assert_ne!(
+            changed_census.signing_transcript().unwrap(),
+            original_transcript
+        );
+    }
+
+    #[test]
+    fn apply_terminal_receipt_request_and_channel_correlation_is_exact() {
+        let (request, _) = apply_request_fixture();
+        let facts = apply_terminal_facts(
+            &request,
+            RuntimeApplyTerminalOutcomeV1::AbortedBeforeHeadCommitExactZero,
+            RuntimeApplyTerminalLifecycleEffectV1::MayHaveStarted,
+            RuntimeApplyTerminalHeadV1::PreservedExisting(TargetSliceDigest::new(
+                Digest32::from_bytes([0xc2; 32]),
+            )),
+        )
+        .expect("aborted terminal facts");
+        let channel = apply_terminal_channel(&request);
+        let receipt = RuntimeApplyTerminalReceiptDraftV1::try_new(
+            &request,
+            facts,
+            channel,
+            apply_terminal_auth_claim(channel),
+        )
+        .and_then(|value| value.finalize(&[0xc3; 64]))
+        .expect("aborted terminal receipt");
+
+        let (wrong_request, _) =
+            apply_request_fixture_for_mode(ReferenceAssemblyModeV1::EmptyDeactivate);
+        assert_wire_error(
+            receipt.validate_against_request(&wrong_request, channel),
+            ReferenceWireErrorCode::CrossReferenceMismatch,
+            Some(5),
+        );
+        let wrong_channel = RuntimeChannelBindingV1::try_new(
+            channel.target(),
+            channel.runtime_peer(),
+            Digest32::from_bytes([0xc4; 32]),
+            channel.peer_credentials_digest(),
+        )
+        .expect("wrong channel fixture");
+        assert_wire_error(
+            receipt.validate_against_request(&request, wrong_channel),
+            ReferenceWireErrorCode::TargetMismatch,
+            Some(19),
+        );
+
+        let mut nonce = receipt.request_nonce().to_vec();
+        nonce[0] ^= 1;
+        let wrong_nonce = RuntimeApplyTerminalReceiptV1::decode(&mutated_tlv(
+            receipt.canonical_wire(),
+            6,
+            &nonce,
+        ))
+        .expect("different nonce is structurally canonical");
+        assert_wire_error(
+            wrong_nonce.validate_against_request(&request, channel),
+            ReferenceWireErrorCode::CrossReferenceMismatch,
+            Some(6),
         );
     }
 

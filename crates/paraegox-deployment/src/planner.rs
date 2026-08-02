@@ -12,9 +12,11 @@ use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_kernel::identity::RuntimeHostId;
 use paraegox_kernel::time::BoundedDuration;
 use paraegox_runtime_contracts::assignment::InstanceRef;
-use paraegox_runtime_contracts::execution::{CardDefinitionRef, CardImplementationRef, DomainRef};
+use paraegox_runtime_contracts::execution::DomainRef;
+use paraegox_runtime_contracts::reference_control::ValidatedReferenceLifecycleBudgetsV1;
 
 use crate::deck::{CardUseKey, DeckLock};
+use crate::manifest_ingress::InstalledManifestProjectionIngress;
 
 const PLAN_CONTENT_DIGEST_DOMAIN: &[u8] = b"paraegox.deployment.plan-content.sha256.v1";
 const INSTANCE_ALLOCATION_DOMAIN: &[u8] =
@@ -49,6 +51,18 @@ pub(crate) struct ValidatedReferenceLifecycleBudgets {
 }
 
 impl ValidatedReferenceLifecycleBudgets {
+    /// Adapts only an already validated Runtime-contract lifecycle value.
+    #[must_use]
+    pub(crate) const fn from_reference_contract(
+        value: ValidatedReferenceLifecycleBudgetsV1,
+    ) -> Self {
+        Self {
+            start: value.start(),
+            drain: value.drain(),
+            cleanup: value.cleanup(),
+        }
+    }
+
     const fn values(self) -> [BoundedDuration; 3] {
         [self.start, self.drain, self.cleanup]
     }
@@ -64,28 +78,6 @@ pub(crate) enum PreviousTargetEligibility {
     EmptyDeactivateTerminalExactZero,
     Busy,
     Ineligible,
-}
-
-/// Opaque facts accompanying one already-validated manifest projection.
-///
-/// There is intentionally no production constructor or parser in S7-C.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct OpaqueManifestProjectionIngress<'a> {
-    canonical_projection: &'a [u8],
-    manifest_digest: PlanManifestDigest,
-    target: RuntimeHostId,
-    profile_fingerprint: Digest32,
-    canonical_empty_config_digest: Digest32,
-    fixture: ManifestFixtureFacts,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ManifestFixtureFacts {
-    definition: CardDefinitionRef,
-    implementation: CardImplementationRef,
-    export: [u8; 16],
-    definition_digest: Digest32,
-    artifact_digest: Digest32,
 }
 
 /// Stable key of one ServiceSpec vertex.
@@ -650,6 +642,7 @@ pub(crate) struct PlanContent {
     shape: TargetIntent,
     manifest_digest: PlanManifestDigest,
     stable_allocation_subject: Option<(CardUseKey, InstanceRef, DomainRef)>,
+    reference_lifecycle: Option<ValidatedReferenceLifecycleBudgetsV1>,
     canonical_bytes: Box<[u8]>,
 }
 
@@ -688,39 +681,66 @@ impl PlanContent {
         let fixture_definition_digest = reader.array::<32>()?;
         let fixture_artifact_digest = reader.array::<32>()?;
 
-        let (stable_allocation_subject, loop_fields) = if shape == TargetIntent::OneSourceLoop {
-            let deck_lock_digest = reader.array::<32>()?;
-            let key = reader.array::<16>()?;
-            let instance = reader.array::<16>()?;
-            let domain = reader.array::<16>()?;
-            let lifecycle = [reader.u64()?, reader.u64()?, reader.u64()?];
-            // The exact upper bound remains owned by the private Runtime
-            // reference contract and is consumed through the future validated
-            // adapter. The persisted Planner value can still prove the
-            // constructor-level nonzero invariant without duplicating that
-            // protocol constant in this crate.
-            if lifecycle.contains(&0) {
-                return Err(PlannerError::InvalidPersistedPlanContent);
-            }
-            let config_digest = reader.array::<32>()?;
-            (
-                Some((
-                    CardUseKey::from_bytes(key),
-                    InstanceRef::from_bytes(instance),
-                    DomainRef::from_bytes(domain),
-                )),
-                Some((
-                    deck_lock_digest,
-                    key,
-                    instance,
-                    domain,
-                    lifecycle,
-                    config_digest,
-                )),
-            )
-        } else {
-            (None, None)
-        };
+        let manifest = InstalledManifestProjectionIngress::try_from_persisted_projection(
+            projection,
+            manifest_digest.value(),
+        )
+        .map_err(|_| PlannerError::InvalidPersistedPlanContent)?;
+        if manifest.target() != expected_target
+            || profile_fingerprint != *manifest.profile_fingerprint().as_bytes()
+            || fixture_definition != *manifest.fixture_definition().as_bytes()
+            || fixture_implementation != *manifest.fixture_implementation().as_bytes()
+            || fixture_export != manifest.fixture_export()
+            || fixture_definition_digest != *manifest.fixture_definition_digest().as_bytes()
+            || fixture_artifact_digest != *manifest.fixture_artifact_digest().as_bytes()
+        {
+            return Err(PlannerError::InvalidPersistedPlanContent);
+        }
+
+        let (stable_allocation_subject, reference_lifecycle, loop_fields) =
+            if shape == TargetIntent::OneSourceLoop {
+                let deck_lock_digest = reader.array::<32>()?;
+                let key = reader.array::<16>()?;
+                let instance = reader.array::<16>()?;
+                let domain = reader.array::<16>()?;
+                let lifecycle = [reader.u64()?, reader.u64()?, reader.u64()?];
+                // The exact upper bound remains owned by the private Runtime
+                // reference contract and is consumed through the future validated
+                // adapter. The persisted Planner value can still prove the
+                // constructor-level nonzero invariant without duplicating that
+                // protocol constant in this crate.
+                if lifecycle.contains(&0) {
+                    return Err(PlannerError::InvalidPersistedPlanContent);
+                }
+                let reference_lifecycle = ValidatedReferenceLifecycleBudgetsV1::try_new(
+                    BoundedDuration::from_nanos(lifecycle[0]),
+                    BoundedDuration::from_nanos(lifecycle[1]),
+                    BoundedDuration::from_nanos(lifecycle[2]),
+                )
+                .map_err(|_| PlannerError::InvalidPersistedPlanContent)?;
+                let config_digest = reader.array::<32>()?;
+                if config_digest != *manifest.canonical_empty_config_digest().as_bytes() {
+                    return Err(PlannerError::InvalidPersistedPlanContent);
+                }
+                (
+                    Some((
+                        CardUseKey::from_bytes(key),
+                        InstanceRef::from_bytes(instance),
+                        DomainRef::from_bytes(domain),
+                    )),
+                    Some(reference_lifecycle),
+                    Some((
+                        deck_lock_digest,
+                        key,
+                        instance,
+                        domain,
+                        lifecycle,
+                        config_digest,
+                    )),
+                )
+            } else {
+                (None, None, None)
+            };
         if reader.remaining() != 0 {
             return Err(PlannerError::InvalidPersistedPlanContent);
         }
@@ -771,6 +791,7 @@ impl PlanContent {
             shape,
             manifest_digest,
             stable_allocation_subject,
+            reference_lifecycle,
             canonical_bytes: canonical_bytes.into(),
         })
     }
@@ -795,6 +816,11 @@ impl PlanContent {
         &self,
     ) -> Option<(CardUseKey, InstanceRef, DomainRef)> {
         self.stable_allocation_subject
+    }
+
+    #[must_use]
+    pub(crate) const fn reference_lifecycle(&self) -> Option<ValidatedReferenceLifecycleBudgetsV1> {
+        self.reference_lifecycle
     }
 
     #[must_use]
@@ -931,7 +957,7 @@ pub(crate) struct PlannerInput<'a> {
     pub(crate) target: RuntimeHostId,
     pub(crate) desired: PlannerDesired<'a>,
     pub(crate) previous: PreviousTargetEligibility,
-    pub(crate) manifest: Option<&'a OpaqueManifestProjectionIngress<'a>>,
+    pub(crate) manifest: Option<&'a InstalledManifestProjectionIngress>,
     pub(crate) allocation: &'a StableAllocationSnapshot,
     pub(crate) service_dependencies: &'a [ServiceDependency],
 }
@@ -1055,7 +1081,7 @@ impl DeploymentPlanner {
         let manifest = input
             .manifest
             .ok_or(PlannerError::MissingManifestProjection)?;
-        if manifest.target != input.target {
+        if manifest.target() != input.target {
             return Err(PlannerError::ManifestTargetMismatch);
         }
 
@@ -1072,12 +1098,12 @@ impl DeploymentPlanner {
 
     fn plan_loop(
         input: &PlannerInput<'_>,
-        manifest: &OpaqueManifestProjectionIngress<'_>,
+        manifest: &InstalledManifestProjectionIngress,
         deck_lock: &DeckLock,
         lifecycle: ValidatedReferenceLifecycleBudgets,
         config_digest: Digest32,
     ) -> Result<PlannerOutcome, PlannerError> {
-        if config_digest != manifest.canonical_empty_config_digest {
+        if config_digest != manifest.canonical_empty_config_digest() {
             return Err(PlannerError::ConfigMismatch);
         }
         let topology = deck_lock.topology();
@@ -1107,11 +1133,11 @@ impl DeploymentPlanner {
         if topology.card_keys()[0].as_bytes() != card.key().as_bytes() {
             return Err(PlannerError::UnsupportedDeckShape);
         }
-        if manifest.fixture.definition != card.definition()
-            || manifest.fixture.implementation != card.implementation()
-            || manifest.fixture.export != *card.export().as_bytes()
-            || manifest.fixture.definition_digest != card.definition_digest()
-            || manifest.fixture.artifact_digest != card.artifact_digest()
+        if manifest.fixture_definition() != card.definition()
+            || manifest.fixture_implementation() != card.implementation()
+            || manifest.fixture_export() != *card.export().as_bytes()
+            || manifest.fixture_definition_digest() != card.definition_digest()
+            || manifest.fixture_artifact_digest() != card.artifact_digest()
         {
             return Err(PlannerError::ManifestFixtureMismatch);
         }
@@ -1135,7 +1161,7 @@ impl DeploymentPlanner {
 
     fn plan_empty(
         input: &PlannerInput<'_>,
-        manifest: &OpaqueManifestProjectionIngress<'_>,
+        manifest: &InstalledManifestProjectionIngress,
     ) -> Result<PlannerOutcome, PlannerError> {
         let active = input
             .allocation
@@ -1387,10 +1413,20 @@ fn build_content(
     target: RuntimeHostId,
     shape: TargetIntent,
     deck_lock: Option<&DeckLock>,
-    manifest: &OpaqueManifestProjectionIngress<'_>,
+    manifest: &InstalledManifestProjectionIngress,
     subject: Option<(CardUseKey, InstanceRef, DomainRef)>,
     loop_facts: Option<(ValidatedReferenceLifecycleBudgets, Digest32)>,
 ) -> Result<PlanContent, PlannerError> {
+    let reference_lifecycle = loop_facts
+        .map(|(lifecycle, _)| {
+            ValidatedReferenceLifecycleBudgetsV1::try_new(
+                lifecycle.start,
+                lifecycle.drain,
+                lifecycle.cleanup,
+            )
+            .map_err(|_| PlannerError::InvalidLifecycleBudget)
+        })
+        .transpose()?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(PLAN_CONTENT_MAGIC);
     bytes.extend_from_slice(&PLAN_CONTENT_VERSION.to_be_bytes());
@@ -1400,17 +1436,17 @@ fn build_content(
         TargetIntent::Omitted => unreachable!("omitted has no PlanContent"),
     });
     bytes.extend_from_slice(target.as_bytes());
-    bytes.extend_from_slice(manifest.profile_fingerprint.as_bytes());
-    bytes.extend_from_slice(manifest.manifest_digest.value().as_bytes());
-    let projection_length = u64::try_from(manifest.canonical_projection.len())
+    bytes.extend_from_slice(manifest.profile_fingerprint().as_bytes());
+    bytes.extend_from_slice(manifest.manifest_digest().as_bytes());
+    let projection_length = u64::try_from(manifest.canonical_projection().len())
         .map_err(|_| PlannerError::CanonicalLengthOverflow)?;
     bytes.extend_from_slice(&projection_length.to_be_bytes());
-    bytes.extend_from_slice(manifest.canonical_projection);
-    bytes.extend_from_slice(manifest.fixture.definition.as_bytes());
-    bytes.extend_from_slice(manifest.fixture.implementation.as_bytes());
-    bytes.extend_from_slice(&manifest.fixture.export);
-    bytes.extend_from_slice(manifest.fixture.definition_digest.as_bytes());
-    bytes.extend_from_slice(manifest.fixture.artifact_digest.as_bytes());
+    bytes.extend_from_slice(manifest.canonical_projection());
+    bytes.extend_from_slice(manifest.fixture_definition().as_bytes());
+    bytes.extend_from_slice(manifest.fixture_implementation().as_bytes());
+    bytes.extend_from_slice(&manifest.fixture_export());
+    bytes.extend_from_slice(manifest.fixture_definition_digest().as_bytes());
+    bytes.extend_from_slice(manifest.fixture_artifact_digest().as_bytes());
     if let Some((key, instance, domain)) = subject {
         let Some(deck_lock) = deck_lock else {
             unreachable!("subject content always carries one DeckLock");
@@ -1433,8 +1469,9 @@ fn build_content(
     Ok(PlanContent {
         target,
         shape,
-        manifest_digest: manifest.manifest_digest,
+        manifest_digest: PlanManifestDigest::try_new(manifest.manifest_digest())?,
         stable_allocation_subject: subject,
+        reference_lifecycle,
         canonical_bytes: bytes.into_boxed_slice(),
     })
 }
@@ -1458,10 +1495,15 @@ fn candidate(
 #[cfg(test)]
 pub(crate) fn journal_test_candidate(
     target: RuntimeHostId,
+    manifest: &InstalledManifestProjectionIngress,
     allocation: &StableAllocationSnapshot,
     desired_key: Option<[u8; 16]>,
     marker: u8,
 ) -> Result<DeploymentPlanCandidate, PlannerError> {
+    if manifest.target() != target {
+        return Err(PlannerError::ManifestTargetMismatch);
+    }
+
     let (shape, subject, delta, diagnostics) = if let Some(key) = desired_key {
         let (selected, delta, diagnostics) =
             allocate_active(target, CardUseKey::from_bytes(key), allocation)?;
@@ -1499,7 +1541,6 @@ pub(crate) fn journal_test_candidate(
         )
     };
 
-    let projection = [marker; 7];
     let mut canonical_bytes = Vec::new();
     canonical_bytes.extend_from_slice(PLAN_CONTENT_MAGIC);
     canonical_bytes.extend_from_slice(&PLAN_CONTENT_VERSION.to_be_bytes());
@@ -1509,17 +1550,20 @@ pub(crate) fn journal_test_candidate(
         TargetIntent::Omitted => unreachable!("test candidate never encodes Omitted"),
     });
     canonical_bytes.extend_from_slice(target.as_bytes());
-    canonical_bytes.extend_from_slice(&[marker.wrapping_add(1); 32]);
-    let manifest_digest =
-        PlanManifestDigest::try_new(Digest32::from_bytes([marker.wrapping_add(2); 32]))?;
+    canonical_bytes.extend_from_slice(manifest.profile_fingerprint().as_bytes());
+    let manifest_digest = PlanManifestDigest::try_new(manifest.manifest_digest())?;
     canonical_bytes.extend_from_slice(manifest_digest.value().as_bytes());
-    canonical_bytes.extend_from_slice(&(projection.len() as u64).to_be_bytes());
-    canonical_bytes.extend_from_slice(&projection);
-    canonical_bytes.extend_from_slice(&[marker.wrapping_add(3); 16]);
-    canonical_bytes.extend_from_slice(&[marker.wrapping_add(4); 16]);
-    canonical_bytes.extend_from_slice(&[marker.wrapping_add(5); 16]);
-    canonical_bytes.extend_from_slice(&[marker.wrapping_add(6); 32]);
-    canonical_bytes.extend_from_slice(&[marker.wrapping_add(7); 32]);
+    canonical_bytes.extend_from_slice(
+        &u64::try_from(manifest.canonical_projection().len())
+            .map_err(|_| PlannerError::CanonicalLengthOverflow)?
+            .to_be_bytes(),
+    );
+    canonical_bytes.extend_from_slice(manifest.canonical_projection());
+    canonical_bytes.extend_from_slice(manifest.fixture_definition().as_bytes());
+    canonical_bytes.extend_from_slice(manifest.fixture_implementation().as_bytes());
+    canonical_bytes.extend_from_slice(&manifest.fixture_export());
+    canonical_bytes.extend_from_slice(manifest.fixture_definition_digest().as_bytes());
+    canonical_bytes.extend_from_slice(manifest.fixture_artifact_digest().as_bytes());
     if let Some((key, instance, domain)) = subject {
         canonical_bytes.extend_from_slice(&[marker.wrapping_add(8); 32]);
         canonical_bytes.extend_from_slice(key.as_bytes());
@@ -1528,7 +1572,7 @@ pub(crate) fn journal_test_candidate(
         canonical_bytes.extend_from_slice(&1_u64.to_be_bytes());
         canonical_bytes.extend_from_slice(&2_u64.to_be_bytes());
         canonical_bytes.extend_from_slice(&3_u64.to_be_bytes());
-        canonical_bytes.extend_from_slice(&[marker.wrapping_add(9); 32]);
+        canonical_bytes.extend_from_slice(manifest.canonical_empty_config_digest().as_bytes());
     }
     candidate(
         PlanContent {
@@ -1536,6 +1580,14 @@ pub(crate) fn journal_test_candidate(
             shape,
             manifest_digest,
             stable_allocation_subject: subject,
+            reference_lifecycle: subject.map(|_| {
+                ValidatedReferenceLifecycleBudgetsV1::try_new(
+                    BoundedDuration::from_nanos(1),
+                    BoundedDuration::from_nanos(2),
+                    BoundedDuration::from_nanos(3),
+                )
+                .expect("test lifecycle must validate")
+            }),
             canonical_bytes: canonical_bytes.into_boxed_slice(),
         },
         delta,
@@ -1546,12 +1598,11 @@ pub(crate) fn journal_test_candidate(
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocationState, DeploymentPlanner, ManifestFixtureFacts, OpaqueManifestProjectionIngress,
-        PlanManifestDigest, PlannerDesired, PlannerDiagnostic, PlannerError, PlannerInput,
-        PlannerOutcome, PreviousTargetEligibility, ServiceDependency, ServiceDependencyError,
-        ServiceRef, StableAllocationRecord, StableAllocationSnapshot, TargetIntent,
-        ValidatedReferenceLifecycleBudgets, allocate_active, validate_service_dependencies,
-        validate_transition,
+        AllocationState, DeploymentPlanner, PlannerDesired, PlannerDiagnostic, PlannerError,
+        PlannerInput, PlannerOutcome, PreviousTargetEligibility, ServiceDependency,
+        ServiceDependencyError, ServiceRef, StableAllocationRecord, StableAllocationSnapshot,
+        TargetIntent, ValidatedReferenceLifecycleBudgets, allocate_active,
+        validate_service_dependencies, validate_transition,
     };
     use crate::deck::{
         CardRefinementRef, CardRefinementRequest, CardUseKey, DeckCardConfig, DeckCardRole,
@@ -1571,6 +1622,12 @@ mod tests {
     use paraegox_runtime_contracts::execution::{
         CardDefinitionRef, CardImplementationRef, DomainRef,
     };
+    use paraegox_runtime_contracts::installation::{
+        InstalledRuntimeArtifactObservationV1, RuntimeCompiledInstallationFactsV1,
+        generate_build_descriptor, generate_manifest,
+    };
+
+    use crate::manifest_ingress::InstalledManifestProjectionIngress;
 
     fn service(byte: u8) -> ServiceRef {
         ServiceRef::from_bytes([byte; 16])
@@ -1792,22 +1849,64 @@ mod tests {
             .expect("matrix Deck must compile before the narrow Planner rejects it")
     }
 
-    fn manifest(target: RuntimeHostId) -> OpaqueManifestProjectionIngress<'static> {
-        OpaqueManifestProjectionIngress {
-            canonical_projection: b"opaque-validated-projection",
-            manifest_digest: PlanManifestDigest::try_new(digest(0x70))
-                .expect("fixture manifest digest must validate"),
+    #[derive(Clone, Copy)]
+    struct ManifestFixtureSeed {
+        definition: u8,
+        implementation: u8,
+        export: u8,
+        definition_digest: u8,
+        artifact_digest: u8,
+    }
+
+    const REFERENCE_MANIFEST_FIXTURE: ManifestFixtureSeed = ManifestFixtureSeed {
+        definition: 10,
+        implementation: 0x4a,
+        export: 0x5a,
+        definition_digest: 10,
+        artifact_digest: 0x6a,
+    };
+
+    fn manifest_with_facts(
+        target: RuntimeHostId,
+        build_byte: u8,
+        artifact_sha_byte: u8,
+        fixture: ManifestFixtureSeed,
+    ) -> InstalledManifestProjectionIngress {
+        let artifact = InstalledRuntimeArtifactObservationV1::try_new(
+            1_048_576,
+            digest(artifact_sha_byte),
+            "aarch64-unknown-linux-gnu",
+        )
+        .expect("artifact facts must validate");
+        let compiled = RuntimeCompiledInstallationFactsV1::try_new(
+            [build_byte; 32],
+            CardDefinitionRef::from_bytes([fixture.definition; 16]),
+            CardImplementationRef::from_bytes([fixture.implementation; 16]),
+            [fixture.export; 16],
+            digest(fixture.definition_digest),
+            digest(fixture.artifact_digest),
+        )
+        .expect("compiled manifest facts must validate");
+        let descriptor =
+            generate_build_descriptor(&artifact, compiled).expect("descriptor must generate");
+        let installation = generate_manifest(
+            descriptor.canonical_wire(),
+            descriptor.descriptor_digest(),
             target,
-            profile_fingerprint: digest(0x71),
-            canonical_empty_config_digest: digest(0x72),
-            fixture: ManifestFixtureFacts {
-                definition: CardDefinitionRef::from_bytes([10; 16]),
-                implementation: CardImplementationRef::from_bytes([0x4a; 16]),
-                export: [0x5a; 16],
-                definition_digest: digest(10),
-                artifact_digest: digest(0x6a),
-            },
-        }
+            &artifact,
+            compiled,
+        )
+        .expect("manifest must generate");
+        InstalledManifestProjectionIngress::from_verified_installation(&installation)
+            .expect("installer ingress must validate")
+    }
+
+    fn manifest(target: RuntimeHostId) -> InstalledManifestProjectionIngress {
+        manifest_with_facts(target, 0x11, 0x22, REFERENCE_MANIFEST_FIXTURE)
+    }
+
+    fn canonical_empty_config_digest() -> Digest32 {
+        manifest(target(0xfe)).canonical_empty_config_digest()
     }
 
     fn empty_snapshot(target: RuntimeHostId) -> StableAllocationSnapshot {
@@ -1819,7 +1918,7 @@ mod tests {
         PlannerDesired::OneSourceLoop {
             deck_lock,
             lifecycle: lifecycle(10, 20, 30),
-            config_digest: digest(0x72),
+            config_digest: canonical_empty_config_digest(),
         }
     }
 
@@ -2094,66 +2193,34 @@ mod tests {
             "DeckLock semantic digest"
         );
 
-        let large_projection = vec![0x42_u8; 4 * 1024 + 1];
-        let mut changed_projection = base_manifest;
-        changed_projection.canonical_projection = &large_projection;
-        let projection_candidate = candidate_outcome(
+        let changed_installation =
+            manifest_with_facts(plan_target, 0x12, 0x23, REFERENCE_MANIFEST_FIXTURE);
+        assert_ne!(
+            base_manifest.canonical_projection(),
+            changed_installation.canonical_projection()
+        );
+        assert_ne!(
+            base_manifest.manifest_digest(),
+            changed_installation.manifest_digest()
+        );
+        let installation_candidate = candidate_outcome(
             DeploymentPlanner::plan(&PlannerInput {
                 target: plan_target,
                 desired: loop_desired(&deck),
                 previous: PreviousTargetEligibility::EmptyDeactivateTerminalExactZero,
-                manifest: Some(&changed_projection),
+                manifest: Some(&changed_installation),
                 allocation: &allocation,
                 service_dependencies: &[],
             })
-            .expect("the opaque validated projection has no Planner-owned protocol cap"),
+            .expect("a second strict installation manifest must plan"),
         );
         assert_ne!(
             baseline_digest,
-            projection_candidate.content_digest(),
-            "manifest canonical projection"
+            installation_candidate.content_digest(),
+            "sealed manifest identity and canonical projection"
         );
 
-        let mut changed_manifest_digest = base_manifest;
-        changed_manifest_digest.manifest_digest = PlanManifestDigest::try_new(digest(0x73))
-            .expect("changed manifest digest must validate");
-        let manifest_digest_candidate = candidate_outcome(
-            DeploymentPlanner::plan(&PlannerInput {
-                target: plan_target,
-                desired: loop_desired(&deck),
-                previous: PreviousTargetEligibility::EmptyDeactivateTerminalExactZero,
-                manifest: Some(&changed_manifest_digest),
-                allocation: &allocation,
-                service_dependencies: &[],
-            })
-            .expect("changed manifest digest must plan"),
-        );
-        assert_ne!(
-            baseline_digest,
-            manifest_digest_candidate.content_digest(),
-            "manifest digest"
-        );
-
-        let mut changed_profile = base_manifest;
-        changed_profile.profile_fingerprint = digest(0x74);
-        let profile_candidate = candidate_outcome(
-            DeploymentPlanner::plan(&PlannerInput {
-                target: plan_target,
-                desired: loop_desired(&deck),
-                previous: PreviousTargetEligibility::EmptyDeactivateTerminalExactZero,
-                manifest: Some(&changed_profile),
-                allocation: &allocation,
-                service_dependencies: &[],
-            })
-            .expect("changed profile fingerprint must plan"),
-        );
-        assert_ne!(
-            baseline_digest,
-            profile_candidate.content_digest(),
-            "profile fingerprint"
-        );
-
-        let empty_digest = |projection: &OpaqueManifestProjectionIngress<'_>| {
+        let empty_digest = |projection: &InstalledManifestProjectionIngress| {
             candidate_outcome(
                 DeploymentPlanner::plan(&PlannerInput {
                     target: plan_target,
@@ -2168,23 +2235,51 @@ mod tests {
             .content_digest()
         };
         let empty_baseline_digest = empty_digest(&base_manifest);
-        let mut fixture_variants = [base_manifest; 5];
-        fixture_variants[0].fixture.definition = CardDefinitionRef::from_bytes([0x31; 16]);
-        fixture_variants[1].fixture.implementation = CardImplementationRef::from_bytes([0x32; 16]);
-        fixture_variants[2].fixture.export = [0x33; 16];
-        fixture_variants[3].fixture.definition_digest = digest(0x34);
-        fixture_variants[4].fixture.artifact_digest = digest(0x35);
-        for (name, variant) in [
-            "fixture definition",
-            "fixture implementation",
-            "fixture export",
-            "fixture definition digest",
-            "fixture artifact digest",
-        ]
-        .into_iter()
-        .zip(fixture_variants.iter())
-        {
-            assert_ne!(empty_baseline_digest, empty_digest(variant), "{name}");
+        let fixture_variants = [
+            (
+                "fixture definition",
+                ManifestFixtureSeed {
+                    definition: 0x31,
+                    ..REFERENCE_MANIFEST_FIXTURE
+                },
+            ),
+            (
+                "fixture implementation",
+                ManifestFixtureSeed {
+                    implementation: 0x32,
+                    ..REFERENCE_MANIFEST_FIXTURE
+                },
+            ),
+            (
+                "fixture export",
+                ManifestFixtureSeed {
+                    export: 0x33,
+                    ..REFERENCE_MANIFEST_FIXTURE
+                },
+            ),
+            (
+                "fixture definition digest",
+                ManifestFixtureSeed {
+                    definition_digest: 0x34,
+                    ..REFERENCE_MANIFEST_FIXTURE
+                },
+            ),
+            (
+                "fixture artifact digest",
+                ManifestFixtureSeed {
+                    artifact_digest: 0x35,
+                    ..REFERENCE_MANIFEST_FIXTURE
+                },
+            ),
+        ];
+        for (name, fixture) in fixture_variants {
+            let variant = manifest_with_facts(plan_target, 0x11, 0x22, fixture);
+            assert_ne!(
+                base_manifest.profile_fingerprint(),
+                variant.profile_fingerprint(),
+                "{name}: profile fingerprint"
+            );
+            assert_ne!(empty_baseline_digest, empty_digest(&variant), "{name}");
         }
 
         let allocation_history = StableAllocationSnapshot::try_new(
@@ -2217,7 +2312,7 @@ mod tests {
                 desired: PlannerDesired::OneSourceLoop {
                     deck_lock: &deck,
                     lifecycle: lifecycle(11, 20, 30),
-                    config_digest: digest(0x72),
+                    config_digest: canonical_empty_config_digest(),
                 },
                 previous: PreviousTargetEligibility::EmptyDeactivateTerminalExactZero,
                 manifest: Some(&base_manifest),
@@ -2230,29 +2325,6 @@ mod tests {
             baseline_digest,
             changed_lifecycle.content_digest(),
             "lifecycle budgets"
-        );
-
-        let mut changed_config_manifest = base_manifest;
-        changed_config_manifest.canonical_empty_config_digest = digest(0x75);
-        let changed_config = candidate_outcome(
-            DeploymentPlanner::plan(&PlannerInput {
-                target: plan_target,
-                desired: PlannerDesired::OneSourceLoop {
-                    deck_lock: &deck,
-                    lifecycle: lifecycle(10, 20, 30),
-                    config_digest: digest(0x75),
-                },
-                previous: PreviousTargetEligibility::EmptyDeactivateTerminalExactZero,
-                manifest: Some(&changed_config_manifest),
-                allocation: &allocation,
-                service_dependencies: &[],
-            })
-            .expect("changed canonical config must plan"),
-        );
-        assert_ne!(
-            baseline_digest,
-            changed_config.content_digest(),
-            "config digest"
         );
 
         let tombstone_history = StableAllocationSnapshot::try_new(
@@ -2440,8 +2512,15 @@ mod tests {
             Err(PlannerError::ManifestTargetMismatch)
         );
 
-        let mut wrong_fixture = manifest(target);
-        wrong_fixture.fixture.artifact_digest = digest(0xff);
+        let wrong_fixture = manifest_with_facts(
+            target,
+            0x11,
+            0x22,
+            ManifestFixtureSeed {
+                artifact_digest: 0xff,
+                ..REFERENCE_MANIFEST_FIXTURE
+            },
+        );
         let fixture_input = PlannerInput {
             manifest: Some(&wrong_fixture),
             ..target_input
@@ -2502,7 +2581,7 @@ mod tests {
             desired: PlannerDesired::OneSourceLoop {
                 deck_lock: &deck,
                 lifecycle: lifecycle(11, 20, 30),
-                config_digest: digest(0x72),
+                config_digest: canonical_empty_config_digest(),
             },
             ..base
         };
@@ -2741,8 +2820,15 @@ mod tests {
     fn zero_port_gate_precedes_config_role_and_fixture_matching() {
         let target = target(11);
         let deck = reference_deck_with_port();
-        let mut manifest = manifest(target);
-        manifest.fixture.artifact_digest = digest(0xff);
+        let manifest = manifest_with_facts(
+            target,
+            0x11,
+            0x22,
+            ManifestFixtureSeed {
+                artifact_digest: 0xff,
+                ..REFERENCE_MANIFEST_FIXTURE
+            },
+        );
         let allocation = empty_snapshot(target);
         let input = PlannerInput {
             target,
@@ -2763,8 +2849,15 @@ mod tests {
     fn refinement_gate_precedes_role_and_fixture_matching() {
         let target = target(20);
         let deck = reference_deck_with_refinement();
-        let mut manifest = manifest(target);
-        manifest.fixture.artifact_digest = digest(0xff);
+        let manifest = manifest_with_facts(
+            target,
+            0x11,
+            0x22,
+            ManifestFixtureSeed {
+                artifact_digest: 0xff,
+                ..REFERENCE_MANIFEST_FIXTURE
+            },
+        );
         let allocation = empty_snapshot(target);
         let input = PlannerInput {
             target,
@@ -2908,7 +3001,7 @@ mod tests {
 
         let assert_rejection = |name: &str,
                                 deck: &DeckLock,
-                                manifest: Option<&OpaqueManifestProjectionIngress<'_>>,
+                                manifest: Option<&InstalledManifestProjectionIngress>,
                                 service_dependencies: &[ServiceDependency],
                                 expected: PlannerError| {
             let before = allocation.clone();
@@ -3026,8 +3119,14 @@ mod tests {
     fn persisted_plan_content_rebuilds_exact_fields_and_rejects_bad_lifecycle() {
         let target = target(24);
         let allocation = empty_snapshot(target);
-        let candidate = super::journal_test_candidate(target, &allocation, Some([2; 16]), 0x51)
-            .expect("typed fixture candidate must validate");
+        let manifest = manifest(target);
+        let candidate =
+            super::journal_test_candidate(target, &manifest, &allocation, Some([2; 16]), 0x51)
+                .expect("typed fixture candidate must validate");
+        assert_eq!(
+            candidate.content().manifest_digest().value(),
+            manifest.manifest_digest()
+        );
         let bytes = candidate.content().canonical_bytes();
         let decoded = super::PlanContent::try_from_persisted(target, bytes)
             .expect("canonical Planner content must decode");
@@ -3055,6 +3154,45 @@ mod tests {
             Err(PlannerError::InvalidManifestDigest)
         );
 
+        let profile_offset = super::PLAN_CONTENT_MAGIC.len() + size_of::<u16>() + 1 + 16;
+        let mut changed_profile = bytes.to_vec();
+        changed_profile[profile_offset] ^= 1;
+        assert_eq!(
+            super::PlanContent::try_from_persisted(target, &changed_profile),
+            Err(PlannerError::InvalidPersistedPlanContent)
+        );
+
+        let projection_length_offset = manifest_offset + 32;
+        let projection_length = usize::try_from(u64::from_be_bytes(
+            bytes[projection_length_offset..projection_length_offset + 8]
+                .try_into()
+                .expect("projection length field"),
+        ))
+        .expect("projection length fits usize");
+        let projection_offset = projection_length_offset + 8;
+        let mut changed_projection = bytes.to_vec();
+        changed_projection[projection_offset] ^= 1;
+        assert_eq!(
+            super::PlanContent::try_from_persisted(target, &changed_projection),
+            Err(PlannerError::InvalidPersistedPlanContent)
+        );
+
+        let fixture_offset = projection_offset + projection_length;
+        let mut changed_fixture = bytes.to_vec();
+        changed_fixture[fixture_offset] ^= 1;
+        assert_eq!(
+            super::PlanContent::try_from_persisted(target, &changed_fixture),
+            Err(PlannerError::InvalidPersistedPlanContent)
+        );
+
+        let mut changed_config = bytes.to_vec();
+        let config_offset = changed_config.len() - 32;
+        changed_config[config_offset] ^= 1;
+        assert_eq!(
+            super::PlanContent::try_from_persisted(target, &changed_config),
+            Err(PlannerError::InvalidPersistedPlanContent)
+        );
+
         let mut zero_budget = bytes.to_vec();
         let first_lifecycle_budget = zero_budget.len() - 32 - (3 * 8);
         zero_budget[first_lifecycle_budget..first_lifecycle_budget + 8]
@@ -3068,14 +3206,13 @@ mod tests {
             DeckCardConfig::CanonicalEmpty,
             DeckCardRole::ReferenceSubject,
         );
-        let manifest = manifest(target);
         assert_eq!(
             DeploymentPlanner::plan(&PlannerInput {
                 target,
                 desired: PlannerDesired::OneSourceLoop {
                     deck_lock: &deck,
                     lifecycle: lifecycle(0, 2, 3),
-                    config_digest: digest(0x72),
+                    config_digest: canonical_empty_config_digest(),
                 },
                 previous: PreviousTargetEligibility::UninitializedNoneExactZero,
                 manifest: Some(&manifest),
@@ -3090,16 +3227,19 @@ mod tests {
     fn allocation_delta_is_exact_one_generation_and_never_removes_history() {
         let target = target(25);
         let empty = empty_snapshot(target);
-        let active_candidate = super::journal_test_candidate(target, &empty, Some([2; 16]), 0x61)
-            .expect("fresh allocation candidate must validate");
+        let manifest = manifest(target);
+        let active_candidate =
+            super::journal_test_candidate(target, &manifest, &empty, Some([2; 16]), 0x61)
+                .expect("fresh allocation candidate must validate");
         let active = empty
             .apply_delta(active_candidate.allocation_delta())
             .expect("fresh delta must apply");
         assert_eq!(active.generation(), 1);
         assert_eq!(active.high_water(), 1);
 
-        let no_change = super::journal_test_candidate(target, &active, Some([2; 16]), 0x62)
-            .expect("stable allocation candidate must validate");
+        let no_change =
+            super::journal_test_candidate(target, &manifest, &active, Some([2; 16]), 0x62)
+                .expect("stable allocation candidate must validate");
         assert!(no_change.allocation_delta().records().is_empty());
         assert_eq!(
             active
@@ -3131,10 +3271,11 @@ mod tests {
             ],
         )
         .expect("structurally valid multi-active recovery input must validate");
-        let mut unordered = super::journal_test_candidate(target, &two_active, None, 0x63)
-            .expect("empty candidate must tombstone both records")
-            .allocation_delta()
-            .clone();
+        let mut unordered =
+            super::journal_test_candidate(target, &manifest, &two_active, None, 0x63)
+                .expect("empty candidate must tombstone both records")
+                .allocation_delta()
+                .clone();
         unordered.records.reverse();
         assert_eq!(
             two_active.apply_delta(&unordered),

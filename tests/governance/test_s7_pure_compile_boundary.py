@@ -142,9 +142,7 @@ def test_pure_compile_sources_do_not_reimplement_manifest_or_side_effects() -> N
             r"(?m)^\s*use\s+std\s*::\s*\{[^}\n]*\b(?:fs|net|process|thread)\b"
         ),
         "async runtime access": re.compile(r"\b(?:tokio|async_std)\s*::"),
-        "async function": re.compile(
-            r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?async\s+fn\b"
-        ),
+        "async function": re.compile(r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?async\s+fn\b"),
         "await point": re.compile(r"\.await\b"),
         "mutable static": re.compile(
             r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?static\s+mut\s+[A-Za-z_]\w*"
@@ -168,7 +166,7 @@ def test_pure_compile_sources_do_not_reimplement_manifest_or_side_effects() -> N
             )
 
 
-def test_s7_c_pure_compile_owners_remain_private_during_s7_e_w1() -> None:
+def test_s7_c_pure_compile_types_remain_private_behind_exact_process_facades() -> None:
     governance = _load_toml(REPO_ROOT / "governance.toml")
     registry = governance["registry"]
 
@@ -181,16 +179,27 @@ def test_s7_c_pure_compile_owners_remain_private_during_s7_e_w1() -> None:
     deployment_row = deployment_rows[0]
     assert deployment_row["status"] == "experimental"
     assert deployment_row["public_entrypoints"] == [
-        "paraegox_deployment::run_tenure_authority_process"
+        "paraegox_deployment::run_tenure_authority_process",
+        "paraegox_deployment::run_deploymentd_process",
+        (
+            "paraegox-deploymentd initialize-reference-v1/commit-reference-loop-v1/"
+            "commit-reference-empty-v1/acquire-tenure-v1/bootstrap-runtime-v1/"
+            "apply-reference-v1 CLI"
+        ),
     ]
-    assert deployment_row["consumers"] == ["paraegox-tenure-authority"]
+    assert deployment_row["consumers"] == [
+        "paraegox-tenure-authority",
+        "paraegox-deploymentd",
+    ]
 
     for api in registry["public_apis"]:
         module = str(api["module"]).replace("-", "_")
         symbols = {str(symbol) for symbol in api["symbols"]}
         if module == "paraegox_deployment":
             assert symbols == {
+                "DeploymentdProcessError",
                 "TenureAuthorityProcessError",
+                "run_deploymentd_process",
                 "run_tenure_authority_process",
             }
             continue
@@ -199,7 +208,8 @@ def test_s7_c_pure_compile_owners_remain_private_during_s7_e_w1() -> None:
     deployment_manifest = _load_toml(DEPLOYMENT_ROOT / "Cargo.toml")
     assert "bin" not in deployment_manifest
     assert not (DEPLOYMENT_SRC / "main.rs").exists()
-    executable_sources = sorted(
-        path.name for path in (DEPLOYMENT_SRC / "bin").glob("*.rs")
-    )
-    assert executable_sources == ["paraegox-tenure-authority.rs"]
+    executable_sources = sorted(path.name for path in (DEPLOYMENT_SRC / "bin").glob("*.rs"))
+    assert executable_sources == [
+        "paraegox-deploymentd.rs",
+        "paraegox-tenure-authority.rs",
+    ]

@@ -12,5 +12,8 @@ nix.workspace = true
 paraegox-runtime = { path = "../paraegox-runtime" }
 tokio = { workspace = true, features = ["macros"] }
 
+[build-dependencies]
+getrandom = { version = "=0.4.3", default-features = false }
+
 [lints]
 workspace = true

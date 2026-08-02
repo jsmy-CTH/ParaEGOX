@@ -22,6 +22,13 @@ use paraegox_runtime_contracts::process_execution::{
     RequestV4WireError, RuntimeApplyRequestV4, RuntimePlanSliceV4,
 };
 use paraegox_runtime_contracts::provenance::SourceScopeRef;
+use paraegox_runtime_contracts::reference_control::{
+    MAX_REFERENCE_LIFECYCLE_NANOS, REFERENCE_ADMISSION_REQUEST_NONCE_CAPACITY,
+    REFERENCE_ADMISSION_TEMPORAL_LINEAGE_CAPACITY, REFERENCE_ADMISSION_TENURE_NONCE_CAPACITY,
+    ReferenceAdmissionPolicyFingerprintV1, ReferenceAdmissionPolicyInputV1,
+    ReferenceApplyIngressIdentitiesV1, ReferenceApplyRequestV1, ReferenceControlError,
+    reference_admission_policy_fingerprint_v1, reference_apply_ingress_identities_v1,
+};
 use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
 use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
 use paraegox_runtime_contracts::wire::{
@@ -54,14 +61,46 @@ struct TenureTrustSelector {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrustedTenureKey {
     selector: TenureTrustSelector,
+    authority_principal: PrincipalRef,
+    authority_uid: u32,
+    authority_gid: u32,
     verifying_key: VerifyingKey,
+}
+
+/// Exact service identity allowed to issue tenure proofs for one source scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrustedTenureIdentity {
+    source_scope: SourceScopeRef,
+    authority_principal: PrincipalRef,
+    authority_uid: u32,
+    authority_gid: u32,
+    authority: TenureAuthorityRef,
+}
+
+impl TrustedTenureIdentity {
+    /// Groups the provisioned Authority principal, OS identity and protocol reference.
+    #[must_use]
+    pub const fn new(
+        source_scope: SourceScopeRef,
+        authority_principal: PrincipalRef,
+        authority_uid: u32,
+        authority_gid: u32,
+        authority: TenureAuthorityRef,
+    ) -> Self {
+        Self {
+            source_scope,
+            authority_principal,
+            authority_uid,
+            authority_gid,
+            authority,
+        }
+    }
 }
 
 impl TrustedTenureKey {
     /// Builds one exact scope/authority/key/algorithm binding.
     pub fn try_new(
-        source_scope: SourceScopeRef,
-        authority: TenureAuthorityRef,
+        identity: TrustedTenureIdentity,
         key: TenureKeyRef,
         algorithm: TenureProofAlgorithm,
         algorithm_version: u16,
@@ -70,12 +109,15 @@ impl TrustedTenureKey {
         ensure_ed25519_profile(algorithm.value(), algorithm_version)?;
         Ok(Self {
             selector: TenureTrustSelector {
-                source_scope,
-                authority,
+                source_scope: identity.source_scope,
+                authority: identity.authority,
                 key,
                 algorithm,
                 algorithm_version,
             },
+            authority_principal: identity.authority_principal,
+            authority_uid: identity.authority_uid,
+            authority_gid: identity.authority_gid,
             verifying_key: parse_trusted_key(verifying_key)?,
         })
     }
@@ -177,8 +219,16 @@ fn parse_trusted_key(
 pub struct ApplyAdmissionPolicy {
     maximum_budget: BoundedDuration,
     state_limits: AdmissionStateLimits,
-    tenure_keys: BTreeMap<TenureTrustSelector, VerifyingKey>,
+    tenure_keys: BTreeMap<TenureTrustSelector, TrustedTenureBinding>,
     apply_keys: BTreeMap<ApplyTrustSelector, VerifyingKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrustedTenureBinding {
+    authority_principal: PrincipalRef,
+    authority_uid: u32,
+    authority_gid: u32,
+    verifying_key: VerifyingKey,
 }
 
 impl ApplyAdmissionPolicy {
@@ -196,7 +246,15 @@ impl ApplyAdmissionPolicy {
         let mut trusted_tenure = BTreeMap::new();
         for trusted in tenure_keys {
             if trusted_tenure
-                .insert(trusted.selector, trusted.verifying_key)
+                .insert(
+                    trusted.selector,
+                    TrustedTenureBinding {
+                        authority_principal: trusted.authority_principal,
+                        authority_uid: trusted.authority_uid,
+                        authority_gid: trusted.authority_gid,
+                        verifying_key: trusted.verifying_key,
+                    },
+                )
                 .is_some()
             {
                 return Err(AdmissionConfigurationError::DuplicateTenureTrust);
@@ -238,6 +296,217 @@ impl ApplyAdmissionPolicy {
     pub const fn state_limits(&self) -> AdmissionStateLimits {
         self.state_limits
     }
+
+    /// Seals this policy only after the shared reference contract reproduces `expected`.
+    pub fn verify_reference_fingerprint(
+        &self,
+        expected: ReferenceAdmissionPolicyFingerprintV1,
+    ) -> Result<(), AdmissionConfigurationError> {
+        if self.maximum_budget.value() != MAX_REFERENCE_LIFECYCLE_NANOS
+            || self.state_limits.tenure_nonce_capacity()
+                != REFERENCE_ADMISSION_TENURE_NONCE_CAPACITY
+            || self.state_limits.request_nonce_capacity()
+                != REFERENCE_ADMISSION_REQUEST_NONCE_CAPACITY
+            || self.state_limits.temporal_lineage_capacity()
+                != REFERENCE_ADMISSION_TEMPORAL_LINEAGE_CAPACITY
+            || self.tenure_keys.len() != 1
+            || self.apply_keys.len() != 1
+        {
+            return Err(AdmissionConfigurationError::NonReferencePolicyShape);
+        }
+        let (tenure_selector, tenure_binding) = self
+            .tenure_keys
+            .first_key_value()
+            .ok_or(AdmissionConfigurationError::NonReferencePolicyShape)?;
+        let (apply_selector, apply_key) = self
+            .apply_keys
+            .first_key_value()
+            .ok_or(AdmissionConfigurationError::NonReferencePolicyShape)?;
+        let derived = reference_admission_policy_fingerprint_v1(ReferenceAdmissionPolicyInputV1 {
+            target: apply_selector.target,
+            source_scope: apply_selector.source_scope,
+            writer: apply_selector.writer,
+            controller_principal: apply_selector.principal,
+            controller_key_ref: apply_selector.key,
+            controller_public_key: apply_key.as_bytes(),
+            authority_principal: tenure_binding.authority_principal,
+            authority_uid: tenure_binding.authority_uid,
+            authority_gid: tenure_binding.authority_gid,
+            tenure_authority_ref: tenure_selector.authority,
+            tenure_key_ref: tenure_selector.key,
+            tenure_public_key: tenure_binding.verifying_key.as_bytes(),
+        })?;
+        if tenure_selector.source_scope != apply_selector.source_scope || derived != expected {
+            return Err(AdmissionConfigurationError::ReferencePolicyFingerprintMismatch);
+        }
+        Ok(())
+    }
+
+    /// Authenticates the trust selectors and both signatures of one strict PXAR v5.
+    ///
+    /// This auth-only seam exists for immutable terminal replay, which remains
+    /// readable after the signed target clock generation becomes historical.
+    /// It grants no authority to install a fresh temporal budget.
+    pub(crate) fn authenticate_reference_apply_request(
+        &self,
+        request: &ReferenceApplyRequestV1,
+    ) -> Result<AuthenticatedReferenceApplyV1, ReferenceApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ReferenceApplyAdmissionError::CanonicalCorrelation);
+        }
+
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ReferenceApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ReferenceApplyAdmissionError::UntrustedApplyKey);
+        };
+
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ReferenceApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ReferenceApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ReferenceApplyAdmissionError::InvalidTenureSignature)?;
+
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ReferenceApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ReferenceApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ReferenceApplyAdmissionError::InvalidRequestSignature)?;
+
+        let identities = reference_apply_ingress_identities_v1(request)
+            .map_err(ReferenceApplyAdmissionError::Identity)?;
+        Ok(AuthenticatedReferenceApplyV1 { identities })
+    }
+
+    /// Authenticates and temporally admits one fresh strict PXAR v5.
+    ///
+    /// This path is additive and deliberately does not decode or alias any of
+    /// the legacy v1-v4 envelopes. The caller supplies a real owner-local
+    /// observation from the signed target clock generation.
+    pub(crate) fn verify_reference_apply_request(
+        &self,
+        request: &ReferenceApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedReferenceApplyIngressV1, ReferenceApplyAdmissionError> {
+        let authenticated = self.authenticate_reference_apply_request(request)?;
+
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ReferenceApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ReferenceApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ReferenceApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ReferenceApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        if admitted_at_nanos == 0
+            || admitted_at_nanos
+                .checked_add(temporal.remaining_budget().value())
+                .is_none()
+        {
+            return Err(ReferenceApplyAdmissionError::DeadlineOverflow);
+        }
+        Ok(VerifiedReferenceApplyIngressV1 {
+            identities: authenticated.identities(),
+            admitted_at_nanos,
+        })
+    }
+}
+
+fn parse_reference_signature(signature: &[u8]) -> Option<Signature> {
+    let bytes = <&[u8; ED25519_SIGNATURE_BYTES]>::try_from(signature).ok()?;
+    Some(Signature::from_bytes(bytes))
+}
+
+/// Trust- and signature-verified PXAR v5 facts safe for read-only replay lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedReferenceApplyV1 {
+    identities: ReferenceApplyIngressIdentitiesV1,
+}
+
+impl AuthenticatedReferenceApplyV1 {
+    #[must_use]
+    pub(crate) const fn identities(self) -> ReferenceApplyIngressIdentitiesV1 {
+        self.identities
+    }
+}
+
+/// Cryptographically and temporally verified fresh PXAR v5 ingress evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedReferenceApplyIngressV1 {
+    identities: ReferenceApplyIngressIdentitiesV1,
+    admitted_at_nanos: u64,
+}
+
+impl VerifiedReferenceApplyIngressV1 {
+    #[must_use]
+    pub(crate) const fn identities(self) -> ReferenceApplyIngressIdentitiesV1 {
+        self.identities
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+}
+
+/// Fail-closed PXAR v5 authentication and target-clock admission failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReferenceApplyAdmissionError {
+    CanonicalCorrelation,
+    UntrustedTenureKey,
+    UntrustedApplyKey,
+    InvalidTenureTranscript,
+    InvalidRequestTranscript,
+    InvalidTenureSignature,
+    InvalidRequestSignature,
+    ClockDomainMismatch,
+    ClockGenerationMismatch,
+    BudgetExceedsPolicy,
+    BudgetExpired,
+    DeadlineOverflow,
+    Identity(ReferenceControlError),
 }
 
 /// Explicit nonzero capacities for caller-persisted admission state.
@@ -297,6 +566,12 @@ impl AdmissionStateLimits {
 /// Stable policy-construction failures. No verifier can be supplied by a caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionConfigurationError {
+    /// Shared reference-contract fingerprint construction failed.
+    ReferenceControl(ReferenceControlError),
+    /// Policy limits or trust cardinality do not match the fixed reference profile.
+    NonReferencePolicyShape,
+    /// The supplied sealed token did not equal the policy's independently derived token.
+    ReferencePolicyFingerprintMismatch,
     /// This implementation admits only Ed25519 algorithm 1/version 1.
     UnsupportedSignatureProfile,
     /// The 32-byte value did not decode as an Ed25519 verification key.
@@ -324,6 +599,11 @@ pub enum AdmissionConfigurationError {
 impl fmt::Display for AdmissionConfigurationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ReferenceControl(error) => write!(formatter, "policy fingerprint: {error}"),
+            Self::NonReferencePolicyShape => formatter.write_str("non-reference policy shape"),
+            Self::ReferencePolicyFingerprintMismatch => {
+                formatter.write_str("reference policy fingerprint mismatch")
+            }
             Self::UnsupportedSignatureProfile => {
                 formatter.write_str("unsupported signature profile")
             }
@@ -344,6 +624,12 @@ impl fmt::Display for AdmissionConfigurationError {
                 formatter.write_str("temporal lineage capacity must be positive")
             }
         }
+    }
+}
+
+impl From<ReferenceControlError> for AdmissionConfigurationError {
+    fn from(error: ReferenceControlError) -> Self {
+        Self::ReferenceControl(error)
     }
 }
 
@@ -710,6 +996,7 @@ impl ApplyAdmission {
         )?;
         let tenure_transcript = proof.signing_transcript()?;
         tenure_key
+            .verifying_key
             .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
             .map_err(|_| AdmissionError::InvalidTenureSignature)?;
 
@@ -1151,7 +1438,7 @@ mod tests {
         AdmissionConfigurationError, AdmissionDisposition, AdmissionError, AdmissionState,
         AdmissionStateLimits, ApplyAdmission, ApplyAdmissionPolicy, ED25519_ALGORITHM,
         ED25519_ALGORITHM_VERSION, RuntimeProcessExecutionRequestAdmissionError,
-        TrustedApplyIdentity, TrustedApplyKey, TrustedTenureKey,
+        TrustedApplyIdentity, TrustedApplyKey, TrustedTenureIdentity, TrustedTenureKey,
     };
 
     const SCOPE: u8 = 1;
@@ -1453,8 +1740,13 @@ mod tests {
             .verifying_key()
             .to_bytes();
         let Ok(trusted) = TrustedTenureKey::try_new(
-            SourceScopeRef::from_bytes([SCOPE; 16]),
-            TenureAuthorityRef::from_bytes([AUTHORITY; 16]),
+            TrustedTenureIdentity::new(
+                SourceScopeRef::from_bytes([SCOPE; 16]),
+                PrincipalRef::from_bytes([AUTHORITY; 16]),
+                1_001,
+                1_002,
+                TenureAuthorityRef::from_bytes([AUTHORITY; 16]),
+            ),
             TenureKeyRef::from_bytes([TENURE_KEY; 16]),
             tenure_algorithm(ED25519_ALGORITHM),
             ED25519_ALGORITHM_VERSION,
@@ -1672,8 +1964,13 @@ mod tests {
             .verifying_key()
             .to_bytes();
         let Ok(tenure_trust) = TrustedTenureKey::try_new(
-            scope,
-            TenureAuthorityRef::from_bytes([0x07; 16]),
+            TrustedTenureIdentity::new(
+                scope,
+                PrincipalRef::from_bytes([0x06; 16]),
+                1_001,
+                1_002,
+                TenureAuthorityRef::from_bytes([0x07; 16]),
+            ),
             TenureKeyRef::from_bytes([0x08; 16]),
             tenure_algorithm(ED25519_ALGORITHM),
             ED25519_ALGORITHM_VERSION,
@@ -1748,8 +2045,13 @@ mod tests {
         weak_key[0] = 1;
         assert_eq!(
             TrustedTenureKey::try_new(
-                SourceScopeRef::from_bytes([SCOPE; 16]),
-                TenureAuthorityRef::from_bytes([AUTHORITY; 16]),
+                TrustedTenureIdentity::new(
+                    SourceScopeRef::from_bytes([SCOPE; 16]),
+                    PrincipalRef::from_bytes([AUTHORITY; 16]),
+                    1_001,
+                    1_002,
+                    TenureAuthorityRef::from_bytes([AUTHORITY; 16]),
+                ),
                 TenureKeyRef::from_bytes([TENURE_KEY; 16]),
                 tenure_algorithm(ED25519_ALGORITHM),
                 ED25519_ALGORITHM_VERSION,
@@ -1760,8 +2062,13 @@ mod tests {
         );
         assert_eq!(
             TrustedTenureKey::try_new(
-                SourceScopeRef::from_bytes([SCOPE; 16]),
-                TenureAuthorityRef::from_bytes([AUTHORITY; 16]),
+                TrustedTenureIdentity::new(
+                    SourceScopeRef::from_bytes([SCOPE; 16]),
+                    PrincipalRef::from_bytes([AUTHORITY; 16]),
+                    1_001,
+                    1_002,
+                    TenureAuthorityRef::from_bytes([AUTHORITY; 16]),
+                ),
                 TenureKeyRef::from_bytes([TENURE_KEY; 16]),
                 tenure_algorithm(2),
                 ED25519_ALGORITHM_VERSION,

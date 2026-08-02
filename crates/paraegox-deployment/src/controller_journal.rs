@@ -8,21 +8,36 @@
 
 use core::fmt;
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
-use paraegox_kernel::identity::RuntimeHostId;
-use paraegox_runtime_contracts::apply::ApplyOperationId;
+use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
+use paraegox_runtime_contracts::apply::{ApplyOperationId, PlanWriterRef, WriterTenureProof};
+use paraegox_runtime_contracts::installation::MAX_INSTALLED_RUNTIME_MANIFEST_BYTES;
 use paraegox_runtime_contracts::provenance::{SourcePlanDigest, TargetSliceDigest};
+use paraegox_runtime_contracts::reference_control::{
+    MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, ReferenceApplyRequestV1,
+    ReferenceApplyTerminalReceiptV1, ReferenceBootstrapResponseV1, ReferenceChannelBindingV1,
+    ReferenceControlError,
+};
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
+use crate::manifest_ingress::ControllerInstalledManifestPin;
 use crate::plan::{DeploymentId, DeploymentRevision, DeploymentScopeId};
 use crate::planner::{
     AllocationState, DeploymentPlanCandidate, PlanContent, PlanContentDigest, PlanManifestDigest,
     StableAllocationDelta, StableAllocationRecord, StableAllocationSnapshot, TargetIntent,
 };
+use crate::tenure_protocol::{
+    AcquireTenureOperationId, AcquireTenureProtocolError, AcquireTenureRequestV1,
+    AcquireTenureResponseV1, MAX_ACQUIRE_TENURE_CLIENT_NONCE_BYTES,
+    MAX_ACQUIRE_TENURE_REQUEST_PAYLOAD_BYTES, MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
+};
 
 const JOURNAL_MAGIC: &[u8; 4] = b"PXJR";
 const JOURNAL_ENVELOPE_VERSION: u16 = 1;
 const CONTROLLER_OWNER_KIND: u16 = 1;
-const CONTROLLER_PAYLOAD_VERSION: u16 = 3;
+// Payload v6 did not bind a tenure transaction to the exact protected
+// Authority transport/provisioning domain used before send. The mandatory
+// domain fingerprint makes v7 a strict successor with no older fallback.
+const CONTROLLER_PAYLOAD_VERSION: u16 = 7;
 const CHECKSUM_ALGORITHM_SHA256: u16 = 1;
 const CHECKSUM_VERSION: u16 = 1;
 const CONTROLLER_PAYLOAD_MAGIC: &[u8; 4] = b"PXCP";
@@ -41,6 +56,7 @@ pub(crate) const MAX_CONTROLLER_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ALLOCATION_RECORDS: usize = 4_096;
 const MAX_CONTROLLER_LEDGER_RECORDS: usize = 256;
 const MAX_CONTROLLER_OPERATIONS: usize = MAX_CONTROLLER_LEDGER_RECORDS;
+const MAX_CONTROLLER_TENURE_TRANSACTIONS: usize = 256;
 // Every archived rollout requires a later retained committed plan operation.
 // With one current rollout, the largest reachable split is therefore
 // 128 committed plan operations + 127 archives + 1 current = 256.
@@ -50,6 +66,10 @@ const MAX_PLAN_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BOOTSTRAP_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_SIGNED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_QUERY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const RUNTIME_RESPONSE_AUTH_PIN_BYTES: usize = 32 + 16 + 32 + 32 + 16 + 2 + 2;
+const REFERENCE_RESPONSE_AUTH_ALGORITHM_ED25519: u16 = 1;
+const REFERENCE_RESPONSE_AUTH_ALGORITHM_VERSION: u16 = 1;
+const ED25519_SIGNATURE_BYTES: usize = 64;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -103,6 +123,7 @@ opaque_digest!(ControllerChannelAuthFingerprint);
 opaque_digest!(ControllerBootstrapResponseDigest);
 opaque_digest!(ControllerQueryResponseDigest);
 opaque_digest!(ControllerOwnerIdentityFingerprint);
+opaque_digest!(ControllerTenureAuthorityDomainFingerprint);
 
 /// Exact committed plan plus its Controller-local operation cross-reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,6 +247,46 @@ impl ControllerCommittedPlan {
             commit_intent_digest: input.commit_intent_digest,
         })
     }
+
+    #[must_use]
+    pub(crate) const fn scope(&self) -> DeploymentScopeId {
+        self.scope
+    }
+
+    #[must_use]
+    pub(crate) const fn plan(&self) -> DeploymentId {
+        self.plan
+    }
+
+    #[must_use]
+    pub(crate) const fn revision(&self) -> DeploymentRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn content(&self) -> &PlanContent {
+        &self.content
+    }
+
+    #[must_use]
+    pub(crate) const fn deployment_plan_digest(&self) -> SourcePlanDigest {
+        self.deployment_plan_digest
+    }
+
+    /// Returns the exact Controller operation which committed this plan.
+    ///
+    /// This is intentionally only a read of the already-validated current
+    /// plan cross-reference. It does not expose the operation ledger or permit
+    /// callers to construct a plan transition.
+    #[must_use]
+    pub(crate) const fn commit_operation(&self) -> ControllerOperationId {
+        self.commit_operation
+    }
 }
 
 /// Durable phase of one Controller-local operation.
@@ -331,6 +392,142 @@ impl ControllerRequestAuthPin {
             rotation_generation,
         })
     }
+
+    #[must_use]
+    pub(crate) const fn key(self) -> ApplyAuthKeyRef {
+        self.key
+    }
+
+    #[must_use]
+    pub(crate) const fn algorithm(self) -> ApplyAuthAlgorithm {
+        self.algorithm
+    }
+
+    #[must_use]
+    pub(crate) const fn algorithm_version(self) -> u16 {
+        self.algorithm_version
+    }
+
+    #[must_use]
+    pub(crate) const fn verification_key_fingerprint(self) -> ControllerAuthKeyFingerprint {
+        self.verification_key_fingerprint
+    }
+}
+
+/// Authenticated Runtime response facts copied out of one exact bootstrap.
+///
+/// `ControllerTargetBinding` may advance to a newer Runtime host epoch.  Every
+/// apply intent therefore retains the response facts that authenticated its
+/// original request so an exact historical PXRT can still be verified after a
+/// Runtime restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerRuntimeResponseAuthPin {
+    bootstrap_response_digest: ControllerBootstrapResponseDigest,
+    runtime_peer: PrincipalRef,
+    local_endpoint_identity_digest: Digest32,
+    peer_credentials_digest: Digest32,
+    key: ApplyAuthKeyRef,
+    algorithm: ApplyAuthAlgorithm,
+    algorithm_version: u16,
+}
+
+struct ControllerStoredRuntimeResponseAuthPinInput {
+    bootstrap_response_digest: ControllerBootstrapResponseDigest,
+    runtime_peer: PrincipalRef,
+    local_endpoint_identity_digest: Digest32,
+    peer_credentials_digest: Digest32,
+    key: ApplyAuthKeyRef,
+    algorithm: ApplyAuthAlgorithm,
+    algorithm_version: u16,
+}
+
+impl ControllerRuntimeResponseAuthPin {
+    pub(crate) fn try_from_bootstrap_response(
+        response: &ReferenceBootstrapResponseV1,
+        channel: ReferenceChannelBindingV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let decoded = ReferenceBootstrapResponseV1::decode(response.canonical_wire())?;
+        if decoded != *response
+            || response.authentication_runtime_peer() != channel.runtime_peer()
+            || response.authentication_channel_binding_digest() != channel.binding_digest()
+            || response.authentication_signature().len() != ED25519_SIGNATURE_BYTES
+        {
+            return Err(ControllerJournalError::InvalidRuntimeResponseAuthPin);
+        }
+        Self::try_from_stored(ControllerStoredRuntimeResponseAuthPinInput {
+            bootstrap_response_digest: ControllerBootstrapResponseDigest::from_stored(
+                response.response_digest(),
+            ),
+            runtime_peer: channel.runtime_peer(),
+            local_endpoint_identity_digest: channel.local_endpoint_identity_digest(),
+            peer_credentials_digest: channel.peer_credentials_digest(),
+            key: response.authentication_key(),
+            algorithm: response.authentication_algorithm(),
+            algorithm_version: response.authentication_algorithm_version(),
+        })
+    }
+
+    fn try_from_stored(
+        input: ControllerStoredRuntimeResponseAuthPinInput,
+    ) -> Result<Self, ControllerJournalError> {
+        if bytes_are_zero(input.bootstrap_response_digest.value().as_bytes())
+            || bytes_are_zero(input.runtime_peer.as_bytes())
+            || bytes_are_zero(input.local_endpoint_identity_digest.as_bytes())
+            || bytes_are_zero(input.peer_credentials_digest.as_bytes())
+            || bytes_are_zero(input.key.as_bytes())
+            || input.algorithm.value() != REFERENCE_RESPONSE_AUTH_ALGORITHM_ED25519
+            || input.algorithm_version != REFERENCE_RESPONSE_AUTH_ALGORITHM_VERSION
+        {
+            return Err(ControllerJournalError::InvalidRuntimeResponseAuthPin);
+        }
+        Ok(Self {
+            bootstrap_response_digest: input.bootstrap_response_digest,
+            runtime_peer: input.runtime_peer,
+            local_endpoint_identity_digest: input.local_endpoint_identity_digest,
+            peer_credentials_digest: input.peer_credentials_digest,
+            key: input.key,
+            algorithm: input.algorithm,
+            algorithm_version: input.algorithm_version,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn bootstrap_response_digest(self) -> ControllerBootstrapResponseDigest {
+        self.bootstrap_response_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_peer(self) -> PrincipalRef {
+        self.runtime_peer
+    }
+
+    pub(crate) fn channel(
+        self,
+        target: RuntimeHostId,
+    ) -> Result<ReferenceChannelBindingV1, ControllerJournalError> {
+        ReferenceChannelBindingV1::try_new(
+            target,
+            self.runtime_peer,
+            self.local_endpoint_identity_digest,
+            self.peer_credentials_digest,
+        )
+        .map_err(|_| ControllerJournalError::InvalidRuntimeResponseAuthPin)
+    }
+
+    #[must_use]
+    pub(crate) const fn key(self) -> ApplyAuthKeyRef {
+        self.key
+    }
+
+    #[must_use]
+    pub(crate) const fn algorithm(self) -> ApplyAuthAlgorithm {
+        self.algorithm
+    }
+
+    #[must_use]
+    pub(crate) const fn algorithm_version(self) -> u16 {
+        self.algorithm_version
+    }
 }
 
 /// Exact Runtime identity and bootstrap evidence pinned before sign/send.
@@ -344,6 +541,7 @@ pub(crate) struct ControllerTargetBinding {
     last_runtime_host_epoch: u64,
     bootstrap_response: Box<[u8]>,
     bootstrap_response_digest: ControllerBootstrapResponseDigest,
+    runtime_response_auth: ControllerRuntimeResponseAuthPin,
 }
 
 pub(crate) struct ControllerTargetBindingInput<'a> {
@@ -355,6 +553,7 @@ pub(crate) struct ControllerTargetBindingInput<'a> {
     pub(crate) last_runtime_host_epoch: u64,
     pub(crate) bootstrap_response: &'a [u8],
     pub(crate) bootstrap_response_digest: ControllerBootstrapResponseDigest,
+    pub(crate) runtime_response_auth: ControllerRuntimeResponseAuthPin,
 }
 
 impl ControllerTargetBinding {
@@ -377,6 +576,26 @@ impl ControllerTargetBinding {
         if input.bootstrap_response.len() > MAX_BOOTSTRAP_RESPONSE_BYTES {
             return Err(ControllerJournalError::BootstrapResponseTooLarge);
         }
+        let response = ReferenceBootstrapResponseV1::decode(input.bootstrap_response)
+            .map_err(|_| ControllerJournalError::InvalidTargetBinding)?;
+        let channel = input
+            .runtime_response_auth
+            .channel(input.target)
+            .map_err(|_| ControllerJournalError::InvalidTargetBinding)?;
+        let derived_auth =
+            ControllerRuntimeResponseAuthPin::try_from_bootstrap_response(&response, channel)
+                .map_err(|_| ControllerJournalError::InvalidTargetBinding)?;
+        let facts = response.facts();
+        if response.canonical_wire() != input.bootstrap_response
+            || response.response_digest() != input.bootstrap_response_digest.value()
+            || derived_auth != input.runtime_response_auth
+            || facts.target() != input.target
+            || facts.runtime_store_instance_id() != input.runtime_store_instance_id
+            || facts.runtime_host_epoch() != input.last_runtime_host_epoch
+            || facts.manifest_digest() != input.manifest_digest.value()
+        {
+            return Err(ControllerJournalError::InvalidTargetBinding);
+        }
         Ok(Self {
             target: input.target,
             runtime_store_instance_id: input.runtime_store_instance_id,
@@ -386,7 +605,53 @@ impl ControllerTargetBinding {
             last_runtime_host_epoch: input.last_runtime_host_epoch,
             bootstrap_response: input.bootstrap_response.into(),
             bootstrap_response_digest: input.bootstrap_response_digest,
+            runtime_response_auth: input.runtime_response_auth,
         })
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_store_instance_id(&self) -> [u8; 32] {
+        self.runtime_store_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn channel_auth_fingerprint(&self) -> ControllerChannelAuthFingerprint {
+        self.channel_auth_fingerprint
+    }
+
+    #[must_use]
+    pub(crate) const fn manifest_digest(&self) -> PlanManifestDigest {
+        self.manifest_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn first_runtime_host_epoch(&self) -> u64 {
+        self.first_runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn last_runtime_host_epoch(&self) -> u64 {
+        self.last_runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) fn bootstrap_response(&self) -> &[u8] {
+        &self.bootstrap_response
+    }
+
+    #[must_use]
+    pub(crate) const fn bootstrap_response_digest(&self) -> ControllerBootstrapResponseDigest {
+        self.bootstrap_response_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_response_auth(&self) -> ControllerRuntimeResponseAuthPin {
+        self.runtime_response_auth
     }
 
     fn validate_successor_of(&self, previous: &Self) -> Result<(), ControllerJournalError> {
@@ -401,7 +666,8 @@ impl ControllerTargetBinding {
         }
         if self.last_runtime_host_epoch == previous.last_runtime_host_epoch
             && (self.bootstrap_response != previous.bootstrap_response
-                || self.bootstrap_response_digest != previous.bootstrap_response_digest)
+                || self.bootstrap_response_digest != previous.bootstrap_response_digest
+                || self.runtime_response_auth != previous.runtime_response_auth)
         {
             return Err(ControllerJournalError::TargetBindingChanged);
         }
@@ -444,6 +710,7 @@ pub(crate) struct ControllerSignedApplyIntent {
     runtime_store_instance_id: [u8; 32],
     binding_channel_auth_fingerprint: ControllerChannelAuthFingerprint,
     binding_manifest_digest: PlanManifestDigest,
+    runtime_response_auth: ControllerRuntimeResponseAuthPin,
 }
 
 pub(crate) struct ControllerSignedApplyIntentInput<'a> {
@@ -466,6 +733,7 @@ struct ControllerStoredSignedApplyIntentInput<'a> {
     runtime_store_instance_id: [u8; 32],
     binding_channel_auth_fingerprint: ControllerChannelAuthFingerprint,
     binding_manifest_digest: PlanManifestDigest,
+    runtime_response_auth: ControllerRuntimeResponseAuthPin,
 }
 
 impl ControllerSignedApplyIntent {
@@ -485,6 +753,7 @@ impl ControllerSignedApplyIntent {
             runtime_store_instance_id: binding.runtime_store_instance_id,
             binding_channel_auth_fingerprint: binding.channel_auth_fingerprint,
             binding_manifest_digest: binding.manifest_digest,
+            runtime_response_auth: binding.runtime_response_auth,
         })
     }
 
@@ -519,7 +788,65 @@ impl ControllerSignedApplyIntent {
             runtime_store_instance_id: input.runtime_store_instance_id,
             binding_channel_auth_fingerprint: input.binding_channel_auth_fingerprint,
             binding_manifest_digest: input.binding_manifest_digest,
+            runtime_response_auth: input.runtime_response_auth,
         })
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn source_plan_digest(&self) -> SourcePlanDigest {
+        self.source_plan_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn target_slice_digest(&self) -> TargetSliceDigest {
+        self.target_slice_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn apply_operation(&self) -> ApplyOperationId {
+        self.apply_operation
+    }
+
+    #[must_use]
+    pub(crate) const fn request_digest(&self) -> ControllerApplyRequestDigest {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub(crate) fn signed_request(&self) -> &[u8] {
+        &self.signed_request
+    }
+
+    #[must_use]
+    pub(crate) const fn request_auth(&self) -> ControllerRequestAuthPin {
+        self.request_auth
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_store_instance_id(&self) -> [u8; 32] {
+        self.runtime_store_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn binding_channel_auth_fingerprint(
+        &self,
+    ) -> ControllerChannelAuthFingerprint {
+        self.binding_channel_auth_fingerprint
+    }
+
+    #[must_use]
+    pub(crate) const fn binding_manifest_digest(&self) -> PlanManifestDigest {
+        self.binding_manifest_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_response_auth(&self) -> ControllerRuntimeResponseAuthPin {
+        self.runtime_response_auth
     }
 }
 
@@ -641,10 +968,71 @@ impl ControllerReconcileAttempt {
     }
 }
 
+/// Exact canonical PXRT returned directly by the Runtime apply endpoint.
+///
+/// This is deliberately separate from opaque query/reconcile evidence. The
+/// Controller apply client verifies Runtime signature and live channel before
+/// calling the journal transition; the journal independently re-decodes and
+/// correlates all request-owned fields before retaining the exact bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerDirectTerminalReceipt {
+    receipt: ReferenceApplyTerminalReceiptV1,
+}
+
+impl ControllerDirectTerminalReceipt {
+    fn try_new(
+        receipt: ReferenceApplyTerminalReceiptV1,
+        intent: &ControllerSignedApplyIntent,
+    ) -> Result<Self, ControllerJournalError> {
+        let decoded = ReferenceApplyTerminalReceiptV1::decode(receipt.canonical_wire())?;
+        let request = ReferenceApplyRequestV1::decode(intent.signed_request())?;
+        let runtime_auth = intent.runtime_response_auth();
+        let original_channel = runtime_auth
+            .channel(intent.target())
+            .map_err(|_| ControllerJournalError::InvalidDirectTerminalReceipt)?;
+        receipt
+            .validate_against_request(&request, original_channel)
+            .map_err(|_| ControllerJournalError::InvalidDirectTerminalReceipt)?;
+        if decoded != receipt
+            || receipt.target() != intent.target()
+            || receipt.target() != request.target()
+            || receipt.runtime_store_instance_id() != intent.runtime_store_instance_id()
+            || receipt.runtime_store_instance_id() != request.expected_runtime_store_instance_id()
+            || receipt.source_scope() != request.provenance().source_scope()
+            || receipt.operation_id() != intent.apply_operation()
+            || receipt.operation_id() != request.control_commitment().control().operation_id()
+            || receipt.request_digest() != intent.request_digest().value()
+            || receipt.request_digest() != request.envelope_request_digest()
+            || receipt.request_nonce() != request.authentication().claim().nonce()
+            || bytes_are_zero(receipt.facts().terminal_result_ref().as_bytes())
+            || receipt.authentication_channel_binding_digest() != original_channel.binding_digest()
+            || receipt.authentication_runtime_peer() != runtime_auth.runtime_peer()
+            || receipt.authentication_key() != runtime_auth.key()
+            || receipt.authentication_algorithm() != runtime_auth.algorithm()
+            || receipt.authentication_algorithm_version() != runtime_auth.algorithm_version()
+            || receipt.authentication_signature().len() != ED25519_SIGNATURE_BYTES
+        {
+            return Err(ControllerJournalError::InvalidDirectTerminalReceipt);
+        }
+        Ok(Self { receipt })
+    }
+
+    #[must_use]
+    pub(crate) const fn receipt(&self) -> &ReferenceApplyTerminalReceiptV1 {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub(crate) const fn desired_head_digest(&self) -> Option<TargetSliceDigest> {
+        self.receipt.facts().desired_head_digest()
+    }
+}
+
 /// One-target signed intent plus append-only reconciliation evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ControllerRolloutRecord {
     signed_intent: ControllerSignedApplyIntent,
+    direct_terminal_receipt: Option<ControllerDirectTerminalReceipt>,
     reconcile_attempts: Box<[ControllerReconcileAttempt]>,
 }
 
@@ -676,14 +1064,142 @@ impl ControllerRolloutRecord {
             }
             last_sequence = Some(sequence);
         }
+        if self.direct_terminal_receipt.is_some()
+            && self
+                .reconcile_attempts
+                .last()
+                .and_then(|attempt| attempt.decision)
+                .is_some_and(ControllerRolloutDecision::is_terminal)
+        {
+            return Err(ControllerJournalError::ConflictingTerminalEvidence);
+        }
         Ok(())
     }
 
     fn is_terminal(&self) -> bool {
-        self.reconcile_attempts
-            .last()
-            .and_then(|attempt| attempt.decision)
-            .is_some_and(ControllerRolloutDecision::is_terminal)
+        self.direct_terminal_receipt.is_some()
+            || self
+                .reconcile_attempts
+                .last()
+                .and_then(|attempt| attempt.decision)
+                .is_some_and(ControllerRolloutDecision::is_terminal)
+    }
+}
+
+/// Durable phase of one exact Controller-to-Authority tenure exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ControllerTenurePhase {
+    Prepared = 1,
+    Uncertain = 2,
+    Committed = 3,
+}
+
+impl ControllerTenurePhase {
+    fn decode(value: u8) -> Result<Self, ControllerJournalError> {
+        match value {
+            1 => Ok(Self::Prepared),
+            2 => Ok(Self::Uncertain),
+            3 => Ok(Self::Committed),
+            _ => Err(ControllerJournalError::UnknownEnum),
+        }
+    }
+
+    const fn permits(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Prepared,
+                Self::Prepared | Self::Uncertain | Self::Committed
+            ) | (Self::Uncertain, Self::Uncertain | Self::Committed)
+                | (Self::Committed, Self::Committed)
+        )
+    }
+
+    #[must_use]
+    pub(crate) const fn is_committed(self) -> bool {
+        matches!(self, Self::Committed)
+    }
+}
+
+/// Exact persisted acquire-tenure transaction, deliberately separate from the
+/// generic plan-operation ledger. Canonical protocol values remain the owner
+/// of every request, response, and proof fact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerTenureTransaction {
+    request: AcquireTenureRequestV1,
+    authority_domain_fingerprint: ControllerTenureAuthorityDomainFingerprint,
+    phase: ControllerTenurePhase,
+    response: Option<AcquireTenureResponseV1>,
+}
+
+impl ControllerTenureTransaction {
+    fn try_new(
+        request: AcquireTenureRequestV1,
+        authority_domain_fingerprint: ControllerTenureAuthorityDomainFingerprint,
+        phase: ControllerTenurePhase,
+        response: Option<AcquireTenureResponseV1>,
+    ) -> Result<Self, ControllerJournalError> {
+        if bytes_are_zero(authority_domain_fingerprint.value().as_bytes()) {
+            return Err(ControllerJournalError::InvalidTenureAuthorityDomainFingerprint);
+        }
+        match (phase, response.as_ref()) {
+            (ControllerTenurePhase::Committed, Some(response)) => {
+                let decoded = AcquireTenureResponseV1::decode_for_request(
+                    response.canonical_bytes(),
+                    &request,
+                )?;
+                if decoded != *response {
+                    return Err(ControllerJournalError::InvalidTenureTransaction);
+                }
+            }
+            (ControllerTenurePhase::Prepared | ControllerTenurePhase::Uncertain, None) => {}
+            _ => return Err(ControllerJournalError::InvalidTenureTransaction),
+        }
+        let decoded = AcquireTenureRequestV1::decode(request.canonical_bytes())?;
+        if decoded != request {
+            return Err(ControllerJournalError::InvalidTenureTransaction);
+        }
+        Ok(Self {
+            request,
+            authority_domain_fingerprint,
+            phase,
+            response,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn operation_id(&self) -> AcquireTenureOperationId {
+        self.request.operation_id()
+    }
+
+    #[must_use]
+    pub(crate) const fn phase(&self) -> ControllerTenurePhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &AcquireTenureRequestV1 {
+        &self.request
+    }
+
+    /// Returns the exact protected Authority transport/provisioning domain
+    /// selected before this request first became durable.
+    #[must_use]
+    pub(crate) const fn authority_domain_fingerprint(
+        &self,
+    ) -> ControllerTenureAuthorityDomainFingerprint {
+        self.authority_domain_fingerprint
+    }
+
+    #[must_use]
+    pub(crate) const fn response(&self) -> Option<&AcquireTenureResponseV1> {
+        self.response.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn committed_proof(&self) -> Option<&WriterTenureProof> {
+        self.response.as_ref().map(AcquireTenureResponseV1::proof)
     }
 }
 
@@ -693,8 +1209,10 @@ pub(crate) struct ControllerJournalState {
     scope: DeploymentScopeId,
     plan_lineage: DeploymentId,
     allocation: StableAllocationSnapshot,
+    installed_manifest: ControllerInstalledManifestPin,
     committed_plan: Option<ControllerCommittedPlan>,
     operations: Box<[ControllerOperationRecord]>,
+    tenure_transactions: Box<[ControllerTenureTransaction]>,
     request_auth: ControllerRequestAuthPin,
     target_binding: Option<ControllerTargetBinding>,
     query_snapshot_high_water: u64,
@@ -706,8 +1224,10 @@ struct ControllerJournalStateInput {
     scope: DeploymentScopeId,
     plan_lineage: DeploymentId,
     allocation: StableAllocationSnapshot,
+    installed_manifest: ControllerInstalledManifestPin,
     committed_plan: Option<ControllerCommittedPlan>,
     operations: Vec<ControllerOperationRecord>,
+    tenure_transactions: Vec<ControllerTenureTransaction>,
     request_auth: ControllerRequestAuthPin,
     target_binding: Option<ControllerTargetBinding>,
     query_snapshot_high_water: u64,
@@ -719,6 +1239,7 @@ struct ControllerJournalMutationInput {
     allocation: StableAllocationSnapshot,
     committed_plan: Option<ControllerCommittedPlan>,
     operations: Vec<ControllerOperationRecord>,
+    tenure_transactions: Vec<ControllerTenureTransaction>,
     request_auth: ControllerRequestAuthPin,
     target_binding: Option<ControllerTargetBinding>,
     query_snapshot_high_water: u64,
@@ -731,6 +1252,7 @@ impl ControllerJournalState {
         scope: DeploymentScopeId,
         plan_lineage: DeploymentId,
         allocation: StableAllocationSnapshot,
+        installed_manifest: ControllerInstalledManifestPin,
         request_auth: ControllerRequestAuthPin,
     ) -> Result<Self, ControllerJournalError> {
         if allocation.generation() != 0
@@ -743,8 +1265,10 @@ impl ControllerJournalState {
             scope,
             plan_lineage,
             allocation,
+            installed_manifest,
             committed_plan: None,
             operations: Vec::new(),
+            tenure_transactions: Vec::new(),
             request_auth,
             target_binding: None,
             query_snapshot_high_water: 0,
@@ -758,8 +1282,10 @@ impl ControllerJournalState {
             scope: input.scope,
             plan_lineage: input.plan_lineage,
             allocation: input.allocation,
+            installed_manifest: input.installed_manifest,
             committed_plan: input.committed_plan,
             operations: input.operations.into_boxed_slice(),
+            tenure_transactions: input.tenure_transactions.into_boxed_slice(),
             request_auth: input.request_auth,
             target_binding: input.target_binding,
             query_snapshot_high_water: input.query_snapshot_high_water,
@@ -817,6 +1343,7 @@ impl ControllerJournalState {
             allocation: self.allocation.clone(),
             committed_plan: self.committed_plan.clone(),
             operations,
+            tenure_transactions: self.tenure_transactions.to_vec(),
             request_auth: self.request_auth,
             target_binding: self.target_binding.clone(),
             query_snapshot_high_water: self.query_snapshot_high_water,
@@ -900,6 +1427,7 @@ impl ControllerJournalState {
             allocation,
             committed_plan: Some(committed_plan),
             operations,
+            tenure_transactions: self.tenure_transactions.to_vec(),
             request_auth: self.request_auth,
             target_binding: self.target_binding.clone(),
             query_snapshot_high_water: self.query_snapshot_high_water,
@@ -942,6 +1470,154 @@ impl ControllerJournalState {
             allocation: self.allocation.clone(),
             committed_plan: self.committed_plan.clone(),
             operations,
+            tenure_transactions: self.tenure_transactions.to_vec(),
+            request_auth: self.request_auth,
+            target_binding: self.target_binding.clone(),
+            query_snapshot_high_water: self.query_snapshot_high_water,
+            rollout: self.rollout.clone(),
+            apply_history: self.apply_history.to_vec(),
+        })
+    }
+
+    /// Persists the exact signed acquire request before any Authority exchange.
+    pub(crate) fn prepare_tenure_acquisition(
+        &self,
+        request: &AcquireTenureRequestV1,
+        authority_domain_fingerprint: ControllerTenureAuthorityDomainFingerprint,
+    ) -> Result<Self, ControllerJournalError> {
+        if bytes_are_zero(authority_domain_fingerprint.value().as_bytes()) {
+            return Err(ControllerJournalError::InvalidTenureAuthorityDomainFingerprint);
+        }
+        if request.scope() != self.scope {
+            return Err(ControllerJournalError::TenureScopeMismatch);
+        }
+        for transaction in &self.tenure_transactions {
+            let stored = transaction.request();
+            let identity_collides = stored.operation_id() == request.operation_id()
+                || stored.request_digest() == request.request_digest()
+                || stored.intent_digest() == request.intent_digest()
+                || stored.client_nonce() == request.client_nonce();
+            if identity_collides {
+                return if stored.canonical_bytes() == request.canonical_bytes()
+                    && transaction.authority_domain_fingerprint() == authority_domain_fingerprint
+                {
+                    Ok(self.clone())
+                } else if stored.canonical_bytes() == request.canonical_bytes() {
+                    Err(ControllerJournalError::TenureAuthorityDomainMismatch)
+                } else {
+                    Err(ControllerJournalError::TenureTransactionConflict)
+                };
+            }
+        }
+        if self.tenure_transactions.len() == MAX_CONTROLLER_TENURE_TRANSACTIONS {
+            return Err(ControllerJournalError::TenureCapacityExceeded);
+        }
+        if self.tenure_transactions.iter().any(|transaction| {
+            matches!(
+                transaction.phase(),
+                ControllerTenurePhase::Prepared | ControllerTenurePhase::Uncertain
+            )
+        }) {
+            return Err(ControllerJournalError::UnresolvedTenureTransactionExists);
+        }
+        let mut tenure_transactions = self.tenure_transactions.to_vec();
+        tenure_transactions.push(ControllerTenureTransaction::try_new(
+            request.clone(),
+            authority_domain_fingerprint,
+            ControllerTenurePhase::Prepared,
+            None,
+        )?);
+        tenure_transactions.sort_unstable_by_key(ControllerTenureTransaction::operation_id);
+        self.rebuild(ControllerJournalMutationInput {
+            allocation: self.allocation.clone(),
+            committed_plan: self.committed_plan.clone(),
+            operations: self.operations.to_vec(),
+            tenure_transactions,
+            request_auth: self.request_auth,
+            target_binding: self.target_binding.clone(),
+            query_snapshot_high_water: self.query_snapshot_high_water,
+            rollout: self.rollout.clone(),
+            apply_history: self.apply_history.to_vec(),
+        })
+    }
+
+    /// Records an ambiguous exchange result without changing request identity.
+    pub(crate) fn mark_tenure_uncertain(
+        &self,
+        request: &AcquireTenureRequestV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let mut tenure_transactions = self.tenure_transactions.to_vec();
+        let Some(transaction) = tenure_transactions
+            .iter_mut()
+            .find(|transaction| transaction.operation_id() == request.operation_id())
+        else {
+            return Err(ControllerJournalError::MissingTenureTransaction);
+        };
+        if transaction.request().canonical_bytes() != request.canonical_bytes() {
+            return Err(ControllerJournalError::TenureTransactionConflict);
+        }
+        match transaction.phase() {
+            ControllerTenurePhase::Prepared => transaction.phase = ControllerTenurePhase::Uncertain,
+            ControllerTenurePhase::Uncertain => return Ok(self.clone()),
+            ControllerTenurePhase::Committed => {
+                return Err(ControllerJournalError::InvalidTenureTransition);
+            }
+        }
+        self.rebuild(ControllerJournalMutationInput {
+            allocation: self.allocation.clone(),
+            committed_plan: self.committed_plan.clone(),
+            operations: self.operations.to_vec(),
+            tenure_transactions,
+            request_auth: self.request_auth,
+            target_binding: self.target_binding.clone(),
+            query_snapshot_high_water: self.query_snapshot_high_water,
+            rollout: self.rollout.clone(),
+            apply_history: self.apply_history.to_vec(),
+        })
+    }
+
+    /// Commits the canonical response and its byte-exact embedded proof.
+    pub(crate) fn commit_tenure_response(
+        &self,
+        request: &AcquireTenureRequestV1,
+        response: &AcquireTenureResponseV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let canonical_response =
+            AcquireTenureResponseV1::decode_for_request(response.canonical_bytes(), request)?;
+        if canonical_response != *response {
+            return Err(ControllerJournalError::InvalidTenureTransaction);
+        }
+        let mut tenure_transactions = self.tenure_transactions.to_vec();
+        let Some(transaction_index) = tenure_transactions
+            .iter_mut()
+            .position(|transaction| transaction.operation_id() == request.operation_id())
+        else {
+            return Err(ControllerJournalError::MissingTenureTransaction);
+        };
+        let transaction = &tenure_transactions[transaction_index];
+        if transaction.request().canonical_bytes() != request.canonical_bytes() {
+            return Err(ControllerJournalError::TenureTransactionConflict);
+        }
+        if transaction.phase() == ControllerTenurePhase::Committed {
+            return if transaction.response() == Some(response) {
+                Ok(self.clone())
+            } else {
+                Err(ControllerJournalError::TenureTransactionConflict)
+            };
+        }
+        validate_new_tenure_proof_successor(
+            &self.tenure_transactions,
+            request.operation_id(),
+            response.proof(),
+        )?;
+        let transaction = &mut tenure_transactions[transaction_index];
+        transaction.phase = ControllerTenurePhase::Committed;
+        transaction.response = Some(canonical_response);
+        self.rebuild(ControllerJournalMutationInput {
+            allocation: self.allocation.clone(),
+            committed_plan: self.committed_plan.clone(),
+            operations: self.operations.to_vec(),
+            tenure_transactions,
             request_auth: self.request_auth,
             target_binding: self.target_binding.clone(),
             query_snapshot_high_water: self.query_snapshot_high_water,
@@ -960,10 +1636,15 @@ impl ControllerJournalState {
             .committed_plan
             .as_ref()
             .ok_or(ControllerJournalError::TargetBindingWithoutPlan)?;
-        if binding.target != self.allocation.target() || binding.target != plan.target {
+        if binding.target != self.allocation.target()
+            || binding.target != self.installed_manifest.target()
+            || binding.target != plan.target
+        {
             return Err(ControllerJournalError::TargetMismatch);
         }
-        if binding.manifest_digest != plan.content.manifest_digest() {
+        if binding.manifest_digest.value() != self.installed_manifest.manifest_digest()
+            || binding.manifest_digest != plan.content.manifest_digest()
+        {
             return Err(ControllerJournalError::ManifestBindingMismatch);
         }
         if let Some(previous) = &self.target_binding {
@@ -973,6 +1654,7 @@ impl ControllerJournalState {
             allocation: self.allocation.clone(),
             committed_plan: self.committed_plan.clone(),
             operations: self.operations.to_vec(),
+            tenure_transactions: self.tenure_transactions.to_vec(),
             request_auth: self.request_auth,
             target_binding: Some(binding),
             query_snapshot_high_water: self.query_snapshot_high_water,
@@ -990,6 +1672,7 @@ impl ControllerJournalState {
             allocation: self.allocation.clone(),
             committed_plan: self.committed_plan.clone(),
             operations: self.operations.to_vec(),
+            tenure_transactions: self.tenure_transactions.to_vec(),
             request_auth,
             target_binding: self.target_binding.clone(),
             query_snapshot_high_water: self.query_snapshot_high_water,
@@ -1022,6 +1705,7 @@ impl ControllerJournalState {
             || intent.request_auth != self.request_auth
             || intent.binding_manifest_digest != plan.content.manifest_digest()
             || binding.manifest_digest != plan.content.manifest_digest()
+            || intent.binding_manifest_digest.value() != self.installed_manifest.manifest_digest()
         {
             return Err(ControllerJournalError::RolloutBindingMismatch);
         }
@@ -1029,13 +1713,55 @@ impl ControllerJournalState {
             allocation: self.allocation.clone(),
             committed_plan: self.committed_plan.clone(),
             operations: self.operations.to_vec(),
+            tenure_transactions: self.tenure_transactions.to_vec(),
             request_auth: self.request_auth,
             target_binding: self.target_binding.clone(),
             query_snapshot_high_water: self.query_snapshot_high_water,
             rollout: Some(ControllerRolloutRecord {
                 signed_intent: intent,
+                direct_terminal_receipt: None,
                 reconcile_attempts: Box::new([]),
             }),
+            apply_history: self.apply_history.to_vec(),
+        })
+    }
+
+    /// Persists one exact, already authenticated direct PXRT response.
+    pub(crate) fn record_direct_terminal_receipt(
+        &self,
+        receipt: &ReferenceApplyTerminalReceiptV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let mut rollout = self
+            .rollout
+            .clone()
+            .ok_or(ControllerJournalError::DanglingRollout)?;
+        let direct =
+            ControllerDirectTerminalReceipt::try_new(receipt.clone(), &rollout.signed_intent)?;
+        if let Some(existing) = &rollout.direct_terminal_receipt {
+            return if existing == &direct {
+                Ok(self.clone())
+            } else {
+                Err(ControllerJournalError::DirectTerminalReceiptChanged)
+            };
+        }
+        if rollout
+            .reconcile_attempts
+            .last()
+            .and_then(|attempt| attempt.decision)
+            .is_some_and(ControllerRolloutDecision::is_terminal)
+        {
+            return Err(ControllerJournalError::ConflictingTerminalEvidence);
+        }
+        rollout.direct_terminal_receipt = Some(direct);
+        self.rebuild(ControllerJournalMutationInput {
+            allocation: self.allocation.clone(),
+            committed_plan: self.committed_plan.clone(),
+            operations: self.operations.to_vec(),
+            tenure_transactions: self.tenure_transactions.to_vec(),
+            request_auth: self.request_auth,
+            target_binding: self.target_binding.clone(),
+            query_snapshot_high_water: self.query_snapshot_high_water,
+            rollout: Some(rollout),
             apply_history: self.apply_history.to_vec(),
         })
     }
@@ -1057,6 +1783,9 @@ impl ControllerJournalState {
             .rollout
             .clone()
             .ok_or(ControllerJournalError::DanglingRollout)?;
+        if rollout.direct_terminal_receipt.is_some() {
+            return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
+        }
         if let Some(existing) = rollout
             .reconcile_attempts
             .iter()
@@ -1104,6 +1833,7 @@ impl ControllerJournalState {
             allocation: self.allocation.clone(),
             committed_plan: self.committed_plan.clone(),
             operations: self.operations.to_vec(),
+            tenure_transactions: self.tenure_transactions.to_vec(),
             request_auth: self.request_auth,
             target_binding: self.target_binding.clone(),
             query_snapshot_high_water: self.query_snapshot_high_water.max(query_snapshot_sequence),
@@ -1122,6 +1852,9 @@ impl ControllerJournalState {
             .rollout
             .clone()
             .ok_or(ControllerJournalError::DanglingRollout)?;
+        if rollout.direct_terminal_receipt.is_some() {
+            return Err(ControllerJournalError::ConflictingTerminalEvidence);
+        }
         let attempt = rollout
             .reconcile_attempts
             .last_mut()
@@ -1139,6 +1872,7 @@ impl ControllerJournalState {
             allocation: self.allocation.clone(),
             committed_plan: self.committed_plan.clone(),
             operations: self.operations.to_vec(),
+            tenure_transactions: self.tenure_transactions.to_vec(),
             request_auth: self.request_auth,
             target_binding: self.target_binding.clone(),
             query_snapshot_high_water: self.query_snapshot_high_water,
@@ -1155,8 +1889,10 @@ impl ControllerJournalState {
             scope: self.scope,
             plan_lineage: self.plan_lineage,
             allocation: input.allocation,
+            installed_manifest: self.installed_manifest.clone(),
             committed_plan: input.committed_plan,
             operations: input.operations,
+            tenure_transactions: input.tenure_transactions,
             request_auth: input.request_auth,
             target_binding: input.target_binding,
             query_snapshot_high_water: input.query_snapshot_high_water,
@@ -1221,15 +1957,229 @@ impl ControllerJournalState {
         Ok(history)
     }
 
-    fn current_revision(&self) -> u64 {
+    /// Returns the current committed plan revision, or zero before first commit.
+    pub(crate) fn current_revision(&self) -> u64 {
         self.committed_plan
             .as_ref()
             .map_or(0, |plan| plan.revision.value())
     }
 
+    /// Returns the immutable installer artifact pinned in sequence one.
+    pub(crate) const fn installed_manifest(&self) -> &ControllerInstalledManifestPin {
+        &self.installed_manifest
+    }
+
+    /// Returns the immutable desired-state scope pinned in sequence one.
+    pub(crate) const fn scope(&self) -> DeploymentScopeId {
+        self.scope
+    }
+
+    /// Returns the immutable plan lineage pinned in sequence one.
+    pub(crate) const fn plan_lineage(&self) -> DeploymentId {
+        self.plan_lineage
+    }
+
+    /// Returns the Controller-owned allocation snapshot consumed by the Planner.
+    pub(crate) const fn allocation(&self) -> &StableAllocationSnapshot {
+        &self.allocation
+    }
+
+    /// Returns the exact Runtime request-auth pin persisted by sequence one.
+    pub(crate) const fn request_auth(&self) -> ControllerRequestAuthPin {
+        self.request_auth
+    }
+
+    /// Returns the last durable authenticated Runtime binding, if any.
+    #[must_use]
+    pub(crate) const fn target_binding(&self) -> Option<&ControllerTargetBinding> {
+        self.target_binding.as_ref()
+    }
+
+    /// Returns the current committed deployment-plan digest when one exists.
+    pub(crate) fn committed_plan_digest(&self) -> Option<SourcePlanDigest> {
+        self.committed_plan
+            .as_ref()
+            .map(|plan| plan.deployment_plan_digest)
+    }
+
+    /// Returns the exact typed committed plan used by the unique PXAR producer.
+    #[must_use]
+    pub(crate) const fn committed_plan(&self) -> Option<&ControllerCommittedPlan> {
+        self.committed_plan.as_ref()
+    }
+
+    /// Returns the exact request already committed before send, when present.
+    #[must_use]
+    pub(crate) fn current_signed_apply_intent(&self) -> Option<&ControllerSignedApplyIntent> {
+        self.rollout.as_ref().map(|rollout| &rollout.signed_intent)
+    }
+
+    /// Reports whether the current exact apply operation already has durable
+    /// terminal evidence. Callers must suppress any second transport send.
+    #[must_use]
+    pub(crate) fn current_apply_is_terminal(&self) -> bool {
+        self.rollout
+            .as_ref()
+            .is_some_and(ControllerRolloutRecord::is_terminal)
+    }
+
+    /// Returns the exact direct PXRT when it is the current terminal evidence.
+    #[must_use]
+    pub(crate) fn current_direct_terminal_receipt(
+        &self,
+    ) -> Option<&ReferenceApplyTerminalReceiptV1> {
+        self.rollout
+            .as_ref()?
+            .direct_terminal_receipt
+            .as_ref()
+            .map(ControllerDirectTerminalReceipt::receipt)
+    }
+
+    /// Returns the exact direct PXRT from the last plan-chronological archive.
+    ///
+    /// The full archived rollout chronology is revalidated before selecting
+    /// its tail. A terminal rollout backed only by opaque reconcile evidence
+    /// is not promoted into a direct Runtime receipt.
+    pub(crate) fn last_archived_direct_terminal_receipt(
+        &self,
+    ) -> Result<Option<&ReferenceApplyTerminalReceiptV1>, ControllerJournalError> {
+        validate_apply_history(
+            &self.apply_history,
+            self.rollout.as_ref(),
+            self.allocation.target(),
+            self.target_binding.as_ref(),
+            &self.operations,
+            self.current_revision(),
+            self.query_snapshot_high_water,
+        )?;
+        let Some(rollout) = self.apply_history.last() else {
+            return Ok(None);
+        };
+        let receipt = rollout
+            .direct_terminal_receipt
+            .as_ref()
+            .ok_or(ControllerJournalError::TerminalDesiredHeadUnavailable)?;
+        Ok(Some(receipt.receipt()))
+    }
+
+    /// Returns the most recent terminal desired slice for the next apply CAS.
+    pub(crate) fn last_terminal_target_slice_digest(
+        &self,
+    ) -> Result<Option<TargetSliceDigest>, ControllerJournalError> {
+        Ok(self
+            .last_archived_direct_terminal_receipt()?
+            .and_then(|receipt| receipt.facts().desired_head_digest()))
+    }
+
+    /// Returns the globally highest committed Authority proof only when its
+    /// writer is the selected writer. A later proof for another writer fences
+    /// every older writer immediately.
+    #[must_use]
+    pub(crate) fn latest_committed_tenure_proof(
+        &self,
+        writer: PlanWriterRef,
+    ) -> Option<&WriterTenureProof> {
+        self.tenure_transactions
+            .iter()
+            .filter_map(ControllerTenureTransaction::committed_proof)
+            .max_by_key(|proof| proof.claim().epoch().value())
+            .filter(|proof| proof.claim().writer() == writer)
+    }
+
+    /// Returns the exact transaction carrying the globally highest committed
+    /// proof. Equal-epoch ambiguity is rejected independently of the state
+    /// validator.
+    pub(crate) fn global_latest_committed_tenure_transaction(
+        &self,
+    ) -> Result<Option<&ControllerTenureTransaction>, ControllerJournalError> {
+        let mut selected: Option<&ControllerTenureTransaction> = None;
+        for transaction in &self.tenure_transactions {
+            if transaction.phase() != ControllerTenurePhase::Committed {
+                continue;
+            }
+            let proof = transaction
+                .committed_proof()
+                .ok_or(ControllerJournalError::InvalidTenureTransaction)?;
+            let Some(previous) = selected else {
+                selected = Some(transaction);
+                continue;
+            };
+            let previous_proof = previous
+                .committed_proof()
+                .ok_or(ControllerJournalError::InvalidTenureTransaction)?;
+            match proof
+                .claim()
+                .epoch()
+                .value()
+                .cmp(&previous_proof.claim().epoch().value())
+            {
+                core::cmp::Ordering::Greater => selected = Some(transaction),
+                core::cmp::Ordering::Equal if transaction != previous => {
+                    return Err(ControllerJournalError::TenureEpochConflict);
+                }
+                core::cmp::Ordering::Equal | core::cmp::Ordering::Less => {}
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Returns the globally latest transaction only when it belongs to the
+    /// selected writer. This preserves the existing process call shape while
+    /// preventing replay of a writer fenced by a later cross-writer tenure.
+    pub(crate) fn latest_committed_tenure_transaction(
+        &self,
+        writer: PlanWriterRef,
+    ) -> Result<Option<&ControllerTenureTransaction>, ControllerJournalError> {
+        Ok(self
+            .global_latest_committed_tenure_transaction()?
+            .filter(|transaction| {
+                transaction
+                    .committed_proof()
+                    .is_some_and(|proof| proof.claim().writer() == writer)
+            }))
+    }
+
+    /// Confirms that an exact proof embedded in a durable apply request came
+    /// from one already committed Authority response in this journal.
+    #[must_use]
+    pub(crate) fn contains_committed_tenure_proof(&self, proof: &WriterTenureProof) -> bool {
+        self.latest_committed_tenure_proof(proof.claim().writer()) == Some(proof)
+    }
+
+    /// Returns one exact tenure transaction by its canonical operation ID.
+    pub(crate) fn tenure_transaction(
+        &self,
+        operation_id: AcquireTenureOperationId,
+    ) -> Option<&ControllerTenureTransaction> {
+        self.tenure_transactions
+            .binary_search_by_key(&operation_id, ControllerTenureTransaction::operation_id)
+            .ok()
+            .map(|index| &self.tenure_transactions[index])
+    }
+
+    /// Returns the unique exact Prepared/Uncertain tenure transaction for
+    /// crash replay. The state validator already forbids more than one; this
+    /// accessor independently fails closed rather than selecting arbitrarily.
+    pub(crate) fn current_unresolved_tenure_transaction(
+        &self,
+    ) -> Result<Option<&ControllerTenureTransaction>, ControllerJournalError> {
+        let mut unresolved = self.tenure_transactions.iter().filter(|transaction| {
+            matches!(
+                transaction.phase(),
+                ControllerTenurePhase::Prepared | ControllerTenurePhase::Uncertain
+            )
+        });
+        let current = unresolved.next();
+        if unresolved.next().is_some() {
+            return Err(ControllerJournalError::UnresolvedTenureTransactionExists);
+        }
+        Ok(current)
+    }
+
     fn is_exact_fresh(&self) -> bool {
         self.committed_plan.is_none()
             && self.operations.is_empty()
+            && self.tenure_transactions.is_empty()
             && self.target_binding.is_none()
             && self.query_snapshot_high_water == 0
             && self.rollout.is_none()
@@ -1244,6 +2194,7 @@ impl ControllerJournalState {
         candidate: &DeploymentPlanCandidate,
     ) -> Result<(), ControllerJournalError> {
         if candidate.content().target() != self.allocation.target()
+            || candidate.content().target() != self.installed_manifest.target()
             || self
                 .target_binding
                 .as_ref()
@@ -1251,10 +2202,11 @@ impl ControllerJournalState {
         {
             return Err(ControllerJournalError::CandidateTargetMismatch);
         }
-        if self
-            .target_binding
-            .as_ref()
-            .is_some_and(|binding| binding.manifest_digest != candidate.content().manifest_digest())
+        if candidate.content().manifest_digest().value()
+            != self.installed_manifest.manifest_digest()
+            || self.target_binding.as_ref().is_some_and(|binding| {
+                binding.manifest_digest != candidate.content().manifest_digest()
+            })
         {
             return Err(ControllerJournalError::CandidateManifestMismatch);
         }
@@ -1271,11 +2223,17 @@ impl ControllerJournalState {
         if bytes_are_zero(self.scope.as_bytes()) || bytes_are_zero(self.plan_lineage.as_bytes()) {
             return Err(ControllerJournalError::InvalidPlanIdentity);
         }
+        if self.allocation.target() != self.installed_manifest.target() {
+            return Err(ControllerJournalError::InstalledManifestTargetMismatch);
+        }
         if self.allocation.records().len() > MAX_ALLOCATION_RECORDS {
             return Err(ControllerJournalError::AllocationCapacityExceeded);
         }
         if self.operations.len() > MAX_CONTROLLER_OPERATIONS {
             return Err(ControllerJournalError::OperationCapacityExceeded);
+        }
+        if self.tenure_transactions.len() > MAX_CONTROLLER_TENURE_TRANSACTIONS {
+            return Err(ControllerJournalError::TenureCapacityExceeded);
         }
         if self.apply_history.len() > MAX_APPLY_OPERATION_HISTORY {
             return Err(ControllerJournalError::ApplyHistoryCapacityExceeded);
@@ -1303,12 +2261,16 @@ impl ControllerJournalState {
             current_revision,
             self.allocation.generation(),
         )?;
+        validate_tenure_transactions(&self.tenure_transactions, self.scope)?;
         if let Some(plan) = &self.committed_plan {
             if plan.scope != self.scope
                 || plan.plan != self.plan_lineage
                 || plan.target != self.allocation.target()
             {
                 return Err(ControllerJournalError::PlanLineageChanged);
+            }
+            if plan.content.manifest_digest().value() != self.installed_manifest.manifest_digest() {
+                return Err(ControllerJournalError::CandidateManifestMismatch);
             }
             let Some(operation) = self
                 .operations
@@ -1346,10 +2308,15 @@ impl ControllerJournalState {
                 .committed_plan
                 .as_ref()
                 .ok_or(ControllerJournalError::TargetBindingWithoutPlan)?;
-            if binding.target != self.allocation.target() || binding.target != plan.target {
+            if binding.target != self.allocation.target()
+                || binding.target != self.installed_manifest.target()
+                || binding.target != plan.target
+            {
                 return Err(ControllerJournalError::TargetMismatch);
             }
-            if binding.manifest_digest != plan.content.manifest_digest() {
+            if binding.manifest_digest.value() != self.installed_manifest.manifest_digest()
+                || binding.manifest_digest != plan.content.manifest_digest()
+            {
                 return Err(ControllerJournalError::ManifestBindingMismatch);
             }
         }
@@ -1380,6 +2347,8 @@ impl ControllerJournalState {
                 || intent.binding_channel_auth_fingerprint != binding.channel_auth_fingerprint
                 || intent.binding_manifest_digest != binding.manifest_digest
                 || intent.binding_manifest_digest != plan.content.manifest_digest()
+                || intent.binding_manifest_digest.value()
+                    != self.installed_manifest.manifest_digest()
             {
                 return Err(ControllerJournalError::RolloutBindingMismatch);
             }
@@ -1392,6 +2361,9 @@ impl ControllerJournalState {
         if self.scope != previous.scope || self.plan_lineage != previous.plan_lineage {
             return Err(ControllerJournalError::PlanLineageChanged);
         }
+        if self.installed_manifest != previous.installed_manifest {
+            return Err(ControllerJournalError::InstalledManifestPinChanged);
+        }
         self.allocation
             .validate_successor_of(&previous.allocation)
             .map_err(|_| ControllerJournalError::InvalidAllocationTransition)?;
@@ -1399,6 +2371,10 @@ impl ControllerJournalState {
             &self.operations,
             &previous.operations,
             previous.current_revision(),
+        )?;
+        validate_tenure_transaction_successors(
+            &self.tenure_transactions,
+            &previous.tenure_transactions,
         )?;
         validate_auth_successor(self.request_auth, previous.request_auth)?;
         if self.query_snapshot_high_water < previous.query_snapshot_high_water {
@@ -1672,6 +2648,141 @@ fn validate_operation_successors(
     Ok(())
 }
 
+fn validate_tenure_transactions(
+    transactions: &[ControllerTenureTransaction],
+    scope: DeploymentScopeId,
+) -> Result<(), ControllerJournalError> {
+    let mut last_operation = None;
+    let mut request_digests = std::collections::BTreeSet::new();
+    let mut intent_digests = std::collections::BTreeSet::new();
+    let mut client_nonces = std::collections::BTreeSet::new();
+    let mut unresolved = 0_usize;
+    let mut committed_proofs: Vec<&WriterTenureProof> = Vec::new();
+
+    for transaction in transactions {
+        let request = transaction.request();
+        if bytes_are_zero(
+            transaction
+                .authority_domain_fingerprint()
+                .value()
+                .as_bytes(),
+        ) {
+            return Err(ControllerJournalError::InvalidTenureAuthorityDomainFingerprint);
+        }
+        if last_operation.is_some_and(|operation| operation >= request.operation_id()) {
+            return Err(ControllerJournalError::NonCanonicalTenureTransaction);
+        }
+        if request.scope() != scope {
+            return Err(ControllerJournalError::TenureScopeMismatch);
+        }
+        if AcquireTenureRequestV1::decode(request.canonical_bytes())? != *request {
+            return Err(ControllerJournalError::InvalidTenureTransaction);
+        }
+        if !request_digests.insert(request.request_digest())
+            || !intent_digests.insert(request.intent_digest())
+            || !client_nonces.insert(request.client_nonce())
+        {
+            return Err(ControllerJournalError::TenureTransactionConflict);
+        }
+        match (transaction.phase(), transaction.response()) {
+            (ControllerTenurePhase::Prepared | ControllerTenurePhase::Uncertain, None) => {
+                unresolved = unresolved
+                    .checked_add(1)
+                    .ok_or(ControllerJournalError::LengthOverflow)?;
+            }
+            (ControllerTenurePhase::Committed, Some(response)) => {
+                if AcquireTenureResponseV1::decode_for_request(response.canonical_bytes(), request)?
+                    != *response
+                {
+                    return Err(ControllerJournalError::InvalidTenureTransaction);
+                }
+                let proof = response.proof();
+                for previous in &committed_proofs {
+                    if previous.claim().epoch() == proof.claim().epoch()
+                        && (previous.claim().writer() != proof.claim().writer()
+                            || *previous != proof)
+                    {
+                        return Err(ControllerJournalError::TenureEpochConflict);
+                    }
+                }
+                committed_proofs.push(proof);
+            }
+            _ => return Err(ControllerJournalError::InvalidTenureTransaction),
+        }
+        last_operation = Some(request.operation_id());
+    }
+    if unresolved > 1 {
+        return Err(ControllerJournalError::UnresolvedTenureTransactionExists);
+    }
+    Ok(())
+}
+
+fn validate_tenure_transaction_successors(
+    current: &[ControllerTenureTransaction],
+    previous: &[ControllerTenureTransaction],
+) -> Result<(), ControllerJournalError> {
+    for old in previous {
+        let Some(new) = current
+            .iter()
+            .find(|transaction| transaction.operation_id() == old.operation_id())
+        else {
+            return Err(ControllerJournalError::TenureTransactionRemoved);
+        };
+        if new.request() != old.request()
+            || new.authority_domain_fingerprint() != old.authority_domain_fingerprint()
+            || !old.phase().permits(new.phase())
+            || old.response().is_some() && old.response() != new.response()
+            || old.phase() == new.phase() && old != new
+        {
+            return Err(ControllerJournalError::TenureTransactionFactChanged);
+        }
+        if new.phase() == ControllerTenurePhase::Committed && new.response().is_none() {
+            return Err(ControllerJournalError::InvalidTenureTransition);
+        }
+        if old.phase() != ControllerTenurePhase::Committed
+            && new.phase() == ControllerTenurePhase::Committed
+        {
+            let proof = new
+                .committed_proof()
+                .ok_or(ControllerJournalError::InvalidTenureTransition)?;
+            validate_new_tenure_proof_successor(previous, new.operation_id(), proof)?;
+        }
+    }
+    for new in current {
+        if !previous
+            .iter()
+            .any(|transaction| transaction.operation_id() == new.operation_id())
+            && (new.phase() != ControllerTenurePhase::Prepared || new.response().is_some())
+        {
+            return Err(ControllerJournalError::InvalidTenureTransition);
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_tenure_proof_successor(
+    previous: &[ControllerTenureTransaction],
+    operation_id: AcquireTenureOperationId,
+    proof: &WriterTenureProof,
+) -> Result<(), ControllerJournalError> {
+    let prior_maximum_epoch = previous
+        .iter()
+        .filter(|transaction| transaction.operation_id() != operation_id)
+        .filter_map(ControllerTenureTransaction::committed_proof)
+        .map(|previous_proof| previous_proof.claim().epoch().value())
+        .max();
+    let Some(prior_maximum_epoch) = prior_maximum_epoch else {
+        return Ok(());
+    };
+    if proof.claim().epoch().value() <= prior_maximum_epoch {
+        return Err(ControllerJournalError::TenureEpochNotMonotonic);
+    }
+    if proof.claim().supersedes_through_epoch().value() < prior_maximum_epoch {
+        return Err(ControllerJournalError::TenureSupersessionGap);
+    }
+    Ok(())
+}
+
 fn validate_auth_successor(
     current: ControllerRequestAuthPin,
     previous: ControllerRequestAuthPin,
@@ -1875,7 +2986,7 @@ fn validate_rollout_successor(
     match (previous, current) {
         (None, None) => Ok(()),
         (None, Some(new)) => {
-            if !new.reconcile_attempts.is_empty() {
+            if new.direct_terminal_receipt.is_some() || !new.reconcile_attempts.is_empty() {
                 Err(ControllerJournalError::SignedIntentNotCommittedFirst)
             } else {
                 Ok(())
@@ -1888,6 +2999,24 @@ fn validate_rollout_successor(
             }
             if new == old {
                 return Ok(());
+            }
+            match (&old.direct_terminal_receipt, &new.direct_terminal_receipt) {
+                (None, Some(_)) if old.reconcile_attempts == new.reconcile_attempts => {
+                    return new.validate();
+                }
+                (Some(_), None) => {
+                    return Err(ControllerJournalError::DirectTerminalReceiptRemoved);
+                }
+                (Some(previous), Some(current)) if previous != current => {
+                    return Err(ControllerJournalError::DirectTerminalReceiptChanged);
+                }
+                (Some(_), Some(_)) => {
+                    return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
+                }
+                (None, None) => {}
+                (None, Some(_)) => {
+                    return Err(ControllerJournalError::QueryEvidenceRemoved);
+                }
             }
             let old_attempts = &old.reconcile_attempts;
             let new_attempts = &new.reconcile_attempts;
@@ -2187,8 +3316,85 @@ fn controller_checksum(prefix: &[u8], payload: &[u8]) -> Result<Digest32, Digest
     Ok(builder.finish())
 }
 
+#[cfg(test)]
+pub(crate) fn refresh_controller_test_checksum(
+    encoded: &mut [u8],
+) -> Result<(), ControllerJournalError> {
+    if encoded.len() < JOURNAL_HEADER_BYTES {
+        return Err(ControllerJournalError::Truncated);
+    }
+    let checksum = controller_checksum(
+        &encoded[..JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES],
+        &encoded[JOURNAL_HEADER_BYTES..],
+    )?;
+    encoded[JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES..JOURNAL_HEADER_BYTES]
+        .copy_from_slice(checksum.as_bytes());
+    Ok(())
+}
+
 fn bytes_are_zero(bytes: &[u8]) -> bool {
     bytes.iter().all(|byte| *byte == 0)
+}
+
+/// Strict installer-derived manifest pin shared by Controller owner tests.
+///
+/// The helper intentionally uses the production contract generator and sealed
+/// deployment adapter; it does not create a raw or unchecked journal pin.
+#[cfg(test)]
+pub(crate) fn controller_test_manifest(target: RuntimeHostId) -> ControllerInstalledManifestPin {
+    controller_test_manifest_with_build(target, 0x11)
+}
+
+#[cfg(test)]
+pub(crate) fn controller_test_manifest_with_build(
+    target: RuntimeHostId,
+    build_marker: u8,
+) -> ControllerInstalledManifestPin {
+    let (installation, _) = controller_test_installation_with_build(target, build_marker);
+    ControllerInstalledManifestPin::from_verified_installation(&installation)
+        .expect("Controller test installed manifest pin")
+}
+
+#[cfg(test)]
+fn controller_test_installation_with_build(
+    target: RuntimeHostId,
+    build_marker: u8,
+) -> (
+    paraegox_runtime_contracts::installation::VerifiedRuntimeInstallationV1,
+    paraegox_runtime_contracts::installation::RuntimeCompiledInstallationFactsV1,
+) {
+    use paraegox_runtime_contracts::execution::{CardDefinitionRef, CardImplementationRef};
+    use paraegox_runtime_contracts::installation::{
+        InstalledRuntimeArtifactObservationV1, RuntimeCompiledInstallationFactsV1,
+        generate_build_descriptor, generate_manifest,
+    };
+
+    let artifact = InstalledRuntimeArtifactObservationV1::try_new(
+        1_048_576,
+        Digest32::from_bytes([0x22; 32]),
+        "aarch64-unknown-linux-gnu",
+    )
+    .expect("Controller test artifact facts must validate");
+    let compiled = RuntimeCompiledInstallationFactsV1::try_new(
+        [build_marker; 32],
+        CardDefinitionRef::from_bytes([0xa1; 16]),
+        CardImplementationRef::from_bytes([0xa2; 16]),
+        [0xa3; 16],
+        Digest32::from_bytes([0xa4; 32]),
+        Digest32::from_bytes([0xa5; 32]),
+    )
+    .expect("Controller test compiled facts must validate");
+    let descriptor =
+        generate_build_descriptor(&artifact, compiled).expect("Controller test descriptor");
+    let installation = generate_manifest(
+        descriptor.canonical_wire(),
+        descriptor.descriptor_digest(),
+        target,
+        &artifact,
+        compiled,
+    )
+    .expect("Controller test manifest");
+    (installation, compiled)
 }
 
 fn validate_plan_content_size(bytes: &[u8]) -> Result<(), ControllerJournalError> {
@@ -2247,6 +3453,9 @@ fn controller_payload_encoded_len(
         + 16
         + 16
         + 16
+        + size_of::<u32>()
+        + state.installed_manifest.canonical_manifest_wire().len()
+        + 32
         + size_of::<u64>()
         + size_of::<u64>()
         + size_of::<u32>();
@@ -2283,13 +3492,45 @@ fn controller_payload_encoded_len(
                 + usize::from(operation.committed_plan_digest.is_some()) * 32,
         )?;
     }
+    checked_encoded_add(&mut length, size_of::<u32>())?;
+    for transaction in &state.tenure_transactions {
+        let request = transaction.request();
+        checked_encoded_add(
+            &mut length,
+            16 + 1
+                + 32
+                + 16
+                + 16
+                + 32
+                + 32
+                + size_of::<u32>()
+                + request.client_nonce().len()
+                + size_of::<u32>()
+                + request.canonical_bytes().len()
+                + 1,
+        )?;
+        if let Some(response) = transaction.response() {
+            checked_encoded_add(
+                &mut length,
+                32 + 32 + size_of::<u32>() + response.canonical_bytes().len(),
+            )?;
+        }
+    }
     checked_encoded_add(&mut length, 16 + 2 + 2 + 32 + 8 + 8)?;
 
     checked_encoded_add(&mut length, 1)?;
     if let Some(binding) = &state.target_binding {
         checked_encoded_add(
             &mut length,
-            16 + 32 + 32 + 32 + 8 + 8 + 4 + binding.bootstrap_response.len() + 32,
+            16 + 32
+                + 32
+                + 32
+                + 8
+                + 8
+                + 4
+                + binding.bootstrap_response.len()
+                + 32
+                + RUNTIME_RESPONSE_AUTH_PIN_BYTES,
         )?;
     }
 
@@ -2317,7 +3558,15 @@ fn rollout_encoded_len(rollout: &ControllerRolloutRecord) -> Result<usize, Contr
         + 32
         + 32
         + 32
+        + RUNTIME_RESPONSE_AUTH_PIN_BYTES
+        + 1
         + size_of::<u32>();
+    if let Some(direct) = &rollout.direct_terminal_receipt {
+        checked_encoded_add(
+            &mut length,
+            size_of::<u32>() + direct.receipt.canonical_wire().len(),
+        )?;
+    }
     for attempt in &rollout.reconcile_attempts {
         checked_encoded_add(
             &mut length,
@@ -2357,6 +3606,11 @@ fn encode_payload_fields(
     encoded.extend_from_slice(state.scope.as_bytes());
     encoded.extend_from_slice(state.plan_lineage.as_bytes());
     encoded.extend_from_slice(state.allocation.target().as_bytes());
+    append_bytes(
+        &mut encoded,
+        state.installed_manifest.canonical_manifest_wire(),
+    )?;
+    encoded.extend_from_slice(state.installed_manifest.manifest_digest().as_bytes());
     encoded.extend_from_slice(&state.allocation.generation().to_be_bytes());
     encoded.extend_from_slice(&state.allocation.high_water().to_be_bytes());
     append_count(&mut encoded, state.allocation.records().len())?;
@@ -2381,6 +3635,10 @@ fn encode_payload_fields(
         append_optional_u64(&mut encoded, operation.committed_allocation_generation);
         append_optional_source_plan_digest(&mut encoded, operation.committed_plan_digest);
     }
+    append_count(&mut encoded, state.tenure_transactions.len())?;
+    for transaction in &state.tenure_transactions {
+        append_tenure_transaction(&mut encoded, transaction)?;
+    }
     append_auth_pin(&mut encoded, state.request_auth);
     encoded.extend_from_slice(&state.query_snapshot_high_water.to_be_bytes());
     append_optional_binding(&mut encoded, state.target_binding.as_ref())?;
@@ -2403,6 +3661,11 @@ fn decode_payload(bytes: &[u8]) -> Result<ControllerJournalState, ControllerJour
     let scope = DeploymentScopeId::from_bytes(reader.take_array::<16>()?);
     let plan_lineage = DeploymentId::from_bytes(reader.take_array::<16>()?);
     let target = RuntimeHostId::from_bytes(reader.take_array::<16>()?);
+    let installed_manifest = ControllerInstalledManifestPin::try_from_persisted_manifest(
+        reader.bounded_bytes(MAX_INSTALLED_RUNTIME_MANIFEST_BYTES)?,
+        Digest32::from_bytes(reader.take_array::<32>()?),
+    )
+    .map_err(|_| ControllerJournalError::InvalidInstalledManifestPin)?;
     let generation = reader.u64()?;
     let high_water = reader.u64()?;
     let allocation_count = reader.count(MAX_ALLOCATION_RECORDS)?;
@@ -2444,6 +3707,11 @@ fn decode_payload(bytes: &[u8]) -> Result<ControllerJournalState, ControllerJour
             decode_optional_source_plan_digest(&mut reader)?,
         )?);
     }
+    let tenure_count = reader.count(MAX_CONTROLLER_TENURE_TRANSACTIONS)?;
+    let mut tenure_transactions = Vec::with_capacity(tenure_count);
+    for _ in 0..tenure_count {
+        tenure_transactions.push(decode_tenure_transaction(&mut reader)?);
+    }
     let request_auth = decode_auth_pin(&mut reader)?;
     let query_snapshot_high_water = reader.u64()?;
     let target_binding = decode_optional_binding(&mut reader)?;
@@ -2460,14 +3728,99 @@ fn decode_payload(bytes: &[u8]) -> Result<ControllerJournalState, ControllerJour
         scope,
         plan_lineage,
         allocation,
+        installed_manifest,
         committed_plan,
         operations,
+        tenure_transactions,
         request_auth,
         target_binding,
         query_snapshot_high_water,
         rollout,
         apply_history,
     })
+}
+
+fn append_tenure_transaction(
+    encoded: &mut Vec<u8>,
+    transaction: &ControllerTenureTransaction,
+) -> Result<(), ControllerJournalError> {
+    let request = transaction.request();
+    encoded.extend_from_slice(request.operation_id().as_bytes());
+    encoded.push(transaction.phase() as u8);
+    encoded.extend_from_slice(
+        transaction
+            .authority_domain_fingerprint()
+            .value()
+            .as_bytes(),
+    );
+    encoded.extend_from_slice(request.scope().as_bytes());
+    encoded.extend_from_slice(request.writer().as_bytes());
+    encoded.extend_from_slice(request.intent_digest().as_bytes());
+    encoded.extend_from_slice(request.request_digest().as_bytes());
+    append_bytes(encoded, request.client_nonce())?;
+    append_bytes(encoded, request.canonical_bytes())?;
+    let Some(response) = transaction.response() else {
+        encoded.push(0);
+        return Ok(());
+    };
+    encoded.push(1);
+    encoded.extend_from_slice(response.response_digest().as_bytes());
+    encoded.extend_from_slice(response.proof_digest().as_bytes());
+    append_bytes(encoded, response.canonical_bytes())?;
+    Ok(())
+}
+
+fn decode_tenure_transaction(
+    reader: &mut Reader<'_>,
+) -> Result<ControllerTenureTransaction, ControllerJournalError> {
+    let operation_id = reader.take_array::<16>()?;
+    let phase = ControllerTenurePhase::decode(reader.u8()?)?;
+    let authority_domain_fingerprint = ControllerTenureAuthorityDomainFingerprint::from_stored(
+        Digest32::from_bytes(reader.take_array::<32>()?),
+    );
+    let scope = reader.take_array::<16>()?;
+    let writer = reader.take_array::<16>()?;
+    let intent_digest = reader.take_array::<32>()?;
+    let request_digest = reader.take_array::<32>()?;
+    let client_nonce = reader
+        .bounded_bytes(MAX_ACQUIRE_TENURE_CLIENT_NONCE_BYTES)?
+        .to_vec();
+    let canonical_request = reader
+        .bounded_bytes(MAX_ACQUIRE_TENURE_REQUEST_PAYLOAD_BYTES)?
+        .to_vec();
+    let request = AcquireTenureRequestV1::decode(&canonical_request)?;
+    if request.operation_id().as_bytes() != &operation_id
+        || request.scope().as_bytes() != &scope
+        || request.writer().as_bytes() != &writer
+        || request.intent_digest().as_bytes() != &intent_digest
+        || request.request_digest().as_bytes() != &request_digest
+        || request.client_nonce() != client_nonce
+        || request.canonical_bytes() != canonical_request
+    {
+        return Err(ControllerJournalError::TenureTransactionFactChanged);
+    }
+
+    let response = match reader.u8()? {
+        0 => None,
+        1 => {
+            let response_digest = reader.take_array::<32>()?;
+            let proof_digest = reader.take_array::<32>()?;
+            let canonical_response = reader
+                .bounded_bytes(MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES)?
+                .to_vec();
+            let response =
+                AcquireTenureResponseV1::decode_for_request(&canonical_response, &request)?;
+            if response.response_digest().as_bytes() != &response_digest
+                || response.proof_digest().as_bytes() != &proof_digest
+                || response.canonical_bytes() != canonical_response
+            {
+                return Err(ControllerJournalError::TenureTransactionFactChanged);
+            }
+            Some(response)
+        }
+        _ => return Err(ControllerJournalError::InvalidPresence),
+    };
+    ControllerTenureTransaction::try_new(request, authority_domain_fingerprint, phase, response)
 }
 
 fn append_optional_plan(
@@ -2556,6 +3909,33 @@ fn decode_auth_pin(
     )
 }
 
+fn append_runtime_response_auth_pin(encoded: &mut Vec<u8>, pin: ControllerRuntimeResponseAuthPin) {
+    encoded.extend_from_slice(pin.bootstrap_response_digest.value().as_bytes());
+    encoded.extend_from_slice(pin.runtime_peer.as_bytes());
+    encoded.extend_from_slice(pin.local_endpoint_identity_digest.as_bytes());
+    encoded.extend_from_slice(pin.peer_credentials_digest.as_bytes());
+    encoded.extend_from_slice(pin.key.as_bytes());
+    encoded.extend_from_slice(&pin.algorithm.value().to_be_bytes());
+    encoded.extend_from_slice(&pin.algorithm_version.to_be_bytes());
+}
+
+fn decode_runtime_response_auth_pin(
+    reader: &mut Reader<'_>,
+) -> Result<ControllerRuntimeResponseAuthPin, ControllerJournalError> {
+    ControllerRuntimeResponseAuthPin::try_from_stored(ControllerStoredRuntimeResponseAuthPinInput {
+        bootstrap_response_digest: ControllerBootstrapResponseDigest::from_stored(
+            Digest32::from_bytes(reader.take_array::<32>()?),
+        ),
+        runtime_peer: PrincipalRef::from_bytes(reader.take_array::<16>()?),
+        local_endpoint_identity_digest: Digest32::from_bytes(reader.take_array::<32>()?),
+        peer_credentials_digest: Digest32::from_bytes(reader.take_array::<32>()?),
+        key: ApplyAuthKeyRef::from_bytes(reader.take_array::<16>()?),
+        algorithm: ApplyAuthAlgorithm::try_new(reader.u16()?)
+            .map_err(|_| ControllerJournalError::InvalidRuntimeResponseAuthPin)?,
+        algorithm_version: reader.u16()?,
+    })
+}
+
 fn append_optional_binding(
     encoded: &mut Vec<u8>,
     binding: Option<&ControllerTargetBinding>,
@@ -2573,6 +3953,7 @@ fn append_optional_binding(
     encoded.extend_from_slice(&binding.last_runtime_host_epoch.to_be_bytes());
     append_bytes(encoded, &binding.bootstrap_response)?;
     encoded.extend_from_slice(binding.bootstrap_response_digest.value().as_bytes());
+    append_runtime_response_auth_pin(encoded, binding.runtime_response_auth);
     Ok(())
 }
 
@@ -2598,6 +3979,7 @@ fn decode_optional_binding(
                 bootstrap_response_digest: ControllerBootstrapResponseDigest::from_stored(
                     Digest32::from_bytes(reader.take_array::<32>()?),
                 ),
+                runtime_response_auth: decode_runtime_response_auth_pin(reader)?,
             },
         )?)),
         _ => Err(ControllerJournalError::InvalidPresence),
@@ -2631,6 +4013,14 @@ fn append_rollout(
     encoded.extend_from_slice(&intent.runtime_store_instance_id);
     encoded.extend_from_slice(intent.binding_channel_auth_fingerprint.value().as_bytes());
     encoded.extend_from_slice(intent.binding_manifest_digest.value().as_bytes());
+    append_runtime_response_auth_pin(encoded, intent.runtime_response_auth);
+
+    if let Some(direct) = &rollout.direct_terminal_receipt {
+        encoded.push(1);
+        append_bytes(encoded, direct.receipt.canonical_wire())?;
+    } else {
+        encoded.push(0);
+    }
 
     append_count(encoded, rollout.reconcile_attempts.len())?;
     for attempt in &rollout.reconcile_attempts {
@@ -2689,7 +4079,18 @@ fn decode_rollout(
                 reader.take_array::<32>()?,
             ))
             .map_err(|_| ControllerJournalError::InvalidRolloutEvidence)?,
+            runtime_response_auth: decode_runtime_response_auth_pin(reader)?,
         })?;
+    let direct_terminal_receipt = match reader.u8()? {
+        0 => None,
+        1 => {
+            let receipt = ReferenceApplyTerminalReceiptV1::decode(
+                reader.bounded_bytes(MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES)?,
+            )?;
+            Some(ControllerDirectTerminalReceipt::try_new(receipt, &intent)?)
+        }
+        _ => return Err(ControllerJournalError::InvalidPresence),
+    };
     let attempt_count = reader.count(MAX_RECONCILE_ATTEMPTS)?;
     let mut attempts = Vec::with_capacity(attempt_count);
     for _ in 0..attempt_count {
@@ -2730,6 +4131,7 @@ fn decode_rollout(
     }
     let rollout = ControllerRolloutRecord {
         signed_intent: intent,
+        direct_terminal_receipt,
         reconcile_attempts: attempts.into_boxed_slice(),
     };
     rollout.validate()?;
@@ -2905,6 +4307,21 @@ pub(crate) enum ControllerJournalError {
     AllocationWithoutCommittedPlan,
     AllocationGenerationHistoryMismatch,
     OperationCapacityExceeded,
+    TenureCapacityExceeded,
+    NonCanonicalTenureTransaction,
+    InvalidTenureTransaction,
+    InvalidTenureAuthorityDomainFingerprint,
+    TenureAuthorityDomainMismatch,
+    TenureTransactionConflict,
+    MissingTenureTransaction,
+    TenureTransactionRemoved,
+    TenureTransactionFactChanged,
+    InvalidTenureTransition,
+    UnresolvedTenureTransactionExists,
+    TenureScopeMismatch,
+    TenureEpochConflict,
+    TenureEpochNotMonotonic,
+    TenureSupersessionGap,
     ControllerLedgerCapacityExceeded,
     NonCanonicalOperation,
     InvalidOperationIdentity,
@@ -2924,6 +4341,9 @@ pub(crate) enum ControllerJournalError {
     StalePlanOperation,
     InvalidPlanIdentity,
     InvalidPlanContent,
+    InvalidInstalledManifestPin,
+    InstalledManifestTargetMismatch,
+    InstalledManifestPinChanged,
     InvalidRevision,
     RevisionNotNext,
     RevisionExhausted,
@@ -2942,6 +4362,7 @@ pub(crate) enum ControllerJournalError {
     AuthRotationRegression,
     AuthPinNotCommittedFirst,
     InvalidTargetBinding,
+    InvalidRuntimeResponseAuthPin,
     TargetMismatch,
     TargetBindingChanged,
     TargetBindingRemoved,
@@ -2977,6 +4398,11 @@ pub(crate) enum ControllerJournalError {
     DanglingRollout,
     TerminalReceiptRequired,
     NonTerminalReceiptForbidden,
+    InvalidDirectTerminalReceipt,
+    DirectTerminalReceiptChanged,
+    DirectTerminalReceiptRemoved,
+    ConflictingTerminalEvidence,
+    TerminalDesiredHeadUnavailable,
     CurrentRolloutExists,
     NonTerminalRolloutBlocksPlanCommit,
     ApplyOperationConflict,
@@ -2993,11 +4419,25 @@ pub(crate) enum ControllerJournalError {
     NonFreshInitialState,
     FreshStateAfterInitialization,
     Digest(DigestBuildError),
+    TenureProtocol(AcquireTenureProtocolError),
+    ReferenceControl(ReferenceControlError),
 }
 
 impl From<DigestBuildError> for ControllerJournalError {
     fn from(value: DigestBuildError) -> Self {
         Self::Digest(value)
+    }
+}
+
+impl From<AcquireTenureProtocolError> for ControllerJournalError {
+    fn from(value: AcquireTenureProtocolError) -> Self {
+        Self::TenureProtocol(value)
+    }
+}
+
+impl From<ReferenceControlError> for ControllerJournalError {
+    fn from(value: ReferenceControlError) -> Self {
+        Self::ReferenceControl(value)
     }
 }
 
@@ -3010,7 +4450,7 @@ impl fmt::Display for ControllerJournalError {
 impl std::error::Error for ControllerJournalError {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         CONTROLLER_PAYLOAD_MAGIC, ControllerApplyRequestDigest, ControllerAuthKeyFingerprint,
         ControllerBootstrapResponseDigest, ControllerChannelAuthFingerprint,
@@ -3019,26 +4459,63 @@ mod tests {
         ControllerOpaqueRuntimeQueryId, ControllerOperationId, ControllerOperationPhase,
         ControllerOwnerIdentityFingerprint, ControllerPlanCommitIntentDigest,
         ControllerQueryResponseDigest, ControllerReceiptRef, ControllerRequestAuthPin,
-        ControllerSignedApplyIntentInput, ControllerTargetBinding, ControllerTargetBindingInput,
-        controller_checksum,
+        ControllerRuntimeResponseAuthPin, ControllerSignedApplyIntentInput,
+        ControllerTargetBinding, ControllerTargetBindingInput,
+        ControllerTenureAuthorityDomainFingerprint, ControllerTenurePhase,
+        ControllerTenureTransaction, MAX_CONTROLLER_TENURE_TRANSACTIONS, controller_checksum,
     };
-    use crate::plan::{DeploymentId, DeploymentScopeId};
+    use crate::plan::{DeploymentId, DeploymentScopeId, DeploymentWriterRef};
     use crate::planner::{
         AllocationState, PlanManifestDigest, StableAllocationSnapshot, journal_test_candidate,
     };
+    use crate::tenure_protocol::{
+        AcquireTenureIntentV1, AcquireTenureOperationId, AcquireTenureRequestDraftV1,
+        AcquireTenureRequestV1, AcquireTenureResponseV1, ControllerAcquireKeyRef,
+        ControllerPublicKeyFingerprint, MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
     use paraegox_kernel::digest::Digest32;
-    use paraegox_kernel::identity::RuntimeHostId;
-    use paraegox_runtime_contracts::apply::ApplyOperationId;
-    use paraegox_runtime_contracts::provenance::{SourcePlanDigest, TargetSliceDigest};
-    use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
+    use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
+    use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
+    use paraegox_runtime_contracts::apply::{
+        ApplyOperationId, ExpectedActive, PlanWriterContext, PlanWriterEpoch, RuntimeApplyControl,
+        TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm, TenureProofAuthority,
+        WriterTenureClaim, WriterTenureProof, WriterTenureSigningTranscript,
+    };
+    use paraegox_runtime_contracts::provenance::{
+        PlanProvenance, SourcePlanDigest, SourcePlanRef, SourcePlanRevision, SourceScopeRef,
+        TargetSliceDigest,
+    };
+    use paraegox_runtime_contracts::reference_control::{
+        MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES, ReferenceApplyRequestDraftV1,
+        ReferenceApplyTerminalFactsV1, ReferenceApplyTerminalHeadV1,
+        ReferenceApplyTerminalLifecycleEffectV1, ReferenceApplyTerminalOutcomeV1,
+        ReferenceApplyTerminalReceiptAuthClaimV1, ReferenceApplyTerminalReceiptDraftV1,
+        ReferenceApplyTerminalReceiptV1, ReferenceBootstrapCompatibilityV1,
+        ReferenceBootstrapFactsV1, ReferenceBootstrapRequestDraftV1, ReferenceBootstrapRequestIdV1,
+        ReferenceBootstrapResponseAuthClaimV1, ReferenceBootstrapResponseDraftV1,
+        ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1,
+        ReferenceBootstrapStateV1, ReferenceChannelBindingV1, ReferenceTargetExecutionPlanV4,
+    };
+    use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
+    use paraegox_runtime_contracts::wire::{
+        ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
+    };
 
     const SCOPE: DeploymentScopeId = DeploymentScopeId::from_bytes([0x21; 16]);
     const PLAN: DeploymentId = DeploymentId::from_bytes([0x22; 16]);
     const TARGET: RuntimeHostId = RuntimeHostId::from_bytes([0x61; 16]);
     const PLAN_OPERATION: ControllerOperationId = ControllerOperationId::from_bytes([0x31; 16]);
+    const CONTROLLER_TENURE_SEED: [u8; 32] = [0x71; 32];
+    const AUTHORITY_TENURE_SEED: [u8; 32] = [0x72; 32];
+    const RUNTIME_RESPONSE_SEED: [u8; 32] = [0x73; 32];
 
     fn digest(byte: u8) -> Digest32 {
         Digest32::from_bytes([byte; 32])
+    }
+
+    fn authority_domain(byte: u8) -> ControllerTenureAuthorityDomainFingerprint {
+        ControllerTenureAuthorityDomainFingerprint::from_stored(digest(byte))
     }
 
     fn auth(key: u8, generation: u64) -> ControllerRequestAuthPin {
@@ -3058,8 +4535,14 @@ mod tests {
     }
 
     fn initial_state() -> ControllerJournalState {
-        ControllerJournalState::try_initialize(SCOPE, PLAN, empty_allocation(TARGET), auth(0x11, 1))
-            .expect("initial state must validate")
+        ControllerJournalState::try_initialize(
+            SCOPE,
+            PLAN,
+            empty_allocation(TARGET),
+            super::controller_test_manifest(TARGET),
+            auth(0x11, 1),
+        )
+        .expect("initial state must validate")
     }
 
     fn initial_snapshot() -> ControllerJournalSnapshot {
@@ -3071,28 +4554,208 @@ mod tests {
         .expect("initial snapshot must validate")
     }
 
+    fn tenure_request(writer: u8, operation: [u8; 16], nonce: &[u8]) -> AcquireTenureRequestV1 {
+        let signing_key = SigningKey::from_bytes(&CONTROLLER_TENURE_SEED);
+        let fingerprint = ControllerPublicKeyFingerprint::for_ed25519_key(
+            &signing_key.verifying_key().to_bytes(),
+        )
+        .expect("Controller tenure fingerprint must validate");
+        let draft = AcquireTenureRequestDraftV1::try_new(
+            AcquireTenureIntentV1::new(
+                SCOPE,
+                DeploymentWriterRef::from_bytes([writer; 16]),
+                AcquireTenureOperationId::from_bytes(operation),
+            ),
+            PrincipalRef::from_bytes([0x73; 16]),
+            ControllerAcquireKeyRef::from_bytes([0x74; 16]),
+            fingerprint,
+            nonce,
+            u32::try_from(MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES)
+                .expect("response bound must fit"),
+        )
+        .expect("tenure request draft must validate");
+        let transcript = draft
+            .signing_transcript()
+            .expect("tenure request transcript must validate");
+        let signature = signing_key.sign(transcript.as_bytes());
+        draft
+            .finalize_ed25519(&signature.to_bytes())
+            .expect("tenure request must validate")
+    }
+
+    fn tenure_response(
+        request: &AcquireTenureRequestV1,
+        epoch: u64,
+        supersedes_through: u64,
+    ) -> AcquireTenureResponseV1 {
+        let authority = TenureProofAuthority::try_new(
+            TenureAuthorityRef::from_bytes([0x75; 16]),
+            TenureKeyRef::from_bytes([0x76; 16]),
+            TenureProofAlgorithm::try_new(1).expect("proof algorithm must validate"),
+            1,
+        )
+        .expect("proof authority must validate");
+        let claim = WriterTenureClaim::try_new(
+            request.proof_source_scope(),
+            request.proof_writer(),
+            PlanWriterEpoch::new(epoch),
+            PlanWriterEpoch::new(supersedes_through),
+        )
+        .expect("tenure claim must validate");
+        let transcript =
+            WriterTenureSigningTranscript::try_new(authority, claim, request.client_nonce())
+                .expect("proof transcript must validate");
+        let signature = SigningKey::from_bytes(&AUTHORITY_TENURE_SEED).sign(transcript.as_bytes());
+        let proof = WriterTenureProof::try_new(
+            authority,
+            claim,
+            request.client_nonce(),
+            &signature.to_bytes(),
+        )
+        .expect("tenure proof must validate");
+        AcquireTenureResponseV1::try_new(request, proof).expect("tenure response must validate")
+    }
+
     fn binding(last_epoch: u64, response: &'static [u8]) -> ControllerTargetBinding {
+        binding_with_store_and_build(
+            [0x62; 32],
+            last_epoch,
+            response[0],
+            0x11,
+            PlanManifestDigest::try_new(super::controller_test_manifest(TARGET).manifest_digest())
+                .expect("fixture manifest digest must validate"),
+        )
+    }
+
+    fn binding_with_store_and_build(
+        runtime_store_instance_id: [u8; 32],
+        last_epoch: u64,
+        response_marker: u8,
+        build_marker: u8,
+        manifest_digest: PlanManifestDigest,
+    ) -> ControllerTargetBinding {
+        let (response, channel) = bootstrap_evidence(
+            runtime_store_instance_id,
+            last_epoch,
+            response_marker,
+            build_marker,
+        );
         ControllerTargetBinding::try_new(ControllerTargetBindingInput {
             target: TARGET,
-            runtime_store_instance_id: [0x62; 32],
+            runtime_store_instance_id,
             channel_auth_fingerprint: ControllerChannelAuthFingerprint::from_stored(digest(0x63)),
-            manifest_digest: PlanManifestDigest::try_new(digest(0x52))
-                .expect("fixture manifest digest must validate"),
+            manifest_digest,
             first_runtime_host_epoch: 2,
             last_runtime_host_epoch: last_epoch,
-            bootstrap_response: response,
-            bootstrap_response_digest: ControllerBootstrapResponseDigest::from_stored(digest(
-                response[0],
-            )),
+            bootstrap_response: response.canonical_wire(),
+            bootstrap_response_digest: ControllerBootstrapResponseDigest::from_stored(
+                response.response_digest(),
+            ),
+            runtime_response_auth: ControllerRuntimeResponseAuthPin::try_from_bootstrap_response(
+                &response, channel,
+            )
+            .expect("fixture Runtime auth pin"),
         })
         .expect("fixture binding must validate")
     }
 
+    fn bootstrap_evidence(
+        runtime_store_instance_id: [u8; 32],
+        epoch: u64,
+        response_marker: u8,
+        build_marker: u8,
+    ) -> (ReferenceBootstrapResponseV1, ReferenceChannelBindingV1) {
+        let controller = SigningKey::from_bytes(&CONTROLLER_TENURE_SEED);
+        let runtime = SigningKey::from_bytes(&RUNTIME_RESPONSE_SEED);
+        let request_claim = ApplyRequestAuthClaim::try_new(
+            PrincipalRef::from_bytes([0x81; 16]),
+            ApplyAuthKeyRef::from_bytes([0x82; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("request algorithm"),
+            1,
+            &[response_marker; 32],
+        )
+        .expect("bootstrap request claim");
+        let request_draft = ReferenceBootstrapRequestDraftV1::try_new(
+            ReferenceBootstrapRequestIdV1::from_bytes([response_marker; 16]),
+            TARGET,
+            SourceScopeRef::from_bytes(*SCOPE.as_bytes()),
+            request_claim,
+            u32::try_from(MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES).expect("response bound"),
+        )
+        .expect("bootstrap request draft");
+        let request_signature = controller.sign(
+            request_draft
+                .signing_transcript()
+                .expect("bootstrap request transcript")
+                .as_bytes(),
+        );
+        let request = request_draft
+            .finalize(&request_signature.to_bytes())
+            .expect("bootstrap request");
+
+        let (installation, compiled) =
+            super::controller_test_installation_with_build(TARGET, build_marker);
+        let compatibility = ReferenceBootstrapCompatibilityV1::try_from_verified_installation(
+            &installation,
+            compiled,
+            digest(0x83),
+        )
+        .expect("bootstrap compatibility");
+        let serving = ReferenceBootstrapServingIdentityV1::try_new(
+            TARGET,
+            runtime_store_instance_id,
+            11,
+            epoch,
+            ClockDomainRef::from_bytes([0x84; 16]),
+            ClockGeneration::try_new(3).expect("clock generation"),
+        )
+        .expect("serving identity");
+        let facts = ReferenceBootstrapFactsV1::try_new(
+            serving,
+            &compatibility,
+            ReferenceBootstrapStateV1::ReadyForApply,
+            None,
+        )
+        .expect("bootstrap facts");
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            PrincipalRef::from_bytes([0x85; 16]),
+            digest(u8::try_from(epoch).expect("fixture epoch marker")),
+            digest(0x86),
+        )
+        .expect("bootstrap channel");
+        let response_claim = ReferenceBootstrapResponseAuthClaimV1::try_new(
+            channel,
+            ApplyAuthKeyRef::from_bytes([0x87; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("response algorithm"),
+            1,
+        )
+        .expect("response auth claim");
+        let response_draft =
+            ReferenceBootstrapResponseDraftV1::try_new(&request, facts, channel, response_claim)
+                .expect("bootstrap response draft");
+        let response_signature = runtime.sign(
+            response_draft
+                .signing_transcript()
+                .expect("bootstrap response transcript")
+                .as_bytes(),
+        );
+        let response = response_draft
+            .finalize(&response_signature.to_bytes())
+            .expect("bootstrap response");
+        (response, channel)
+    }
+
     fn committed_snapshot() -> ControllerJournalSnapshot {
         let initial = initial_snapshot();
-        let candidate =
-            journal_test_candidate(TARGET, &initial.state.allocation, Some([2; 16]), 0x50)
-                .expect("fixture candidate must validate");
+        let candidate = journal_test_candidate(
+            TARGET,
+            initial.state.installed_manifest().projection(),
+            &initial.state.allocation,
+            Some([2; 16]),
+            0x50,
+        )
+        .expect("fixture candidate must validate");
         let prepared_state = initial
             .state
             .prepare_plan_candidate(PLAN_OPERATION, &candidate)
@@ -3214,10 +4877,174 @@ mod tests {
             .expect("decision snapshot must succeed")
     }
 
+    pub(crate) fn direct_active_snapshot() -> (
+        ControllerJournalSnapshot,
+        ReferenceApplyTerminalReceiptV1,
+        TargetSliceDigest,
+    ) {
+        let bound = bound_snapshot();
+        let state = bound.state();
+        let plan = state.committed_plan().expect("fixture committed plan");
+        let (_, instance, domain) = plan
+            .content()
+            .stable_allocation_subject()
+            .expect("fixture Loop allocation subject");
+        let budgets = plan
+            .content()
+            .reference_lifecycle()
+            .expect("fixture Loop lifecycle");
+        let execution = ReferenceTargetExecutionPlanV4::try_one_source_loop(
+            state.installed_manifest().verified_manifest(),
+            instance,
+            domain,
+            budgets,
+        )
+        .expect("fixture execution plan");
+        let provenance = PlanProvenance::new(
+            SourceScopeRef::from_bytes(*plan.scope().as_bytes()),
+            SourcePlanRef::from_bytes(*plan.plan().as_bytes()),
+            SourcePlanRevision::new(plan.revision().value()),
+            plan.deployment_plan_digest(),
+        );
+        let tenure_request = tenure_request(0x31, [0x91; 16], &[0x92; 32]);
+        let tenure_proof = tenure_response(&tenure_request, 1, 0).proof().clone();
+        let writer = tenure_proof.claim().writer();
+        let writer_context =
+            PlanWriterContext::try_new(writer, tenure_proof.claim().epoch(), tenure_proof)
+                .expect("fixture writer context");
+        let apply_operation = ApplyOperationId::from_bytes([0x93; 16]);
+        let control =
+            RuntimeApplyControl::new(writer_context, ExpectedActive::None, apply_operation);
+        let bootstrap = ReferenceBootstrapResponseV1::decode(
+            state
+                .target_binding()
+                .expect("fixture target binding")
+                .bootstrap_response(),
+        )
+        .expect("fixture bootstrap response");
+        let bootstrap_facts = bootstrap.facts();
+        let budget = BoundedDuration::from_nanos(1_000);
+        let temporal = ApplyTemporalConstraint::try_new(
+            TemporalConstraintId::from_bytes([0x94; 16]),
+            bootstrap_facts.clock_domain(),
+            bootstrap_facts.clock_generation(),
+            budget,
+            budget,
+        )
+        .expect("fixture temporal constraint");
+        let request_auth = state.request_auth();
+        let auth_claim = ApplyRequestAuthClaim::try_new(
+            PrincipalRef::from_bytes([0x95; 16]),
+            request_auth.key(),
+            request_auth.algorithm(),
+            request_auth.algorithm_version(),
+            &[0x96; 32],
+        )
+        .expect("fixture request auth claim");
+        let request_draft = ReferenceApplyRequestDraftV1::try_new(
+            execution,
+            provenance,
+            control,
+            temporal,
+            state
+                .target_binding()
+                .expect("fixture target binding")
+                .runtime_store_instance_id(),
+            auth_claim,
+        )
+        .expect("fixture apply request draft");
+        let controller = SigningKey::from_bytes(&CONTROLLER_TENURE_SEED);
+        let request_signature = controller.sign(
+            request_draft
+                .signing_transcript()
+                .expect("fixture request transcript")
+                .as_bytes(),
+        );
+        let request = request_draft
+            .finalize(&request_signature.to_bytes())
+            .expect("fixture apply request");
+        let target_slice = request.target_slice_digest();
+        let signed_state = state
+            .record_signed_apply_intent(ControllerSignedApplyIntentInput {
+                target: request.target(),
+                source_plan_digest: request.provenance().source_plan_digest(),
+                target_slice_digest: target_slice,
+                apply_operation,
+                request_digest: ControllerApplyRequestDigest::from_stored(
+                    request.envelope_request_digest(),
+                ),
+                signed_request: request.canonical_wire(),
+            })
+            .expect("fixture signed apply intent");
+        let signed = bound
+            .try_successor(signed_state)
+            .expect("fixture signed apply successor");
+
+        let runtime_auth = signed
+            .state()
+            .target_binding()
+            .expect("fixture target binding")
+            .runtime_response_auth();
+        let channel = runtime_auth
+            .channel(TARGET)
+            .expect("fixture Runtime response channel");
+        let terminal_facts = ReferenceApplyTerminalFactsV1::try_new(
+            &request,
+            ReferenceApplyTerminalOutcomeV1::OneSourceLoopActive,
+            ReferenceApplyTerminalLifecycleEffectV1::MayHaveStarted,
+            ReferenceApplyTerminalHeadV1::CommittedIncoming,
+            digest(0x97),
+            digest(0x98),
+            bootstrap_facts.runtime_host_epoch(),
+            10,
+            bootstrap_facts.clock_generation(),
+            11_000,
+        )
+        .expect("fixture terminal facts");
+        let terminal_claim = ReferenceApplyTerminalReceiptAuthClaimV1::try_new(
+            channel,
+            runtime_auth.key(),
+            runtime_auth.algorithm(),
+            runtime_auth.algorithm_version(),
+        )
+        .expect("fixture terminal auth claim");
+        let terminal_draft = ReferenceApplyTerminalReceiptDraftV1::try_new(
+            &request,
+            terminal_facts,
+            channel,
+            terminal_claim,
+        )
+        .expect("fixture terminal receipt draft");
+        let runtime = SigningKey::from_bytes(&RUNTIME_RESPONSE_SEED);
+        let terminal_signature = runtime.sign(
+            terminal_draft
+                .signing_transcript()
+                .expect("fixture terminal transcript")
+                .as_bytes(),
+        );
+        let receipt = terminal_draft
+            .finalize(&terminal_signature.to_bytes())
+            .expect("fixture terminal receipt");
+        let terminal_state = signed
+            .state()
+            .record_direct_terminal_receipt(&receipt)
+            .expect("fixture direct terminal receipt");
+        let terminal = signed
+            .try_successor(terminal_state)
+            .expect("fixture direct terminal successor");
+        (terminal, receipt, target_slice)
+    }
+
     fn state_with_two_archived_rollouts() -> ControllerJournalState {
         let mut state = decided_snapshot().state;
-        let second_plan = journal_test_candidate(TARGET, &state.allocation, None, 0x50)
-            .expect("second plan fixture must validate");
+        let second_plan = journal_test_candidate(
+            TARGET,
+            state.installed_manifest().projection(),
+            &state.allocation,
+            None,
+            0x50,
+        )
+        .expect("second plan fixture must validate");
         let second_plan_operation = ControllerOperationId::from_bytes([0x32; 16]);
         state = state
             .prepare_plan_candidate(second_plan_operation, &second_plan)
@@ -3237,8 +5064,14 @@ mod tests {
                 Some(ControllerReceiptRef::from_bytes([0x79; 16])),
             )
             .expect("second rollout must become terminal");
-        let third_plan = journal_test_candidate(TARGET, &state.allocation, None, 0x50)
-            .expect("third plan fixture must validate");
+        let third_plan = journal_test_candidate(
+            TARGET,
+            state.installed_manifest().projection(),
+            &state.allocation,
+            None,
+            0x50,
+        )
+        .expect("third plan fixture must validate");
         let third_plan_operation = ControllerOperationId::from_bytes([0x33; 16]);
         state = state
             .prepare_plan_candidate(third_plan_operation, &third_plan)
@@ -3274,13 +5107,7 @@ mod tests {
     }
 
     fn refresh_checksum(encoded: &mut [u8]) {
-        let checksum = controller_checksum(
-            &encoded[..super::JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES],
-            &encoded[super::JOURNAL_HEADER_BYTES..],
-        )
-        .expect("mutated envelope must checksum");
-        encoded[super::JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES..super::JOURNAL_HEADER_BYTES]
-            .copy_from_slice(checksum.as_bytes());
+        super::refresh_controller_test_checksum(encoded).expect("mutated envelope must checksum");
     }
 
     #[test]
@@ -3292,12 +5119,27 @@ mod tests {
         assert_eq!(
             &encoded[super::JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES..super::JOURNAL_HEADER_BYTES],
             &[
-                97, 108, 160, 126, 77, 63, 57, 202, 69, 59, 39, 55, 189, 77, 105, 237, 39, 253, 26,
-                225, 232, 116, 23, 235, 217, 27, 130, 182, 138, 156, 155, 58,
+                97, 51, 121, 129, 124, 115, 180, 178, 194, 140, 117, 45, 205, 39, 28, 246, 108,
+                145, 5, 26, 106, 51, 182, 124, 128, 215, 16, 75, 91, 158, 85, 173,
             ]
         );
         let decoded = ControllerJournalSnapshot::decode(&encoded).expect("snapshot must decode");
         assert_eq!(decoded, snapshot);
+        assert_eq!(
+            decoded.state.installed_manifest(),
+            snapshot.state.installed_manifest()
+        );
+        assert_eq!(
+            decoded
+                .state
+                .committed_plan
+                .as_ref()
+                .expect("decided snapshot must retain its committed plan")
+                .content
+                .manifest_digest(),
+            PlanManifestDigest::try_new(decoded.state.installed_manifest().manifest_digest())
+                .expect("installed manifest digest must remain valid")
+        );
         assert_eq!(decoded.encode().expect("snapshot must reencode"), encoded);
     }
 
@@ -3319,16 +5161,98 @@ mod tests {
         );
 
         let mut forged_plan = encoded.to_vec();
-        let projection = [0x50; 7];
-        let plan_offset = forged_plan
-            .windows(projection.len())
-            .position(|window| window == projection)
-            .expect("fixture PlanContent projection must be encoded");
+        let manifest = snapshot
+            .state
+            .installed_manifest()
+            .canonical_manifest_wire();
+        let manifest_offset = forged_plan
+            .windows(manifest.len())
+            .position(|window| window == manifest)
+            .expect("exact installed manifest must be encoded");
+        let projection = snapshot
+            .state
+            .installed_manifest()
+            .projection()
+            .canonical_projection();
+        let plan_search_start = manifest_offset + manifest.len();
+        let plan_offset = plan_search_start
+            + forged_plan[plan_search_start..]
+                .windows(projection.len())
+                .position(|window| window == projection)
+                .expect("fixture PlanContent projection must be encoded");
         forged_plan[plan_offset] ^= 1;
         refresh_checksum(&mut forged_plan);
         assert_eq!(
             ControllerJournalSnapshot::decode(&forged_plan),
+            Err(ControllerJournalError::InvalidPlanContent)
+        );
+
+        let committed_plan = snapshot
+            .state
+            .committed_plan
+            .as_ref()
+            .expect("committed snapshot must retain its plan");
+        let content = committed_plan.content.canonical_bytes();
+        let content_offset = encoded[plan_search_start..]
+            .windows(content.len())
+            .position(|window| window == content)
+            .map(|offset| plan_search_start + offset)
+            .expect("exact committed PlanContent must be encoded");
+        let content_digest_offset = content_offset + content.len();
+        assert_eq!(
+            &encoded[content_digest_offset..content_digest_offset + 32],
+            committed_plan.plan_content_digest.value().as_bytes()
+        );
+        let mut forged_content_digest = encoded.to_vec();
+        forged_content_digest[content_digest_offset] ^= 1;
+        refresh_checksum(&mut forged_content_digest);
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&forged_content_digest),
             Err(ControllerJournalError::PlanContentDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn restart_strictly_decodes_the_exact_sequence_one_installed_manifest_pin() {
+        let snapshot = initial_snapshot();
+        let encoded = snapshot.encode().expect("snapshot must encode");
+        let pin = snapshot.state.installed_manifest();
+        let manifest = pin.canonical_manifest_wire();
+        let manifest_offset = encoded
+            .windows(manifest.len())
+            .position(|window| window == manifest)
+            .expect("exact installed manifest must be persisted");
+        assert_eq!(
+            &encoded[manifest_offset..manifest_offset + manifest.len()],
+            manifest
+        );
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&encoded)
+                .expect("strict restart must accept the exact pin")
+                .state
+                .installed_manifest(),
+            pin
+        );
+
+        let mut changed_manifest = encoded.to_vec();
+        changed_manifest[manifest_offset + manifest.len() - 1] ^= 1;
+        refresh_checksum(&mut changed_manifest);
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&changed_manifest),
+            Err(ControllerJournalError::InvalidInstalledManifestPin)
+        );
+
+        let manifest_digest = pin.manifest_digest();
+        let digest_offset = encoded
+            .windows(manifest_digest.as_bytes().len())
+            .position(|window| window == manifest_digest.as_bytes())
+            .expect("separate installed manifest digest must be persisted");
+        let mut changed_digest = encoded.to_vec();
+        changed_digest[digest_offset] ^= 1;
+        refresh_checksum(&mut changed_digest);
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&changed_digest),
+            Err(ControllerJournalError::InvalidInstalledManifestPin)
         );
     }
 
@@ -3363,7 +5287,7 @@ mod tests {
             Err(ControllerJournalError::UnknownEnvelopeVersion)
         );
         let mut bad_payload_version = encoded.to_vec();
-        bad_payload_version[9] = 4;
+        bad_payload_version[9] = 3;
         assert_eq!(
             ControllerJournalSnapshot::decode(&bad_payload_version),
             Err(ControllerJournalError::UnknownPayloadVersion)
@@ -3403,11 +5327,426 @@ mod tests {
     }
 
     #[test]
+    fn tenure_codec_persists_exact_prepared_uncertain_and_committed_bytes() {
+        let initial = initial_snapshot();
+        assert_eq!(
+            initial.state().current_unresolved_tenure_transaction(),
+            Ok(None)
+        );
+        let request = tenure_request(0x31, [0x32; 16], b"tenure-codec-nonce");
+        let authority_domain = authority_domain(0xa5);
+        let prepared_state = initial
+            .state()
+            .prepare_tenure_acquisition(&request, authority_domain)
+            .expect("tenure request must prepare");
+        let prepared = initial
+            .try_successor(prepared_state)
+            .expect("Prepared must be a valid successor");
+        let prepared_bytes = prepared.encode().expect("Prepared snapshot must encode");
+        let decoded_prepared = ControllerJournalSnapshot::decode(&prepared_bytes)
+            .expect("Prepared snapshot must strictly decode");
+        let transaction = decoded_prepared
+            .state()
+            .tenure_transaction(request.operation_id())
+            .expect("Prepared transaction must survive restart");
+        assert_eq!(transaction.phase(), ControllerTenurePhase::Prepared);
+        assert_eq!(transaction.authority_domain_fingerprint(), authority_domain);
+        assert_eq!(
+            transaction.request().canonical_bytes(),
+            request.canonical_bytes()
+        );
+        assert_eq!(
+            decoded_prepared
+                .state()
+                .current_unresolved_tenure_transaction()
+                .expect("unique Prepared transaction"),
+            Some(transaction)
+        );
+        assert_eq!(
+            decoded_prepared
+                .state()
+                .latest_committed_tenure_transaction(request.proof_writer()),
+            Ok(None)
+        );
+
+        let uncertain_state = prepared
+            .state()
+            .mark_tenure_uncertain(&request)
+            .expect("uncertain result must persist");
+        let uncertain = prepared
+            .try_successor(uncertain_state)
+            .expect("Uncertain must be a valid successor");
+        let decoded_uncertain = ControllerJournalSnapshot::decode(
+            &uncertain.encode().expect("Uncertain snapshot must encode"),
+        )
+        .expect("Uncertain snapshot must strictly decode");
+        assert_eq!(
+            decoded_uncertain
+                .state()
+                .tenure_transaction(request.operation_id())
+                .expect("Uncertain transaction must survive restart")
+                .phase(),
+            ControllerTenurePhase::Uncertain
+        );
+        assert_eq!(
+            decoded_uncertain
+                .state()
+                .current_unresolved_tenure_transaction()
+                .expect("unique Uncertain transaction")
+                .expect("Uncertain transaction")
+                .request()
+                .canonical_bytes(),
+            request.canonical_bytes()
+        );
+
+        let response = tenure_response(&request, 5, 4);
+        let committed_state = uncertain
+            .state()
+            .commit_tenure_response(&request, &response)
+            .expect("canonical response must commit");
+        let committed = uncertain
+            .try_successor(committed_state)
+            .expect("Committed must be a valid successor");
+        let committed_bytes = committed.encode().expect("Committed snapshot must encode");
+        let decoded_committed = ControllerJournalSnapshot::decode(&committed_bytes)
+            .expect("Committed snapshot must strictly decode");
+        let committed_transaction = decoded_committed
+            .state()
+            .tenure_transaction(request.operation_id())
+            .expect("Committed transaction must survive restart");
+        assert_eq!(
+            committed_transaction.phase(),
+            ControllerTenurePhase::Committed
+        );
+        assert_eq!(committed_transaction.response(), Some(&response));
+        assert_eq!(
+            committed_transaction
+                .committed_proof()
+                .expect("committed proof must exist"),
+            response.proof()
+        );
+        assert_eq!(
+            decoded_committed
+                .state()
+                .current_unresolved_tenure_transaction(),
+            Ok(None)
+        );
+        assert_eq!(
+            decoded_committed
+                .state()
+                .latest_committed_tenure_transaction(request.proof_writer())
+                .expect("unique highest committed tenure"),
+            Some(committed_transaction)
+        );
+
+        let mut old_payload_version = prepared_bytes.to_vec();
+        old_payload_version[8..10].copy_from_slice(&6_u16.to_be_bytes());
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&old_payload_version),
+            Err(ControllerJournalError::UnknownPayloadVersion)
+        );
+        let mut old_inner_payload_version = prepared_bytes.to_vec();
+        let inner_version_offset = super::JOURNAL_HEADER_BYTES + CONTROLLER_PAYLOAD_MAGIC.len();
+        old_inner_payload_version[inner_version_offset..inner_version_offset + 2]
+            .copy_from_slice(&6_u16.to_be_bytes());
+        refresh_checksum(&mut old_inner_payload_version);
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&old_inner_payload_version),
+            Err(ControllerJournalError::UnknownPayloadVersion)
+        );
+
+        let digest_offset = prepared_bytes
+            .windows(request.request_digest().as_bytes().len())
+            .position(|window| window == request.request_digest().as_bytes())
+            .expect("explicit request digest must be persisted");
+        let mut changed_identity_fact = prepared_bytes.to_vec();
+        changed_identity_fact[digest_offset] ^= 1;
+        refresh_checksum(&mut changed_identity_fact);
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&changed_identity_fact),
+            Err(ControllerJournalError::TenureTransactionFactChanged)
+        );
+        let authority_domain_offset = prepared_bytes
+            .windows(16 + 1 + 32)
+            .position(|window| {
+                &window[..16] == request.operation_id().as_bytes()
+                    && window[16] == ControllerTenurePhase::Prepared as u8
+                    && &window[17..] == authority_domain.value().as_bytes()
+            })
+            .map(|offset| offset + 17)
+            .expect("Authority domain fingerprint must be persisted after the transaction phase");
+        let mut zero_authority_domain = prepared_bytes.to_vec();
+        zero_authority_domain[authority_domain_offset..authority_domain_offset + 32].fill(0);
+        refresh_checksum(&mut zero_authority_domain);
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&zero_authority_domain),
+            Err(ControllerJournalError::InvalidTenureAuthorityDomainFingerprint)
+        );
+        assert!(
+            ControllerJournalSnapshot::decode(&committed_bytes[..committed_bytes.len() - 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tenure_identity_replay_and_successors_are_exact_and_append_only() {
+        let initial = initial_snapshot();
+        let request = tenure_request(0x31, [0x32; 16], b"tenure-identity-nonce");
+        let prepared_state = initial
+            .state()
+            .prepare_tenure_acquisition(&request, authority_domain(0xa5))
+            .expect("tenure request must prepare");
+        assert_eq!(
+            prepared_state
+                .prepare_tenure_acquisition(&request, authority_domain(0xa5))
+                .expect("exact Prepared replay must be idempotent"),
+            prepared_state
+        );
+        assert_eq!(
+            prepared_state.prepare_tenure_acquisition(&request, authority_domain(0xa6)),
+            Err(ControllerJournalError::TenureAuthorityDomainMismatch)
+        );
+        assert_eq!(
+            initial.state().prepare_tenure_acquisition(
+                &request,
+                ControllerTenureAuthorityDomainFingerprint::from_stored(Digest32::from_bytes(
+                    [0; 32],
+                )),
+            ),
+            Err(ControllerJournalError::InvalidTenureAuthorityDomainFingerprint)
+        );
+        let changed_nonce = tenure_request(0x31, [0x32; 16], b"changed-tenure-nonce");
+        assert_eq!(
+            prepared_state.prepare_tenure_acquisition(&changed_nonce, authority_domain(0xa5)),
+            Err(ControllerJournalError::TenureTransactionConflict)
+        );
+        let nonce_collision = tenure_request(0x31, [0x33; 16], b"tenure-identity-nonce");
+        assert_eq!(
+            prepared_state.prepare_tenure_acquisition(&nonce_collision, authority_domain(0xa5)),
+            Err(ControllerJournalError::TenureTransactionConflict)
+        );
+
+        let mut removed = prepared_state.clone();
+        removed.tenure_transactions = Box::new([]);
+        assert_eq!(
+            removed.validate_successor_of(&prepared_state),
+            Err(ControllerJournalError::TenureTransactionRemoved)
+        );
+        let mut changed = prepared_state.clone();
+        changed.tenure_transactions[0] = ControllerTenureTransaction::try_new(
+            changed_nonce,
+            authority_domain(0xa5),
+            ControllerTenurePhase::Prepared,
+            None,
+        )
+        .expect("changed canonical request is individually valid");
+        assert_eq!(
+            changed.validate_successor_of(&prepared_state),
+            Err(ControllerJournalError::TenureTransactionFactChanged)
+        );
+        let mut changed_domain = prepared_state.clone();
+        changed_domain.tenure_transactions[0].authority_domain_fingerprint = authority_domain(0xa6);
+        assert_eq!(
+            changed_domain.validate_successor_of(&prepared_state),
+            Err(ControllerJournalError::TenureTransactionFactChanged)
+        );
+
+        let response = tenure_response(&request, 5, 4);
+        let committed = prepared_state
+            .commit_tenure_response(&request, &response)
+            .expect("tenure response must commit");
+        assert_eq!(
+            committed
+                .commit_tenure_response(&request, &response)
+                .expect("exact success replay must be idempotent"),
+            committed
+        );
+    }
+
+    #[test]
+    fn tenure_successor_requires_monotonic_covered_epochs_and_consistent_same_epoch_proofs() {
+        let first_request = tenure_request(0x31, [1; 16], b"first-tenure-nonce");
+        let first_prepared = initial_state()
+            .prepare_tenure_acquisition(&first_request, authority_domain(0xa5))
+            .expect("first tenure must prepare");
+        let first_response = tenure_response(&first_request, 5, 4);
+        let first_committed = first_prepared
+            .commit_tenure_response(&first_request, &first_response)
+            .expect("first tenure must commit");
+
+        let second_request = tenure_request(0x31, [2; 16], b"second-tenure-nonce");
+        let second_prepared = first_committed
+            .prepare_tenure_acquisition(&second_request, authority_domain(0xa5))
+            .expect("second tenure must prepare");
+
+        let lower_response = tenure_response(&second_request, 4, 3);
+        assert_eq!(
+            second_prepared.commit_tenure_response(&second_request, &lower_response),
+            Err(ControllerJournalError::TenureEpochNotMonotonic)
+        );
+        let mut forged_lower = second_prepared.clone();
+        forged_lower.tenure_transactions[1] = ControllerTenureTransaction::try_new(
+            second_request.clone(),
+            authority_domain(0xa5),
+            ControllerTenurePhase::Committed,
+            Some(lower_response),
+        )
+        .expect("lower proof is individually canonical");
+        assert_eq!(
+            forged_lower.validate_successor_of(&second_prepared),
+            Err(ControllerJournalError::TenureEpochNotMonotonic)
+        );
+
+        let gap_response = tenure_response(&second_request, 7, 4);
+        assert_eq!(
+            second_prepared.commit_tenure_response(&second_request, &gap_response),
+            Err(ControllerJournalError::TenureSupersessionGap)
+        );
+        let mut forged_gap = second_prepared.clone();
+        forged_gap.tenure_transactions[1] = ControllerTenureTransaction::try_new(
+            second_request.clone(),
+            authority_domain(0xa5),
+            ControllerTenurePhase::Committed,
+            Some(gap_response),
+        )
+        .expect("gap proof is individually canonical");
+        assert_eq!(
+            forged_gap.validate_successor_of(&second_prepared),
+            Err(ControllerJournalError::TenureSupersessionGap)
+        );
+
+        let same_epoch_response = tenure_response(&second_request, 5, 4);
+        let mut forged_same_epoch = second_prepared.clone();
+        forged_same_epoch.tenure_transactions[1] = ControllerTenureTransaction::try_new(
+            second_request.clone(),
+            authority_domain(0xa5),
+            ControllerTenurePhase::Committed,
+            Some(same_epoch_response),
+        )
+        .expect("same-epoch proof is individually canonical");
+        assert_eq!(
+            forged_same_epoch.validate(),
+            Err(ControllerJournalError::TenureEpochConflict)
+        );
+        assert_eq!(
+            forged_same_epoch.latest_committed_tenure_transaction(second_request.proof_writer()),
+            Err(ControllerJournalError::TenureEpochConflict)
+        );
+
+        let covered_response = tenure_response(&second_request, 7, 5);
+        let second_committed = second_prepared
+            .commit_tenure_response(&second_request, &covered_response)
+            .expect("higher epoch covering the prior maximum must commit");
+        assert_eq!(
+            second_committed
+                .latest_committed_tenure_transaction(second_request.proof_writer())
+                .expect("unambiguous latest committed tenure")
+                .expect("latest committed tenure")
+                .request()
+                .canonical_bytes(),
+            second_request.canonical_bytes()
+        );
+    }
+
+    #[test]
+    fn globally_latest_writer_fences_every_older_writer_proof() {
+        let writer_a_request = tenure_request(0x31, [1; 16], b"writer-a-tenure-nonce");
+        let writer_a_prepared = initial_state()
+            .prepare_tenure_acquisition(&writer_a_request, authority_domain(0xa5))
+            .expect("writer A tenure must prepare");
+        let writer_a_response = tenure_response(&writer_a_request, 1, 0);
+        let writer_a_committed = writer_a_prepared
+            .commit_tenure_response(&writer_a_request, &writer_a_response)
+            .expect("writer A tenure must commit");
+        assert_eq!(
+            writer_a_committed.latest_committed_tenure_proof(writer_a_request.proof_writer()),
+            Some(writer_a_response.proof())
+        );
+
+        let writer_b_request = tenure_request(0x32, [2; 16], b"writer-b-tenure-nonce");
+        let writer_b_prepared = writer_a_committed
+            .prepare_tenure_acquisition(&writer_b_request, authority_domain(0xa5))
+            .expect("writer B tenure must prepare");
+        let writer_b_response = tenure_response(&writer_b_request, 2, 1);
+        let writer_b_committed = writer_b_prepared
+            .commit_tenure_response(&writer_b_request, &writer_b_response)
+            .expect("writer B tenure must commit and cover writer A");
+
+        assert_eq!(
+            writer_b_committed
+                .global_latest_committed_tenure_transaction()
+                .expect("global latest tenure must be unambiguous")
+                .expect("global latest tenure must exist")
+                .request(),
+            &writer_b_request
+        );
+        assert_eq!(
+            writer_b_committed.latest_committed_tenure_proof(writer_a_request.proof_writer()),
+            None
+        );
+        assert_eq!(
+            writer_b_committed.latest_committed_tenure_transaction(writer_a_request.proof_writer()),
+            Ok(None)
+        );
+        assert!(
+            !writer_b_committed.contains_committed_tenure_proof(writer_a_response.proof()),
+            "a globally superseded writer proof must not replay"
+        );
+        assert_eq!(
+            writer_b_committed.latest_committed_tenure_proof(writer_b_request.proof_writer()),
+            Some(writer_b_response.proof())
+        );
+        assert!(writer_b_committed.contains_committed_tenure_proof(writer_b_response.proof()));
+    }
+
+    #[test]
+    fn tenure_transaction_capacity_is_independent_and_bounded() {
+        let mut state = initial_state();
+        for index in 1..=MAX_CONTROLLER_TENURE_TRANSACTIONS {
+            let operation = u128::try_from(index)
+                .expect("fixture index must fit")
+                .to_be_bytes();
+            let nonce = u64::try_from(index)
+                .expect("fixture index must fit")
+                .to_be_bytes();
+            let request = tenure_request(0x31, operation, &nonce);
+            state = state
+                .prepare_tenure_acquisition(&request, authority_domain(0xa5))
+                .expect("bounded tenure row must prepare");
+            let epoch = u64::try_from(index).expect("fixture index must fit") + 1;
+            let response = tenure_response(&request, epoch, epoch - 1);
+            state = state
+                .commit_tenure_response(&request, &response)
+                .expect("bounded tenure row must commit");
+        }
+        assert!(
+            state.operations.is_empty(),
+            "tenure rows are not plan-ledger rows"
+        );
+        let overflow_request = tenure_request(
+            0x31,
+            u128::try_from(MAX_CONTROLLER_TENURE_TRANSACTIONS + 1)
+                .expect("overflow fixture index must fit")
+                .to_be_bytes(),
+            b"overflow-tenure-nonce",
+        );
+        assert_eq!(
+            state.prepare_tenure_acquisition(&overflow_request, authority_domain(0xa5)),
+            Err(ControllerJournalError::TenureCapacityExceeded)
+        );
+    }
+
+    #[test]
     fn plan_commit_requires_exact_typed_candidate_and_prepared_operation() {
         let initial = initial_snapshot();
-        let candidate =
-            journal_test_candidate(TARGET, &initial.state.allocation, Some([2; 16]), 0x50)
-                .expect("fixture candidate must validate");
+        let candidate = journal_test_candidate(
+            TARGET,
+            initial.state.installed_manifest().projection(),
+            &initial.state.allocation,
+            Some([2; 16]),
+            0x50,
+        )
+        .expect("fixture candidate must validate");
         assert_eq!(
             initial
                 .state
@@ -3422,9 +5761,14 @@ mod tests {
         let prepared = initial
             .try_successor(prepared_state)
             .expect("prepared state must be a successor");
-        let different =
-            journal_test_candidate(TARGET, &prepared.state.allocation, Some([2; 16]), 0x51)
-                .expect("different typed candidate must validate");
+        let different = journal_test_candidate(
+            TARGET,
+            prepared.state.installed_manifest().projection(),
+            &prepared.state.allocation,
+            Some([2; 16]),
+            0x51,
+        )
+        .expect("different typed candidate must validate");
         assert_eq!(
             prepared
                 .state
@@ -3465,9 +5809,14 @@ mod tests {
     #[test]
     fn snapshot_successor_rejects_owner_sequence_lineage_and_operation_swaps() {
         let initial = initial_snapshot();
-        let candidate =
-            journal_test_candidate(TARGET, &initial.state.allocation, Some([2; 16]), 0x50)
-                .expect("fixture candidate must validate");
+        let candidate = journal_test_candidate(
+            TARGET,
+            initial.state.installed_manifest().projection(),
+            &initial.state.allocation,
+            Some([2; 16]),
+            0x50,
+        )
+        .expect("fixture candidate must validate");
         let prepared_state = initial
             .state
             .prepare_plan_candidate(PLAN_OPERATION, &candidate)
@@ -3536,6 +5885,29 @@ mod tests {
     }
 
     #[test]
+    fn installed_manifest_pin_is_required_for_the_target_and_never_changes() {
+        let wrong_target = RuntimeHostId::from_bytes([0x62; 16]);
+        assert_eq!(
+            ControllerJournalState::try_initialize(
+                SCOPE,
+                PLAN,
+                empty_allocation(TARGET),
+                super::controller_test_manifest(wrong_target),
+                auth(0x11, 1),
+            ),
+            Err(ControllerJournalError::InstalledManifestTargetMismatch)
+        );
+
+        let initial = initial_snapshot();
+        let mut changed = initial.state.clone();
+        changed.installed_manifest = super::controller_test_manifest_with_build(TARGET, 0x12);
+        assert_eq!(
+            initial.try_successor(changed),
+            Err(ControllerJournalError::InstalledManifestPinChanged)
+        );
+    }
+
+    #[test]
     fn auth_and_target_binding_are_monotonic_and_identity_fixed() {
         let committed = committed_snapshot();
         let rotated_state = committed
@@ -3551,18 +5923,14 @@ mod tests {
         );
 
         let bound = bound_snapshot();
-        let changed_store = ControllerTargetBinding::try_new(ControllerTargetBindingInput {
-            target: TARGET,
-            runtime_store_instance_id: [0x72; 32],
-            channel_auth_fingerprint: ControllerChannelAuthFingerprint::from_stored(digest(0x63)),
-            manifest_digest: PlanManifestDigest::try_new(digest(0x52))
-                .expect("fixture manifest digest must validate"),
-            first_runtime_host_epoch: 2,
-            last_runtime_host_epoch: 4,
-            bootstrap_response: b"bootstrap-four",
-            bootstrap_response_digest: ControllerBootstrapResponseDigest::from_stored(digest(b'b')),
-        })
-        .expect("changed store binding is individually valid");
+        let changed_store = binding_with_store_and_build(
+            [0x72; 32],
+            4,
+            b'b',
+            0x11,
+            PlanManifestDigest::try_new(bound.state.installed_manifest().manifest_digest())
+                .expect("installed manifest digest must validate"),
+        );
         assert_eq!(
             bound.state.record_target_binding(changed_store),
             Err(ControllerJournalError::TargetBindingChanged)
@@ -3588,8 +5956,10 @@ mod tests {
             .expect("higher host epoch must be a snapshot successor");
 
         let other_target = RuntimeHostId::from_bytes([0x71; 16]);
+        let other_manifest = super::controller_test_manifest(other_target);
         let other_candidate = journal_test_candidate(
             other_target,
+            other_manifest.projection(),
             &empty_allocation(other_target),
             Some([2; 16]),
             0x52,
@@ -3601,6 +5971,36 @@ mod tests {
                 &other_candidate
             ),
             Err(ControllerJournalError::CandidateTargetMismatch)
+        );
+    }
+
+    #[test]
+    fn checksum_valid_single_field_runtime_auth_pin_mutation_is_rejected_on_reopen() {
+        let bound = bound_snapshot();
+        let pin = bound
+            .state
+            .target_binding
+            .as_ref()
+            .expect("fixture target binding")
+            .runtime_response_auth;
+        let mut encoded_pin = Vec::new();
+        super::append_runtime_response_auth_pin(&mut encoded_pin, pin);
+        let mut encoded = bound.encode().expect("bound snapshot bytes").into_vec();
+        let matches = encoded
+            .windows(encoded_pin.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == encoded_pin).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "auth pin encoding must be unique");
+
+        // Keep the exact PXBR and its digest, but alter one endpoint-identity
+        // byte inside the separately persisted auth pin.
+        let endpoint_digest_offset = matches[0] + 32 + 16;
+        encoded[endpoint_digest_offset] ^= 0x01;
+        super::refresh_controller_test_checksum(&mut encoded).expect("refresh checksum");
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&encoded),
+            Err(ControllerJournalError::InvalidTargetBinding)
         );
     }
 
@@ -3697,8 +6097,14 @@ mod tests {
     #[test]
     fn nonterminal_rollouts_block_plan_commit_and_no_current_intent_can_be_overwritten() {
         fn assert_plan_commit_blocked(state: &ControllerJournalState) {
-            let candidate = journal_test_candidate(TARGET, &state.allocation, None, 0x50)
-                .expect("same-manifest empty candidate must validate");
+            let candidate = journal_test_candidate(
+                TARGET,
+                state.installed_manifest().projection(),
+                &state.allocation,
+                None,
+                0x50,
+            )
+            .expect("same-manifest empty candidate must validate");
             let operation = ControllerOperationId::from_bytes([0x32; 16]);
             let prepared = state
                 .prepare_plan_candidate(operation, &candidate)
@@ -3881,8 +6287,15 @@ mod tests {
     #[test]
     fn manifest_binding_and_historical_auth_pin_cannot_swap_after_rotation() {
         let bound = bound_snapshot();
-        let manifest_b = journal_test_candidate(TARGET, &bound.state.allocation, None, 0x51)
-            .expect("different-manifest candidate must be typed");
+        let installed_manifest_b = super::controller_test_manifest_with_build(TARGET, 0x12);
+        let manifest_b = journal_test_candidate(
+            TARGET,
+            installed_manifest_b.projection(),
+            &bound.state.allocation,
+            None,
+            0x51,
+        )
+        .expect("different-manifest candidate must be typed");
         assert_eq!(
             bound.state.prepare_plan_candidate(
                 ControllerOperationId::from_bytes([0x32; 16]),
@@ -3890,18 +6303,14 @@ mod tests {
             ),
             Err(ControllerJournalError::CandidateManifestMismatch)
         );
-        let mismatched_binding = ControllerTargetBinding::try_new(ControllerTargetBindingInput {
-            target: TARGET,
-            runtime_store_instance_id: [0x62; 32],
-            channel_auth_fingerprint: ControllerChannelAuthFingerprint::from_stored(digest(0x63)),
-            manifest_digest: PlanManifestDigest::try_new(digest(0x53))
+        let mismatched_binding = binding_with_store_and_build(
+            [0x62; 32],
+            4,
+            0x73,
+            0x12,
+            PlanManifestDigest::try_new(installed_manifest_b.manifest_digest())
                 .expect("manifest B digest must validate"),
-            first_runtime_host_epoch: 2,
-            last_runtime_host_epoch: 4,
-            bootstrap_response: b"manifest-b-bootstrap",
-            bootstrap_response_digest: ControllerBootstrapResponseDigest::from_stored(digest(0x73)),
-        })
-        .expect("manifest B binding is individually well formed");
+        );
         assert_eq!(
             bound.state.record_target_binding(mismatched_binding),
             Err(ControllerJournalError::ManifestBindingMismatch)
@@ -3952,8 +6361,14 @@ mod tests {
                 Some(ControllerReceiptRef::from_bytes([0x6f; 16])),
             )
             .expect("Retired decision must record");
-        let candidate = journal_test_candidate(TARGET, &terminal.allocation, None, 0x50)
-            .expect("same-manifest next plan must validate");
+        let candidate = journal_test_candidate(
+            TARGET,
+            terminal.installed_manifest().projection(),
+            &terminal.allocation,
+            None,
+            0x50,
+        )
+        .expect("same-manifest next plan must validate");
         let operation = ControllerOperationId::from_bytes([0x32; 16]);
         let prepared = terminal
             .prepare_plan_candidate(operation, &candidate)
@@ -4009,8 +6424,14 @@ mod tests {
                     Some(ControllerReceiptRef::from_bytes(receipt)),
                 )
                 .expect("capacity terminal decision must record");
-            let candidate = journal_test_candidate(TARGET, &state.allocation, None, 0x50)
-                .expect("capacity next plan must validate");
+            let candidate = journal_test_candidate(
+                TARGET,
+                state.installed_manifest().projection(),
+                &state.allocation,
+                None,
+                0x50,
+            )
+            .expect("capacity next plan must validate");
             let mut controller_operation = [0_u8; 16];
             controller_operation[0] = 0x80;
             controller_operation[14..].copy_from_slice(&index.to_be_bytes());
@@ -4067,8 +6488,14 @@ mod tests {
                 + usize::from(state.rollout.is_some()),
             super::MAX_CONTROLLER_LEDGER_RECORDS
         );
-        let candidate = journal_test_candidate(TARGET, &state.allocation, None, 0x50)
-            .expect("capacity overflow plan must validate");
+        let candidate = journal_test_candidate(
+            TARGET,
+            state.installed_manifest().projection(),
+            &state.allocation,
+            None,
+            0x50,
+        )
+        .expect("capacity overflow plan must validate");
         let operation = ControllerOperationId::from_bytes([0xa6; 16]);
         let before = state.clone();
         assert_eq!(
@@ -4082,8 +6509,14 @@ mod tests {
     fn shared_ledger_allows_255_plan_records_plus_current_and_rejects_the_next_record() {
         let mut state = bound_snapshot().state;
         for index in 0..254_u16 {
-            let candidate = journal_test_candidate(TARGET, &state.allocation, None, 0x50)
-                .expect("same-manifest no-change plan must validate");
+            let candidate = journal_test_candidate(
+                TARGET,
+                state.installed_manifest().projection(),
+                &state.allocation,
+                None,
+                0x50,
+            )
+            .expect("same-manifest no-change plan must validate");
             let mut operation = [0_u8; 16];
             operation[0] = 0x81;
             operation[14..].copy_from_slice(&index.to_be_bytes());
@@ -4100,8 +6533,14 @@ mod tests {
         state = state
             .record_signed_apply_intent(different_signed_input(&state, 0xb1, 0xb2))
             .expect("the 256th shared ledger record is available to current rollout");
-        let candidate = journal_test_candidate(TARGET, &state.allocation, None, 0x50)
-            .expect("next candidate must remain pure");
+        let candidate = journal_test_candidate(
+            TARGET,
+            state.installed_manifest().projection(),
+            &state.allocation,
+            None,
+            0x50,
+        )
+        .expect("next candidate must remain pure");
         let before = state.clone();
         assert_eq!(
             state.prepare_plan_candidate(ControllerOperationId::from_bytes([0xb3; 16]), &candidate),
@@ -4337,9 +6776,14 @@ mod tests {
     #[test]
     fn checksum_valid_but_unreachable_state_forgery_is_rejected() {
         let initial = initial_snapshot();
-        let candidate =
-            journal_test_candidate(TARGET, &initial.state.allocation, Some([2; 16]), 0x50)
-                .expect("fixture candidate must validate");
+        let candidate = journal_test_candidate(
+            TARGET,
+            initial.state.installed_manifest().projection(),
+            &initial.state.allocation,
+            Some([2; 16]),
+            0x50,
+        )
+        .expect("fixture candidate must validate");
         let prepared_state = initial
             .state
             .prepare_plan_candidate(PLAN_OPERATION, &candidate)
@@ -4407,8 +6851,14 @@ mod tests {
             .allocation
             .apply_delta(candidate.allocation_delta())
             .expect("active allocation must apply");
-        let empty_candidate = journal_test_candidate(TARGET, &active_allocation, None, 0x50)
-            .expect("empty candidate must validate");
+        let empty_candidate = journal_test_candidate(
+            TARGET,
+            initial.state.installed_manifest().projection(),
+            &active_allocation,
+            None,
+            0x50,
+        )
+        .expect("empty candidate must validate");
         let tombstones = active_allocation
             .apply_delta(empty_candidate.allocation_delta())
             .expect("tombstone allocation must apply");
@@ -4433,7 +6883,7 @@ mod tests {
             PlanManifestDigest::try_new(digest(0x53)).expect("manifest B digest must validate");
         assert_eq!(
             ControllerJournalSnapshot::decode(&encode_unvalidated_state(&manifest_swap, 4)),
-            Err(ControllerJournalError::ManifestBindingMismatch)
+            Err(ControllerJournalError::InvalidTargetBinding)
         );
         let signed = signed_snapshot();
         let mut signed_manifest_swap = signed.state.clone();
@@ -4451,10 +6901,80 @@ mod tests {
     }
 
     #[test]
+    fn archived_direct_terminal_receipt_is_exact_and_plan_chronological() {
+        let (terminal, receipt, loop_slice) = direct_active_snapshot();
+        assert_eq!(
+            terminal.state().current_direct_terminal_receipt(),
+            Some(&receipt)
+        );
+        assert_eq!(
+            terminal.state().last_archived_direct_terminal_receipt(),
+            Ok(None),
+            "a current direct PXRT is not archived until a successor plan commits"
+        );
+
+        let empty_candidate = journal_test_candidate(
+            TARGET,
+            terminal.state().installed_manifest().projection(),
+            terminal.state().allocation(),
+            None,
+            0x50,
+        )
+        .expect("empty candidate must validate");
+        let empty_operation = ControllerOperationId::from_bytes([0x32; 16]);
+        let prepared_state = terminal
+            .state()
+            .prepare_plan_candidate(empty_operation, &empty_candidate)
+            .expect("empty candidate must prepare");
+        let prepared = terminal
+            .try_successor(prepared_state)
+            .expect("empty prepare must preserve direct receipt");
+        let committed_state = prepared
+            .state()
+            .commit_plan_candidate(empty_operation, &empty_candidate)
+            .expect("empty candidate must commit");
+        let empty = prepared
+            .try_successor(committed_state)
+            .expect("empty commit must archive direct receipt");
+
+        let archived = empty
+            .state()
+            .last_archived_direct_terminal_receipt()
+            .expect("archive chronology must validate")
+            .expect("direct receipt must be available");
+        assert_eq!(archived, &receipt);
+        assert_eq!(archived.canonical_wire(), receipt.canonical_wire());
+        assert_eq!(archived.facts().desired_head_digest(), Some(loop_slice));
+        assert_eq!(
+            empty.state().last_terminal_target_slice_digest(),
+            Ok(Some(loop_slice))
+        );
+        assert_eq!(
+            empty
+                .state()
+                .committed_plan()
+                .expect("empty committed plan")
+                .commit_operation(),
+            empty_operation
+        );
+    }
+
+    #[test]
     fn next_plan_archives_terminal_rollout_and_retains_allocation_history() {
         let decided = decided_snapshot();
-        let empty_candidate = journal_test_candidate(TARGET, &decided.state.allocation, None, 0x50)
-            .expect("empty candidate must validate");
+        assert_eq!(
+            decided.state.last_archived_direct_terminal_receipt(),
+            Ok(None),
+            "the current terminal rollout is not archived plan history"
+        );
+        let empty_candidate = journal_test_candidate(
+            TARGET,
+            decided.state.installed_manifest().projection(),
+            &decided.state.allocation,
+            None,
+            0x50,
+        )
+        .expect("empty candidate must validate");
         let empty_operation = ControllerOperationId::from_bytes([0x32; 16]);
         let prepared_state = decided
             .state
@@ -4474,8 +6994,30 @@ mod tests {
         assert!(empty.state.rollout.is_none());
         assert_eq!(empty.state.apply_history.len(), 1);
         assert_eq!(
+            empty
+                .state
+                .committed_plan()
+                .expect("empty committed plan")
+                .commit_operation(),
+            empty_operation
+        );
+        assert_eq!(
             empty.state.apply_history[0],
             *decided.state.rollout.as_ref().expect("terminal rollout")
+        );
+        assert_eq!(
+            empty.state.last_archived_direct_terminal_receipt(),
+            Err(ControllerJournalError::TerminalDesiredHeadUnavailable),
+            "opaque reconcile evidence must not be exposed as a direct PXRT"
+        );
+        let mut wrong_archive_chronology = empty.state.clone();
+        wrong_archive_chronology.apply_history[0]
+            .signed_intent
+            .source_plan_digest = SourcePlanDigest::new(digest(0xf1));
+        assert_eq!(
+            wrong_archive_chronology.last_archived_direct_terminal_receipt(),
+            Err(ControllerJournalError::ArchivedPlanDigestMismatch),
+            "the read facade must independently reject an archive outside plan chronology"
         );
         assert_eq!(empty.state.target_binding, decided.state.target_binding);
         assert_eq!(empty.state.operations.len(), 2);
@@ -4485,9 +7027,14 @@ mod tests {
             AllocationState::Tombstone
         );
 
-        let next_candidate =
-            journal_test_candidate(TARGET, &empty.state.allocation, Some([3; 16]), 0x50)
-                .expect("new-key candidate must validate");
+        let next_candidate = journal_test_candidate(
+            TARGET,
+            empty.state.installed_manifest().projection(),
+            &empty.state.allocation,
+            Some([3; 16]),
+            0x50,
+        )
+        .expect("new-key candidate must validate");
         let next_operation = ControllerOperationId::from_bytes([0x33; 16]);
         let prepared_next = empty
             .state
@@ -4520,8 +7067,14 @@ mod tests {
     #[test]
     fn operation_capacity_is_exact_and_never_evicts_history() {
         let mut state = initial_state();
-        let candidate = journal_test_candidate(TARGET, &state.allocation, None, 0x30)
-            .expect("no-change candidate must validate");
+        let candidate = journal_test_candidate(
+            TARGET,
+            state.installed_manifest().projection(),
+            &state.allocation,
+            None,
+            0x30,
+        )
+        .expect("no-change candidate must validate");
         for index in 0..super::MAX_CONTROLLER_OPERATIONS {
             let mut operation = [0_u8; 16];
             operation[0] = 1;

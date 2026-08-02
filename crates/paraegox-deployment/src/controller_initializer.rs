@@ -24,6 +24,7 @@ use crate::controller_store::{
     ensure_fresh_controller_directory, open_controller_directory,
     publish_initial_controller_snapshot, read_active_controller_snapshot,
 };
+use crate::manifest_ingress::ControllerInstalledManifestPin;
 use crate::plan::{DeploymentId, DeploymentScopeId};
 use crate::planner::StableAllocationSnapshot;
 
@@ -40,6 +41,7 @@ pub(crate) struct ControllerInitializationInput {
     scope: DeploymentScopeId,
     plan_lineage: DeploymentId,
     allocation: StableAllocationSnapshot,
+    installed_manifest: ControllerInstalledManifestPin,
     request_auth: ControllerRequestAuthPin,
     owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
 }
@@ -49,6 +51,7 @@ impl ControllerInitializationInput {
         scope: DeploymentScopeId,
         plan_lineage: DeploymentId,
         allocation: StableAllocationSnapshot,
+        installed_manifest: ControllerInstalledManifestPin,
         request_auth: ControllerRequestAuthPin,
         owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
     ) -> Result<Self, ControllerInitializationError> {
@@ -58,6 +61,7 @@ impl ControllerInitializationInput {
             scope,
             plan_lineage,
             allocation.clone(),
+            installed_manifest.clone(),
             request_auth,
         )?;
         if owner_identity_fingerprint
@@ -72,6 +76,7 @@ impl ControllerInitializationInput {
             scope,
             plan_lineage,
             allocation,
+            installed_manifest,
             request_auth,
             owner_identity_fingerprint,
         })
@@ -82,6 +87,7 @@ impl ControllerInitializationInput {
             self.scope,
             self.plan_lineage,
             self.allocation,
+            self.installed_manifest,
             self.request_auth,
         )
     }
@@ -518,7 +524,7 @@ mod tests {
 
     use crate::controller_journal::{
         ControllerAuthKeyFingerprint, ControllerOperationId, ControllerOwnerIdentityFingerprint,
-        ControllerRequestAuthPin,
+        ControllerRequestAuthPin, controller_test_manifest, controller_test_manifest_with_build,
     };
     use crate::controller_store::{
         CONTROLLER_ACTIVE_FILE_NAME, CONTROLLER_LOCK_FILE_NAME, ControllerCommitFailpoint,
@@ -612,16 +618,20 @@ mod tests {
     fn input_with_owner(
         owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
     ) -> ControllerInitializationInput {
+        input_with_owner_and_build(owner_identity_fingerprint, 0x11)
+    }
+
+    fn input_with_owner_and_build(
+        owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
+        build_marker: u8,
+    ) -> ControllerInitializationInput {
+        let target = RuntimeHostId::from_bytes([0x23; 16]);
         ControllerInitializationInput::try_new(
             DeploymentScopeId::from_bytes([0x21; 16]),
             DeploymentId::from_bytes([0x22; 16]),
-            StableAllocationSnapshot::try_new(
-                RuntimeHostId::from_bytes([0x23; 16]),
-                0,
-                0,
-                Vec::new(),
-            )
-            .unwrap_or_else(|error| panic!("fixture allocation failed: {error}")),
+            StableAllocationSnapshot::try_new(target, 0, 0, Vec::new())
+                .unwrap_or_else(|error| panic!("fixture allocation failed: {error}")),
+            controller_test_manifest_with_build(target, build_marker),
             auth(0x24, 1),
             owner_identity_fingerprint,
         )
@@ -689,6 +699,22 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("receipt reconstruction failed: {error}"));
         assert_eq!(reconstructed, receipt);
+
+        let store = ControllerStore::open_with_policy(
+            directory.path(),
+            *receipt.store_instance_id(),
+            owner(),
+            ControllerFilesystemPolicy::ExplicitFixture,
+        )
+        .unwrap_or_else(|error| panic!("initialized store reopen failed: {error}"));
+        assert_eq!(
+            store
+                .snapshot()
+                .unwrap_or_else(|error| panic!("initialized snapshot unavailable: {error}"))
+                .state()
+                .installed_manifest(),
+            &controller_test_manifest(RuntimeHostId::from_bytes([0x23; 16]))
+        );
     }
 
     #[test]
@@ -747,6 +773,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap_or_else(|error| panic!("fixture allocation failed: {error}")),
+                controller_test_manifest(RuntimeHostId::from_bytes([0x23; 16])),
                 auth(0x24, 1),
                 ControllerOwnerIdentityFingerprint::from_stored(digest(0)),
             ),
@@ -934,6 +961,15 @@ mod tests {
             ),
             Err(ControllerReceiptRecoveryError::Store(_))
         ));
+        assert_eq!(
+            reconstruct_sequence_one_controller_receipt_with_policy(
+                directory.path(),
+                input_with_owner_and_build(owner(), 0x12),
+                ControllerFilesystemPolicy::ExplicitFixture,
+            )
+            .expect_err("same owner with a different installed manifest pin must fail"),
+            ControllerReceiptRecoveryError::InitializationBindingMismatch
+        );
 
         let wrong_lineage = ControllerInitializationInput::try_new(
             DeploymentScopeId::from_bytes([0x21; 16]),
@@ -945,6 +981,7 @@ mod tests {
                 Vec::new(),
             )
             .unwrap_or_else(|error| panic!("fixture allocation failed: {error}")),
+            controller_test_manifest(RuntimeHostId::from_bytes([0x23; 16])),
             auth(0x24, 1),
             owner(),
         )
@@ -975,6 +1012,12 @@ mod tests {
         .unwrap_or_else(|error| panic!("fixture allocation failed: {error}"));
         let candidate = journal_test_candidate(
             RuntimeHostId::from_bytes([0x23; 16]),
+            store
+                .snapshot()
+                .unwrap_or_else(|error| panic!("fixture snapshot unavailable: {error}"))
+                .state()
+                .installed_manifest()
+                .projection(),
             &allocation,
             Some([0x25; 16]),
             0x26,

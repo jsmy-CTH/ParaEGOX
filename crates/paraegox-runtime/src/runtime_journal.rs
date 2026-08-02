@@ -6,27 +6,39 @@
 //! retained as exact opaque bytes plus their externally supplied digests. Their
 //! canonical schemas and semantic bounds remain owned by the crate-private S7-B
 //! successor contract until S7-E connects the real producer and Runtime
-//! consumer. Nothing here decodes or reconstructs those contracts.
+//! consumer. The store-pinned build identity is nevertheless persisted as the
+//! exact four-field journal projection required by that contract; it is not a
+//! second contract type or digest domain. Nothing here decodes or reconstructs
+//! the descriptor or manifest contracts.
 
 use core::fmt;
 
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_runtime_contracts::provenance::{SourcePlanDigest, TargetSliceDigest};
+use paraegox_runtime_contracts::reference_control::{
+    MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, REFERENCE_ADMISSION_REQUEST_NONCE_CAPACITY,
+    REFERENCE_ADMISSION_TEMPORAL_LINEAGE_CAPACITY, REFERENCE_ADMISSION_TENURE_NONCE_CAPACITY,
+    ReferenceApplyTerminalHeadV1, ReferenceApplyTerminalLifecycleEffectV1,
+    ReferenceApplyTerminalOutcomeV1, ReferenceApplyTerminalReceiptV1,
+};
 
 pub(crate) const RUNTIME_JOURNAL_ENVELOPE_VERSION: u16 = 1;
-pub(crate) const RUNTIME_JOURNAL_PAYLOAD_VERSION: u16 = 2;
+// Payload v2 had no production initializer or store. The fixed-width build
+// identity introduced by v3 therefore has no supported v2 decoder, migrator, or
+// stored-version fallback.
+pub(crate) const RUNTIME_JOURNAL_PAYLOAD_VERSION: u16 = 3;
 pub(crate) const RUNTIME_JOURNAL_OWNER_KIND: u16 = 3;
 pub(crate) const RUNTIME_JOURNAL_CHECKSUM_ALGORITHM: u16 = 1;
 pub(crate) const RUNTIME_JOURNAL_CHECKSUM_VERSION: u16 = 1;
 pub(crate) const MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_RUNTIME_TERMINAL_OPERATIONS: usize = 256;
 pub(crate) const MAX_RUNTIME_RECOVERY_TERMINALS: usize = 256;
-pub(crate) const MAX_RUNTIME_TENURE_NONCES: usize = 256;
-pub(crate) const MAX_RUNTIME_REQUEST_NONCES: usize = 256;
-pub(crate) const MAX_RUNTIME_TEMPORAL_LINEAGES: usize = 256;
+pub(crate) const MAX_RUNTIME_TENURE_NONCES: usize = REFERENCE_ADMISSION_TENURE_NONCE_CAPACITY;
+pub(crate) const MAX_RUNTIME_REQUEST_NONCES: usize = REFERENCE_ADMISSION_REQUEST_NONCE_CAPACITY;
+pub(crate) const MAX_RUNTIME_TEMPORAL_LINEAGES: usize =
+    REFERENCE_ADMISSION_TEMPORAL_LINEAGE_CAPACITY;
 pub(crate) const MAX_RUNTIME_OWNED_RESOURCES: usize = 4096;
 pub(crate) const MAX_RUNTIME_SOURCE_SCOPES: usize = 1;
-pub(crate) const MAX_RUNTIME_TERMINAL_RESPONSE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_RUNTIME_RESOURCE_EVIDENCE_BYTES: usize = 512;
 
 // These are owner-local journal container limits, not copies of the private
@@ -44,6 +56,8 @@ const RUNTIME_STARTUP_RECONCILE_DOMAIN: &[u8] =
     b"paraegox.runtime.owner-journal.startup-reconcile.sha256.v1";
 const RUNTIME_RECOVERY_FAILURE_DOMAIN: &[u8] =
     b"paraegox.runtime.owner-journal.recovery-failure.sha256.v1";
+const RUNTIME_RAW_ACTION_OUTCOME_DOMAIN: &[u8] =
+    b"paraegox.runtime.owner-journal.raw-action-outcome.sha256.v1";
 const HEADER_WITHOUT_CHECKSUM_BYTES: usize = 94;
 const HEADER_BYTES: usize = HEADER_WITHOUT_CHECKSUM_BYTES + 32;
 
@@ -70,6 +84,24 @@ impl OpaqueCanonicalValue {
         Self::try_new(canonical_bytes, digest, MAX_OPAQUE_REQUEST_OR_SLICE_BYTES)
     }
 
+    pub(crate) fn try_resource_evidence(
+        canonical_bytes: &[u8],
+        digest: Digest32,
+    ) -> Result<Self, RuntimeJournalError> {
+        Self::try_new(canonical_bytes, digest, MAX_RUNTIME_RESOURCE_EVIDENCE_BYTES)
+    }
+
+    pub(crate) fn try_terminal_response(
+        canonical_bytes: &[u8],
+        digest: Digest32,
+    ) -> Result<Self, RuntimeJournalError> {
+        Self::try_new(
+            canonical_bytes,
+            digest,
+            MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES,
+        )
+    }
+
     fn try_new(
         canonical_bytes: &[u8],
         digest: Digest32,
@@ -86,6 +118,63 @@ impl OpaqueCanonicalValue {
             canonical_bytes: canonical_bytes.into(),
             digest,
         })
+    }
+}
+
+/// Owner-private journal projection of the canonical `RuntimeBuildIdentityV1`.
+///
+/// The field names, order, and 32-byte widths deliberately match the contract.
+/// This value does not define a second wire schema or an aggregate identity
+/// digest; it only prevents the Runtime journal from replacing the fixed tuple
+/// with opaque bytes and an invented digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StorePinnedBuildIdentity {
+    build_instance_id: [u8; 32],
+    build_descriptor_digest: Digest32,
+    runtime_artifact_sha256: Digest32,
+    compiled_reference_compatibility_digest: Digest32,
+}
+
+impl StorePinnedBuildIdentity {
+    pub(crate) fn try_new(
+        build_instance_id: [u8; 32],
+        build_descriptor_digest: Digest32,
+        runtime_artifact_sha256: Digest32,
+        compiled_reference_compatibility_digest: Digest32,
+    ) -> Result<Self, RuntimeJournalError> {
+        let identity = Self {
+            build_instance_id,
+            build_descriptor_digest,
+            runtime_artifact_sha256,
+            compiled_reference_compatibility_digest,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub(crate) const fn build_instance_id(self) -> [u8; 32] {
+        self.build_instance_id
+    }
+
+    pub(crate) const fn build_descriptor_digest(self) -> Digest32 {
+        self.build_descriptor_digest
+    }
+
+    pub(crate) const fn runtime_artifact_sha256(self) -> Digest32 {
+        self.runtime_artifact_sha256
+    }
+
+    pub(crate) const fn compiled_reference_compatibility_digest(self) -> Digest32 {
+        self.compiled_reference_compatibility_digest
+    }
+
+    fn validate(self) -> Result<(), RuntimeJournalError> {
+        if self.build_instance_id.iter().all(|byte| *byte == 0) {
+            return Err(RuntimeJournalError::ZeroReference);
+        }
+        ensure_nonzero_digest(&self.build_descriptor_digest)?;
+        ensure_nonzero_digest(&self.runtime_artifact_sha256)?;
+        ensure_nonzero_digest(&self.compiled_reference_compatibility_digest)
     }
 }
 
@@ -114,7 +203,7 @@ pub(crate) struct HostClockAdmissionState {
     pub(crate) clock_generation_high_water: u64,
     pub(crate) build_descriptor: OpaqueCanonicalValue,
     pub(crate) singleton_manifest: OpaqueCanonicalValue,
-    pub(crate) store_pinned_build_identity: OpaqueCanonicalValue,
+    pub(crate) store_pinned_build_identity: StorePinnedBuildIdentity,
     pub(crate) compiled_build_instance_id: [u8; 32],
     pub(crate) compiled_compatibility_digest: Digest32,
     pub(crate) admission_policy_fingerprint: Digest32,
@@ -123,6 +212,190 @@ pub(crate) struct HostClockAdmissionState {
     pub(crate) tenure_nonces: Vec<ReplayLedgerRecord>,
     pub(crate) request_nonces: Vec<ReplayLedgerRecord>,
     pub(crate) temporal_lineages: Vec<TemporalLineageRecord>,
+}
+
+/// Typed inputs accepted by the owner-private sequence-one snapshot builder.
+///
+/// The compiled fields must be independently obtained actual values. The
+/// builder validates them against the store-pinned identity instead of deriving
+/// or echoing them from that identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeJournalSequenceOne {
+    pub(crate) clock_domain: Ref16,
+    pub(crate) build_descriptor: OpaqueCanonicalValue,
+    pub(crate) singleton_manifest: OpaqueCanonicalValue,
+    pub(crate) store_pinned_build_identity: StorePinnedBuildIdentity,
+    pub(crate) compiled_build_instance_id: [u8; 32],
+    pub(crate) compiled_compatibility_digest: Digest32,
+    pub(crate) admission_policy_fingerprint: Digest32,
+    pub(crate) channel_policy_fingerprint: Digest32,
+    pub(crate) controller_key_fingerprint: Digest32,
+}
+
+/// Authenticated writer-tenure facts admitted before any request-owned state.
+///
+/// The caller supplies the nonce identity only after the authority proof and
+/// its exact nonce have been verified.  The proof-envelope digest remains the
+/// canonical digest owned by `paraegox-runtime-contracts`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeTenureAdmissionInput {
+    pub(crate) expected_store_instance_id: [u8; 32],
+    pub(crate) owner_target_fingerprint: Digest32,
+    pub(crate) source_scope: Ref16,
+    pub(crate) writer: Ref16,
+    pub(crate) epoch: u64,
+    pub(crate) supersedes_through_epoch: u64,
+    pub(crate) proof_envelope_digest: Digest32,
+    pub(crate) tenure_nonce_identity: Digest32,
+    pub(crate) principal: Ref16,
+}
+
+impl RuntimeTenureAdmissionInput {
+    pub(crate) const fn fence(self) -> WriterFenceRecord {
+        WriterFenceRecord {
+            source_scope: self.source_scope,
+            writer: self.writer,
+            epoch: self.epoch,
+            proof_envelope_digest: self.proof_envelope_digest,
+            tenure_nonce_identity: self.tenure_nonce_identity,
+            principal: self.principal,
+        }
+    }
+}
+
+/// Target-clock lineage produced by the authenticated ingress clock owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeTemporalAdmissionInput {
+    pub(crate) constraint_id: Ref16,
+    pub(crate) original_budget_nanos: u64,
+    pub(crate) remaining_budget_nanos: u64,
+    pub(crate) installed_clock_generation: u64,
+    pub(crate) installed_deadline_nanos: u64,
+    pub(crate) lineage_digest: Digest32,
+}
+
+/// Strictly decoded and authenticated PXAR facts consumed by full admission.
+///
+/// `request` is the byte-exact request and sole persisted copy of its nested
+/// Slice.  The remaining values are typed cross-checks from the canonical PXAR
+/// facade, not independently decoded journal data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeApplyAdmissionInput {
+    pub(crate) tenure: RuntimeTenureAdmissionInput,
+    pub(crate) request: OpaqueCanonicalValue,
+    pub(crate) request_nonce_identity: Digest32,
+    pub(crate) operation_id: Ref16,
+    pub(crate) source_revision: u64,
+    pub(crate) source_plan_digest: SourcePlanDigest,
+    pub(crate) incoming_slice_digest: TargetSliceDigest,
+    pub(crate) incoming_kind: DesiredHeadKind,
+    pub(crate) manifest_digest: Digest32,
+    pub(crate) expected_active: ExpectedActiveCas,
+    pub(crate) temporal: RuntimeTemporalAdmissionInput,
+}
+
+/// One owner-clock observation made before an effect boundary or terminal
+/// selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeDeadlineObservation {
+    pub(crate) clock_generation: u64,
+    pub(crate) observed_at_nanos: u64,
+}
+
+/// Fresh action and generation identities allocated for one source start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeStartActionInput {
+    pub(crate) action_id: Ref16,
+    pub(crate) domain_generation: u64,
+    pub(crate) instance_generation: u64,
+    pub(crate) resource_generation: u64,
+    pub(crate) pre_intent: RuntimeDeadlineObservation,
+}
+
+/// Fixed logical resources of the reference one-source Loop profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeOneSourceResourceRefs {
+    pub(crate) loop_domain: Ref16,
+    pub(crate) card_instance: Ref16,
+}
+
+/// Exact OS/workspace/containment evidence for one action-bound resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeResourceOwnershipInput {
+    pub(crate) logical_ref: Ref16,
+    pub(crate) os_identity: OpaqueCanonicalValue,
+    pub(crate) workspace_identity: OpaqueCanonicalValue,
+    pub(crate) containment_identity: OpaqueCanonicalValue,
+}
+
+/// Exact ownership evidence for the fixed reference profile resources.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeOneSourceOwnershipInput {
+    pub(crate) loop_domain: RuntimeResourceOwnershipInput,
+    pub(crate) card_instance: RuntimeResourceOwnershipInput,
+}
+
+/// Exact lifecycle budgets retained from the old active Slice during retire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeRetiringLifecycleBudgets {
+    pub(crate) start_nanos: u64,
+    pub(crate) drain_nanos: u64,
+    pub(crate) cleanup_nanos: u64,
+}
+
+/// Inputs atomically committed by the live/nonzero empty head-first boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeEmptyRetireInput {
+    pub(crate) action_id: Ref16,
+    pub(crate) incoming_slice: OpaqueCanonicalValue,
+    pub(crate) budgets: RuntimeRetiringLifecycleBudgets,
+    pub(crate) pre_intent: RuntimeDeadlineObservation,
+}
+
+/// One fixed resource tombstone produced by the real cleanup owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeResourceTombstoneInput {
+    pub(crate) logical_ref: Ref16,
+    pub(crate) evidence: OpaqueCanonicalValue,
+}
+
+/// Tombstones proving the fixed one-source resource generation reached zero.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeOneSourceTombstonesInput {
+    pub(crate) loop_domain: RuntimeResourceTombstoneInput,
+    pub(crate) card_instance: RuntimeResourceTombstoneInput,
+}
+
+/// Exact response bytes plus the one owner-clock terminal-selection sample.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeTerminalInput {
+    pub(crate) canonical_response: OpaqueCanonicalValue,
+    pub(crate) selection: RuntimeDeadlineObservation,
+}
+
+/// In-memory proof that the real one-source owner returned callback success for
+/// this exact durable action.  It is never journaled independently: success,
+/// desired/live publication and terminal Receipt remain one atomic successor.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeOneSourceCallbackSuccessInput {
+    pub(crate) action_id: Ref16,
+}
+
+/// Pure journal-owned terminal facts used to build PXRT before the terminal
+/// successor is committed.  Every value is derived from the same snapshot and
+/// observation consumed by the successor; callers cannot supply an outcome,
+/// census, raw digest, epoch, or completion sequence independently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeTerminalPreview {
+    pub(crate) outcome: TerminalOutcome,
+    pub(crate) lifecycle_effect: TerminalLifecycleEffect,
+    pub(crate) head_disposition: TerminalHeadDisposition,
+    pub(crate) resource_census_digest: Digest32,
+    pub(crate) raw_outcome_digest: Digest32,
+    pub(crate) completion_runtime_host_epoch: u64,
+    pub(crate) completion_snapshot_sequence: u64,
+    pub(crate) selection_clock_generation: u64,
+    pub(crate) selection_observed_at_nanos: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -521,7 +794,7 @@ pub(crate) struct RecoveryAction {
     pub(crate) source_plan_digest: SourcePlanDigest,
     pub(crate) active_slice_digest: TargetSliceDigest,
     pub(crate) manifest_digest: Digest32,
-    pub(crate) store_pinned_build_identity_digest: Digest32,
+    pub(crate) store_pinned_build_identity: StorePinnedBuildIdentity,
     pub(crate) compiled_build_instance_id: [u8; 32],
     pub(crate) compiled_compatibility_digest: Digest32,
     pub(crate) signed_start_budget_nanos: u64,
@@ -1001,9 +1274,7 @@ impl RuntimeJournalState {
         self.host
             .singleton_manifest
             .validate_bound(MAX_PINNED_OPAQUE_ARTIFACT_BYTES)?;
-        self.host
-            .store_pinned_build_identity
-            .validate_bound(MAX_PINNED_OPAQUE_ARTIFACT_BYTES)?;
+        self.host.store_pinned_build_identity.validate()?;
         if self
             .host
             .compiled_build_instance_id
@@ -1013,6 +1284,21 @@ impl RuntimeJournalState {
             return Err(RuntimeJournalError::ZeroReference);
         }
         ensure_nonzero_digest(&self.host.compiled_compatibility_digest)?;
+        if self.host.build_descriptor.digest
+            != self
+                .host
+                .store_pinned_build_identity
+                .build_descriptor_digest()
+            || self.host.compiled_build_instance_id
+                != self.host.store_pinned_build_identity.build_instance_id()
+            || self.host.compiled_compatibility_digest
+                != self
+                    .host
+                    .store_pinned_build_identity
+                    .compiled_reference_compatibility_digest()
+        {
+            return Err(RuntimeJournalError::InvalidStateInvariant);
+        }
         ensure_nonzero_digest(&self.host.admission_policy_fingerprint)?;
         ensure_nonzero_digest(&self.host.channel_policy_fingerprint)?;
         ensure_nonzero_digest(&self.host.controller_key_fingerprint)?;
@@ -1595,7 +1881,17 @@ impl RuntimeJournalState {
                     return Err(RuntimeJournalError::DanglingReference);
                 }
                 self.validate_active_commit_ref(active)?;
-                self.validate_exact_zero_commit_census(active, census_digest)?;
+                if self.current_action().is_none() {
+                    self.validate_exact_zero_commit_census(active, census_digest)?;
+                } else if !self.current_action().is_some_and(|action| {
+                    action.kind == JournalActionKind::StartOneSourceLoop
+                        && self.prepared.as_ref().is_some_and(|prepared| {
+                            prepared.incoming_kind == DesiredHeadKind::OneSourceLoop
+                                && prepared.action == Some(action)
+                        })
+                }) {
+                    return Err(RuntimeJournalError::InvalidStateInvariant);
+                }
             }
             LiveMaterialization::Quarantined {
                 active_slice_digest,
@@ -1724,7 +2020,7 @@ impl RuntimeJournalState {
             ensure_nonzero_digest(&terminal.result_digest)?;
             terminal
                 .canonical_response
-                .validate_bound(MAX_RUNTIME_TERMINAL_RESPONSE_BYTES)?;
+                .validate_bound(MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES)?;
             if terminal.canonical_response.digest != terminal.result_digest {
                 return Err(RuntimeJournalError::DanglingReference);
             }
@@ -2376,6 +2672,7 @@ impl RuntimeJournalState {
         expected.host.temporal_lineages = self.host.temporal_lineages.clone();
         expected.source_revision_high_water = self.source_revision_high_water;
         expected.prepared = self.prepared.clone();
+        expected.live_materialization = full_admission_live_materialization(previous);
         if expected != *self {
             return Err(RuntimeJournalError::NonMonotonicTransition);
         }
@@ -3226,57 +3523,57 @@ fn validate_tenure_prepared_successor(
     current: Option<&PreparedOperation>,
     previous: Option<&PreparedOperation>,
 ) -> Result<(), RuntimeJournalError> {
-    match (previous, current) {
-        (None, None) => Ok(()),
-        (None, Some(_)) | (Some(_), None) => Err(RuntimeJournalError::NonMonotonicTransition),
-        (Some(previous), Some(current)) => {
-            let mut expected = previous.clone();
-            match previous.phase {
-                PreparedPhase::PreparedNoEffects
-                | PreparedPhase::SupersededBeforeEffects
-                | PreparedPhase::StartupExpiredNoEffects => {
-                    expected.phase = PreparedPhase::SupersededBeforeEffects;
-                }
-                PreparedPhase::FirstActionIntent
-                | PreparedPhase::HeadCommittedRetiringOld
-                | PreparedPhase::SupersededReconcileRequired
-                | PreparedPhase::StartupReconcileRequired => {
-                    expected.phase = PreparedPhase::SupersededReconcileRequired;
-                    expected.raw_outcome = Some(takeover_raw(previous.raw_outcome));
-                }
+    if tenure_successor_prepared(previous).as_ref() == current {
+        Ok(())
+    } else {
+        Err(RuntimeJournalError::NonMonotonicTransition)
+    }
+}
+
+fn tenure_successor_prepared(previous: Option<&PreparedOperation>) -> Option<PreparedOperation> {
+    previous.map(|previous| {
+        let mut expected = previous.clone();
+        match previous.phase {
+            PreparedPhase::PreparedNoEffects
+            | PreparedPhase::SupersededBeforeEffects
+            | PreparedPhase::StartupExpiredNoEffects => {
+                expected.phase = PreparedPhase::SupersededBeforeEffects;
             }
-            if &expected == current {
-                Ok(())
-            } else {
-                Err(RuntimeJournalError::NonMonotonicTransition)
+            PreparedPhase::FirstActionIntent
+            | PreparedPhase::HeadCommittedRetiringOld
+            | PreparedPhase::SupersededReconcileRequired
+            | PreparedPhase::StartupReconcileRequired => {
+                expected.phase = PreparedPhase::SupersededReconcileRequired;
+                expected.raw_outcome = Some(takeover_raw(previous.raw_outcome));
             }
         }
-    }
+        expected
+    })
 }
 
 fn validate_tenure_recovery_successor(
     current: Option<RecoveryAction>,
     previous: Option<RecoveryAction>,
 ) -> Result<(), RuntimeJournalError> {
-    match (previous, current) {
-        (None, None) => Ok(()),
-        (None, Some(_)) | (Some(_), None) => Err(RuntimeJournalError::NonMonotonicTransition),
-        (Some(previous), Some(current)) => {
-            let mut expected = previous;
-            match previous.phase {
-                RecoveryPhase::RecoveryPlannedNoEffects
-                | RecoveryPhase::StartupInvalidatedNoEffects => {}
-                RecoveryPhase::StartCallIntent | RecoveryPhase::StartupReconcileRequired => {
-                    expected.raw_outcome = Some(takeover_raw(previous.raw_outcome));
-                }
-            }
-            if expected == current {
-                Ok(())
-            } else {
-                Err(RuntimeJournalError::NonMonotonicTransition)
+    if tenure_successor_recovery(previous) == current {
+        Ok(())
+    } else {
+        Err(RuntimeJournalError::NonMonotonicTransition)
+    }
+}
+
+fn tenure_successor_recovery(previous: Option<RecoveryAction>) -> Option<RecoveryAction> {
+    previous.map(|previous| {
+        let mut expected = previous;
+        match previous.phase {
+            RecoveryPhase::RecoveryPlannedNoEffects
+            | RecoveryPhase::StartupInvalidatedNoEffects => {}
+            RecoveryPhase::StartCallIntent | RecoveryPhase::StartupReconcileRequired => {
+                expected.raw_outcome = Some(takeover_raw(previous.raw_outcome));
             }
         }
-    }
+        expected
+    })
 }
 
 fn prepared_identity_equal(current: &PreparedOperation, previous: &PreparedOperation) -> bool {
@@ -3306,6 +3603,25 @@ fn expected_active_matches(
             expected == TargetSliceDigest::new(active.slice.digest)
         }
         _ => false,
+    }
+}
+
+fn full_admission_live_materialization(previous: &RuntimeJournalState) -> LiveMaterialization {
+    match previous.live_materialization {
+        LiveMaterialization::StartupInvalidated {
+            recovery_eligibility: StartupRecoveryEligibility::NoActiveHead,
+            ..
+        } => LiveMaterialization::None,
+        LiveMaterialization::StartupInvalidated {
+            active_slice_digest: Some(active_slice_digest),
+            recovery_eligibility: StartupRecoveryEligibility::CanonicalEmptyExactZero,
+            resource_census_digest,
+            ..
+        } => LiveMaterialization::ExactZero {
+            active_slice_digest,
+            census_digest: resource_census_digest,
+        },
+        live => live,
     }
 }
 
@@ -3367,6 +3683,15 @@ fn full_admission_shape_is_allowed(
             previous.active_desired.as_ref(),
             previous.live_materialization,
         ) {
+            (None, LiveMaterialization::None)
+            | (
+                None,
+                LiveMaterialization::StartupInvalidated {
+                    active_slice_digest: None,
+                    recovery_eligibility: StartupRecoveryEligibility::NoActiveHead,
+                    ..
+                },
+            ) => true,
             (_, LiveMaterialization::LiveReady { .. })
             | (_, LiveMaterialization::ExactZero { .. })
             | (_, LiveMaterialization::RecoveryFailedNotReady { .. }) => true,
@@ -3806,6 +4131,15 @@ fn exact_zero_fast_path_eligible(previous: &RuntimeJournalState) -> bool {
         previous.active_desired.as_ref(),
         previous.live_materialization,
     ) {
+        (None, LiveMaterialization::None) => true,
+        (
+            None,
+            LiveMaterialization::StartupInvalidated {
+                active_slice_digest: None,
+                recovery_eligibility: StartupRecoveryEligibility::NoActiveHead,
+                ..
+            },
+        ) => true,
         (
             Some(active),
             LiveMaterialization::ExactZero {
@@ -4010,7 +4344,7 @@ impl RecoveryAction {
         ensure_nonzero_digest(self.source_plan_digest.value())?;
         ensure_nonzero_digest(self.active_slice_digest.value())?;
         ensure_nonzero_digest(&self.manifest_digest)?;
-        ensure_nonzero_digest(&self.store_pinned_build_identity_digest)?;
+        self.store_pinned_build_identity.validate()?;
         ensure_nonzero_digest(&self.compiled_compatibility_digest)?;
         ensure_nonzero_digest(&self.deadline_evidence_digest)?;
         if self
@@ -4018,7 +4352,7 @@ impl RecoveryAction {
             .iter()
             .all(|byte| *byte == 0)
             || self.source_revision == 0
-            || self.store_pinned_build_identity_digest != host.store_pinned_build_identity.digest
+            || self.store_pinned_build_identity != host.store_pinned_build_identity
             || self.compiled_build_instance_id != host.compiled_build_instance_id
             || self.compiled_compatibility_digest != host.compiled_compatibility_digest
             || self.manifest_digest != host.singleton_manifest.digest
@@ -4153,7 +4487,7 @@ impl RecoveryAction {
         self.compiled_build_instance_id
             .iter()
             .all(|byte| *byte == 0)
-            || self.store_pinned_build_identity_digest != host.store_pinned_build_identity.digest
+            || self.store_pinned_build_identity != host.store_pinned_build_identity
             || self.compiled_build_instance_id != host.compiled_build_instance_id
             || self.compiled_compatibility_digest != host.compiled_compatibility_digest
             || self.manifest_digest != host.singleton_manifest.digest
@@ -4381,8 +4715,7 @@ fn validate_recovery_latch_successor(
         && (current.action != previous.action
             || current.active_slice_digest != previous.active_slice_digest
             || current.manifest_digest != previous.manifest_digest
-            || current.store_pinned_build_identity_digest
-                != previous.store_pinned_build_identity_digest
+            || current.store_pinned_build_identity != previous.store_pinned_build_identity
             || current.compiled_build_instance_id != previous.compiled_build_instance_id
             || current.compiled_compatibility_digest != previous.compiled_compatibility_digest
             || current.signed_start_budget_nanos != previous.signed_start_budget_nanos
@@ -4568,6 +4901,179 @@ fn compute_resource_census_digest(
     Ok(builder.finish())
 }
 
+/// Canonical digest of the complete Runtime-owned raw action latch embedded by
+/// reference terminal facts.  PXRT carries only this digest; the journal keeps
+/// and validates the source fields.
+pub(crate) fn runtime_raw_action_outcome_digest_v1(
+    raw: RawActionOutcomeLatch,
+) -> Result<Digest32, RuntimeJournalError> {
+    raw.validate()?;
+    let mut builder = Digest32Builder::try_new(RUNTIME_RAW_ACTION_OUTCOME_DOMAIN)?;
+    builder.field_u16(raw.callback as u16)?;
+    match raw.callback_reason_digest {
+        None => {
+            builder.field_u16(0)?;
+        }
+        Some(digest) => {
+            builder.field_u16(1)?.field_digest(&digest)?;
+        }
+    }
+    builder
+        .field_u16(raw.deadline as u16)?
+        .field_u64(raw.observed_clock_generation)?
+        .field_u64(raw.observed_at_nanos)?
+        .field_u16(u16::from(raw.host_interrupted))?
+        .field_u16(u16::from(raw.higher_tenure_takeover))?
+        .field_u16(raw.cleanup as u16)?;
+    match raw.cleanup_evidence_digest {
+        None => {
+            builder.field_u16(0)?;
+        }
+        Some(digest) => {
+            builder.field_u16(1)?.field_digest(&digest)?;
+        }
+    }
+    Ok(builder.finish())
+}
+
+/// Strictly decodes the canonical PXRT stored by one terminal and verifies
+/// every fact for which the owner journal is authoritative.  The request and
+/// live-channel checks are intentionally performed by apply ingress/replay,
+/// because only that layer owns the typed PXAR and current channel.
+pub(crate) fn decode_and_validate_terminal_receipt(
+    store_instance_id: [u8; 32],
+    terminal: &TerminalOperationRecord,
+) -> Result<ReferenceApplyTerminalReceiptV1, RuntimeJournalError> {
+    let receipt =
+        ReferenceApplyTerminalReceiptV1::decode(&terminal.canonical_response.canonical_bytes)
+            .map_err(|_| RuntimeJournalError::InvalidStateInvariant)?;
+    if receipt.canonical_wire() != terminal.canonical_response.canonical_bytes.as_ref()
+        || receipt.receipt_digest() != terminal.canonical_response.digest
+        || receipt.receipt_digest() != terminal.result_digest
+        || receipt.runtime_store_instance_id() != store_instance_id
+        || receipt.source_scope().as_bytes() != &terminal.source_scope
+        || receipt.operation_id().as_bytes() != &terminal.operation_id
+        || receipt.request_digest() != terminal.request_digest
+    {
+        return Err(RuntimeJournalError::InvalidStateInvariant);
+    }
+    let facts = receipt.facts();
+    let expected_head = match terminal.head_disposition {
+        TerminalHeadDisposition::Preserved(None) => ReferenceApplyTerminalHeadV1::PreservedNone,
+        TerminalHeadDisposition::Preserved(Some(digest)) => {
+            ReferenceApplyTerminalHeadV1::PreservedExisting(digest)
+        }
+        TerminalHeadDisposition::CommittedIncoming => {
+            ReferenceApplyTerminalHeadV1::CommittedIncoming
+        }
+    };
+    let expected_head_digest = match terminal.head_disposition {
+        TerminalHeadDisposition::Preserved(digest) => digest,
+        TerminalHeadDisposition::CommittedIncoming => Some(terminal.target_slice_digest),
+    };
+    if facts.outcome() != reference_terminal_outcome(terminal.selection.primary)
+        || facts.lifecycle_effect()
+            != reference_terminal_lifecycle(terminal.selection.lifecycle_effect)
+        || facts.head() != expected_head
+        || facts.desired_head_digest() != expected_head_digest
+        || facts.resource_census_digest() != terminal.resource_census_digest
+        || facts.raw_outcome_digest()
+            != runtime_raw_action_outcome_digest_v1(terminal.selection.raw)?
+        || facts.completion_runtime_host_epoch() != terminal.completion_runtime_host_epoch
+        || facts.completion_snapshot_sequence() != terminal.completion_snapshot_sequence
+        || facts.selection_clock_generation().value()
+            != terminal.selection.selection_clock_generation
+        || facts.selection_observed_at_nanos() != terminal.selection.selection_observed_at_nanos
+    {
+        return Err(RuntimeJournalError::InvalidStateInvariant);
+    }
+    Ok(receipt)
+}
+
+fn validate_terminal_receipts(
+    store_instance_id: [u8; 32],
+    state: &RuntimeJournalState,
+) -> Result<(), RuntimeJournalError> {
+    for terminal in &state.terminal_operations {
+        // Legacy unit-state fixtures predate PXRT and exercise unrelated
+        // journal transition invariants.  Production builds do not contain
+        // this branch; focused apply tests use real PXRT and exercise the exact
+        // production validator above.
+        #[cfg(test)]
+        if is_legacy_terminal_test_fixture(&terminal.canonical_response.canonical_bytes) {
+            continue;
+        }
+        decode_and_validate_terminal_receipt(store_instance_id, terminal)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn is_legacy_terminal_test_fixture(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        b"terminal-response"
+            | b"one-source-active-response"
+            | b"empty-exact-zero-response"
+            | b"next-empty-exact-zero-response"
+            | b"empty-timeout-exact-zero-response"
+    )
+}
+
+const fn reference_terminal_outcome(value: TerminalOutcome) -> ReferenceApplyTerminalOutcomeV1 {
+    match value {
+        TerminalOutcome::OneSourceLoopActive => {
+            ReferenceApplyTerminalOutcomeV1::OneSourceLoopActive
+        }
+        TerminalOutcome::EmptyDeactivateExactZero => {
+            ReferenceApplyTerminalOutcomeV1::EmptyDeactivateExactZero
+        }
+        TerminalOutcome::StartTimedOutBeforeIntentNoEffects => {
+            ReferenceApplyTerminalOutcomeV1::StartTimedOutBeforeIntentNoEffects
+        }
+        TerminalOutcome::StopTimedOutBeforeHeadCommitNoEffects => {
+            ReferenceApplyTerminalOutcomeV1::StopTimedOutBeforeHeadCommitNoEffects
+        }
+        TerminalOutcome::StartFailedBeforeHeadCommitExactZero => {
+            ReferenceApplyTerminalOutcomeV1::StartFailedBeforeHeadCommitExactZero
+        }
+        TerminalOutcome::StartTimedOutBeforeHeadCommitExactZero => {
+            ReferenceApplyTerminalOutcomeV1::StartTimedOutBeforeHeadCommitExactZero
+        }
+        TerminalOutcome::StopFailedButExactZero => {
+            ReferenceApplyTerminalOutcomeV1::StopFailedButExactZero
+        }
+        TerminalOutcome::TimedOutButExactZero => {
+            ReferenceApplyTerminalOutcomeV1::TimedOutButExactZero
+        }
+        TerminalOutcome::AbortedBeforeIntentNoEffects => {
+            ReferenceApplyTerminalOutcomeV1::AbortedBeforeIntentNoEffects
+        }
+        TerminalOutcome::AbortedBeforeHeadCommitExactZero => {
+            ReferenceApplyTerminalOutcomeV1::AbortedBeforeHeadCommitExactZero
+        }
+        TerminalOutcome::SupersededAfterIntentExactZero => {
+            ReferenceApplyTerminalOutcomeV1::SupersededAfterIntentExactZero
+        }
+        TerminalOutcome::InterruptedButNowExactZero => {
+            ReferenceApplyTerminalOutcomeV1::InterruptedButNowExactZero
+        }
+    }
+}
+
+const fn reference_terminal_lifecycle(
+    value: TerminalLifecycleEffect,
+) -> ReferenceApplyTerminalLifecycleEffectV1 {
+    match value {
+        TerminalLifecycleEffect::ProvenNotStarted => {
+            ReferenceApplyTerminalLifecycleEffectV1::ProvenNotStarted
+        }
+        TerminalLifecycleEffect::MayHaveStarted => {
+            ReferenceApplyTerminalLifecycleEffectV1::MayHaveStarted
+        }
+    }
+}
+
 fn ordered_records_preserved<T, K: Ord + Copy>(
     current: &[T],
     previous: &[T],
@@ -4607,6 +5113,57 @@ pub(crate) struct RuntimeJournalSnapshot {
 }
 
 impl RuntimeJournalSnapshot {
+    pub(crate) fn try_initialize(
+        store_instance_id: [u8; 32],
+        owner_target_fingerprint: Digest32,
+        initial: RuntimeJournalSequenceOne,
+    ) -> Result<Self, RuntimeJournalError> {
+        let RuntimeJournalSequenceOne {
+            clock_domain,
+            build_descriptor,
+            singleton_manifest,
+            store_pinned_build_identity,
+            compiled_build_instance_id,
+            compiled_compatibility_digest,
+            admission_policy_fingerprint,
+            channel_policy_fingerprint,
+            controller_key_fingerprint,
+        } = initial;
+        Self::try_new(
+            store_instance_id,
+            owner_target_fingerprint,
+            1,
+            RuntimeJournalState {
+                last_transaction: RuntimeJournalTransaction::Initialized,
+                host: HostClockAdmissionState {
+                    runtime_host_epoch_high_water: 0,
+                    clock_domain,
+                    clock_generation_high_water: 0,
+                    build_descriptor,
+                    singleton_manifest,
+                    store_pinned_build_identity,
+                    compiled_build_instance_id,
+                    compiled_compatibility_digest,
+                    admission_policy_fingerprint,
+                    channel_policy_fingerprint,
+                    controller_key_fingerprint,
+                    tenure_nonces: Vec::new(),
+                    request_nonces: Vec::new(),
+                    temporal_lineages: Vec::new(),
+                },
+                writer_fence: None,
+                source_revision_high_water: None,
+                prepared: None,
+                active_desired: None,
+                live_materialization: LiveMaterialization::None,
+                recovery_action: None,
+                recovery_terminals: Vec::new(),
+                owned_resources: Vec::new(),
+                terminal_operations: Vec::new(),
+            },
+        )
+    }
+
     pub(crate) fn try_new(
         store_instance_id: [u8; 32],
         owner_target_fingerprint: Digest32,
@@ -4616,6 +5173,7 @@ impl RuntimeJournalSnapshot {
         validate_envelope_identity(&store_instance_id, &owner_target_fingerprint, sequence)?;
         state.validate(sequence)?;
         state.validate_owner_target_binding(&owner_target_fingerprint)?;
+        validate_terminal_receipts(store_instance_id, &state)?;
         let payload = encode_payload(&state)?;
         let canonical_wire = encode_snapshot(
             &store_instance_id,
@@ -4684,6 +5242,7 @@ impl RuntimeJournalSnapshot {
         let state = decode_payload(payload)?;
         state.validate(sequence)?;
         state.validate_owner_target_binding(&owner_target_fingerprint)?;
+        validate_terminal_receipts(store_instance_id, &state)?;
         if encode_payload(&state)? != payload {
             return Err(RuntimeJournalError::NonCanonicalEncoding);
         }
@@ -4712,6 +5271,1189 @@ impl RuntimeJournalSnapshot {
             .validate_new_terminal_metadata(&previous.state, self.sequence)
     }
 
+    /// Derives the sole valid process-start successor from this already
+    /// validated snapshot.
+    ///
+    /// The startup transaction advances both host-owned generations, expires
+    /// or reconciles any nonterminal action, invalidates the old live view, and
+    /// records canonical census/invalidation evidence before any bootstrap fact
+    /// can be exposed.  No caller supplies a live state, eligibility, or digest.
+    pub(crate) fn try_startup_invalidation_successor(&self) -> Result<Self, RuntimeJournalError> {
+        let next_runtime_host_epoch = self
+            .state
+            .host
+            .runtime_host_epoch_high_water
+            .checked_add(1)
+            .ok_or(RuntimeJournalError::IntegerOverflow)?;
+        let next_clock_generation = self
+            .state
+            .host
+            .clock_generation_high_water
+            .checked_add(1)
+            .ok_or(RuntimeJournalError::IntegerOverflow)?;
+        let prepared = startup_invalidated_prepared(self.state.prepared.as_ref())?;
+        let recovery_action = startup_invalidated_recovery(self.state.recovery_action)?;
+        let (recovery_eligibility, failure_evidence_digest) = startup_eligibility(&self.state)?;
+        let resource_census_digest = compute_resource_census_digest(&self.state.owned_resources)?;
+
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::StartupInvalidation;
+        state.host.runtime_host_epoch_high_water = next_runtime_host_epoch;
+        state.host.clock_generation_high_water = next_clock_generation;
+        state.prepared = prepared;
+        state.recovery_action = recovery_action;
+        state.live_materialization = LiveMaterialization::StartupInvalidated {
+            active_slice_digest: self
+                .state
+                .active_desired
+                .as_ref()
+                .map(|active| TargetSliceDigest::new(active.slice.digest)),
+            previous_runtime_host_epoch: self.state.host.runtime_host_epoch_high_water,
+            previous_clock_generation: self.state.host.clock_generation_high_water,
+            recovery_eligibility,
+            // The evidence digest does not cover itself.  A nonzero temporary
+            // value keeps the intermediate typed state explicit until the
+            // canonical owner derives the final digest below.
+            invalidation_evidence_digest: Digest32::from_bytes([1; 32]),
+            failure_evidence_digest,
+            resource_census_digest,
+        };
+        let invalidation_evidence_digest =
+            startup_invalidation_evidence_digest(&self.state, &state)?;
+        let LiveMaterialization::StartupInvalidated {
+            invalidation_evidence_digest: recorded_evidence,
+            ..
+        } = &mut state.live_materialization
+        else {
+            unreachable!("startup builder just installed the invalidated state")
+        };
+        *recorded_evidence = invalidation_evidence_digest;
+
+        self.try_validated_successor(state)
+    }
+
+    /// Commits only the authenticated writer-tenure takeover and replay fact.
+    /// Request nonce, temporal lineage, revision and prepared operation remain
+    /// byte-identical until the separate full-admission transaction.
+    pub(crate) fn try_tenure_only_successor(
+        &self,
+        input: RuntimeTenureAdmissionInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        if input.expected_store_instance_id != self.store_instance_id
+            || input.owner_target_fingerprint != self.owner_target_fingerprint
+            || input.epoch == 0
+            || input.supersedes_through_epoch >= input.epoch
+            || self.state.host.tenure_nonces.len() >= MAX_RUNTIME_TENURE_NONCES
+        {
+            return Err(RuntimeJournalError::InvalidStateInvariant);
+        }
+        match self.state.writer_fence {
+            Some(previous)
+                if input.source_scope != previous.source_scope
+                    || input.epoch <= previous.epoch
+                    || input.supersedes_through_epoch < previous.epoch =>
+            {
+                return Err(RuntimeJournalError::NonMonotonicTransition);
+            }
+            None if input.supersedes_through_epoch != 0 => {
+                return Err(RuntimeJournalError::NonMonotonicTransition);
+            }
+            _ => {}
+        }
+
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::TenureOnly;
+        insert_replay_record(
+            &mut state.host.tenure_nonces,
+            ReplayLedgerRecord {
+                identity: input.tenure_nonce_identity,
+                value_digest: input.proof_envelope_digest,
+            },
+        )?;
+        state.writer_fence = Some(input.fence());
+        state.prepared = tenure_successor_prepared(self.state.prepared.as_ref());
+        state.recovery_action = tenure_successor_recovery(self.state.recovery_action);
+        self.try_validated_successor(state)
+    }
+
+    /// Commits the exact authenticated request, temporal lineage, revision
+    /// high-water and `PreparedNoEffects` atomically after tenure is durable.
+    pub(crate) fn try_full_admission_successor(
+        &self,
+        input: RuntimeApplyAdmissionInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        if input.tenure.expected_store_instance_id != self.store_instance_id
+            || input.tenure.owner_target_fingerprint != self.owner_target_fingerprint
+            || self.state.writer_fence != Some(input.tenure.fence())
+            || input.manifest_digest != self.state.host.singleton_manifest.digest
+            || input.temporal.installed_clock_generation
+                != self.state.host.clock_generation_high_water
+            || input.temporal.original_budget_nanos == 0
+            || input.temporal.remaining_budget_nanos == 0
+            || input.temporal.remaining_budget_nanos > input.temporal.original_budget_nanos
+            || input.temporal.installed_deadline_nanos == 0
+            || self.state.host.request_nonces.len() >= MAX_RUNTIME_REQUEST_NONCES
+            || self.state.host.temporal_lineages.len() >= MAX_RUNTIME_TEMPORAL_LINEAGES
+            || self.state.terminal_operations.iter().any(|terminal| {
+                terminal.source_scope == input.tenure.source_scope
+                    && terminal.operation_id == input.operation_id
+            })
+        {
+            return Err(RuntimeJournalError::InvalidStateInvariant);
+        }
+
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::FullAdmission;
+        insert_replay_record(
+            &mut state.host.request_nonces,
+            ReplayLedgerRecord {
+                identity: input.request_nonce_identity,
+                value_digest: input.request.digest,
+            },
+        )?;
+        insert_temporal_record(
+            &mut state.host.temporal_lineages,
+            TemporalLineageRecord {
+                constraint_id: input.temporal.constraint_id,
+                source_scope: input.tenure.source_scope,
+                target_fingerprint: self.owner_target_fingerprint,
+                original_budget_nanos: input.temporal.original_budget_nanos,
+                remaining_budget_nanos: input.temporal.remaining_budget_nanos,
+                clock_generation: input.temporal.installed_clock_generation,
+                deadline_nanos: input.temporal.installed_deadline_nanos,
+                lineage_digest: input.temporal.lineage_digest,
+            },
+        )?;
+        state.source_revision_high_water = Some(SourceRevisionHighWater {
+            source_scope: input.tenure.source_scope,
+            revision: input.source_revision,
+        });
+        state.prepared = Some(PreparedOperation {
+            source_scope: input.tenure.source_scope,
+            operation_id: input.operation_id,
+            source_revision: input.source_revision,
+            request: input.request,
+            request_nonce_identity: input.request_nonce_identity,
+            source_plan_digest: input.source_plan_digest,
+            incoming_slice_digest: input.incoming_slice_digest,
+            incoming_kind: input.incoming_kind,
+            manifest_digest: input.manifest_digest,
+            expected_active: input.expected_active,
+            temporal_constraint_id: input.temporal.constraint_id,
+            temporal_lineage_digest: input.temporal.lineage_digest,
+            installed_clock_generation: input.temporal.installed_clock_generation,
+            installed_deadline_nanos: input.temporal.installed_deadline_nanos,
+            phase: PreparedPhase::PreparedNoEffects,
+            action: None,
+            retiring: None,
+            raw_outcome: None,
+        });
+        state.live_materialization = full_admission_live_materialization(&self.state);
+        self.try_validated_successor(state)
+    }
+
+    /// Commits the sole normal-start effect boundary after a target-clock
+    /// observation proves the admitted deadline has not been reached.
+    pub(crate) fn try_one_source_intent_successor(
+        &self,
+        input: RuntimeStartActionInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        if prepared.incoming_kind != DesiredHeadKind::OneSourceLoop
+            || prepared.phase != PreparedPhase::PreparedNoEffects
+            || prepared.action.is_some()
+            || input.pre_intent.clock_generation != prepared.installed_clock_generation
+            || input.pre_intent.clock_generation != self.state.host.clock_generation_high_water
+            || input.pre_intent.observed_at_nanos == 0
+            || input.pre_intent.observed_at_nanos >= prepared.installed_deadline_nanos
+        {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::PreparedProgress;
+        let prepared = state
+            .prepared
+            .as_mut()
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        prepared.phase = PreparedPhase::FirstActionIntent;
+        prepared.action = Some(JournalActionRef {
+            action_id: input.action_id,
+            kind: JournalActionKind::StartOneSourceLoop,
+            runtime_host_epoch: state.host.runtime_host_epoch_high_water,
+            clock_generation: input.pre_intent.clock_generation,
+            domain_generation: input.domain_generation,
+            instance_generation: input.instance_generation,
+            resource_generation: input.resource_generation,
+        });
+        self.try_validated_successor(state)
+    }
+
+    /// Reserves exactly the LoopDomain and CardInstance records bound to the
+    /// durable normal-start action.  This method performs no OS operation.
+    pub(crate) fn try_reserve_one_source_resources_successor(
+        &self,
+        resources: RuntimeOneSourceResourceRefs,
+    ) -> Result<Self, RuntimeJournalError> {
+        let action = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| prepared.phase == PreparedPhase::FirstActionIntent)
+            .and_then(|prepared| prepared.action)
+            .filter(|action| action.kind == JournalActionKind::StartOneSourceLoop)
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        if self
+            .state
+            .owned_resources
+            .iter()
+            .any(|resource| !resource.phase.is_terminal())
+        {
+            return Err(RuntimeJournalError::MultipleOwnerActions);
+        }
+
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::ResourceProgress;
+        insert_resource_record(
+            &mut state.owned_resources,
+            OwnedResourceRecord {
+                kind: ResourceKind::LoopDomain,
+                logical_ref: resources.loop_domain,
+                generation: action.resource_generation,
+                runtime_host_epoch: action.runtime_host_epoch,
+                phase: ResourcePhase::Reserved,
+                action_id: Some(action.action_id),
+                os_identity: None,
+                workspace_identity: None,
+                containment_identity: None,
+                tombstone_evidence: None,
+            },
+        )?;
+        insert_resource_record(
+            &mut state.owned_resources,
+            OwnedResourceRecord {
+                kind: ResourceKind::CardInstance,
+                logical_ref: resources.card_instance,
+                generation: action.resource_generation,
+                runtime_host_epoch: action.runtime_host_epoch,
+                phase: ResourcePhase::Reserved,
+                action_id: Some(action.action_id),
+                os_identity: None,
+                workspace_identity: None,
+                containment_identity: None,
+                tombstone_evidence: None,
+            },
+        )?;
+        let census = compute_resource_census_digest(&state.owned_resources)?;
+        state.live_materialization = with_resource_census(state.live_materialization, census);
+        self.try_validated_successor(state)
+    }
+
+    /// Records exact identities returned by the real resource owner for the
+    /// two previously reserved reference-profile resources.
+    pub(crate) fn try_own_one_source_resources_successor(
+        &self,
+        input: RuntimeOneSourceOwnershipInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        let action = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| prepared.phase == PreparedPhase::FirstActionIntent)
+            .and_then(|prepared| prepared.action)
+            .filter(|action| action.kind == JournalActionKind::StartOneSourceLoop)
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::ResourceProgress;
+        install_resource_ownership(
+            &mut state.owned_resources,
+            ResourceKind::LoopDomain,
+            action,
+            input.loop_domain,
+        )?;
+        install_resource_ownership(
+            &mut state.owned_resources,
+            ResourceKind::CardInstance,
+            action,
+            input.card_instance,
+        )?;
+        let census = compute_resource_census_digest(&state.owned_resources)?;
+        state.live_materialization = with_resource_census(state.live_materialization, census);
+        self.try_validated_successor(state)
+    }
+
+    /// Derives the exact one-source terminal facts without mutating the
+    /// snapshot.  The caller signs these facts, strict-decodes the resulting
+    /// PXRT, and then supplies those exact bytes to the terminal successor.
+    pub(crate) fn try_preview_one_source_success_terminal(
+        &self,
+        callback_success: &RuntimeOneSourceCallbackSuccessInput,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<RuntimeTerminalPreview, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::FirstActionIntent
+                    && prepared.incoming_kind == DesiredHeadKind::OneSourceLoop
+                    && prepared.raw_outcome.is_none()
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        let action = prepared
+            .action
+            .filter(|action| action.kind == JournalActionKind::StartOneSourceLoop)
+            .ok_or(RuntimeJournalError::DanglingReference)?;
+        if callback_success.action_id != action.action_id {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        // The successful callback observation is supplied in-memory by this
+        // terminal call.  A persisted raw latch means a previous effect
+        // boundary became uncertain and must never enter the atomic happy path.
+        let raw = RawActionOutcomeLatch {
+            callback: CallbackOutcome::KnownSuccess,
+            callback_reason_digest: None,
+            deadline: DeadlineOutcome::NotObserved,
+            observed_clock_generation: 0,
+            observed_at_nanos: 0,
+            host_interrupted: false,
+            higher_tenure_takeover: false,
+            cleanup: CleanupOutcome::NotObserved,
+            cleanup_evidence_digest: None,
+        };
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            observation,
+            TerminalLifecycleEffect::MayHaveStarted,
+        )?;
+        if selection.primary != TerminalOutcome::OneSourceLoopActive {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let mut resources = self.state.owned_resources.clone();
+        for resource in &mut resources {
+            if resource.phase == ResourcePhase::Owned
+                && resource.action_id == Some(action.action_id)
+            {
+                resource.action_id = None;
+            }
+        }
+        let census = compute_resource_census_digest(&resources)?;
+        self.terminal_preview(
+            selection,
+            TerminalHeadDisposition::CommittedIncoming,
+            census,
+        )
+    }
+
+    /// Publishes the fixed one-source desired/live head and terminal result in
+    /// one validated snapshot after both action-bound resources are owned.
+    pub(crate) fn try_one_source_success_terminal_successor(
+        &self,
+        incoming_slice: OpaqueCanonicalValue,
+        callback_success: RuntimeOneSourceCallbackSuccessInput,
+        terminal: RuntimeTerminalInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::FirstActionIntent
+                    && prepared.incoming_kind == DesiredHeadKind::OneSourceLoop
+                    && prepared.raw_outcome.is_none()
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        if TargetSliceDigest::new(incoming_slice.digest) != prepared.incoming_slice_digest {
+            return Err(RuntimeJournalError::DanglingReference);
+        }
+        let action = prepared
+            .action
+            .filter(|action| action.kind == JournalActionKind::StartOneSourceLoop)
+            .ok_or(RuntimeJournalError::DanglingReference)?;
+        if callback_success.action_id != action.action_id {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let raw = RawActionOutcomeLatch {
+            callback: CallbackOutcome::KnownSuccess,
+            callback_reason_digest: None,
+            deadline: DeadlineOutcome::NotObserved,
+            observed_clock_generation: 0,
+            observed_at_nanos: 0,
+            host_interrupted: false,
+            higher_tenure_takeover: false,
+            cleanup: CleanupOutcome::NotObserved,
+            cleanup_evidence_digest: None,
+        };
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            terminal.selection,
+            TerminalLifecycleEffect::MayHaveStarted,
+        )?;
+        if selection.primary != TerminalOutcome::OneSourceLoopActive {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+
+        let completion_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(RuntimeJournalError::SequenceOverflow)?;
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::NormalStartTerminal;
+        for resource in &mut state.owned_resources {
+            if resource.phase == ResourcePhase::Owned
+                && resource.action_id == Some(action.action_id)
+            {
+                resource.action_id = None;
+            }
+        }
+        let census = compute_resource_census_digest(&state.owned_resources)?;
+        let result_digest = terminal.canonical_response.digest;
+        state.active_desired = Some(ActiveDesiredHead {
+            kind: DesiredHeadKind::OneSourceLoop,
+            source_scope: prepared.source_scope,
+            source_revision: prepared.source_revision,
+            slice: incoming_slice,
+            source_plan_digest: prepared.source_plan_digest,
+            manifest_digest: prepared.manifest_digest,
+            operation_id: prepared.operation_id,
+            committing_result_digest: Some(result_digest),
+        });
+        state.live_materialization = LiveMaterialization::LiveReady {
+            active_slice_digest: prepared.incoming_slice_digest,
+            runtime_host_epoch: action.runtime_host_epoch,
+            resource_generation: action.resource_generation,
+            resource_census_digest: census,
+        };
+        insert_terminal_record(
+            &mut state.terminal_operations,
+            terminal_record(
+                prepared,
+                selection,
+                TerminalHeadDisposition::CommittedIncoming,
+                census,
+                terminal.canonical_response,
+                state.host.runtime_host_epoch_high_water,
+                completion_sequence,
+            ),
+        )?;
+        state.prepared = None;
+        self.try_validated_successor(state)
+    }
+
+    /// Derives the exact-zero terminal selected when the owner clock crosses
+    /// the admitted deadline after the durable start intent but before any
+    /// resource reservation, materialization, or callback effect.
+    pub(crate) fn try_preview_one_source_post_intent_timeout_terminal(
+        &self,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<RuntimeTerminalPreview, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::FirstActionIntent
+                    && prepared.incoming_kind == DesiredHeadKind::OneSourceLoop
+                    && prepared.raw_outcome.is_none()
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        let action = prepared
+            .action
+            .filter(|action| action.kind == JournalActionKind::StartOneSourceLoop)
+            .ok_or(RuntimeJournalError::DanglingReference)?;
+        if observation.clock_generation != prepared.installed_clock_generation
+            || observation.observed_at_nanos < prepared.installed_deadline_nanos
+            || self.state.owned_resources.iter().any(|resource| {
+                resource.action_id == Some(action.action_id) && !resource.phase.is_terminal()
+            })
+        {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let raw = RawActionOutcomeLatch {
+            callback: CallbackOutcome::NotInvoked,
+            callback_reason_digest: None,
+            deadline: DeadlineOutcome::TimedOut,
+            observed_clock_generation: observation.clock_generation,
+            observed_at_nanos: observation.observed_at_nanos,
+            host_interrupted: false,
+            higher_tenure_takeover: false,
+            cleanup: CleanupOutcome::NotObserved,
+            cleanup_evidence_digest: None,
+        };
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            observation,
+            TerminalLifecycleEffect::ProvenNotStarted,
+        )?;
+        if selection.primary != TerminalOutcome::StartTimedOutBeforeHeadCommitExactZero {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let census = compute_resource_census_digest(&self.state.owned_resources)?;
+        self.terminal_preview(selection, preserved_head_disposition(&self.state), census)
+    }
+
+    /// Commits the post-intent/pre-effect timeout without creating or
+    /// tombstoning a resource.  The durable intent remains attached to the
+    /// terminal history, while desired/live/resource state stays exact zero.
+    pub(crate) fn try_one_source_post_intent_timeout_terminal_successor(
+        &self,
+        terminal: RuntimeTerminalInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::FirstActionIntent
+                    && prepared.incoming_kind == DesiredHeadKind::OneSourceLoop
+                    && prepared.raw_outcome.is_none()
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        let action = prepared
+            .action
+            .filter(|action| action.kind == JournalActionKind::StartOneSourceLoop)
+            .ok_or(RuntimeJournalError::DanglingReference)?;
+        if terminal.selection.clock_generation != prepared.installed_clock_generation
+            || terminal.selection.observed_at_nanos < prepared.installed_deadline_nanos
+            || self.state.owned_resources.iter().any(|resource| {
+                resource.action_id == Some(action.action_id) && !resource.phase.is_terminal()
+            })
+        {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let raw = RawActionOutcomeLatch {
+            callback: CallbackOutcome::NotInvoked,
+            callback_reason_digest: None,
+            deadline: DeadlineOutcome::TimedOut,
+            observed_clock_generation: terminal.selection.clock_generation,
+            observed_at_nanos: terminal.selection.observed_at_nanos,
+            host_interrupted: false,
+            higher_tenure_takeover: false,
+            cleanup: CleanupOutcome::NotObserved,
+            cleanup_evidence_digest: None,
+        };
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            terminal.selection,
+            TerminalLifecycleEffect::ProvenNotStarted,
+        )?;
+        if selection.primary != TerminalOutcome::StartTimedOutBeforeHeadCommitExactZero {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let completion_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(RuntimeJournalError::SequenceOverflow)?;
+        let census = compute_resource_census_digest(&self.state.owned_resources)?;
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::NormalStartTerminal;
+        insert_terminal_record(
+            &mut state.terminal_operations,
+            terminal_record(
+                prepared,
+                selection,
+                preserved_head_disposition(&self.state),
+                census,
+                terminal.canonical_response,
+                state.host.runtime_host_epoch_high_water,
+                completion_sequence,
+            ),
+        )?;
+        state.prepared = None;
+        self.try_validated_successor(state)
+    }
+
+    /// Atomically commits the canonical empty desired head before any stop or
+    /// cleanup effect, retaining the exact old Slice and signed budgets.
+    pub(crate) fn try_empty_head_retire_successor(
+        &self,
+        input: RuntimeEmptyRetireInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::PreparedNoEffects
+                    && prepared.incoming_kind == DesiredHeadKind::EmptyDeactivate
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        let old_active = self
+            .state
+            .active_desired
+            .as_ref()
+            .filter(|active| active.kind == DesiredHeadKind::OneSourceLoop)
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        let LiveMaterialization::LiveReady {
+            runtime_host_epoch,
+            resource_generation,
+            resource_census_digest,
+            ..
+        } = self.state.live_materialization
+        else {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        };
+        if TargetSliceDigest::new(input.incoming_slice.digest) != prepared.incoming_slice_digest
+            || input.pre_intent.clock_generation != prepared.installed_clock_generation
+            || input.pre_intent.clock_generation != self.state.host.clock_generation_high_water
+            || input.pre_intent.observed_at_nanos == 0
+            || input.pre_intent.observed_at_nanos >= prepared.installed_deadline_nanos
+            || input.budgets.start_nanos == 0
+            || input.budgets.drain_nanos == 0
+            || input.budgets.cleanup_nanos == 0
+        {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let action = JournalActionRef {
+            action_id: input.action_id,
+            kind: JournalActionKind::DrainToEmpty,
+            runtime_host_epoch,
+            clock_generation: input.pre_intent.clock_generation,
+            domain_generation: resource_generation,
+            instance_generation: resource_generation,
+            resource_generation,
+        };
+
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::EmptyHeadRetire;
+        let current_prepared = state
+            .prepared
+            .as_mut()
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        current_prepared.phase = PreparedPhase::HeadCommittedRetiringOld;
+        current_prepared.action = Some(action);
+        current_prepared.retiring = Some(RetiringLiveFacts {
+            old_slice: old_active.slice.clone(),
+            old_source_plan_digest: old_active.source_plan_digest,
+            old_manifest_digest: old_active.manifest_digest,
+            signed_start_budget_nanos: input.budgets.start_nanos,
+            signed_drain_budget_nanos: input.budgets.drain_nanos,
+            signed_cleanup_budget_nanos: input.budgets.cleanup_nanos,
+            old_runtime_host_epoch: runtime_host_epoch,
+            old_clock_generation: action.clock_generation,
+            old_resource_generation: resource_generation,
+            old_resource_census_digest: resource_census_digest,
+        });
+        state.active_desired = Some(ActiveDesiredHead {
+            kind: DesiredHeadKind::EmptyDeactivate,
+            source_scope: prepared.source_scope,
+            source_revision: prepared.source_revision,
+            slice: input.incoming_slice,
+            source_plan_digest: prepared.source_plan_digest,
+            manifest_digest: prepared.manifest_digest,
+            operation_id: prepared.operation_id,
+            committing_result_digest: None,
+        });
+        for resource in &mut state.owned_resources {
+            if !resource.phase.is_terminal() {
+                if resource.phase != ResourcePhase::Owned || resource.action_id.is_some() {
+                    return Err(RuntimeJournalError::NonMonotonicTransition);
+                }
+                resource.phase = ResourcePhase::CleanupPending;
+                resource.action_id = Some(action.action_id);
+            }
+        }
+        let census = compute_resource_census_digest(&state.owned_resources)?;
+        state.live_materialization = LiveMaterialization::Draining {
+            active_slice_digest: prepared.incoming_slice_digest,
+            operation_id: prepared.operation_id,
+            action_id: action.action_id,
+            retiring_generation: resource_generation,
+            resource_census_digest: census,
+        };
+        self.try_validated_successor(state)
+    }
+
+    /// Durably latches a successful stop callback before cleanup/tombstones are
+    /// allowed to produce the exact-zero terminal.
+    pub(crate) fn try_latch_empty_success_successor(
+        &self,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<Self, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::HeadCommittedRetiringOld
+                    && prepared.incoming_kind == DesiredHeadKind::EmptyDeactivate
+                    && prepared.raw_outcome.is_none()
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        if observation.clock_generation != prepared.installed_clock_generation
+            || observation.clock_generation != self.state.host.clock_generation_high_water
+            || observation.observed_at_nanos == 0
+        {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let deadline = if observation.observed_at_nanos >= prepared.installed_deadline_nanos {
+            DeadlineOutcome::TimedOut
+        } else {
+            DeadlineOutcome::NotObserved
+        };
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::PreparedProgress;
+        state
+            .prepared
+            .as_mut()
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?
+            .raw_outcome = Some(RawActionOutcomeLatch {
+            callback: CallbackOutcome::KnownSuccess,
+            callback_reason_digest: None,
+            deadline,
+            observed_clock_generation: if deadline == DeadlineOutcome::TimedOut {
+                observation.clock_generation
+            } else {
+                0
+            },
+            observed_at_nanos: if deadline == DeadlineOutcome::TimedOut {
+                observation.observed_at_nanos
+            } else {
+                0
+            },
+            host_interrupted: false,
+            higher_tenure_takeover: false,
+            cleanup: CleanupOutcome::NotObserved,
+            cleanup_evidence_digest: None,
+        });
+        self.try_validated_successor(state)
+    }
+
+    /// Derives exact Loop-to-empty terminal facts after applying the supplied
+    /// real tombstones to a cloned resource set.
+    pub(crate) fn try_preview_empty_exact_zero_terminal(
+        &self,
+        tombstones: &RuntimeOneSourceTombstonesInput,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<RuntimeTerminalPreview, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::HeadCommittedRetiringOld
+                    && prepared.incoming_kind == DesiredHeadKind::EmptyDeactivate
+                    && prepared.raw_outcome.is_some_and(|raw| {
+                        raw.callback == CallbackOutcome::KnownSuccess
+                            && raw.cleanup == CleanupOutcome::NotObserved
+                            && !raw.host_interrupted
+                            && !raw.higher_tenure_takeover
+                    })
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        let action = prepared
+            .action
+            .ok_or(RuntimeJournalError::DanglingReference)?;
+        let mut resources = self.state.owned_resources.clone();
+        install_resource_tombstone(
+            &mut resources,
+            ResourceKind::LoopDomain,
+            action,
+            tombstones.loop_domain.clone(),
+        )?;
+        install_resource_tombstone(
+            &mut resources,
+            ResourceKind::CardInstance,
+            action,
+            tombstones.card_instance.clone(),
+        )?;
+        let census = compute_resource_census_digest(&resources)?;
+        let mut raw = prepared
+            .raw_outcome
+            .ok_or(RuntimeJournalError::DanglingReference)?;
+        raw.cleanup = CleanupOutcome::ExactZero;
+        raw.cleanup_evidence_digest = Some(census);
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            observation,
+            TerminalLifecycleEffect::MayHaveStarted,
+        )?;
+        if !matches!(
+            selection.primary,
+            TerminalOutcome::EmptyDeactivateExactZero | TerminalOutcome::TimedOutButExactZero
+        ) {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        self.terminal_preview(
+            selection,
+            TerminalHeadDisposition::CommittedIncoming,
+            census,
+        )
+    }
+
+    /// Commits real tombstones, the empty exact-zero live view and the terminal
+    /// response atomically after the head-first stop callback was latched.
+    pub(crate) fn try_empty_exact_zero_terminal_successor(
+        &self,
+        tombstones: RuntimeOneSourceTombstonesInput,
+        terminal: RuntimeTerminalInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::HeadCommittedRetiringOld
+                    && prepared.incoming_kind == DesiredHeadKind::EmptyDeactivate
+                    && prepared.raw_outcome.is_some_and(|raw| {
+                        raw.callback == CallbackOutcome::KnownSuccess
+                            && raw.cleanup == CleanupOutcome::NotObserved
+                            && !raw.host_interrupted
+                            && !raw.higher_tenure_takeover
+                    })
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        let action = prepared
+            .action
+            .ok_or(RuntimeJournalError::DanglingReference)?;
+        let completion_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(RuntimeJournalError::SequenceOverflow)?;
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::ExactZeroTerminal;
+        install_resource_tombstone(
+            &mut state.owned_resources,
+            ResourceKind::LoopDomain,
+            action,
+            tombstones.loop_domain,
+        )?;
+        install_resource_tombstone(
+            &mut state.owned_resources,
+            ResourceKind::CardInstance,
+            action,
+            tombstones.card_instance,
+        )?;
+        let census = compute_resource_census_digest(&state.owned_resources)?;
+        let mut raw = prepared
+            .raw_outcome
+            .ok_or(RuntimeJournalError::DanglingReference)?;
+        raw.cleanup = CleanupOutcome::ExactZero;
+        raw.cleanup_evidence_digest = Some(census);
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            terminal.selection,
+            TerminalLifecycleEffect::MayHaveStarted,
+        )?;
+        if !matches!(
+            selection.primary,
+            TerminalOutcome::EmptyDeactivateExactZero | TerminalOutcome::TimedOutButExactZero
+        ) {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let result_digest = terminal.canonical_response.digest;
+        state
+            .active_desired
+            .as_mut()
+            .ok_or(RuntimeJournalError::DanglingReference)?
+            .committing_result_digest = Some(result_digest);
+        state.live_materialization = LiveMaterialization::ExactZero {
+            active_slice_digest: prepared.incoming_slice_digest,
+            census_digest: census,
+        };
+        insert_terminal_record(
+            &mut state.terminal_operations,
+            terminal_record(
+                prepared,
+                selection,
+                TerminalHeadDisposition::CommittedIncoming,
+                census,
+                terminal.canonical_response,
+                state.host.runtime_host_epoch_high_water,
+                completion_sequence,
+            ),
+        )?;
+        state.prepared = None;
+        self.try_validated_successor(state)
+    }
+
+    /// Derives a pre-effect deadline terminal while preserving the exact
+    /// current desired head and resource census.
+    pub(crate) fn try_preview_no_effect_deadline_terminal(
+        &self,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<RuntimeTerminalPreview, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::PreparedNoEffects
+                    && prepared.action.is_none()
+                    && prepared.raw_outcome.is_none()
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        if observation.clock_generation != prepared.installed_clock_generation
+            || observation.observed_at_nanos < prepared.installed_deadline_nanos
+        {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let raw = RawActionOutcomeLatch {
+            callback: CallbackOutcome::NotInvoked,
+            callback_reason_digest: None,
+            deadline: DeadlineOutcome::TimedOut,
+            observed_clock_generation: observation.clock_generation,
+            observed_at_nanos: observation.observed_at_nanos,
+            host_interrupted: false,
+            higher_tenure_takeover: false,
+            cleanup: CleanupOutcome::NotObserved,
+            cleanup_evidence_digest: None,
+        };
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            observation,
+            TerminalLifecycleEffect::ProvenNotStarted,
+        )?;
+        if !matches!(
+            selection.primary,
+            TerminalOutcome::StartTimedOutBeforeIntentNoEffects
+                | TerminalOutcome::StopTimedOutBeforeHeadCommitNoEffects
+        ) {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let head_disposition = TerminalHeadDisposition::Preserved(
+            self.state
+                .active_desired
+                .as_ref()
+                .map(|active| TargetSliceDigest::new(active.slice.digest)),
+        );
+        let census = compute_resource_census_digest(&self.state.owned_resources)?;
+        self.terminal_preview(selection, head_disposition, census)
+    }
+
+    /// Commits a deadline selected before any lifecycle effect.  Desired/live
+    /// state and resources remain byte-identical; only the terminal/replay fact
+    /// is added and the prepared operation is retired.
+    pub(crate) fn try_no_effect_deadline_terminal_successor(
+        &self,
+        terminal: RuntimeTerminalInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::PreparedNoEffects
+                    && prepared.action.is_none()
+                    && prepared.raw_outcome.is_none()
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        if terminal.selection.clock_generation != prepared.installed_clock_generation
+            || terminal.selection.observed_at_nanos < prepared.installed_deadline_nanos
+        {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let raw = RawActionOutcomeLatch {
+            callback: CallbackOutcome::NotInvoked,
+            callback_reason_digest: None,
+            deadline: DeadlineOutcome::TimedOut,
+            observed_clock_generation: terminal.selection.clock_generation,
+            observed_at_nanos: terminal.selection.observed_at_nanos,
+            host_interrupted: false,
+            higher_tenure_takeover: false,
+            cleanup: CleanupOutcome::NotObserved,
+            cleanup_evidence_digest: None,
+        };
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            terminal.selection,
+            TerminalLifecycleEffect::ProvenNotStarted,
+        )?;
+        if !matches!(
+            selection.primary,
+            TerminalOutcome::StartTimedOutBeforeIntentNoEffects
+                | TerminalOutcome::StopTimedOutBeforeHeadCommitNoEffects
+        ) {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let completion_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(RuntimeJournalError::SequenceOverflow)?;
+        let head_disposition = TerminalHeadDisposition::Preserved(
+            self.state
+                .active_desired
+                .as_ref()
+                .map(|active| TargetSliceDigest::new(active.slice.digest)),
+        );
+        let census = compute_resource_census_digest(&self.state.owned_resources)?;
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::OperationTerminalNoEffects;
+        insert_terminal_record(
+            &mut state.terminal_operations,
+            terminal_record(
+                prepared,
+                selection,
+                head_disposition,
+                census,
+                terminal.canonical_response,
+                state.host.runtime_host_epoch_high_water,
+                completion_sequence,
+            ),
+        )?;
+        state.prepared = None;
+        self.try_validated_successor(state)
+    }
+
+    /// Commits a new canonical empty head without action/resource creation when
+    /// the predecessor already proves exact zero.
+    pub(crate) fn try_empty_exact_zero_fast_path_successor(
+        &self,
+        incoming_slice: OpaqueCanonicalValue,
+        terminal: RuntimeTerminalInput,
+    ) -> Result<Self, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::PreparedNoEffects
+                    && prepared.incoming_kind == DesiredHeadKind::EmptyDeactivate
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        if !exact_zero_fast_path_eligible(&self.state)
+            || TargetSliceDigest::new(incoming_slice.digest) != prepared.incoming_slice_digest
+        {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let raw = RawActionOutcomeLatch {
+            callback: CallbackOutcome::NotInvoked,
+            callback_reason_digest: None,
+            deadline: DeadlineOutcome::NotObserved,
+            observed_clock_generation: 0,
+            observed_at_nanos: 0,
+            host_interrupted: false,
+            higher_tenure_takeover: false,
+            cleanup: CleanupOutcome::NotObserved,
+            cleanup_evidence_digest: None,
+        };
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            terminal.selection,
+            TerminalLifecycleEffect::ProvenNotStarted,
+        )?;
+        if selection.primary != TerminalOutcome::EmptyDeactivateExactZero {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let completion_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(RuntimeJournalError::SequenceOverflow)?;
+        let mut state = self.state.clone();
+        state.last_transaction = RuntimeJournalTransaction::ExactZeroTerminal;
+        let census = compute_resource_census_digest(&state.owned_resources)?;
+        let result_digest = terminal.canonical_response.digest;
+        state.active_desired = Some(ActiveDesiredHead {
+            kind: DesiredHeadKind::EmptyDeactivate,
+            source_scope: prepared.source_scope,
+            source_revision: prepared.source_revision,
+            slice: incoming_slice,
+            source_plan_digest: prepared.source_plan_digest,
+            manifest_digest: prepared.manifest_digest,
+            operation_id: prepared.operation_id,
+            committing_result_digest: Some(result_digest),
+        });
+        state.live_materialization = LiveMaterialization::ExactZero {
+            active_slice_digest: prepared.incoming_slice_digest,
+            census_digest: census,
+        };
+        insert_terminal_record(
+            &mut state.terminal_operations,
+            terminal_record(
+                prepared,
+                selection,
+                TerminalHeadDisposition::CommittedIncoming,
+                census,
+                terminal.canonical_response,
+                state.host.runtime_host_epoch_high_water,
+                completion_sequence,
+            ),
+        )?;
+        state.prepared = None;
+        self.try_validated_successor(state)
+    }
+
+    /// Derives exact no-effect empty terminal facts for an already exact-zero
+    /// predecessor without constructing response bytes or mutating state.
+    pub(crate) fn try_preview_empty_exact_zero_fast_path(
+        &self,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<RuntimeTerminalPreview, RuntimeJournalError> {
+        let prepared = self
+            .state
+            .prepared
+            .as_ref()
+            .filter(|prepared| {
+                prepared.phase == PreparedPhase::PreparedNoEffects
+                    && prepared.incoming_kind == DesiredHeadKind::EmptyDeactivate
+            })
+            .ok_or(RuntimeJournalError::NonMonotonicTransition)?;
+        if !exact_zero_fast_path_eligible(&self.state) {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let raw = RawActionOutcomeLatch {
+            callback: CallbackOutcome::NotInvoked,
+            callback_reason_digest: None,
+            deadline: DeadlineOutcome::NotObserved,
+            observed_clock_generation: 0,
+            observed_at_nanos: 0,
+            host_interrupted: false,
+            higher_tenure_takeover: false,
+            cleanup: CleanupOutcome::NotObserved,
+            cleanup_evidence_digest: None,
+        };
+        let selection = terminal_selection(
+            prepared,
+            raw,
+            observation,
+            TerminalLifecycleEffect::ProvenNotStarted,
+        )?;
+        if selection.primary != TerminalOutcome::EmptyDeactivateExactZero {
+            return Err(RuntimeJournalError::NonMonotonicTransition);
+        }
+        let census = compute_resource_census_digest(&self.state.owned_resources)?;
+        self.terminal_preview(
+            selection,
+            TerminalHeadDisposition::CommittedIncoming,
+            census,
+        )
+    }
+
+    fn terminal_preview(
+        &self,
+        selection: TerminalOutcomeSelection,
+        head_disposition: TerminalHeadDisposition,
+        resource_census_digest: Digest32,
+    ) -> Result<RuntimeTerminalPreview, RuntimeJournalError> {
+        Ok(RuntimeTerminalPreview {
+            outcome: selection.primary,
+            lifecycle_effect: selection.lifecycle_effect,
+            head_disposition,
+            resource_census_digest,
+            raw_outcome_digest: runtime_raw_action_outcome_digest_v1(selection.raw)?,
+            completion_runtime_host_epoch: self.state.host.runtime_host_epoch_high_water,
+            completion_snapshot_sequence: self
+                .sequence
+                .checked_add(1)
+                .ok_or(RuntimeJournalError::SequenceOverflow)?,
+            selection_clock_generation: selection.selection_clock_generation,
+            selection_observed_at_nanos: selection.selection_observed_at_nanos,
+        })
+    }
+
     pub(crate) const fn store_instance_id(&self) -> &[u8; 32] {
         &self.store_instance_id
     }
@@ -4730,6 +6472,271 @@ impl RuntimeJournalSnapshot {
 
     pub(crate) fn canonical_wire(&self) -> &[u8] {
         &self.canonical_wire
+    }
+
+    fn try_validated_successor(
+        &self,
+        state: RuntimeJournalState,
+    ) -> Result<Self, RuntimeJournalError> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(RuntimeJournalError::SequenceOverflow)?;
+        let successor = Self::try_new(
+            self.store_instance_id,
+            self.owner_target_fingerprint,
+            sequence,
+            state,
+        )?;
+        successor.validate_successor_of(self)?;
+        Ok(successor)
+    }
+}
+
+fn insert_replay_record(
+    records: &mut Vec<ReplayLedgerRecord>,
+    record: ReplayLedgerRecord,
+) -> Result<(), RuntimeJournalError> {
+    match records.binary_search_by_key(&record.identity, |existing| existing.identity) {
+        Ok(_) => Err(RuntimeJournalError::NonMonotonicTransition),
+        Err(index) => {
+            records.insert(index, record);
+            Ok(())
+        }
+    }
+}
+
+fn insert_temporal_record(
+    records: &mut Vec<TemporalLineageRecord>,
+    record: TemporalLineageRecord,
+) -> Result<(), RuntimeJournalError> {
+    match records.binary_search_by_key(&record.constraint_id, |existing| existing.constraint_id) {
+        Ok(_) => Err(RuntimeJournalError::NonMonotonicTransition),
+        Err(index) => {
+            records.insert(index, record);
+            Ok(())
+        }
+    }
+}
+
+fn insert_resource_record(
+    resources: &mut Vec<OwnedResourceRecord>,
+    record: OwnedResourceRecord,
+) -> Result<(), RuntimeJournalError> {
+    if resources.len() >= MAX_RUNTIME_OWNED_RESOURCES {
+        return Err(RuntimeJournalError::CapacityExceeded);
+    }
+    match resources.binary_search_by_key(&record.key(), OwnedResourceRecord::key) {
+        Ok(_) => Err(RuntimeJournalError::NonMonotonicTransition),
+        Err(index) => {
+            resources.insert(index, record);
+            Ok(())
+        }
+    }
+}
+
+fn install_resource_ownership(
+    resources: &mut [OwnedResourceRecord],
+    kind: ResourceKind,
+    action: JournalActionRef,
+    input: RuntimeResourceOwnershipInput,
+) -> Result<(), RuntimeJournalError> {
+    let key = (kind, input.logical_ref, action.resource_generation);
+    let index = resources
+        .binary_search_by_key(&key, OwnedResourceRecord::key)
+        .map_err(|_| RuntimeJournalError::DanglingReference)?;
+    let resource = &mut resources[index];
+    if resource.phase != ResourcePhase::Reserved
+        || resource.action_id != Some(action.action_id)
+        || resource.runtime_host_epoch != action.runtime_host_epoch
+    {
+        return Err(RuntimeJournalError::NonMonotonicTransition);
+    }
+    resource.phase = ResourcePhase::Owned;
+    resource.os_identity = Some(input.os_identity);
+    resource.workspace_identity = Some(input.workspace_identity);
+    resource.containment_identity = Some(input.containment_identity);
+    Ok(())
+}
+
+fn install_resource_tombstone(
+    resources: &mut [OwnedResourceRecord],
+    kind: ResourceKind,
+    action: JournalActionRef,
+    input: RuntimeResourceTombstoneInput,
+) -> Result<(), RuntimeJournalError> {
+    let key = (kind, input.logical_ref, action.resource_generation);
+    let index = resources
+        .binary_search_by_key(&key, OwnedResourceRecord::key)
+        .map_err(|_| RuntimeJournalError::DanglingReference)?;
+    let resource = &mut resources[index];
+    if resource.phase != ResourcePhase::CleanupPending
+        || resource.action_id != Some(action.action_id)
+        || resource.runtime_host_epoch != action.runtime_host_epoch
+    {
+        return Err(RuntimeJournalError::NonMonotonicTransition);
+    }
+    resource.phase = ResourcePhase::Terminal;
+    resource.action_id = None;
+    resource.tombstone_evidence = Some(input.evidence);
+    Ok(())
+}
+
+fn terminal_selection(
+    prepared: &PreparedOperation,
+    raw: RawActionOutcomeLatch,
+    observation: RuntimeDeadlineObservation,
+    lifecycle_effect: TerminalLifecycleEffect,
+) -> Result<TerminalOutcomeSelection, RuntimeJournalError> {
+    TerminalOutcomeSelection::try_select(
+        TerminalSelectionContext {
+            incoming_kind: prepared.incoming_kind,
+            predecessor_phase: prepared.phase,
+            installed_clock_generation: prepared.installed_clock_generation,
+            installed_deadline_nanos: prepared.installed_deadline_nanos,
+        },
+        TerminalSelectionObservation {
+            raw,
+            selection_clock_generation: observation.clock_generation,
+            selection_observed_at_nanos: observation.observed_at_nanos,
+            lifecycle_effect,
+        },
+    )
+}
+
+fn terminal_record(
+    prepared: &PreparedOperation,
+    selection: TerminalOutcomeSelection,
+    head_disposition: TerminalHeadDisposition,
+    resource_census_digest: Digest32,
+    canonical_response: OpaqueCanonicalValue,
+    completion_runtime_host_epoch: u64,
+    completion_snapshot_sequence: u64,
+) -> TerminalOperationRecord {
+    TerminalOperationRecord {
+        source_scope: prepared.source_scope,
+        operation_id: prepared.operation_id,
+        request_digest: prepared.request.digest,
+        request_nonce_identity: prepared.request_nonce_identity,
+        source_revision: prepared.source_revision,
+        source_plan_digest: prepared.source_plan_digest,
+        target_slice_digest: prepared.incoming_slice_digest,
+        temporal_constraint_id: prepared.temporal_constraint_id,
+        temporal_lineage_digest: prepared.temporal_lineage_digest,
+        incoming_kind: prepared.incoming_kind,
+        completion_predecessor_phase: prepared.phase,
+        installed_clock_generation: prepared.installed_clock_generation,
+        installed_deadline_nanos: prepared.installed_deadline_nanos,
+        action: prepared.action,
+        predecessor_raw_outcome: prepared.raw_outcome,
+        selection,
+        head_disposition,
+        resource_census_digest,
+        result_digest: canonical_response.digest,
+        canonical_response,
+        completion_runtime_host_epoch,
+        completion_snapshot_sequence,
+    }
+}
+
+fn insert_terminal_record(
+    terminals: &mut Vec<TerminalOperationRecord>,
+    terminal: TerminalOperationRecord,
+) -> Result<(), RuntimeJournalError> {
+    if terminals.len() >= MAX_RUNTIME_TERMINAL_OPERATIONS {
+        return Err(RuntimeJournalError::CapacityExceeded);
+    }
+    match terminals.binary_search_by_key(&terminal.key(), TerminalOperationRecord::key) {
+        Ok(_) => Err(RuntimeJournalError::NonMonotonicTransition),
+        Err(index) => {
+            terminals.insert(index, terminal);
+            Ok(())
+        }
+    }
+}
+
+fn with_resource_census(live: LiveMaterialization, census: Digest32) -> LiveMaterialization {
+    match live {
+        LiveMaterialization::StartupInvalidated {
+            active_slice_digest,
+            previous_runtime_host_epoch,
+            previous_clock_generation,
+            recovery_eligibility,
+            invalidation_evidence_digest,
+            failure_evidence_digest,
+            ..
+        } => LiveMaterialization::StartupInvalidated {
+            active_slice_digest,
+            previous_runtime_host_epoch,
+            previous_clock_generation,
+            recovery_eligibility,
+            invalidation_evidence_digest,
+            failure_evidence_digest,
+            resource_census_digest: census,
+        },
+        LiveMaterialization::Recovering {
+            active_slice_digest,
+            action_id,
+            resource_generation,
+            ..
+        } => LiveMaterialization::Recovering {
+            active_slice_digest,
+            action_id,
+            resource_generation,
+            resource_census_digest: census,
+        },
+        LiveMaterialization::LiveReady {
+            active_slice_digest,
+            runtime_host_epoch,
+            resource_generation,
+            ..
+        } => LiveMaterialization::LiveReady {
+            active_slice_digest,
+            runtime_host_epoch,
+            resource_generation,
+            resource_census_digest: census,
+        },
+        LiveMaterialization::RecoveryFailedNotReady {
+            active_slice_digest,
+            terminal_recovery_action_id,
+            failure_latch_digest,
+            ..
+        } => LiveMaterialization::RecoveryFailedNotReady {
+            active_slice_digest,
+            terminal_recovery_action_id,
+            failure_latch_digest,
+            resource_census_digest: census,
+        },
+        LiveMaterialization::Draining {
+            active_slice_digest,
+            operation_id,
+            action_id,
+            retiring_generation,
+            ..
+        } => LiveMaterialization::Draining {
+            active_slice_digest,
+            operation_id,
+            action_id,
+            retiring_generation,
+            resource_census_digest: census,
+        },
+        LiveMaterialization::ExactZero {
+            active_slice_digest,
+            ..
+        } => LiveMaterialization::ExactZero {
+            active_slice_digest,
+            census_digest: census,
+        },
+        LiveMaterialization::Quarantined {
+            active_slice_digest,
+            reason_digest,
+            ..
+        } => LiveMaterialization::Quarantined {
+            active_slice_digest,
+            reason_digest,
+            resource_census_digest: census,
+        },
+        LiveMaterialization::None => LiveMaterialization::None,
     }
 }
 
@@ -4798,7 +6805,7 @@ fn encode_payload(state: &RuntimeJournalState) -> Result<Vec<u8>, RuntimeJournal
     encoder.u64(host.clock_generation_high_water);
     encoder.opaque(&host.build_descriptor)?;
     encoder.opaque(&host.singleton_manifest)?;
-    encoder.opaque(&host.store_pinned_build_identity)?;
+    encode_store_pinned_build_identity(&mut encoder, host.store_pinned_build_identity);
     encoder.bytes(&host.compiled_build_instance_id);
     encoder.digest(&host.compiled_compatibility_digest);
     encoder.digest(&host.admission_policy_fingerprint);
@@ -4976,7 +6983,7 @@ fn encode_recovery_action(encoder: &mut Encoder, recovery: RecoveryAction) {
     encoder.digest(recovery.source_plan_digest.value());
     encoder.digest(recovery.active_slice_digest.value());
     encoder.digest(&recovery.manifest_digest);
-    encoder.digest(&recovery.store_pinned_build_identity_digest);
+    encode_store_pinned_build_identity(encoder, recovery.store_pinned_build_identity);
     encoder.bytes(&recovery.compiled_build_instance_id);
     encoder.digest(&recovery.compiled_compatibility_digest);
     encoder.u64(recovery.signed_start_budget_nanos);
@@ -4984,6 +6991,13 @@ fn encode_recovery_action(encoder: &mut Encoder, recovery: RecoveryAction) {
     encoder.digest(&recovery.deadline_evidence_digest);
     encoder.u8(recovery.phase as u8);
     encode_optional_raw_outcome(encoder, recovery.raw_outcome);
+}
+
+fn encode_store_pinned_build_identity(encoder: &mut Encoder, identity: StorePinnedBuildIdentity) {
+    encoder.bytes(&identity.build_instance_id());
+    encoder.digest(&identity.build_descriptor_digest());
+    encoder.digest(&identity.runtime_artifact_sha256());
+    encoder.digest(&identity.compiled_reference_compatibility_digest());
 }
 
 fn encode_terminal_selection(encoder: &mut Encoder, selection: TerminalOutcomeSelection) {
@@ -5224,7 +7238,7 @@ fn decode_payload(payload: &[u8]) -> Result<RuntimeJournalState, RuntimeJournalE
     let clock_generation_high_water = cursor.u64()?;
     let build_descriptor = cursor.opaque(MAX_PINNED_OPAQUE_ARTIFACT_BYTES)?;
     let singleton_manifest = cursor.opaque(MAX_PINNED_OPAQUE_ARTIFACT_BYTES)?;
-    let store_pinned_build_identity = cursor.opaque(MAX_PINNED_OPAQUE_ARTIFACT_BYTES)?;
+    let store_pinned_build_identity = decode_store_pinned_build_identity(&mut cursor)?;
     let compiled_build_instance_id = cursor.array::<32>()?;
     let compiled_compatibility_digest = cursor.digest()?;
     let admission_policy_fingerprint = cursor.digest()?;
@@ -5407,7 +7421,7 @@ fn decode_payload(payload: &[u8]) -> Result<RuntimeJournalState, RuntimeJournalE
             },
             resource_census_digest: cursor.digest()?,
             result_digest: cursor.digest()?,
-            canonical_response: cursor.opaque(MAX_RUNTIME_TERMINAL_RESPONSE_BYTES)?,
+            canonical_response: cursor.opaque(MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES)?,
             completion_runtime_host_epoch: cursor.u64()?,
             completion_snapshot_sequence: cursor.u64()?,
         });
@@ -5464,7 +7478,7 @@ fn decode_recovery_action(cursor: &mut Cursor<'_>) -> Result<RecoveryAction, Run
         source_plan_digest: SourcePlanDigest::new(cursor.digest()?),
         active_slice_digest: TargetSliceDigest::new(cursor.digest()?),
         manifest_digest: cursor.digest()?,
-        store_pinned_build_identity_digest: cursor.digest()?,
+        store_pinned_build_identity: decode_store_pinned_build_identity(cursor)?,
         compiled_build_instance_id: cursor.array::<32>()?,
         compiled_compatibility_digest: cursor.digest()?,
         signed_start_budget_nanos: cursor.u64()?,
@@ -5473,6 +7487,17 @@ fn decode_recovery_action(cursor: &mut Cursor<'_>) -> Result<RecoveryAction, Run
         phase: RecoveryPhase::decode(cursor.u8()?)?,
         raw_outcome: decode_optional_raw_outcome(cursor)?,
     })
+}
+
+fn decode_store_pinned_build_identity(
+    cursor: &mut Cursor<'_>,
+) -> Result<StorePinnedBuildIdentity, RuntimeJournalError> {
+    StorePinnedBuildIdentity::try_new(
+        cursor.array::<32>()?,
+        cursor.digest()?,
+        cursor.digest()?,
+        cursor.digest()?,
+    )
 }
 
 fn decode_terminal_selection(
@@ -5828,6 +7853,11 @@ mod tests {
     fn pinned(bytes: &[u8], digest_byte: u8) -> OpaqueCanonicalValue {
         OpaqueCanonicalValue::try_pinned_artifact(bytes, digest(digest_byte))
             .expect("fixture pinned value must validate")
+    }
+
+    fn store_pinned_build_identity() -> StorePinnedBuildIdentity {
+        StorePinnedBuildIdentity::try_new([0x57; 32], digest(0x44), digest(0x56), digest(0x58))
+            .expect("fixture store-pinned build identity must validate")
     }
 
     fn evidence(bytes: &[u8], digest_byte: u8) -> OpaqueCanonicalValue {
@@ -6221,35 +8251,89 @@ mod tests {
         }
     }
 
-    fn sequence_one_state() -> RuntimeJournalState {
-        RuntimeJournalState {
-            last_transaction: RuntimeJournalTransaction::Initialized,
-            host: HostClockAdmissionState {
-                runtime_host_epoch_high_water: 0,
-                clock_domain: [0x33; 16],
-                clock_generation_high_water: 0,
-                build_descriptor: pinned(b"descriptor-v1", 0x44),
-                singleton_manifest: pinned(b"manifest-v1", 0x55),
-                store_pinned_build_identity: pinned(b"build-identity-v1", 0x56),
-                compiled_build_instance_id: [0x57; 32],
-                compiled_compatibility_digest: digest(0x58),
-                admission_policy_fingerprint: digest(0x66),
-                channel_policy_fingerprint: digest(0x67),
-                controller_key_fingerprint: digest(0x68),
-                tenure_nonces: Vec::new(),
-                request_nonces: Vec::new(),
-                temporal_lineages: Vec::new(),
-            },
-            writer_fence: None,
-            source_revision_high_water: None,
-            prepared: None,
-            active_desired: None,
-            live_materialization: LiveMaterialization::None,
-            recovery_action: None,
-            recovery_terminals: Vec::new(),
-            owned_resources: Vec::new(),
-            terminal_operations: Vec::new(),
+    fn sequence_one_input() -> RuntimeJournalSequenceOne {
+        RuntimeJournalSequenceOne {
+            clock_domain: [0x33; 16],
+            build_descriptor: pinned(b"descriptor-v1", 0x44),
+            singleton_manifest: pinned(b"manifest-v1", 0x55),
+            store_pinned_build_identity: store_pinned_build_identity(),
+            compiled_build_instance_id: [0x57; 32],
+            compiled_compatibility_digest: digest(0x58),
+            admission_policy_fingerprint: digest(0x66),
+            channel_policy_fingerprint: digest(0x67),
+            controller_key_fingerprint: digest(0x68),
         }
+    }
+
+    fn production_tenure_input() -> RuntimeTenureAdmissionInput {
+        RuntimeTenureAdmissionInput {
+            expected_store_instance_id: [0x11; 32],
+            owner_target_fingerprint: digest(0x22),
+            source_scope: [0x01; 16],
+            writer: [0x02; 16],
+            epoch: 1,
+            supersedes_through_epoch: 0,
+            proof_envelope_digest: digest(0x21),
+            tenure_nonce_identity: digest(0x20),
+            principal: [0x03; 16],
+        }
+    }
+
+    fn production_one_source_admission_input() -> RuntimeApplyAdmissionInput {
+        RuntimeApplyAdmissionInput {
+            tenure: production_tenure_input(),
+            request: opaque(b"one-source-request-with-sole-slice", 0x31),
+            request_nonce_identity: digest(0x30),
+            operation_id: [0x34; 16],
+            source_revision: 1,
+            source_plan_digest: source_plan_digest(0x35),
+            incoming_slice_digest: target_slice_digest(0x36),
+            incoming_kind: DesiredHeadKind::OneSourceLoop,
+            manifest_digest: digest(0x55),
+            expected_active: ExpectedActiveCas::None,
+            temporal: RuntimeTemporalAdmissionInput {
+                constraint_id: [0x32; 16],
+                original_budget_nanos: 1_000,
+                remaining_budget_nanos: 1_000,
+                installed_clock_generation: 1,
+                installed_deadline_nanos: 10_000,
+                lineage_digest: digest(0x33),
+            },
+        }
+    }
+
+    fn production_empty_admission_input(
+        base: u8,
+        revision: u64,
+        expected_active: TargetSliceDigest,
+        deadline_nanos: u64,
+    ) -> RuntimeApplyAdmissionInput {
+        RuntimeApplyAdmissionInput {
+            tenure: production_tenure_input(),
+            request: opaque(b"empty-request-with-sole-slice", base.wrapping_add(1)),
+            request_nonce_identity: digest(base),
+            operation_id: [base.wrapping_add(4); 16],
+            source_revision: revision,
+            source_plan_digest: source_plan_digest(base.wrapping_add(5)),
+            incoming_slice_digest: target_slice_digest(base.wrapping_add(6)),
+            incoming_kind: DesiredHeadKind::EmptyDeactivate,
+            manifest_digest: digest(0x55),
+            expected_active: ExpectedActiveCas::Exact(expected_active),
+            temporal: RuntimeTemporalAdmissionInput {
+                constraint_id: [base.wrapping_add(2); 16],
+                original_budget_nanos: 2_000,
+                remaining_budget_nanos: 2_000,
+                installed_clock_generation: 1,
+                installed_deadline_nanos: deadline_nanos,
+                lineage_digest: digest(base.wrapping_add(3)),
+            },
+        }
+    }
+
+    fn sequence_one_state() -> RuntimeJournalState {
+        RuntimeJournalSnapshot::try_initialize([0x11; 32], digest(0x22), sequence_one_input())
+            .expect("fixture sequence-one snapshot must validate")
+            .state
     }
 
     fn initialized_idle_state() -> RuntimeJournalState {
@@ -6483,7 +8567,7 @@ mod tests {
             source_plan_digest: active.source_plan_digest,
             active_slice_digest,
             manifest_digest: digest(0x55),
-            store_pinned_build_identity_digest: digest(0x56),
+            store_pinned_build_identity: store_pinned_build_identity(),
             compiled_build_instance_id: [0x57; 32],
             compiled_compatibility_digest: digest(0x58),
             signed_start_budget_nanos: 100,
@@ -6741,6 +8825,7 @@ mod tests {
             retiring: None,
             raw_outcome: None,
         });
+        current.live_materialization = full_admission_live_materialization(previous);
         current
     }
 
@@ -7077,6 +9162,7 @@ mod tests {
             retiring: None,
             raw_outcome: None,
         });
+        current.live_materialization = full_admission_live_materialization(previous);
         current
     }
 
@@ -7416,7 +9502,7 @@ mod tests {
             source_plan_digest: active.source_plan_digest,
             active_slice_digest: opaque_target_slice(&active.slice),
             manifest_digest: active.manifest_digest,
-            store_pinned_build_identity_digest: previous.host.store_pinned_build_identity.digest,
+            store_pinned_build_identity: previous.host.store_pinned_build_identity,
             compiled_build_instance_id: previous.host.compiled_build_instance_id,
             compiled_compatibility_digest: previous.host.compiled_compatibility_digest,
             signed_start_budget_nanos: 100,
@@ -7897,16 +9983,107 @@ mod tests {
     }
 
     #[test]
+    fn store_pinned_build_identity_is_exactly_four_fixed_width_fields() {
+        let identity = store_pinned_build_identity();
+        let mut encoder = Encoder::with_capacity(128);
+        encode_store_pinned_build_identity(&mut encoder, identity);
+
+        assert_eq!(encoder.bytes.len(), 128);
+        assert_eq!(&encoder.bytes[0..32], &[0x57; 32]);
+        assert_eq!(&encoder.bytes[32..64], &[0x44; 32]);
+        assert_eq!(&encoder.bytes[64..96], &[0x56; 32]);
+        assert_eq!(&encoder.bytes[96..128], &[0x58; 32]);
+
+        let mut cursor = Cursor::new(&encoder.bytes);
+        assert_eq!(
+            decode_store_pinned_build_identity(&mut cursor),
+            Ok(identity)
+        );
+        assert_eq!(cursor.finish(), Ok(()));
+        assert_eq!(
+            StorePinnedBuildIdentity::try_new([0; 32], digest(0x44), digest(0x56), digest(0x58),),
+            Err(RuntimeJournalError::ZeroReference)
+        );
+        assert_eq!(
+            StorePinnedBuildIdentity::try_new(
+                [0x57; 32],
+                Digest32::from_bytes([0; 32]),
+                digest(0x56),
+                digest(0x58),
+            ),
+            Err(RuntimeJournalError::ZeroDigest)
+        );
+    }
+
+    #[test]
+    fn typed_sequence_one_builder_fixes_initial_state_and_cross_checks_compiled_actual() {
+        let snapshot =
+            RuntimeJournalSnapshot::try_initialize([0x11; 32], digest(0x22), sequence_one_input())
+                .expect("typed sequence-one input must initialize");
+        assert_eq!(snapshot.sequence(), 1);
+        assert_eq!(snapshot.state(), &sequence_one_state());
+        assert_eq!(
+            snapshot.state().last_transaction,
+            RuntimeJournalTransaction::Initialized
+        );
+        assert!(snapshot.state().writer_fence.is_none());
+        assert!(snapshot.state().prepared.is_none());
+        assert!(snapshot.state().active_desired.is_none());
+        assert!(snapshot.state().recovery_action.is_none());
+        assert!(snapshot.state().owned_resources.is_empty());
+        assert!(snapshot.state().terminal_operations.is_empty());
+
+        let mut wrong_descriptor = sequence_one_input();
+        wrong_descriptor.build_descriptor = pinned(b"other-descriptor-v1", 0xf0);
+        assert_eq!(
+            RuntimeJournalSnapshot::try_initialize([0x11; 32], digest(0x22), wrong_descriptor,),
+            Err(RuntimeJournalError::InvalidStateInvariant)
+        );
+
+        let mut wrong_compiled_id = sequence_one_input();
+        wrong_compiled_id.compiled_build_instance_id = [0xf1; 32];
+        assert_eq!(
+            RuntimeJournalSnapshot::try_initialize([0x11; 32], digest(0x22), wrong_compiled_id,),
+            Err(RuntimeJournalError::InvalidStateInvariant)
+        );
+
+        let mut wrong_compiled_compatibility = sequence_one_input();
+        wrong_compiled_compatibility.compiled_compatibility_digest = digest(0xf2);
+        assert_eq!(
+            RuntimeJournalSnapshot::try_initialize(
+                [0x11; 32],
+                digest(0x22),
+                wrong_compiled_compatibility,
+            ),
+            Err(RuntimeJournalError::InvalidStateInvariant)
+        );
+    }
+
+    #[test]
+    fn payload_v2_has_no_supported_stored_version_fallback() {
+        let snapshot =
+            RuntimeJournalSnapshot::try_initialize([0x11; 32], digest(0x22), sequence_one_input())
+                .expect("fixture v3 snapshot must initialize");
+        let mut version_two = snapshot.canonical_wire().to_vec();
+        version_two[8..10].copy_from_slice(&2_u16.to_be_bytes());
+
+        assert_eq!(
+            RuntimeJournalSnapshot::decode(&version_two),
+            Err(RuntimeJournalError::UnsupportedPayloadVersion)
+        );
+    }
+
+    #[test]
     fn sequence_one_has_a_frozen_envelope_checksum_and_round_trips() {
         let snapshot = snapshot(1, sequence_one_state());
         let encoded = snapshot.canonical_wire();
-        assert_eq!(encoded.len(), 486);
-        assert_eq!(&encoded[..14], b"PXJR\0\x01\0\x03\0\x02\0\x01\0\x01");
+        assert_eq!(encoded.len(), 561);
+        assert_eq!(&encoded[..14], b"PXJR\0\x01\0\x03\0\x03\0\x01\0\x01");
         assert_eq!(
             &encoded[HEADER_WITHOUT_CHECKSUM_BYTES..HEADER_BYTES],
             &[
-                238, 61, 15, 43, 207, 123, 204, 111, 181, 191, 125, 50, 31, 64, 20, 123, 67, 59,
-                93, 127, 231, 166, 19, 40, 132, 73, 238, 23, 117, 79, 195, 43,
+                80, 238, 20, 132, 228, 168, 76, 246, 79, 5, 49, 164, 237, 65, 129, 250, 140, 224,
+                109, 210, 85, 106, 198, 134, 88, 64, 74, 224, 120, 193, 87, 249,
             ]
         );
         let decoded = RuntimeJournalSnapshot::decode(encoded).expect("golden must decode");
@@ -7921,12 +10098,12 @@ mod tests {
     #[test]
     fn full_live_ready_state_has_a_frozen_envelope_checksum() {
         let snapshot = snapshot(7, active_state());
-        assert_eq!(snapshot.canonical_wire().len(), 2_015);
+        assert_eq!(snapshot.canonical_wire().len(), 2_090);
         assert_eq!(
             &snapshot.canonical_wire()[HEADER_WITHOUT_CHECKSUM_BYTES..HEADER_BYTES],
             &[
-                18, 227, 235, 235, 31, 201, 83, 85, 150, 255, 133, 250, 220, 244, 78, 144, 85, 241,
-                202, 219, 14, 38, 174, 214, 191, 103, 65, 211, 111, 142, 170, 50,
+                35, 51, 157, 4, 145, 108, 247, 64, 34, 224, 137, 160, 67, 110, 10, 28, 203, 175,
+                252, 97, 176, 84, 54, 116, 53, 135, 10, 168, 167, 220, 5, 164,
             ],
         );
     }
@@ -7969,7 +10146,7 @@ mod tests {
             Err(RuntimeJournalError::WrongOwnerKind)
         );
         let mut bad_payload = encoded.clone();
-        bad_payload[9] = 3;
+        bad_payload[9] = 2;
         assert_eq!(
             RuntimeJournalSnapshot::decode(&bad_payload),
             Err(RuntimeJournalError::UnsupportedPayloadVersion)
@@ -8115,22 +10292,22 @@ mod tests {
             Err(RuntimeJournalError::OpaqueValueTooLarge)
         );
 
-        let exact_terminal_body = vec![0_u8; MAX_RUNTIME_TERMINAL_RESPONSE_BYTES];
+        let exact_terminal_body = vec![0_u8; MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES];
         assert_eq!(
             OpaqueCanonicalValue::try_new(
                 &exact_terminal_body,
                 digest(1),
-                MAX_RUNTIME_TERMINAL_RESPONSE_BYTES,
+                MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES,
             )
-            .and_then(|value| value.validate_bound(MAX_RUNTIME_TERMINAL_RESPONSE_BYTES)),
+            .and_then(|value| { value.validate_bound(MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES) }),
             Ok(())
         );
-        let oversized_terminal_body = vec![0_u8; MAX_RUNTIME_TERMINAL_RESPONSE_BYTES + 1];
+        let oversized_terminal_body = vec![0_u8; MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES + 1];
         assert_eq!(
             OpaqueCanonicalValue::try_new(
                 &oversized_terminal_body,
                 digest(1),
-                MAX_RUNTIME_TERMINAL_RESPONSE_BYTES,
+                MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES,
             ),
             Err(RuntimeJournalError::OpaqueValueTooLarge)
         );
@@ -8512,7 +10689,7 @@ mod tests {
             source_plan_digest: active.source_plan_digest,
             active_slice_digest,
             manifest_digest: digest(0x55),
-            store_pinned_build_identity_digest: digest(0x56),
+            store_pinned_build_identity: store_pinned_build_identity(),
             compiled_build_instance_id: [0x57; 32],
             compiled_compatibility_digest: digest(0x58),
             signed_start_budget_nanos: 100,
@@ -8600,15 +10777,26 @@ mod tests {
         let mut mutations = Vec::new();
 
         let mut store_identity = base.clone();
-        store_identity.host.store_pinned_build_identity = pinned(b"changed-build-id", 0xf0);
+        store_identity
+            .host
+            .store_pinned_build_identity
+            .runtime_artifact_sha256 = digest(0xf0);
         mutations.push(store_identity);
 
         let mut compiled_id = base.clone();
         compiled_id.host.compiled_build_instance_id = [0xf1; 32];
+        compiled_id
+            .host
+            .store_pinned_build_identity
+            .build_instance_id = [0xf1; 32];
         mutations.push(compiled_id);
 
         let mut compiled_compatibility = base.clone();
         compiled_compatibility.host.compiled_compatibility_digest = digest(0xf2);
+        compiled_compatibility
+            .host
+            .store_pinned_build_identity
+            .compiled_reference_compatibility_digest = digest(0xf2);
         mutations.push(compiled_compatibility);
 
         let mut channel = base.clone();
@@ -8632,6 +10820,18 @@ mod tests {
             .as_mut()
             .expect("fixture recovery must exist")
             .compiled_build_instance_id = [0xf5; 32];
+        assert_eq!(
+            recovery.validate(7),
+            Err(RuntimeJournalError::InvalidStateInvariant)
+        );
+
+        let mut recovery = recovering_state();
+        recovery
+            .recovery_action
+            .as_mut()
+            .expect("fixture recovery must exist")
+            .store_pinned_build_identity
+            .runtime_artifact_sha256 = digest(0xf6);
         assert_eq!(
             recovery.validate(7),
             Err(RuntimeJournalError::InvalidStateInvariant)
@@ -8986,6 +11186,353 @@ mod tests {
         assert_eq!(
             snapshot(10, swapped).validate_successor_of(&snapshot(9, admitted)),
             Err(RuntimeJournalError::NonMonotonicTransition)
+        );
+    }
+
+    #[test]
+    fn production_startup_builder_derives_the_validated_successor() {
+        let initialized =
+            RuntimeJournalSnapshot::try_initialize([0x11; 32], digest(0x22), sequence_one_input())
+                .expect("fixture sequence one must initialize");
+        let started = initialized
+            .try_startup_invalidation_successor()
+            .expect("initialized journal must accept startup invalidation");
+        assert_eq!(started.sequence(), 2);
+        assert_eq!(started.validate_successor_of(&initialized), Ok(()));
+        assert_eq!(
+            started.state(),
+            &startup_successor_state(initialized.state())
+        );
+        assert_eq!(started.state().host.runtime_host_epoch_high_water, 1);
+        assert_eq!(started.state().host.clock_generation_high_water, 1);
+        assert!(matches!(
+            started.state().live_materialization,
+            LiveMaterialization::StartupInvalidated {
+                recovery_eligibility: StartupRecoveryEligibility::NoActiveHead,
+                ..
+            }
+        ));
+
+        let active = snapshot(7, active_state());
+        let restarted_active = active
+            .try_startup_invalidation_successor()
+            .expect("active journal must accept startup invalidation");
+        assert_eq!(restarted_active.sequence(), 8);
+        assert_eq!(restarted_active.validate_successor_of(&active), Ok(()));
+        assert_eq!(
+            restarted_active.state(),
+            &startup_successor_state(active.state())
+        );
+        assert!(matches!(
+            restarted_active.state().live_materialization,
+            LiveMaterialization::StartupInvalidated {
+                recovery_eligibility: StartupRecoveryEligibility::EligibleOneSourceLoop,
+                ..
+            }
+        ));
+
+        let draining = snapshot(7, draining_state());
+        let restarted_draining = draining
+            .try_startup_invalidation_successor()
+            .expect("draining journal must accept startup invalidation");
+        assert_eq!(restarted_draining.sequence(), 8);
+        assert_eq!(restarted_draining.validate_successor_of(&draining), Ok(()));
+        assert_eq!(
+            restarted_draining.state(),
+            &startup_successor_state(draining.state())
+        );
+        assert!(matches!(
+            restarted_draining.state().live_materialization,
+            LiveMaterialization::StartupInvalidated {
+                recovery_eligibility: StartupRecoveryEligibility::ReconcileRequired,
+                ..
+            }
+        ));
+        assert!(matches!(
+            restarted_draining
+                .state()
+                .prepared
+                .as_ref()
+                .map(|prepared| prepared.phase),
+            Some(PreparedPhase::StartupReconcileRequired)
+        ));
+    }
+
+    #[test]
+    fn production_apply_builders_complete_start_drain_and_zero_fast_path() {
+        let sequence_one =
+            RuntimeJournalSnapshot::try_initialize([0x11; 32], digest(0x22), sequence_one_input())
+                .expect("fixture sequence one must initialize");
+        let started = sequence_one
+            .try_startup_invalidation_successor()
+            .expect("startup must commit");
+        let tenured = started
+            .try_tenure_only_successor(production_tenure_input())
+            .expect("tenure-only must commit");
+        assert_eq!(tenured.state().host.request_nonces.len(), 0);
+        assert_eq!(tenured.state().host.temporal_lineages.len(), 0);
+        assert!(tenured.state().source_revision_high_water.is_none());
+        assert!(tenured.state().prepared.is_none());
+
+        let admitted = tenured
+            .try_full_admission_successor(production_one_source_admission_input())
+            .expect("full admission must commit after tenure");
+        assert!(matches!(
+            admitted.state().live_materialization,
+            LiveMaterialization::None
+        ));
+        let intent = admitted
+            .try_one_source_intent_successor(RuntimeStartActionInput {
+                action_id: [0x37; 16],
+                domain_generation: 2,
+                instance_generation: 2,
+                resource_generation: 2,
+                pre_intent: RuntimeDeadlineObservation {
+                    clock_generation: 1,
+                    observed_at_nanos: 9_000,
+                },
+            })
+            .expect("pre-deadline intent must commit");
+        let reserved = intent
+            .try_reserve_one_source_resources_successor(RuntimeOneSourceResourceRefs {
+                loop_domain: [0x38; 16],
+                card_instance: [0x39; 16],
+            })
+            .expect("fixed resources must reserve");
+        let owned = reserved
+            .try_own_one_source_resources_successor(RuntimeOneSourceOwnershipInput {
+                loop_domain: RuntimeResourceOwnershipInput {
+                    logical_ref: [0x38; 16],
+                    os_identity: evidence(b"loop-os", 0x40),
+                    workspace_identity: evidence(b"loop-workspace", 0x42),
+                    containment_identity: evidence(b"loop-containment", 0x44),
+                },
+                card_instance: RuntimeResourceOwnershipInput {
+                    logical_ref: [0x39; 16],
+                    os_identity: evidence(b"card-os", 0x41),
+                    workspace_identity: evidence(b"card-workspace", 0x43),
+                    containment_identity: evidence(b"card-containment", 0x45),
+                },
+            })
+            .expect("real ownership evidence must commit");
+        let active = owned
+            .try_one_source_success_terminal_successor(
+                opaque(b"one-source-slice-from-request", 0x36),
+                RuntimeOneSourceCallbackSuccessInput {
+                    action_id: [0x37; 16],
+                },
+                RuntimeTerminalInput {
+                    canonical_response: OpaqueCanonicalValue::try_terminal_response(
+                        b"one-source-active-response",
+                        digest(0x46),
+                    )
+                    .expect("terminal response"),
+                    selection: RuntimeDeadlineObservation {
+                        clock_generation: 1,
+                        observed_at_nanos: 9_500,
+                    },
+                },
+            )
+            .expect("one-source success must publish desired and live atomically");
+        assert!(matches!(
+            active.state().live_materialization,
+            LiveMaterialization::LiveReady { .. }
+        ));
+        assert_eq!(
+            active
+                .state()
+                .terminal_operations
+                .last()
+                .map(|record| record.selection.primary),
+            Some(TerminalOutcome::OneSourceLoopActive)
+        );
+
+        let active_digest = active
+            .state()
+            .active_desired
+            .as_ref()
+            .map(|head| TargetSliceDigest::new(head.slice.digest))
+            .expect("active digest");
+        let empty_admitted = active
+            .try_full_admission_successor(production_empty_admission_input(
+                0xb0,
+                2,
+                active_digest,
+                20_000,
+            ))
+            .expect("empty request must admit");
+        let draining = empty_admitted
+            .try_empty_head_retire_successor(RuntimeEmptyRetireInput {
+                action_id: [0xb7; 16],
+                incoming_slice: opaque(b"canonical-empty-from-request", 0xb6),
+                budgets: RuntimeRetiringLifecycleBudgets {
+                    start_nanos: 100,
+                    drain_nanos: 200,
+                    cleanup_nanos: 300,
+                },
+                pre_intent: RuntimeDeadlineObservation {
+                    clock_generation: 1,
+                    observed_at_nanos: 15_000,
+                },
+            })
+            .expect("empty head-first retire must commit before effect");
+        assert!(matches!(
+            draining.state().live_materialization,
+            LiveMaterialization::Draining { .. }
+        ));
+        assert_eq!(
+            draining
+                .state()
+                .active_desired
+                .as_ref()
+                .map(|head| head.kind),
+            Some(DesiredHeadKind::EmptyDeactivate)
+        );
+        let callback = draining
+            .try_latch_empty_success_successor(RuntimeDeadlineObservation {
+                clock_generation: 1,
+                observed_at_nanos: 18_000,
+            })
+            .expect("stop callback must latch before cleanup");
+        let exact_zero = callback
+            .try_empty_exact_zero_terminal_successor(
+                RuntimeOneSourceTombstonesInput {
+                    loop_domain: RuntimeResourceTombstoneInput {
+                        logical_ref: [0x38; 16],
+                        evidence: evidence(b"loop-tombstone", 0xc0),
+                    },
+                    card_instance: RuntimeResourceTombstoneInput {
+                        logical_ref: [0x39; 16],
+                        evidence: evidence(b"card-tombstone", 0xc1),
+                    },
+                },
+                RuntimeTerminalInput {
+                    canonical_response: OpaqueCanonicalValue::try_terminal_response(
+                        b"empty-exact-zero-response",
+                        digest(0xc2),
+                    )
+                    .expect("terminal response"),
+                    selection: RuntimeDeadlineObservation {
+                        clock_generation: 1,
+                        observed_at_nanos: 19_000,
+                    },
+                },
+            )
+            .expect("real tombstones must commit exact zero");
+        assert!(matches!(
+            exact_zero.state().live_materialization,
+            LiveMaterialization::ExactZero { .. }
+        ));
+        assert_eq!(
+            exact_zero
+                .state()
+                .terminal_operations
+                .last()
+                .map(|record| record.selection.primary),
+            Some(TerminalOutcome::EmptyDeactivateExactZero)
+        );
+
+        let empty_digest = exact_zero
+            .state()
+            .active_desired
+            .as_ref()
+            .map(|head| TargetSliceDigest::new(head.slice.digest))
+            .expect("empty digest");
+        let second_empty = exact_zero
+            .try_full_admission_successor(production_empty_admission_input(
+                0xd0,
+                3,
+                empty_digest,
+                30_000,
+            ))
+            .expect("higher-revision empty must admit");
+        let fast_path = second_empty
+            .try_empty_exact_zero_fast_path_successor(
+                opaque(b"next-canonical-empty-from-request", 0xd6),
+                RuntimeTerminalInput {
+                    canonical_response: OpaqueCanonicalValue::try_terminal_response(
+                        b"next-empty-exact-zero-response",
+                        digest(0xd7),
+                    )
+                    .expect("terminal response"),
+                    selection: RuntimeDeadlineObservation {
+                        clock_generation: 1,
+                        observed_at_nanos: 25_000,
+                    },
+                },
+            )
+            .expect("already-zero fast path must not create an action");
+        assert!(fast_path.state().current_action().is_none());
+        assert_eq!(
+            fast_path
+                .state()
+                .terminal_operations
+                .last()
+                .map(|record| record.selection.lifecycle_effect),
+            Some(TerminalLifecycleEffect::ProvenNotStarted)
+        );
+    }
+
+    #[test]
+    fn empty_callback_at_deadline_is_latched_and_finishes_as_timeout() {
+        let old_active = active_state();
+        let admitted = admitted_empty_state(&old_active);
+        let draining = empty_head_retire_state(&admitted);
+        let draining = snapshot(9, draining);
+        let deadline = draining
+            .state()
+            .prepared
+            .as_ref()
+            .expect("prepared drain")
+            .installed_deadline_nanos;
+        let latched = draining
+            .try_latch_empty_success_successor(RuntimeDeadlineObservation {
+                clock_generation: draining.state().host.clock_generation_high_water,
+                observed_at_nanos: deadline,
+            })
+            .expect("deadline equality must preserve callback and timeout facts");
+        let raw = latched
+            .state()
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.raw_outcome)
+            .expect("raw outcome must persist");
+        assert_eq!(raw.callback, CallbackOutcome::KnownSuccess);
+        assert_eq!(raw.deadline, DeadlineOutcome::TimedOut);
+        assert_eq!(raw.observed_at_nanos, deadline);
+
+        let terminal = latched
+            .try_empty_exact_zero_terminal_successor(
+                RuntimeOneSourceTombstonesInput {
+                    loop_domain: RuntimeResourceTombstoneInput {
+                        logical_ref: [0x05; 16],
+                        evidence: evidence(b"loop-timeout-tombstone", 0xe0),
+                    },
+                    card_instance: RuntimeResourceTombstoneInput {
+                        logical_ref: [0x06; 16],
+                        evidence: evidence(b"card-timeout-tombstone", 0xe1),
+                    },
+                },
+                RuntimeTerminalInput {
+                    canonical_response: OpaqueCanonicalValue::try_terminal_response(
+                        b"empty-timeout-exact-zero-response",
+                        digest(0xe2),
+                    )
+                    .expect("terminal response"),
+                    selection: RuntimeDeadlineObservation {
+                        clock_generation: latched.state().host.clock_generation_high_water,
+                        observed_at_nanos: deadline,
+                    },
+                },
+            )
+            .expect("late success must still clean up to a timeout terminal");
+        assert_eq!(
+            terminal
+                .state()
+                .terminal_operations
+                .last()
+                .map(|record| record.selection.primary),
+            Some(TerminalOutcome::TimedOutButExactZero)
         );
     }
 
@@ -9852,6 +12399,10 @@ mod tests {
 
         let mut changed_pin_state = current_state.clone();
         changed_pin_state.host.build_descriptor = pinned(b"descriptor-v2", 0xb1);
+        changed_pin_state
+            .host
+            .store_pinned_build_identity
+            .build_descriptor_digest = digest(0xb1);
         let changed_pin = snapshot(8, changed_pin_state);
         assert_eq!(
             changed_pin.validate_successor_of(&previous),

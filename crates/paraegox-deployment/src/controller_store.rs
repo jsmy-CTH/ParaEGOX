@@ -233,6 +233,15 @@ impl ControllerStore {
         self.commit_with_failpoint(next, ControllerCommitFailpoint::None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn commit_with_test_failpoint(
+        &mut self,
+        next: ControllerJournalSnapshot,
+        failpoint: ControllerCommitFailpoint,
+    ) -> Result<(), ControllerStoreError> {
+        self.commit_with_failpoint(next, failpoint)
+    }
+
     fn commit_with_failpoint(
         &mut self,
         next: ControllerJournalSnapshot,
@@ -1408,20 +1417,41 @@ impl std::error::Error for ControllerStoreError {}
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::future::Future;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use ed25519_dalek::{Signer, SigningKey};
     use paraegox_kernel::digest::Digest32;
-    use paraegox_kernel::identity::RuntimeHostId;
+    use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
+    use paraegox_runtime_contracts::apply::{
+        PlanWriterEpoch, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm,
+        TenureProofAuthority, WriterTenureClaim, WriterTenureProof, WriterTenureSigningTranscript,
+    };
     use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
+    use tokio::runtime::Builder as RuntimeBuilder;
 
     use crate::controller_journal::{
         ControllerAuthKeyFingerprint, ControllerJournalSnapshot, ControllerJournalState,
         ControllerOperationId, ControllerOwnerIdentityFingerprint, ControllerRequestAuthPin,
+        ControllerTenurePhase, controller_test_manifest, refresh_controller_test_checksum,
     };
-    use crate::plan::{DeploymentId, DeploymentScopeId};
+    use crate::controller_tenure::{
+        ControllerTenureError, acquire_tenure_once_with_test_exchange,
+        commit_verified_response_with_test_commit,
+    };
+    use crate::plan::{DeploymentId, DeploymentScopeId, DeploymentWriterRef};
     use crate::planner::{StableAllocationSnapshot, journal_test_candidate};
+    use crate::tenure_client::{
+        AcquireTenureExchangeError, AcquireTenureRequestToSign, PreparedAcquireTenureRequest,
+        TenureClientFailure,
+    };
+    use crate::tenure_protocol::{
+        AcquireTenureIntentV1, AcquireTenureOperationId, AcquireTenureRequestDraftV1,
+        AcquireTenureResponseV1, ControllerAcquireKeyRef, ControllerPublicKeyFingerprint,
+        MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
+    };
 
     use super::{
         CONTROLLER_ACTIVE_FILE_NAME, CONTROLLER_LOCK_FILE_NAME, ControllerCommitFailpoint,
@@ -1613,6 +1643,7 @@ mod tests {
             DeploymentScopeId::from_bytes([0x32; 16]),
             DeploymentId::from_bytes([0x33; 16]),
             allocation,
+            controller_test_manifest(target),
             auth(0x34, 1),
         )
         .unwrap_or_else(|error| panic!("fixture state failed: {error}"));
@@ -1652,6 +1683,85 @@ mod tests {
         .unwrap_or_else(|error| panic!("fixture store open failed: {error}"))
     }
 
+    fn run_async<T>(future: impl Future<Output = T>) -> T {
+        RuntimeBuilder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap_or_else(|error| panic!("test runtime failed: {error}"))
+            .block_on(future)
+    }
+
+    fn prepared_tenure_request(operation: u8, nonce: &[u8]) -> PreparedAcquireTenureRequest {
+        let signing_key = SigningKey::from_bytes(&[0x71; 32]);
+        let fingerprint = ControllerPublicKeyFingerprint::for_ed25519_key(
+            &signing_key.verifying_key().to_bytes(),
+        )
+        .expect("Controller tenure fingerprint must validate");
+        let draft = AcquireTenureRequestDraftV1::try_new(
+            AcquireTenureIntentV1::new(
+                DeploymentScopeId::from_bytes([0x32; 16]),
+                DeploymentWriterRef::from_bytes([0x72; 16]),
+                AcquireTenureOperationId::from_bytes([operation; 16]),
+            ),
+            PrincipalRef::from_bytes([0x73; 16]),
+            ControllerAcquireKeyRef::from_bytes([0x74; 16]),
+            fingerprint,
+            nonce,
+            u32::try_from(MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES)
+                .expect("response bound must fit"),
+        )
+        .expect("tenure request draft must validate");
+        let to_sign =
+            AcquireTenureRequestToSign::try_new(draft).expect("request must prepare for signing");
+        let signature = signing_key.sign(to_sign.signing_bytes());
+        to_sign
+            .finalize_ed25519(&signature.to_bytes())
+            .expect("signed tenure request must validate")
+    }
+
+    fn tenure_response(
+        prepared: &PreparedAcquireTenureRequest,
+        epoch: u64,
+    ) -> AcquireTenureResponseV1 {
+        let authority = TenureProofAuthority::try_new(
+            TenureAuthorityRef::from_bytes([0x75; 16]),
+            TenureKeyRef::from_bytes([0x76; 16]),
+            TenureProofAlgorithm::try_new(1).expect("proof algorithm must validate"),
+            1,
+        )
+        .expect("proof authority must validate");
+        let claim = WriterTenureClaim::try_new(
+            prepared.request().proof_source_scope(),
+            prepared.request().proof_writer(),
+            PlanWriterEpoch::new(epoch),
+            PlanWriterEpoch::new(epoch - 1),
+        )
+        .expect("proof claim must validate");
+        let transcript = WriterTenureSigningTranscript::try_new(
+            authority,
+            claim,
+            prepared.request().client_nonce(),
+        )
+        .expect("proof transcript must validate");
+        let signature = SigningKey::from_bytes(&[0x77; 32]).sign(transcript.as_bytes());
+        let proof = WriterTenureProof::try_new(
+            authority,
+            claim,
+            prepared.request().client_nonce(),
+            &signature.to_bytes(),
+        )
+        .expect("tenure proof must validate");
+        AcquireTenureResponseV1::try_new(prepared.request(), proof)
+            .expect("tenure response must validate")
+    }
+
+    fn active_snapshot(directory: &TestDirectory) -> ControllerJournalSnapshot {
+        let bytes = fs::read(directory.path().join(CONTROLLER_ACTIVE_FILE_NAME))
+            .expect("active snapshot must be readable");
+        ControllerJournalSnapshot::decode(&bytes).expect("active snapshot must strictly decode")
+    }
+
     fn successor_of(initial: &ControllerJournalSnapshot) -> ControllerJournalSnapshot {
         let allocation = StableAllocationSnapshot::try_new(
             RuntimeHostId::from_bytes([0x31; 16]),
@@ -1662,6 +1772,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("fixture allocation failed: {error}"));
         let candidate = journal_test_candidate(
             RuntimeHostId::from_bytes([0x31; 16]),
+            initial.state().installed_manifest().projection(),
             &allocation,
             Some([0x35; 16]),
             0x36,
@@ -1713,7 +1824,241 @@ mod tests {
             .unwrap_or_else(|error| panic!("fixture commit failed: {error}"));
         assert_eq!(store.snapshot(), Ok(&next));
         drop(store);
-        assert_eq!(open_fixture(&directory).snapshot(), Ok(&next));
+        let reopened = open_fixture(&directory);
+        assert_eq!(reopened.snapshot(), Ok(&next));
+        assert_eq!(
+            reopened
+                .snapshot()
+                .expect("reopened snapshot")
+                .state()
+                .installed_manifest(),
+            initial.state().installed_manifest()
+        );
+    }
+
+    #[test]
+    fn tenure_exchange_observes_durable_prepared_and_success_replays_without_resend() {
+        let directory = TestDirectory::new();
+        let initial = initial_snapshot();
+        install(&initial, &directory);
+        let mut store = open_fixture(&directory);
+        let prepared = prepared_tenure_request(0x41, b"durable-before-exchange");
+        let expected_frame = prepared.frame_bytes().to_vec();
+        let response = tenure_response(&prepared, 5);
+
+        let acquired = run_async(acquire_tenure_once_with_test_exchange(
+            &mut store,
+            &prepared,
+            |durable| {
+                let disk = active_snapshot(&directory);
+                let transaction = disk
+                    .state()
+                    .tenure_transaction(durable.request().operation_id())
+                    .expect("exchange must observe the durable transaction");
+                assert_eq!(transaction.phase(), ControllerTenurePhase::Prepared);
+                assert_eq!(
+                    transaction.request().canonical_bytes(),
+                    durable.request().canonical_bytes()
+                );
+                assert_eq!(durable.frame_bytes(), expected_frame);
+                let response = response.clone();
+                async move { Ok(response) }
+            },
+        ))
+        .expect("verified response must commit");
+        assert!(!acquired.replayed_from_journal());
+        assert_eq!(acquired.proof(), response.proof());
+
+        drop(store);
+        let mut reopened = open_fixture(&directory);
+        let transaction = reopened
+            .snapshot()
+            .expect("reopened store must remain operational")
+            .state()
+            .tenure_transaction(prepared.request().operation_id())
+            .expect("committed tenure must survive restart");
+        assert_eq!(transaction.phase(), ControllerTenurePhase::Committed);
+        assert_eq!(transaction.response(), Some(&response));
+        let replayed = run_async(acquire_tenure_once_with_test_exchange(
+            &mut reopened,
+            &prepared,
+            |_| async { panic!("committed exact replay must not exchange again") },
+        ))
+        .expect("committed exact replay must return the journal proof");
+        assert!(replayed.replayed_from_journal());
+        assert_eq!(replayed.proof(), response.proof());
+    }
+
+    #[test]
+    fn tenure_not_sent_stays_prepared_and_uncertain_is_durable_with_exact_restart_frame() {
+        for (operation, nonce, exchange_error, expected_phase) in [
+            (
+                0x42,
+                b"not-sent-tenure".as_slice(),
+                AcquireTenureExchangeError::NotSent(TenureClientFailure::SocketMetadataUnavailable),
+                ControllerTenurePhase::Prepared,
+            ),
+            (
+                0x43,
+                b"uncertain-tenure".as_slice(),
+                AcquireTenureExchangeError::Uncertain(TenureClientFailure::TruncatedResponse),
+                ControllerTenurePhase::Uncertain,
+            ),
+        ] {
+            let directory = TestDirectory::new();
+            let initial = initial_snapshot();
+            install(&initial, &directory);
+            let mut store = open_fixture(&directory);
+            let prepared = prepared_tenure_request(operation, nonce);
+            let expected_frame = prepared.frame_bytes().to_vec();
+            let result = run_async(acquire_tenure_once_with_test_exchange(
+                &mut store,
+                &prepared,
+                |_| async move { Err(exchange_error) },
+            ));
+            assert_eq!(result, Err(ControllerTenureError::Exchange(exchange_error)));
+
+            drop(store);
+            let reopened = open_fixture(&directory);
+            let transaction = reopened
+                .snapshot()
+                .expect("reopened store must remain operational")
+                .state()
+                .tenure_transaction(prepared.request().operation_id())
+                .expect("tenure transaction must survive restart");
+            assert_eq!(transaction.phase(), expected_phase);
+            let recovered = PreparedAcquireTenureRequest::try_from_canonical_request_bytes(
+                transaction.request().canonical_bytes(),
+            )
+            .expect("restart must reconstruct the exact prepared request");
+            assert_eq!(recovered.request(), prepared.request());
+            assert_eq!(recovered.frame_bytes(), expected_frame);
+        }
+    }
+
+    #[test]
+    fn verified_response_publish_failures_preserve_typed_ambiguity_and_restart_truth() {
+        for (operation, nonce, failpoint, expected_phase) in [
+            (
+                0x44,
+                b"verified-before-rename".as_slice(),
+                ControllerCommitFailpoint::BeforeRename,
+                ControllerTenurePhase::Prepared,
+            ),
+            (
+                0x45,
+                b"verified-after-directory-sync".as_slice(),
+                ControllerCommitFailpoint::AfterDirectorySyncBeforeReturn,
+                ControllerTenurePhase::Committed,
+            ),
+        ] {
+            let directory = TestDirectory::new();
+            let initial = initial_snapshot();
+            install(&initial, &directory);
+            let mut store = open_fixture(&directory);
+            let prepared = prepared_tenure_request(operation, nonce);
+            let prepared_state = store
+                .snapshot()
+                .expect("store must be operational")
+                .state()
+                .prepare_tenure_acquisition(
+                    prepared.request(),
+                    crate::controller_journal::ControllerTenureAuthorityDomainFingerprint::from_stored(
+                        Digest32::from_bytes([0xa5; 32]),
+                    ),
+                )
+                .expect("tenure request must prepare");
+            let prepared_snapshot = store
+                .snapshot()
+                .expect("store must be operational")
+                .try_successor(prepared_state)
+                .expect("Prepared must be a valid successor");
+            store
+                .commit(prepared_snapshot)
+                .expect("Prepared must be durable before simulated success");
+            let response = tenure_response(&prepared, 5);
+
+            let result = commit_verified_response_with_test_commit(
+                &mut store,
+                prepared.request(),
+                &response,
+                |store, next| store.commit_with_failpoint(next, failpoint),
+            );
+            assert!(matches!(
+                result,
+                Err(ControllerTenureError::VerifiedResponsePersistence {
+                    response_digest,
+                    store: ControllerStoreError::Publish(_),
+                }) if response_digest == response.response_digest()
+            ));
+            assert_eq!(store.snapshot(), Err(ControllerStoreError::Stopped));
+
+            drop(store);
+            let mut reopened = open_fixture(&directory);
+            assert_eq!(
+                reopened
+                    .snapshot()
+                    .expect("restart must resolve publish truth")
+                    .state()
+                    .tenure_transaction(prepared.request().operation_id())
+                    .expect("tenure transaction must survive restart")
+                    .phase(),
+                expected_phase
+            );
+            let replay = run_async(acquire_tenure_once_with_test_exchange(
+                &mut reopened,
+                &prepared,
+                |durable| {
+                    assert_eq!(durable.frame_bytes(), prepared.frame_bytes());
+                    let response = response.clone();
+                    async move { Ok(response) }
+                },
+            ))
+            .expect("restart must replay Prepared or return Committed exactly");
+            assert_eq!(replay.proof(), response.proof());
+            assert_eq!(
+                replay.replayed_from_journal(),
+                expected_phase == ControllerTenurePhase::Committed
+            );
+        }
+    }
+
+    #[test]
+    fn restart_file_read_rejects_a_checksum_valid_but_invalid_manifest_pin() {
+        let directory = TestDirectory::new();
+        let initial = initial_snapshot();
+        install(&initial, &directory);
+
+        let mut encoded = initial
+            .encode()
+            .expect("fixture snapshot must encode")
+            .to_vec();
+        let manifest = initial
+            .state()
+            .installed_manifest()
+            .canonical_manifest_wire();
+        let offset = encoded
+            .windows(manifest.len())
+            .position(|window| window == manifest)
+            .expect("installed manifest must be in the active snapshot");
+        encoded[offset + manifest.len() - 1] ^= 1;
+        refresh_controller_test_checksum(&mut encoded)
+            .expect("forged fixture checksum must rebuild");
+        fs::write(directory.path().join(CONTROLLER_ACTIVE_FILE_NAME), encoded)
+            .expect("forged active snapshot write");
+
+        assert_eq!(
+            ControllerStore::open_with_policy(
+                directory.path(),
+                STORE_ID,
+                owner(),
+                ControllerFilesystemPolicy::ExplicitFixture,
+            )
+            .expect_err("restart must strictly decode the installed manifest pin"),
+            ControllerStoreOpenError::Codec(
+                crate::controller_journal::ControllerJournalError::InvalidInstalledManifestPin
+            )
+        );
     }
 
     #[test]
