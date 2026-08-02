@@ -708,6 +708,65 @@ def authority_binary() -> Path:
 
 
 @pytest.fixture
+def root_controlled_authority_binary(authority_binary: Path) -> Iterator[Path]:
+    assert sys.platform == "linux"
+    with tempfile.TemporaryDirectory(prefix="pxa-bin-", dir="/tmp") as path:
+        install_dir = Path(path).resolve()
+        installed_binary = install_dir / "paraegox-tenure-authority"
+        _run_checked(
+            [
+                "sudo",
+                "-n",
+                "install",
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0755",
+                os.fspath(install_dir),
+            ]
+        )
+        try:
+            _run_checked(
+                [
+                    "sudo",
+                    "-n",
+                    "install",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0555",
+                    os.fspath(authority_binary),
+                    os.fspath(installed_binary),
+                ]
+            )
+            assert install_dir.stat().st_uid == 0
+            assert install_dir.stat().st_gid == 0
+            assert _mode_bits(install_dir) == 0o755
+            assert installed_binary.is_file()
+            assert not installed_binary.is_symlink()
+            assert installed_binary.stat().st_uid == 0
+            assert installed_binary.stat().st_gid == 0
+            assert _mode_bits(installed_binary) == 0o555
+            yield installed_binary
+        finally:
+            _run_checked(
+                [
+                    "sudo",
+                    "-n",
+                    "chown",
+                    "-R",
+                    f"{os.getuid()}:{os.getgid()}",
+                    os.fspath(install_dir),
+                ]
+            )
+
+
+@pytest.fixture
 def authority_tmp_path() -> Iterator[Path]:
     # Darwin limits AF_UNIX paths to 104 bytes, while pytest's default path can
     # exceed that before the socket filename is appended.
@@ -782,10 +841,13 @@ def test_independent_request_encoder_matches_frozen_rust_golden() -> None:
     reason="distinct service-account execution evidence runs on the Linux reference target",
 )
 def test_real_authority_process_commits_replays_locks_and_recovers(
-    authority_binary: Path,
+    root_controlled_authority_binary: Path,
     authority_tmp_path: Path,
 ) -> None:
     authority_uid, authority_gid, command_prefix = _linux_distinct_authority_identity()
+    _run_checked(
+        [*command_prefix, "test", "-x", os.fspath(root_controlled_authority_binary)]
+    )
     fixture = _install(
         authority_tmp_path,
         authority_uid=authority_uid,
@@ -797,7 +859,7 @@ def test_real_authority_process_commits_replays_locks_and_recovers(
     )
     with pytest.raises(PermissionError):
         fixture.private_seed_path.read_bytes()
-    _initialize(authority_binary, fixture)
+    _initialize(root_controlled_authority_binary, fixture)
     with pytest.raises(PermissionError):
         (fixture.state_dir / "authority.snapshot").read_bytes()
     assert _mode_bits(fixture.state_dir / "authority.lock") == 0o600
@@ -898,7 +960,7 @@ def test_real_authority_process_commits_replays_locks_and_recovers(
         nonce=b"first-nonce",
         signer=fixture.controller_private,
     )
-    with _server(authority_binary, fixture) as first_server:
+    with _server(root_controlled_authority_binary, fixture) as first_server:
         for invalid in invalid_requests:
             _exchange_rejected(fixture.socket_path, invalid)
         assert _file_identity(fixture.state_dir / "authority.snapshot") == sequence_one_identity
@@ -925,7 +987,7 @@ def test_real_authority_process_commits_replays_locks_and_recovers(
 
         contender = subprocess.run(
             _authority_command(
-                authority_binary,
+                root_controlled_authority_binary,
                 fixture.serve_arguments(),
                 command_prefix=fixture.command_prefix,
                 restrictive_umask=fixture.restrictive_umask,
@@ -944,7 +1006,7 @@ def test_real_authority_process_commits_replays_locks_and_recovers(
         _kill_server(first_server)
         assert fixture.socket_path.exists()
 
-    with _server(authority_binary, fixture):
+    with _server(root_controlled_authority_binary, fixture):
         first_frame = _exchange(fixture.socket_path, first_request)
         first = _verify_response(
             first_frame,

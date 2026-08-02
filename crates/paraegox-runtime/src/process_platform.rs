@@ -827,11 +827,15 @@ fn observe_open_fds(
     }
     let entries = match fs::read_dir(path.join("fd")) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if is_procfs_disappearance(&error) => return Ok(None),
         Err(error) => return Err(ProcessPlatformError::Io(error)),
     };
     for entry in entries {
-        entry.map_err(ProcessPlatformError::Io)?;
+        match entry {
+            Ok(_) => {}
+            Err(error) if is_procfs_disappearance(&error) => return Ok(None),
+            Err(error) => return Err(ProcessPlatformError::Io(error)),
+        }
         if aggregate_open_fds >= maximum_open_fds {
             return Err(ProcessPlatformError::OpenFileLimitExceeded);
         }
@@ -866,9 +870,17 @@ fn resident_bytes(status: &[u8]) -> Result<u64, ProcessPlatformError> {
 fn read_optional(path: PathBuf) -> Result<Option<Vec<u8>>, ProcessPlatformError> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) if is_procfs_disappearance(&error) => Ok(None),
         Err(error) => Err(ProcessPlatformError::Io(error)),
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_procfs_disappearance(error: &io::Error) -> bool {
+    // procfs may retain a numeric dentry after its task lookup is gone and
+    // report ESRCH instead of ENOENT. Keep this narrower than ordinary I/O or
+    // permission failures so an incomplete census cannot otherwise pass.
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(Errno::ESRCH as i32)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1426,6 +1438,22 @@ mod tests {
                 if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert_eq!(second_member_attempts, 1);
+    }
+
+    #[test]
+    fn procfs_disappearance_is_narrow_and_keeps_real_errors_fail_closed() {
+        assert!(is_procfs_disappearance(&io::Error::from_raw_os_error(
+            Errno::ENOENT as i32,
+        )));
+        assert!(is_procfs_disappearance(&io::Error::from_raw_os_error(
+            Errno::ESRCH as i32,
+        )));
+        assert!(!is_procfs_disappearance(&io::Error::from_raw_os_error(
+            Errno::EACCES as i32,
+        )));
+        assert!(!is_procfs_disappearance(&io::Error::from_raw_os_error(
+            Errno::EIO as i32,
+        )));
     }
 
     #[tokio::test(flavor = "current_thread")]
