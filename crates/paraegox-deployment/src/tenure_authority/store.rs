@@ -797,8 +797,9 @@ fn read_bounded_linux_proc_file(
         if remaining == 0 {
             return Err(LinuxMountEvidenceError::EvidenceTooLarge);
         }
+        let read_bound = remaining.min(chunk.len());
         let read = source
-            .read(&mut chunk[..remaining.min(chunk.len())])
+            .read(&mut chunk[..read_bound])
             .map_err(|error| LinuxMountEvidenceError::Io(error.kind()))?;
         if read == 0 {
             return Ok(bytes);
