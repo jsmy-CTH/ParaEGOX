@@ -83,7 +83,7 @@ use crate::{
         runtime_reference_owner::RuntimeFixedReferenceMaterializationOwner,
     },
     runtime_journal::{
-        DesiredHeadKind, ExpectedActiveCas, LiveMaterialization, PreparedPhase, ResourcePhase,
+        DesiredHeadKind, ExpectedActiveCas, LiveMaterialization, PreparedPhase,
         RuntimeDeadlineObservation, RuntimeJournalSnapshot, StorePinnedBuildIdentity,
     },
     runtime_provisioning::{
@@ -92,6 +92,9 @@ use crate::{
     },
     runtime_store::{RuntimeStore, RuntimeStoreError, RuntimeStoreOpenError},
 };
+
+#[cfg(test)]
+use crate::runtime_journal::ResourcePhase;
 
 const ED25519_SIGNATURE_BYTES: usize = 64;
 const CONTROL_FRAME_HEADER_BYTES: usize = 4;
@@ -223,6 +226,7 @@ impl RuntimeBootstrapStore for RuntimeStore {
 /// the startup-invalidation snapshot commit have both succeeded.
 struct StartedRuntimeBootstrapService<Store> {
     store: Store,
+    #[cfg(test)]
     state: RuntimeControlState,
     clock: RuntimeClock,
     owner: RuntimeFixedReferenceMaterializationOwner,
@@ -290,6 +294,7 @@ where
         let (store, state, owner) = (parts.store, parts.state, parts.owner);
         Ok(Self {
             store,
+            #[cfg(test)]
             state,
             clock,
             owner,

@@ -78,7 +78,8 @@ def test_only_the_two_real_process_facades_are_promoted() -> None:
     assert symbols == PUBLIC_DEPLOYMENTD_SYMBOLS
 
 
-def test_governance_claims_exact_one_shot_controller_vertical_without_second_restart_owner() -> None:
+def test_governance_claims_exact_one_shot_controller_vertical_without_second_restart_owner(
+) -> None:
     governance = _load_toml(REPO_ROOT / "governance.toml")["registry"]
     packages = [
         package
