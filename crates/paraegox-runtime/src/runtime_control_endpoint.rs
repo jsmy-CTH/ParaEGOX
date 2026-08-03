@@ -291,13 +291,12 @@ where
             &signer,
             active_execution.as_ref(),
         )?;
-        let (store, state, owner) = (parts.store, parts.state, parts.owner);
         Ok(Self {
-            store,
+            store: parts.store,
             #[cfg(test)]
-            state,
+            state: parts.state,
             clock,
-            owner,
+            owner: parts.owner,
             signer,
             compiled,
             compatibility,
