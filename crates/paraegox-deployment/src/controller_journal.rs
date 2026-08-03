@@ -3,19 +3,22 @@
 //! This module owns no filesystem, signing key, endpoint, retry loop, or live
 //! Controller process. It persists only Planner-owned allocation/plan values
 //! and forces every durable mutation through an explicit predecessor check.
-//! Runtime query evidence stays opaque and journal-local until its owning
-//! contract has a real Controller client in S7-F.
+//! S7-F query requests and responses use only the canonical PXQR/PXQS owner;
+//! the journal persists each request before transport and each authenticated
+//! response before any rollout decision.
 
 use core::fmt;
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
+use paraegox_kernel::time::{ClockDomainRef, ClockGeneration};
 use paraegox_runtime_contracts::apply::{ApplyOperationId, PlanWriterRef, WriterTenureProof};
 use paraegox_runtime_contracts::installation::MAX_INSTALLED_RUNTIME_MANIFEST_BYTES;
 use paraegox_runtime_contracts::provenance::{SourcePlanDigest, TargetSliceDigest};
 use paraegox_runtime_contracts::reference_control::{
-    MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, ReferenceApplyRequestV1,
-    ReferenceApplyTerminalReceiptV1, ReferenceBootstrapResponseV1, ReferenceChannelBindingV1,
-    ReferenceControlError,
+    MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, MAX_REFERENCE_QUERY_REQUEST_BYTES,
+    MAX_REFERENCE_QUERY_RESPONSE_BYTES, ReferenceApplyRequestV1, ReferenceApplyTerminalReceiptV1,
+    ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1, ReferenceChannelBindingV1,
+    ReferenceControlError, ReferenceQueryIdV1, ReferenceQueryRequestV1, ReferenceQueryResponseV1,
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
@@ -34,10 +37,13 @@ use crate::tenure_protocol::{
 const JOURNAL_MAGIC: &[u8; 4] = b"PXJR";
 const JOURNAL_ENVELOPE_VERSION: u16 = 1;
 const CONTROLLER_OWNER_KIND: u16 = 1;
-// Payload v6 did not bind a tenure transaction to the exact protected
-// Authority transport/provisioning domain used before send. The mandatory
-// domain fingerprint makes v7 a strict successor with no older fallback.
-const CONTROLLER_PAYLOAD_VERSION: u16 = 7;
+// Payload v7 retained only an opaque query response after transport. It could
+// not prove that the exact canonical PXQR and its request-time channel, Runtime
+// response key, store, host epoch, and clock baseline were durable before the
+// first send. The exact request -> response -> decision split makes v8 a strict
+// successor with no older fallback.
+pub(crate) const CONTROLLER_PAYLOAD_VERSION: u16 = 8;
+const CONTROLLER_LEGACY_PAYLOAD_VERSION: u16 = 7;
 const CHECKSUM_ALGORITHM_SHA256: u16 = 1;
 const CHECKSUM_VERSION: u16 = 1;
 const CONTROLLER_PAYLOAD_MAGIC: &[u8; 4] = b"PXCP";
@@ -65,7 +71,8 @@ const MAX_RECONCILE_ATTEMPTS: usize = 256;
 const MAX_PLAN_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BOOTSTRAP_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_SIGNED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-const MAX_QUERY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const QUERY_CHANNEL_BINDING_BYTES: usize = 16 + 16 + 32 + 32;
+const QUERY_SERVING_BASELINE_BYTES: usize = 16 + 32 + 8 + 8 + 16 + 8;
 const RUNTIME_RESPONSE_AUTH_PIN_BYTES: usize = 32 + 16 + 32 + 32 + 16 + 2 + 2;
 const REFERENCE_RESPONSE_AUTH_ALGORITHM_ED25519: u16 = 1;
 const REFERENCE_RESPONSE_AUTH_ALGORITHM_VERSION: u16 = 1;
@@ -110,10 +117,6 @@ macro_rules! opaque_digest {
 }
 
 opaque_id!(ControllerOperationId);
-// Opaque Controller-local identity of Runtime query evidence. This is
-// deliberately not a Runtime query wire DTO or compatibility promise. S7-F
-// must connect the unique runtime-contract query type at the real client seam.
-opaque_id!(ControllerOpaqueRuntimeQueryId);
 opaque_id!(ControllerReceiptRef);
 opaque_digest!(ControllerPlanCommitIntentDigest);
 opaque_digest!(ControllerPlanContentStorageChecksum);
@@ -121,7 +124,6 @@ opaque_digest!(ControllerApplyRequestDigest);
 opaque_digest!(ControllerAuthKeyFingerprint);
 opaque_digest!(ControllerChannelAuthFingerprint);
 opaque_digest!(ControllerBootstrapResponseDigest);
-opaque_digest!(ControllerQueryResponseDigest);
 opaque_digest!(ControllerOwnerIdentityFingerprint);
 opaque_digest!(ControllerTenureAuthorityDomainFingerprint);
 
@@ -850,62 +852,209 @@ impl ControllerSignedApplyIntent {
     }
 }
 
-/// Exact opaque Runtime query evidence, not a duplicated wire contract.
+/// Exact canonical PXQR plus every request-time Runtime verification pin.
+///
+/// This row is committed before the transport may send a byte. It deliberately
+/// stores the canonical contract value rather than copying its selector fields
+/// into a Controller-owned protocol approximation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ControllerOpaqueQueryObservation {
-    query_id: ControllerOpaqueRuntimeQueryId,
-    query_snapshot_sequence: u64,
-    query_response: Box<[u8]>,
-    query_response_digest: ControllerQueryResponseDigest,
-    channel_peer_fingerprint: ControllerChannelAuthFingerprint,
+pub(crate) struct ControllerPreparedQuery {
+    request: ReferenceQueryRequestV1,
+    request_auth: ControllerRequestAuthPin,
+    request_time_channel: ReferenceChannelBindingV1,
+    runtime_response_auth: ControllerRuntimeResponseAuthPin,
+    serving_baseline: ReferenceBootstrapServingIdentityV1,
 }
 
-pub(crate) struct ControllerOpaqueQueryObservationInput<'a> {
-    pub(crate) query_id: ControllerOpaqueRuntimeQueryId,
-    pub(crate) query_snapshot_sequence: u64,
-    pub(crate) query_response: &'a [u8],
-    pub(crate) query_response_digest: ControllerQueryResponseDigest,
-    pub(crate) channel_peer_fingerprint: ControllerChannelAuthFingerprint,
-}
-
-impl ControllerOpaqueQueryObservation {
+impl ControllerPreparedQuery {
     fn try_new(
-        input: ControllerOpaqueQueryObservationInput<'_>,
+        request: ReferenceQueryRequestV1,
+        binding: &ControllerTargetBinding,
+        request_auth: ControllerRequestAuthPin,
+        source_scope: paraegox_runtime_contracts::provenance::SourceScopeRef,
+        intent: &ControllerSignedApplyIntent,
     ) -> Result<Self, ControllerJournalError> {
-        if bytes_are_zero(input.query_id.as_bytes())
-            || input.query_snapshot_sequence == 0
-            || bytes_are_zero(input.query_response_digest.value().as_bytes())
-            || bytes_are_zero(input.channel_peer_fingerprint.value().as_bytes())
+        let decoded = ReferenceQueryRequestV1::decode(request.canonical_wire())?;
+        let claim = request.authentication().claim();
+        let runtime_response_auth = binding.runtime_response_auth();
+        let request_time_channel = runtime_response_auth.channel(binding.target())?;
+        let bootstrap = ReferenceBootstrapResponseV1::decode(binding.bootstrap_response())?;
+        let facts = bootstrap.facts();
+        let serving_baseline = ReferenceBootstrapServingIdentityV1::try_new(
+            facts.target(),
+            facts.runtime_store_instance_id(),
+            facts.snapshot_sequence(),
+            facts.runtime_host_epoch(),
+            facts.clock_domain(),
+            facts.clock_generation(),
+        )?;
+        if decoded != request
+            || request.canonical_wire().is_empty()
+            || request.canonical_wire().len() > MAX_REFERENCE_QUERY_REQUEST_BYTES
+            || bytes_are_zero(request.query_id().as_bytes())
+            || request.target() != binding.target()
+            || request.target() != intent.target()
+            || request.source_scope() != source_scope
+            || request.expected_runtime_store_instance_id() != binding.runtime_store_instance_id()
+            || request.requested_operation_id() != intent.apply_operation()
+            || request
+                .expected_request_digest()
+                .is_some_and(|digest| digest != intent.request_digest().value())
+            || claim.key() != request_auth.key()
+            || claim.algorithm() != request_auth.algorithm()
+            || claim.algorithm_version() != request_auth.algorithm_version()
+            || claim.algorithm().value() != REFERENCE_RESPONSE_AUTH_ALGORITHM_ED25519
+            || claim.algorithm_version() != REFERENCE_RESPONSE_AUTH_ALGORITHM_VERSION
+            || request.authentication().signature().len() != ED25519_SIGNATURE_BYTES
+            || request.max_response_bytes() as usize > MAX_REFERENCE_QUERY_RESPONSE_BYTES
+            || serving_baseline.target() != request.target()
+            || serving_baseline.runtime_store_instance_id()
+                != request.expected_runtime_store_instance_id()
+            || serving_baseline.runtime_host_epoch() != binding.last_runtime_host_epoch()
+            || runtime_response_auth.runtime_peer() != request_time_channel.runtime_peer()
         {
-            return Err(ControllerJournalError::InvalidQueryEvidence);
-        }
-        if input.query_response.is_empty() {
-            return Err(ControllerJournalError::EmptyQueryResponse);
-        }
-        if input.query_response.len() > MAX_QUERY_RESPONSE_BYTES {
-            return Err(ControllerJournalError::QueryResponseTooLarge);
+            return Err(ControllerJournalError::InvalidQueryRequest);
         }
         Ok(Self {
-            query_id: input.query_id,
-            query_snapshot_sequence: input.query_snapshot_sequence,
-            query_response: input.query_response.into(),
-            query_response_digest: input.query_response_digest,
-            channel_peer_fingerprint: input.channel_peer_fingerprint,
+            request,
+            request_auth,
+            request_time_channel,
+            runtime_response_auth,
+            serving_baseline,
         })
     }
 
-    fn validate_successor_of(&self, previous: &Self) -> Result<(), ControllerJournalError> {
-        if self.query_snapshot_sequence < previous.query_snapshot_sequence {
-            return Err(ControllerJournalError::QuerySequenceRegression);
+    fn validate(
+        &self,
+        binding: &ControllerTargetBinding,
+        source_scope: paraegox_runtime_contracts::provenance::SourceScopeRef,
+        intent: &ControllerSignedApplyIntent,
+    ) -> Result<(), ControllerJournalError> {
+        let decoded = ReferenceQueryRequestV1::decode(self.request.canonical_wire())?;
+        let claim = self.request.authentication().claim();
+        if decoded != self.request
+            || self.request.canonical_wire().is_empty()
+            || self.request.canonical_wire().len() > MAX_REFERENCE_QUERY_REQUEST_BYTES
+            || bytes_are_zero(self.request.query_id().as_bytes())
+            || self.request.target() != binding.target()
+            || self.request.target() != intent.target()
+            || self.request.source_scope() != source_scope
+            || self.request.expected_runtime_store_instance_id()
+                != binding.runtime_store_instance_id()
+            || self.request.requested_operation_id() != intent.apply_operation()
+            || self
+                .request
+                .expected_request_digest()
+                .is_some_and(|digest| digest != intent.request_digest().value())
+            || claim.key() != self.request_auth.key()
+            || claim.algorithm() != self.request_auth.algorithm()
+            || claim.algorithm_version() != self.request_auth.algorithm_version()
+            || claim.algorithm().value() != REFERENCE_RESPONSE_AUTH_ALGORITHM_ED25519
+            || claim.algorithm_version() != REFERENCE_RESPONSE_AUTH_ALGORITHM_VERSION
+            || self.request.authentication().signature().len() != ED25519_SIGNATURE_BYTES
+            || self.request.max_response_bytes() as usize > MAX_REFERENCE_QUERY_RESPONSE_BYTES
+            || self.request_time_channel.target() != self.request.target()
+            || self.request_time_channel.runtime_peer() != self.runtime_response_auth.runtime_peer()
+            || self.runtime_response_auth.channel(self.request.target())?
+                != self.request_time_channel
+            || self.serving_baseline.target() != self.request.target()
+            || self.serving_baseline.runtime_store_instance_id()
+                != self.request.expected_runtime_store_instance_id()
+            || self.serving_baseline.runtime_host_epoch() < binding.first_runtime_host_epoch()
+            || self.serving_baseline.runtime_host_epoch() > binding.last_runtime_host_epoch()
+        {
+            return Err(ControllerJournalError::InvalidQueryRequest);
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &ReferenceQueryRequestV1 {
+        &self.request
+    }
+
+    #[must_use]
+    pub(crate) const fn request_auth(&self) -> ControllerRequestAuthPin {
+        self.request_auth
+    }
+
+    #[must_use]
+    pub(crate) const fn request_time_channel(&self) -> ReferenceChannelBindingV1 {
+        self.request_time_channel
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_response_auth(&self) -> ControllerRuntimeResponseAuthPin {
+        self.runtime_response_auth
+    }
+
+    #[must_use]
+    pub(crate) const fn serving_baseline(&self) -> ReferenceBootstrapServingIdentityV1 {
+        self.serving_baseline
+    }
+}
+
+/// Exact PXQS bytes after signature-first client validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerQueryObservation {
+    response: ReferenceQueryResponseV1,
+    response_digest: Digest32,
+    channel_peer: ReferenceChannelBindingV1,
+}
+
+impl ControllerQueryObservation {
+    fn try_new(
+        response: ReferenceQueryResponseV1,
+        channel_peer: ReferenceChannelBindingV1,
+        prepared: &ControllerPreparedQuery,
+    ) -> Result<Self, ControllerJournalError> {
+        let decoded = ReferenceQueryResponseV1::decode(response.canonical_wire())?;
+        if decoded != response
+            || response.canonical_wire().is_empty()
+            || response.canonical_wire().len() > MAX_REFERENCE_QUERY_RESPONSE_BYTES
+            || response.canonical_wire().len() > prepared.request().max_response_bytes() as usize
+            || channel_peer != prepared.request_time_channel()
+            || response.authentication_runtime_peer()
+                != prepared.runtime_response_auth().runtime_peer()
+            || response.authentication_key() != prepared.runtime_response_auth().key()
+            || response.authentication_algorithm() != prepared.runtime_response_auth().algorithm()
+            || response.authentication_algorithm_version()
+                != prepared.runtime_response_auth().algorithm_version()
+            || response.authentication_signature().len() != ED25519_SIGNATURE_BYTES
+        {
+            return Err(ControllerJournalError::InvalidQueryResponse);
+        }
+        response.validate_against_request(
+            prepared.request(),
+            channel_peer,
+            prepared.serving_baseline(),
+        )?;
+        Ok(Self {
+            response_digest: response.response_digest(),
+            response,
+            channel_peer,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn response(&self) -> &ReferenceQueryResponseV1 {
+        &self.response
+    }
+
+    #[must_use]
+    pub(crate) const fn channel_peer(&self) -> ReferenceChannelBindingV1 {
+        self.channel_peer
+    }
+
+    fn query_snapshot_sequence(&self) -> u64 {
+        self.response.facts().serving().snapshot_sequence()
     }
 }
 
 /// Reconcile decision bound to one already-durable opaque query observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ControllerRolloutDecision {
-    query_id: ControllerOpaqueRuntimeQueryId,
+    query_id: ReferenceQueryIdV1,
     query_snapshot_sequence: u64,
     observed: ControllerObservedTarget,
     receipt: Option<ControllerReceiptRef>,
@@ -913,7 +1062,7 @@ pub(crate) struct ControllerRolloutDecision {
 
 impl ControllerRolloutDecision {
     fn try_new(
-        observation: &ControllerOpaqueQueryObservation,
+        observation: &ControllerQueryObservation,
         observed: ControllerObservedTarget,
         receipt: Option<ControllerReceiptRef>,
     ) -> Result<Self, ControllerJournalError> {
@@ -934,8 +1083,8 @@ impl ControllerRolloutDecision {
             _ => {}
         }
         Ok(Self {
-            query_id: observation.query_id,
-            query_snapshot_sequence: observation.query_snapshot_sequence,
+            query_id: observation.response.query_id(),
+            query_snapshot_sequence: observation.query_snapshot_sequence(),
             observed,
             receipt,
         })
@@ -949,22 +1098,59 @@ impl ControllerRolloutDecision {
     }
 }
 
-/// One immutable query observation followed by its optional later decision.
+/// Stable reason that one durable PXQR ended without an authenticated PXQS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ControllerQueryClosureKind {
+    NotSent = 1,
+    DeliveryUncertain = 2,
+    ResidentAuthorityLostAfterRestart = 3,
+    ResponseRejected = 4,
+}
+
+impl ControllerQueryClosureKind {
+    fn decode(value: u8) -> Result<Self, ControllerJournalError> {
+        match value {
+            1 => Ok(Self::NotSent),
+            2 => Ok(Self::DeliveryUncertain),
+            3 => Ok(Self::ResidentAuthorityLostAfterRestart),
+            4 => Ok(Self::ResponseRejected),
+            _ => Err(ControllerJournalError::UnknownEnum),
+        }
+    }
+}
+
+/// One immutable query request followed by either an exact observation or a
+/// durable no-response closure, and then an optional observation decision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ControllerReconcileAttempt {
-    observation: ControllerOpaqueQueryObservation,
+    prepared: ControllerPreparedQuery,
+    observation: Option<ControllerQueryObservation>,
+    closure: Option<ControllerQueryClosureKind>,
     decision: Option<ControllerRolloutDecision>,
 }
 
 impl ControllerReconcileAttempt {
     fn validate(&self) -> Result<(), ControllerJournalError> {
-        if let Some(decision) = self.decision
-            && (decision.query_id != self.observation.query_id
-                || decision.query_snapshot_sequence != self.observation.query_snapshot_sequence)
-        {
-            return Err(ControllerJournalError::DanglingRolloutDecision);
+        if self.closure.is_some() && (self.observation.is_some() || self.decision.is_some()) {
+            return Err(ControllerJournalError::InvalidQueryClosure);
+        }
+        match (&self.observation, self.decision) {
+            (None, Some(_)) => return Err(ControllerJournalError::QueryNotCommittedBeforeDecision),
+            (Some(observation), Some(decision))
+                if decision.query_id != observation.response.query_id()
+                    || decision.query_snapshot_sequence
+                        != observation.query_snapshot_sequence() =>
+            {
+                return Err(ControllerJournalError::DanglingRolloutDecision);
+            }
+            _ => {}
         }
         Ok(())
+    }
+
+    const fn is_closed_without_response(&self) -> bool {
+        self.closure.is_some()
     }
 }
 
@@ -1045,14 +1231,21 @@ impl ControllerRolloutRecord {
         let mut query_ids = std::collections::BTreeSet::new();
         for (index, attempt) in self.reconcile_attempts.iter().enumerate() {
             attempt.validate()?;
-            let sequence = attempt.observation.query_snapshot_sequence;
-            if last_sequence.is_some_and(|previous| previous > sequence) {
-                return Err(ControllerJournalError::NonCanonicalReconcileHistory);
-            }
-            if !query_ids.insert(attempt.observation.query_id) {
+            let query_id = attempt.prepared.request().query_id();
+            if !query_ids.insert(query_id) {
                 return Err(ControllerJournalError::QueryEvidenceChanged);
             }
-            if index + 1 != self.reconcile_attempts.len() && attempt.decision.is_none() {
+            if let Some(observation) = &attempt.observation {
+                let sequence = observation.query_snapshot_sequence();
+                if last_sequence.is_some_and(|previous| previous > sequence) {
+                    return Err(ControllerJournalError::NonCanonicalReconcileHistory);
+                }
+                last_sequence = Some(sequence);
+            }
+            if index + 1 != self.reconcile_attempts.len()
+                && !attempt.is_closed_without_response()
+                && (attempt.observation.is_none() || attempt.decision.is_none())
+            {
                 return Err(ControllerJournalError::DanglingQueryObservation);
             }
             if attempt
@@ -1062,7 +1255,6 @@ impl ControllerRolloutRecord {
             {
                 return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
             }
-            last_sequence = Some(sequence);
         }
         if self.direct_terminal_receipt.is_some()
             && self
@@ -1766,19 +1958,16 @@ impl ControllerJournalState {
         })
     }
 
-    /// Second rollout transaction: persist exact authenticated query evidence.
-    pub(crate) fn record_query_observation(
+    /// Persists the exact signed PXQR and request-time verification baseline
+    /// before any query transport send.
+    pub(crate) fn prepare_query_request(
         &self,
-        input: ControllerOpaqueQueryObservationInput<'_>,
+        request: &ReferenceQueryRequestV1,
     ) -> Result<Self, ControllerJournalError> {
-        let observation = ControllerOpaqueQueryObservation::try_new(input)?;
         let binding = self
             .target_binding
             .as_ref()
             .ok_or(ControllerJournalError::DanglingRollout)?;
-        if observation.channel_peer_fingerprint != binding.channel_auth_fingerprint {
-            return Err(ControllerJournalError::QueryChannelMismatch);
-        }
         let mut rollout = self
             .rollout
             .clone()
@@ -1786,30 +1975,55 @@ impl ControllerJournalState {
         if rollout.direct_terminal_receipt.is_some() {
             return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
         }
-        if let Some(existing) = rollout
-            .reconcile_attempts
-            .iter()
-            .find(|attempt| attempt.observation.query_id == observation.query_id)
-        {
-            if existing.observation == observation {
-                return Ok(self.clone());
+        let source_scope = paraegox_runtime_contracts::provenance::SourceScopeRef::from_bytes(
+            *self.scope.as_bytes(),
+        );
+        let prepared = ControllerPreparedQuery::try_new(
+            request.clone(),
+            binding,
+            self.request_auth,
+            source_scope,
+            &rollout.signed_intent,
+        )?;
+        for record in &self.apply_history {
+            for attempt in &record.reconcile_attempts {
+                let existing = attempt.prepared.request();
+                let collides = existing.query_id() == request.query_id()
+                    || existing.request_digest() == request.request_digest()
+                    || existing.authentication().claim().nonce()
+                        == request.authentication().claim().nonce();
+                if collides {
+                    return Err(ControllerJournalError::QueryIdentityConflict);
+                }
             }
-            return Err(ControllerJournalError::QueryEvidenceChanged);
         }
-        if self.apply_history.iter().any(|record| {
-            record
-                .reconcile_attempts
-                .iter()
-                .any(|attempt| attempt.observation.query_id == observation.query_id)
-        }) {
-            return Err(ControllerJournalError::QueryIdentityConflict);
-        }
-        if observation.query_snapshot_sequence < self.query_snapshot_high_water {
-            return Err(ControllerJournalError::QuerySequenceRegression);
+        for (index, attempt) in rollout.reconcile_attempts.iter().enumerate() {
+            let existing = attempt.prepared.request();
+            let collides = existing.query_id() == request.query_id()
+                || existing.request_digest() == request.request_digest()
+                || existing.authentication().claim().nonce()
+                    == request.authentication().claim().nonce();
+            if collides {
+                if existing.canonical_wire() != request.canonical_wire() {
+                    return Err(ControllerJournalError::QueryIdentityConflict);
+                }
+                if attempt.closure.is_some() {
+                    return Err(ControllerJournalError::QueryAlreadyClosed);
+                }
+                let is_latest_open = index + 1 == rollout.reconcile_attempts.len()
+                    && attempt.observation.is_none()
+                    && attempt.decision.is_none();
+                return if is_latest_open {
+                    Ok(self.clone())
+                } else {
+                    Err(ControllerJournalError::QueryIdentityConflict)
+                };
+            }
         }
         if let Some(previous) = rollout.reconcile_attempts.last() {
-            observation.validate_successor_of(&previous.observation)?;
-            if previous.decision.is_none() {
+            if !previous.is_closed_without_response()
+                && (previous.observation.is_none() || previous.decision.is_none())
+            {
                 return Err(ControllerJournalError::DanglingQueryObservation);
             }
             if previous
@@ -1822,10 +2036,11 @@ impl ControllerJournalState {
         if rollout.reconcile_attempts.len() == MAX_RECONCILE_ATTEMPTS {
             return Err(ControllerJournalError::ReconcileCapacityExceeded);
         }
-        let query_snapshot_sequence = observation.query_snapshot_sequence;
         let mut attempts = rollout.reconcile_attempts.to_vec();
         attempts.push(ControllerReconcileAttempt {
-            observation,
+            prepared,
+            observation: None,
+            closure: None,
             decision: None,
         });
         rollout.reconcile_attempts = attempts.into_boxed_slice();
@@ -1836,13 +2051,115 @@ impl ControllerJournalState {
             tenure_transactions: self.tenure_transactions.to_vec(),
             request_auth: self.request_auth,
             target_binding: self.target_binding.clone(),
-            query_snapshot_high_water: self.query_snapshot_high_water.max(query_snapshot_sequence),
+            query_snapshot_high_water: self.query_snapshot_high_water,
             rollout: Some(rollout),
             apply_history: self.apply_history.to_vec(),
         })
     }
 
-    /// Third rollout transaction: bind a decision to already-durable query facts.
+    /// Persists one exact PXQS after signature-first client validation. This is
+    /// a separate successor from both the prepared PXQR and any later decision.
+    pub(crate) fn record_query_response(
+        &self,
+        response: &ReferenceQueryResponseV1,
+        channel_peer: ReferenceChannelBindingV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let mut rollout = self
+            .rollout
+            .clone()
+            .ok_or(ControllerJournalError::DanglingRollout)?;
+        if rollout.direct_terminal_receipt.is_some() {
+            return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
+        }
+        let attempt_index = rollout
+            .reconcile_attempts
+            .len()
+            .checked_sub(1)
+            .ok_or(ControllerJournalError::MissingPreparedQuery)?;
+        let attempt = &rollout.reconcile_attempts[attempt_index];
+        if attempt.closure.is_some() {
+            return Err(ControllerJournalError::QueryAlreadyClosed);
+        }
+        if attempt.prepared.request().query_id() != response.query_id() {
+            return Err(ControllerJournalError::QueryIdentityConflict);
+        }
+        let observation =
+            ControllerQueryObservation::try_new(response.clone(), channel_peer, &attempt.prepared)?;
+        if let Some(existing) = &attempt.observation {
+            return if existing == &observation {
+                Ok(self.clone())
+            } else {
+                Err(ControllerJournalError::QueryEvidenceChanged)
+            };
+        }
+        let sequence = observation.query_snapshot_sequence();
+        if sequence < self.query_snapshot_high_water {
+            return Err(ControllerJournalError::QuerySequenceRegression);
+        }
+        if let Some(previous) = rollout.reconcile_attempts[..attempt_index]
+            .iter()
+            .rev()
+            .find_map(|prior| prior.observation.as_ref())
+            && sequence < previous.query_snapshot_sequence()
+        {
+            return Err(ControllerJournalError::QuerySequenceRegression);
+        }
+        rollout.reconcile_attempts[attempt_index].observation = Some(observation);
+        self.rebuild(ControllerJournalMutationInput {
+            allocation: self.allocation.clone(),
+            committed_plan: self.committed_plan.clone(),
+            operations: self.operations.to_vec(),
+            tenure_transactions: self.tenure_transactions.to_vec(),
+            request_auth: self.request_auth,
+            target_binding: self.target_binding.clone(),
+            query_snapshot_high_water: self.query_snapshot_high_water.max(sequence),
+            rollout: Some(rollout),
+            apply_history: self.apply_history.to_vec(),
+        })
+    }
+
+    /// Closes the latest durable PXQR without manufacturing a PXQS or rollout
+    /// decision. The original request/id/nonce remain append-only evidence.
+    pub(crate) fn record_query_closure(
+        &self,
+        closure: ControllerQueryClosureKind,
+    ) -> Result<Self, ControllerJournalError> {
+        let mut rollout = self
+            .rollout
+            .clone()
+            .ok_or(ControllerJournalError::DanglingRollout)?;
+        if rollout.direct_terminal_receipt.is_some() {
+            return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
+        }
+        let attempt = rollout
+            .reconcile_attempts
+            .last_mut()
+            .ok_or(ControllerJournalError::MissingPreparedQuery)?;
+        if attempt.observation.is_some() || attempt.decision.is_some() {
+            return Err(ControllerJournalError::InvalidQueryClosure);
+        }
+        if let Some(existing) = attempt.closure {
+            return if existing == closure {
+                Ok(self.clone())
+            } else {
+                Err(ControllerJournalError::QueryClosureChanged)
+            };
+        }
+        attempt.closure = Some(closure);
+        self.rebuild(ControllerJournalMutationInput {
+            allocation: self.allocation.clone(),
+            committed_plan: self.committed_plan.clone(),
+            operations: self.operations.to_vec(),
+            tenure_transactions: self.tenure_transactions.to_vec(),
+            request_auth: self.request_auth,
+            target_binding: self.target_binding.clone(),
+            query_snapshot_high_water: self.query_snapshot_high_water,
+            rollout: Some(rollout),
+            apply_history: self.apply_history.to_vec(),
+        })
+    }
+
+    /// Binds a decision to an already-durable exact PXQS in a later snapshot.
     pub(crate) fn record_rollout_decision(
         &self,
         observed: ControllerObservedTarget,
@@ -1859,7 +2176,14 @@ impl ControllerJournalState {
             .reconcile_attempts
             .last_mut()
             .ok_or(ControllerJournalError::DanglingRolloutDecision)?;
-        let decision = ControllerRolloutDecision::try_new(&attempt.observation, observed, receipt)?;
+        if attempt.closure.is_some() {
+            return Err(ControllerJournalError::InvalidQueryClosure);
+        }
+        let observation = attempt
+            .observation
+            .as_ref()
+            .ok_or(ControllerJournalError::QueryNotCommittedBeforeDecision)?;
+        let decision = ControllerRolloutDecision::try_new(observation, observed, receipt)?;
         if let Some(previous) = attempt.decision {
             return if previous == decision {
                 Ok(self.clone())
@@ -2014,6 +2338,57 @@ impl ControllerJournalState {
         self.rollout.as_ref().map(|rollout| &rollout.signed_intent)
     }
 
+    /// Returns the latest exact PXQR once it is durable. A missing response is
+    /// intentionally still returned as recovery evidence; restart code must
+    /// explicitly close lost resident authority before a later call may
+    /// allocate a fresh query identity.
+    #[must_use]
+    pub(crate) fn current_prepared_query(&self) -> Option<&ControllerPreparedQuery> {
+        self.rollout
+            .as_ref()?
+            .reconcile_attempts
+            .last()
+            .map(|attempt| &attempt.prepared)
+    }
+
+    /// Returns the latest exact PXQS only after the response has its own
+    /// durable journal successor.
+    #[must_use]
+    pub(crate) fn current_query_observation(&self) -> Option<&ControllerQueryObservation> {
+        self.rollout
+            .as_ref()?
+            .reconcile_attempts
+            .last()?
+            .observation
+            .as_ref()
+    }
+
+    /// Returns the stable no-response closure for the latest PXQR, if any.
+    #[must_use]
+    pub(crate) fn current_query_closure(&self) -> Option<ControllerQueryClosureKind> {
+        self.rollout.as_ref()?.reconcile_attempts.last()?.closure
+    }
+
+    #[must_use]
+    pub(crate) fn current_query_is_open(&self) -> bool {
+        self.rollout
+            .as_ref()
+            .and_then(|rollout| rollout.reconcile_attempts.last())
+            .is_some_and(|attempt| {
+                attempt.observation.is_none()
+                    && attempt.closure.is_none()
+                    && attempt.decision.is_none()
+            })
+    }
+
+    #[must_use]
+    pub(crate) fn current_query_has_decision(&self) -> bool {
+        self.rollout
+            .as_ref()
+            .and_then(|rollout| rollout.reconcile_attempts.last())
+            .is_some_and(|attempt| attempt.decision.is_some())
+    }
+
     /// Reports whether the current exact apply operation already has durable
     /// terminal evidence. Callers must suppress any second transport send.
     #[must_use]
@@ -2046,11 +2421,14 @@ impl ControllerJournalState {
         validate_apply_history(
             &self.apply_history,
             self.rollout.as_ref(),
-            self.allocation.target(),
-            self.target_binding.as_ref(),
-            &self.operations,
-            self.current_revision(),
-            self.query_snapshot_high_water,
+            ApplyHistoryValidationContext {
+                scope: self.scope,
+                target: self.allocation.target(),
+                binding: self.target_binding.as_ref(),
+                operations: &self.operations,
+                current_revision: self.current_revision(),
+                query_snapshot_high_water: self.query_snapshot_high_water,
+            },
         )?;
         let Some(rollout) = self.apply_history.last() else {
             return Ok(None);
@@ -2323,11 +2701,14 @@ impl ControllerJournalState {
         validate_apply_history(
             &self.apply_history,
             self.rollout.as_ref(),
-            self.allocation.target(),
-            self.target_binding.as_ref(),
-            &self.operations,
-            current_revision,
-            self.query_snapshot_high_water,
+            ApplyHistoryValidationContext {
+                scope: self.scope,
+                target: self.allocation.target(),
+                binding: self.target_binding.as_ref(),
+                operations: &self.operations,
+                current_revision,
+                query_snapshot_high_water: self.query_snapshot_high_water,
+            },
         )?;
         if let Some(rollout) = &self.rollout {
             let plan = self
@@ -2806,20 +3187,28 @@ fn validate_request_auth_pin(pin: ControllerRequestAuthPin) -> Result<(), Contro
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ApplyHistoryValidationContext<'a> {
+    scope: DeploymentScopeId,
+    target: RuntimeHostId,
+    binding: Option<&'a ControllerTargetBinding>,
+    operations: &'a [ControllerOperationRecord],
+    current_revision: u64,
+    query_snapshot_high_water: u64,
+}
+
 fn validate_apply_history(
     history: &[ControllerRolloutRecord],
     current: Option<&ControllerRolloutRecord>,
-    target: RuntimeHostId,
-    binding: Option<&ControllerTargetBinding>,
-    operations: &[ControllerOperationRecord],
-    current_revision: u64,
-    query_snapshot_high_water: u64,
+    context: ApplyHistoryValidationContext<'_>,
 ) -> Result<(), ControllerJournalError> {
     let mut last_archived_plan_revision = None;
     let mut apply_operations = std::collections::BTreeSet::new();
     let mut request_digests = std::collections::BTreeSet::new();
     let mut source_plan_digests = std::collections::BTreeSet::new();
     let mut query_ids = std::collections::BTreeSet::new();
+    let mut query_request_digests = std::collections::BTreeSet::new();
+    let mut query_client_nonces = std::collections::BTreeSet::new();
     let mut maximum_query_sequence = 0_u64;
     for record in history {
         record.validate()?;
@@ -2827,17 +3216,20 @@ fn validate_apply_history(
             return Err(ControllerJournalError::NonTerminalApplyHistory);
         }
         validate_request_auth_pin(record.signed_intent.request_auth)?;
-        validate_archived_binding(&record.signed_intent, target, binding)?;
+        validate_archived_binding(&record.signed_intent, context.target, context.binding)?;
         validate_rollout_query_lineage(
             record,
-            binding,
+            context.binding,
+            context.scope,
             &mut query_ids,
+            &mut query_request_digests,
+            &mut query_client_nonces,
             &mut maximum_query_sequence,
         )?;
         if !source_plan_digests.insert(record.signed_intent.source_plan_digest) {
             return Err(ControllerJournalError::ApplyPlanAlreadyArchived);
         }
-        let mut matching_commits = operations.iter().filter(|operation| {
+        let mut matching_commits = context.operations.iter().filter(|operation| {
             operation.phase == ControllerOperationPhase::Committed
                 && operation.committed_plan_digest == Some(record.signed_intent.source_plan_digest)
         });
@@ -2851,7 +3243,7 @@ fn validate_apply_history(
             .expected_revision
             .checked_add(1)
             .ok_or(ControllerJournalError::RevisionExhausted)?;
-        if archived_plan_revision >= current_revision
+        if archived_plan_revision >= context.current_revision
             || last_archived_plan_revision
                 .is_some_and(|previous| previous >= archived_plan_revision)
         {
@@ -2868,11 +3260,14 @@ fn validate_apply_history(
     if let Some(record) = current {
         record.validate()?;
         validate_request_auth_pin(record.signed_intent.request_auth)?;
-        validate_archived_binding(&record.signed_intent, target, binding)?;
+        validate_archived_binding(&record.signed_intent, context.target, context.binding)?;
         validate_rollout_query_lineage(
             record,
-            binding,
+            context.binding,
+            context.scope,
             &mut query_ids,
+            &mut query_request_digests,
+            &mut query_client_nonces,
             &mut maximum_query_sequence,
         )?;
         if !apply_operations.insert(record.signed_intent.apply_operation)
@@ -2881,7 +3276,7 @@ fn validate_apply_history(
             return Err(ControllerJournalError::ApplyOperationConflict);
         }
     }
-    if query_snapshot_high_water != maximum_query_sequence {
+    if context.query_snapshot_high_water != maximum_query_sequence {
         return Err(ControllerJournalError::QueryHighWaterMismatch);
     }
     Ok(())
@@ -2890,19 +3285,39 @@ fn validate_apply_history(
 fn validate_rollout_query_lineage(
     record: &ControllerRolloutRecord,
     binding: Option<&ControllerTargetBinding>,
-    query_ids: &mut std::collections::BTreeSet<ControllerOpaqueRuntimeQueryId>,
+    scope: DeploymentScopeId,
+    query_ids: &mut std::collections::BTreeSet<ReferenceQueryIdV1>,
+    query_request_digests: &mut std::collections::BTreeSet<Digest32>,
+    query_client_nonces: &mut std::collections::BTreeSet<Box<[u8]>>,
     maximum_query_sequence: &mut u64,
 ) -> Result<(), ControllerJournalError> {
     let binding = binding.ok_or(ControllerJournalError::DanglingRollout)?;
+    let source_scope =
+        paraegox_runtime_contracts::provenance::SourceScopeRef::from_bytes(*scope.as_bytes());
     for attempt in &record.reconcile_attempts {
-        if attempt.observation.channel_peer_fingerprint != binding.channel_auth_fingerprint {
-            return Err(ControllerJournalError::QueryChannelMismatch);
-        }
-        if !query_ids.insert(attempt.observation.query_id) {
+        attempt
+            .prepared
+            .validate(binding, source_scope, &record.signed_intent)?;
+        let request = attempt.prepared.request();
+        if !query_ids.insert(request.query_id())
+            || !query_request_digests.insert(request.request_digest())
+            || !query_client_nonces.insert(request.authentication().claim().nonce().into())
+        {
             return Err(ControllerJournalError::QueryIdentityConflict);
         }
-        *maximum_query_sequence =
-            (*maximum_query_sequence).max(attempt.observation.query_snapshot_sequence);
+        if let Some(observation) = &attempt.observation {
+            let validated = ControllerQueryObservation::try_new(
+                observation.response.clone(),
+                observation.channel_peer,
+                &attempt.prepared,
+            )?;
+            if &validated != observation || validated.response_digest != observation.response_digest
+            {
+                return Err(ControllerJournalError::InvalidQueryResponse);
+            }
+            *maximum_query_sequence =
+                (*maximum_query_sequence).max(observation.query_snapshot_sequence());
+        }
     }
     Ok(())
 }
@@ -3027,23 +3442,44 @@ fn validate_rollout_successor(
                 let Some((new_last, new_prefix)) = new_attempts.split_last() else {
                     return Err(ControllerJournalError::RolloutIntentChanged);
                 };
-                if old_prefix != new_prefix
-                    || old_last.observation != new_last.observation
-                    || old_last.decision.is_some()
-                    || new_last.decision.is_none()
-                {
+                if old_prefix != new_prefix || old_last.prepared != new_last.prepared {
+                    return Err(ControllerJournalError::QueryEvidenceChanged);
+                }
+                let response_commit = old_last.observation.is_none()
+                    && new_last.observation.is_some()
+                    && old_last.closure.is_none()
+                    && new_last.closure.is_none()
+                    && old_last.decision.is_none()
+                    && new_last.decision.is_none();
+                let closure_commit = old_last.observation.is_none()
+                    && new_last.observation.is_none()
+                    && old_last.closure.is_none()
+                    && new_last.closure.is_some()
+                    && old_last.decision.is_none()
+                    && new_last.decision.is_none();
+                let decision_commit = old_last.observation == new_last.observation
+                    && old_last.observation.is_some()
+                    && old_last.closure.is_none()
+                    && new_last.closure.is_none()
+                    && old_last.decision.is_none()
+                    && new_last.decision.is_some();
+                if !response_commit && !closure_commit && !decision_commit {
                     return Err(ControllerJournalError::QueryNotCommittedBeforeDecision);
                 }
             } else if new_attempts.len() == old_attempts.len() + 1 {
                 if new_attempts[..old_attempts.len()] != **old_attempts
-                    || new_attempts
-                        .last()
-                        .is_some_and(|attempt| attempt.decision.is_some())
+                    || new_attempts.last().is_some_and(|attempt| {
+                        attempt.observation.is_some()
+                            || attempt.closure.is_some()
+                            || attempt.decision.is_some()
+                    })
                 {
                     return Err(ControllerJournalError::QueryNotCommittedBeforeDecision);
                 }
                 if let Some(last) = old_attempts.last()
-                    && (last.decision.is_none()
+                    && !last.is_closed_without_response()
+                    && (last.observation.is_none()
+                        || last.decision.is_none()
                         || last
                             .decision
                             .is_some_and(ControllerRolloutDecision::is_terminal))
@@ -3080,6 +3516,52 @@ pub(crate) struct ControllerJournalSnapshot {
     owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
     snapshot_sequence: u64,
     state: ControllerJournalState,
+}
+
+/// Strictly parsed v7 source evidence plus its canonical v8 successor.
+///
+/// This value is produced only by the explicit offline migration parser. The
+/// normal Controller open path remains v8-only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerJournalPayloadV7Migration {
+    snapshot: ControllerJournalSnapshot,
+    source_payload_version: u16,
+    source_checksum: Digest32,
+    source_store_instance_id: [u8; 32],
+    source_owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
+    source_snapshot_sequence: u64,
+}
+
+impl ControllerJournalPayloadV7Migration {
+    pub(crate) const fn snapshot(&self) -> &ControllerJournalSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn into_snapshot(self) -> ControllerJournalSnapshot {
+        self.snapshot
+    }
+
+    pub(crate) const fn source_payload_version(&self) -> u16 {
+        self.source_payload_version
+    }
+
+    pub(crate) const fn source_checksum(&self) -> Digest32 {
+        self.source_checksum
+    }
+
+    pub(crate) const fn source_store_instance_id(&self) -> &[u8; 32] {
+        &self.source_store_instance_id
+    }
+
+    pub(crate) const fn source_owner_identity_fingerprint(
+        &self,
+    ) -> ControllerOwnerIdentityFingerprint {
+        self.source_owner_identity_fingerprint
+    }
+
+    pub(crate) const fn source_snapshot_sequence(&self) -> u64 {
+        self.source_snapshot_sequence
+    }
 }
 
 impl ControllerJournalSnapshot {
@@ -3177,7 +3659,14 @@ impl ControllerJournalSnapshot {
     }
 
     pub(crate) fn encode(&self) -> Result<Box<[u8]>, ControllerJournalError> {
-        let payload = encode_payload(&self.state)?;
+        self.encode_with_payload_version(CONTROLLER_PAYLOAD_VERSION)
+    }
+
+    fn encode_with_payload_version(
+        &self,
+        payload_version: u16,
+    ) -> Result<Box<[u8]>, ControllerJournalError> {
+        let payload = encode_payload_version(&self.state, payload_version)?;
         let payload_length =
             u64::try_from(payload.len()).map_err(|_| ControllerJournalError::SnapshotTooLarge)?;
         let total_length = JOURNAL_HEADER_BYTES
@@ -3191,7 +3680,7 @@ impl ControllerJournalSnapshot {
         prefix.extend_from_slice(JOURNAL_MAGIC);
         prefix.extend_from_slice(&JOURNAL_ENVELOPE_VERSION.to_be_bytes());
         prefix.extend_from_slice(&CONTROLLER_OWNER_KIND.to_be_bytes());
-        prefix.extend_from_slice(&CONTROLLER_PAYLOAD_VERSION.to_be_bytes());
+        prefix.extend_from_slice(&payload_version.to_be_bytes());
         prefix.extend_from_slice(&CHECKSUM_ALGORITHM_SHA256.to_be_bytes());
         prefix.extend_from_slice(&CHECKSUM_VERSION.to_be_bytes());
         prefix.extend_from_slice(&self.store_instance_id);
@@ -3205,6 +3694,11 @@ impl ControllerJournalSnapshot {
         encoded.extend_from_slice(checksum.as_bytes());
         encoded.extend_from_slice(&payload);
         Ok(encoded.into_boxed_slice())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encode_payload_v7_for_test(&self) -> Result<Box<[u8]>, ControllerJournalError> {
+        self.encode_with_payload_version(CONTROLLER_LEGACY_PAYLOAD_VERSION)
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ControllerJournalError> {
@@ -3255,6 +3749,86 @@ impl ControllerJournalSnapshot {
             snapshot_sequence,
             decode_payload(payload)?,
         )
+    }
+
+    /// Converts one strictly validated payload-v7 snapshot to canonical v8.
+    /// Normal [`Self::decode`] deliberately never falls back to this parser.
+    pub(crate) fn migrate_payload_v7(bytes: &[u8]) -> Result<Self, ControllerJournalError> {
+        Ok(Self::migrate_payload_v7_with_metadata(bytes)?.into_snapshot())
+    }
+
+    /// Performs the explicit v7 conversion while retaining exact source facts
+    /// needed by the store-owned migration receipt.
+    pub(crate) fn migrate_payload_v7_with_metadata(
+        bytes: &[u8],
+    ) -> Result<ControllerJournalPayloadV7Migration, ControllerJournalError> {
+        if bytes.len() < JOURNAL_HEADER_BYTES {
+            return Err(ControllerJournalError::Truncated);
+        }
+        if bytes.len() > MAX_CONTROLLER_SNAPSHOT_BYTES {
+            return Err(ControllerJournalError::SnapshotTooLarge);
+        }
+        let mut reader = Reader::new(bytes);
+        if reader.take_array::<4>()? != *JOURNAL_MAGIC {
+            return Err(ControllerJournalError::InvalidMagic);
+        }
+        if reader.u16()? != JOURNAL_ENVELOPE_VERSION {
+            return Err(ControllerJournalError::UnknownEnvelopeVersion);
+        }
+        if reader.u16()? != CONTROLLER_OWNER_KIND {
+            return Err(ControllerJournalError::OwnerKindMismatch);
+        }
+        let source_payload_version = reader.u16()?;
+        if source_payload_version != CONTROLLER_LEGACY_PAYLOAD_VERSION {
+            return Err(ControllerJournalError::UnknownPayloadVersion);
+        }
+        if reader.u16()? != CHECKSUM_ALGORITHM_SHA256 || reader.u16()? != CHECKSUM_VERSION {
+            return Err(ControllerJournalError::UnknownChecksumVersion);
+        }
+        let store_instance_id = reader.take_array::<32>()?;
+        let owner_identity_fingerprint = ControllerOwnerIdentityFingerprint::from_stored(
+            Digest32::from_bytes(reader.take_array::<32>()?),
+        );
+        let snapshot_sequence = reader.u64()?;
+        let payload_length =
+            usize::try_from(reader.u64()?).map_err(|_| ControllerJournalError::LengthOverflow)?;
+        if payload_length > MAX_CONTROLLER_SNAPSHOT_BYTES - JOURNAL_HEADER_BYTES {
+            return Err(ControllerJournalError::SnapshotTooLarge);
+        }
+        let checksum = Digest32::from_bytes(reader.take_array::<32>()?);
+        let expected_length = JOURNAL_HEADER_BYTES
+            .checked_add(payload_length)
+            .ok_or(ControllerJournalError::LengthOverflow)?;
+        if expected_length != bytes.len() {
+            return if expected_length < bytes.len() {
+                Err(ControllerJournalError::TrailingBytes)
+            } else {
+                Err(ControllerJournalError::Truncated)
+            };
+        }
+        let prefix = &bytes[..JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES];
+        let payload = reader.take(payload_length)?;
+        if controller_checksum(prefix, payload)? != checksum {
+            return Err(ControllerJournalError::ChecksumMismatch);
+        }
+        let state = decode_payload_version(payload, CONTROLLER_LEGACY_PAYLOAD_VERSION, true)?;
+        if encode_payload_version(&state, CONTROLLER_LEGACY_PAYLOAD_VERSION)? != payload {
+            return Err(ControllerJournalError::NonCanonicalEncoding);
+        }
+        let snapshot = Self::try_from_stored(
+            store_instance_id,
+            owner_identity_fingerprint,
+            snapshot_sequence,
+            state,
+        )?;
+        Ok(ControllerJournalPayloadV7Migration {
+            snapshot,
+            source_payload_version,
+            source_checksum: checksum,
+            source_store_instance_id: store_instance_id,
+            source_owner_identity_fingerprint: owner_identity_fingerprint,
+            source_snapshot_sequence: snapshot_sequence,
+        })
     }
 }
 
@@ -3568,10 +4142,28 @@ fn rollout_encoded_len(rollout: &ControllerRolloutRecord) -> Result<usize, Contr
         )?;
     }
     for attempt in &rollout.reconcile_attempts {
+        let prepared = &attempt.prepared;
         checked_encoded_add(
             &mut length,
-            16 + 8 + 4 + attempt.observation.query_response.len() + 32 + 32 + 1,
+            size_of::<u32>()
+                + prepared.request.canonical_wire().len()
+                + (16 + 2 + 2 + 32 + 8)
+                + QUERY_CHANNEL_BINDING_BYTES
+                + RUNTIME_RESPONSE_AUTH_PIN_BYTES
+                + QUERY_SERVING_BASELINE_BYTES
+                + 1,
         )?;
+        if let Some(observation) = &attempt.observation {
+            checked_encoded_add(
+                &mut length,
+                size_of::<u32>()
+                    + observation.response.canonical_wire().len()
+                    + 32
+                    + QUERY_CHANNEL_BINDING_BYTES,
+            )?;
+        }
+        checked_encoded_add(&mut length, 1 + usize::from(attempt.closure.is_some()))?;
+        checked_encoded_add(&mut length, 1)?;
         if let Some(decision) = attempt.decision {
             checked_encoded_add(
                 &mut length,
@@ -3590,19 +4182,32 @@ fn checked_encoded_add(total: &mut usize, amount: usize) -> Result<(), Controlle
 }
 
 fn encode_payload(state: &ControllerJournalState) -> Result<Vec<u8>, ControllerJournalError> {
+    encode_payload_version(state, CONTROLLER_PAYLOAD_VERSION)
+}
+
+fn encode_payload_version(
+    state: &ControllerJournalState,
+    payload_version: u16,
+) -> Result<Vec<u8>, ControllerJournalError> {
+    if payload_version != CONTROLLER_PAYLOAD_VERSION
+        && payload_version != CONTROLLER_LEGACY_PAYLOAD_VERSION
+    {
+        return Err(ControllerJournalError::UnknownPayloadVersion);
+    }
     state.validate()?;
     let expected_length = controller_payload_encoded_len(state)?;
-    let encoded = encode_payload_fields(state)?;
+    let encoded = encode_payload_fields(state, payload_version)?;
     debug_assert_eq!(encoded.len(), expected_length);
     Ok(encoded)
 }
 
 fn encode_payload_fields(
     state: &ControllerJournalState,
+    payload_version: u16,
 ) -> Result<Vec<u8>, ControllerJournalError> {
     let mut encoded = Vec::new();
     encoded.extend_from_slice(CONTROLLER_PAYLOAD_MAGIC);
-    encoded.extend_from_slice(&CONTROLLER_PAYLOAD_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&payload_version.to_be_bytes());
     encoded.extend_from_slice(state.scope.as_bytes());
     encoded.extend_from_slice(state.plan_lineage.as_bytes());
     encoded.extend_from_slice(state.allocation.target().as_bytes());
@@ -3651,11 +4256,19 @@ fn encode_payload_fields(
 }
 
 fn decode_payload(bytes: &[u8]) -> Result<ControllerJournalState, ControllerJournalError> {
+    decode_payload_version(bytes, CONTROLLER_PAYLOAD_VERSION, false)
+}
+
+fn decode_payload_version(
+    bytes: &[u8],
+    expected_payload_version: u16,
+    reject_legacy_query_evidence: bool,
+) -> Result<ControllerJournalState, ControllerJournalError> {
     let mut reader = Reader::new(bytes);
     if reader.take_array::<4>()? != *CONTROLLER_PAYLOAD_MAGIC {
         return Err(ControllerJournalError::InvalidPayloadMagic);
     }
-    if reader.u16()? != CONTROLLER_PAYLOAD_VERSION {
+    if reader.u16()? != expected_payload_version {
         return Err(ControllerJournalError::UnknownPayloadVersion);
     }
     let scope = DeploymentScopeId::from_bytes(reader.take_array::<16>()?);
@@ -3714,12 +4327,15 @@ fn decode_payload(bytes: &[u8]) -> Result<ControllerJournalState, ControllerJour
     }
     let request_auth = decode_auth_pin(&mut reader)?;
     let query_snapshot_high_water = reader.u64()?;
+    if reject_legacy_query_evidence && query_snapshot_high_water != 0 {
+        return Err(ControllerJournalError::LegacyOpaqueQueryEvidenceUnavailable);
+    }
     let target_binding = decode_optional_binding(&mut reader)?;
-    let rollout = decode_optional_rollout(&mut reader)?;
+    let rollout = decode_optional_rollout(&mut reader, reject_legacy_query_evidence)?;
     let history_count = reader.count(MAX_APPLY_OPERATION_HISTORY)?;
     let mut apply_history = Vec::with_capacity(history_count);
     for _ in 0..history_count {
-        apply_history.push(decode_rollout(&mut reader)?);
+        apply_history.push(decode_rollout(&mut reader, reject_legacy_query_evidence)?);
     }
     if reader.remaining() != 0 {
         return Err(ControllerJournalError::TrailingBytes);
@@ -3919,6 +4535,52 @@ fn append_runtime_response_auth_pin(encoded: &mut Vec<u8>, pin: ControllerRuntim
     encoded.extend_from_slice(&pin.algorithm_version.to_be_bytes());
 }
 
+fn append_query_channel(encoded: &mut Vec<u8>, channel: ReferenceChannelBindingV1) {
+    encoded.extend_from_slice(channel.target().as_bytes());
+    encoded.extend_from_slice(channel.runtime_peer().as_bytes());
+    encoded.extend_from_slice(channel.local_endpoint_identity_digest().as_bytes());
+    encoded.extend_from_slice(channel.peer_credentials_digest().as_bytes());
+}
+
+fn decode_query_channel(
+    reader: &mut Reader<'_>,
+) -> Result<ReferenceChannelBindingV1, ControllerJournalError> {
+    ReferenceChannelBindingV1::try_new(
+        RuntimeHostId::from_bytes(reader.take_array::<16>()?),
+        PrincipalRef::from_bytes(reader.take_array::<16>()?),
+        Digest32::from_bytes(reader.take_array::<32>()?),
+        Digest32::from_bytes(reader.take_array::<32>()?),
+    )
+    .map_err(Into::into)
+}
+
+fn append_query_serving_baseline(
+    encoded: &mut Vec<u8>,
+    baseline: ReferenceBootstrapServingIdentityV1,
+) {
+    encoded.extend_from_slice(baseline.target().as_bytes());
+    encoded.extend_from_slice(&baseline.runtime_store_instance_id());
+    encoded.extend_from_slice(&baseline.snapshot_sequence().to_be_bytes());
+    encoded.extend_from_slice(&baseline.runtime_host_epoch().to_be_bytes());
+    encoded.extend_from_slice(baseline.clock_domain().as_bytes());
+    encoded.extend_from_slice(&baseline.clock_generation().value().to_be_bytes());
+}
+
+fn decode_query_serving_baseline(
+    reader: &mut Reader<'_>,
+) -> Result<ReferenceBootstrapServingIdentityV1, ControllerJournalError> {
+    ReferenceBootstrapServingIdentityV1::try_new(
+        RuntimeHostId::from_bytes(reader.take_array::<16>()?),
+        reader.take_array::<32>()?,
+        reader.u64()?,
+        reader.u64()?,
+        ClockDomainRef::from_bytes(reader.take_array::<16>()?),
+        ClockGeneration::try_new(reader.u64()?)
+            .map_err(|_| ControllerJournalError::InvalidQueryRequest)?,
+    )
+    .map_err(Into::into)
+}
+
 fn decode_runtime_response_auth_pin(
     reader: &mut Reader<'_>,
 ) -> Result<ControllerRuntimeResponseAuthPin, ControllerJournalError> {
@@ -4024,12 +4686,26 @@ fn append_rollout(
 
     append_count(encoded, rollout.reconcile_attempts.len())?;
     for attempt in &rollout.reconcile_attempts {
-        let observation = &attempt.observation;
-        encoded.extend_from_slice(observation.query_id.as_bytes());
-        encoded.extend_from_slice(&observation.query_snapshot_sequence.to_be_bytes());
-        append_bytes(encoded, &observation.query_response)?;
-        encoded.extend_from_slice(observation.query_response_digest.value().as_bytes());
-        encoded.extend_from_slice(observation.channel_peer_fingerprint.value().as_bytes());
+        let prepared = &attempt.prepared;
+        append_bytes(encoded, prepared.request.canonical_wire())?;
+        append_auth_pin(encoded, prepared.request_auth);
+        append_query_channel(encoded, prepared.request_time_channel);
+        append_runtime_response_auth_pin(encoded, prepared.runtime_response_auth);
+        append_query_serving_baseline(encoded, prepared.serving_baseline);
+        if let Some(observation) = &attempt.observation {
+            encoded.push(1);
+            append_bytes(encoded, observation.response.canonical_wire())?;
+            encoded.extend_from_slice(observation.response_digest.as_bytes());
+            append_query_channel(encoded, observation.channel_peer);
+        } else {
+            encoded.push(0);
+        }
+        if let Some(closure) = attempt.closure {
+            encoded.push(1);
+            encoded.push(closure as u8);
+        } else {
+            encoded.push(0);
+        }
         if let Some(decision) = attempt.decision {
             encoded.push(1);
             encoded.extend_from_slice(decision.query_id.as_bytes());
@@ -4045,16 +4721,18 @@ fn append_rollout(
 
 fn decode_optional_rollout(
     reader: &mut Reader<'_>,
+    reject_legacy_query_evidence: bool,
 ) -> Result<Option<ControllerRolloutRecord>, ControllerJournalError> {
     match reader.u8()? {
         0 => Ok(None),
-        1 => Ok(Some(decode_rollout(reader)?)),
+        1 => Ok(Some(decode_rollout(reader, reject_legacy_query_evidence)?)),
         _ => Err(ControllerJournalError::InvalidPresence),
     }
 }
 
 fn decode_rollout(
     reader: &mut Reader<'_>,
+    reject_legacy_query_evidence: bool,
 ) -> Result<ControllerRolloutRecord, ControllerJournalError> {
     let intent =
         ControllerSignedApplyIntent::try_from_stored(ControllerStoredSignedApplyIntentInput {
@@ -4092,29 +4770,53 @@ fn decode_rollout(
         _ => return Err(ControllerJournalError::InvalidPresence),
     };
     let attempt_count = reader.count(MAX_RECONCILE_ATTEMPTS)?;
+    if reject_legacy_query_evidence && attempt_count != 0 {
+        return Err(ControllerJournalError::LegacyOpaqueQueryEvidenceUnavailable);
+    }
     let mut attempts = Vec::with_capacity(attempt_count);
     for _ in 0..attempt_count {
-        let observation =
-            ControllerOpaqueQueryObservation::try_new(ControllerOpaqueQueryObservationInput {
-                query_id: ControllerOpaqueRuntimeQueryId::from_bytes(reader.take_array::<16>()?),
-                query_snapshot_sequence: reader.u64()?,
-                query_response: reader.bounded_bytes(MAX_QUERY_RESPONSE_BYTES)?,
-                query_response_digest: ControllerQueryResponseDigest::from_stored(
-                    Digest32::from_bytes(reader.take_array::<32>()?),
-                ),
-                channel_peer_fingerprint: ControllerChannelAuthFingerprint::from_stored(
-                    Digest32::from_bytes(reader.take_array::<32>()?),
-                ),
-            })?;
+        let prepared = ControllerPreparedQuery {
+            request: ReferenceQueryRequestV1::decode(
+                reader.bounded_bytes(MAX_REFERENCE_QUERY_REQUEST_BYTES)?,
+            )?,
+            request_auth: decode_auth_pin(reader)?,
+            request_time_channel: decode_query_channel(reader)?,
+            runtime_response_auth: decode_runtime_response_auth_pin(reader)?,
+            serving_baseline: decode_query_serving_baseline(reader)?,
+        };
+        let observation = match reader.u8()? {
+            0 => None,
+            1 => {
+                let response = ReferenceQueryResponseV1::decode(
+                    reader.bounded_bytes(MAX_REFERENCE_QUERY_RESPONSE_BYTES)?,
+                )?;
+                let response_digest = Digest32::from_bytes(reader.take_array::<32>()?);
+                let channel_peer = decode_query_channel(reader)?;
+                let observation =
+                    ControllerQueryObservation::try_new(response, channel_peer, &prepared)?;
+                if observation.response_digest != response_digest {
+                    return Err(ControllerJournalError::InvalidQueryResponse);
+                }
+                Some(observation)
+            }
+            _ => return Err(ControllerJournalError::InvalidPresence),
+        };
+        let closure = match reader.u8()? {
+            0 => None,
+            1 => Some(ControllerQueryClosureKind::decode(reader.u8()?)?),
+            _ => return Err(ControllerJournalError::InvalidPresence),
+        };
         let decision = match reader.u8()? {
             0 => None,
             1 => {
-                let query_id =
-                    ControllerOpaqueRuntimeQueryId::from_bytes(reader.take_array::<16>()?);
+                let query_id = ReferenceQueryIdV1::from_bytes(reader.take_array::<16>()?);
                 let query_snapshot_sequence = reader.u64()?;
                 let observed = ControllerObservedTarget::decode(reader.u8()?)?;
                 let receipt = decode_optional_id(reader)?.map(ControllerReceiptRef::from_bytes);
-                let decision = ControllerRolloutDecision::try_new(&observation, observed, receipt)?;
+                let response = observation
+                    .as_ref()
+                    .ok_or(ControllerJournalError::QueryNotCommittedBeforeDecision)?;
+                let decision = ControllerRolloutDecision::try_new(response, observed, receipt)?;
                 if decision.query_id != query_id
                     || decision.query_snapshot_sequence != query_snapshot_sequence
                 {
@@ -4125,7 +4827,9 @@ fn decode_rollout(
             _ => return Err(ControllerJournalError::InvalidPresence),
         };
         attempts.push(ControllerReconcileAttempt {
+            prepared,
             observation,
+            closure,
             decision,
         });
     }
@@ -4289,6 +4993,7 @@ pub(crate) enum ControllerJournalError {
     TrailingBytes,
     LengthOverflow,
     LengthMismatch,
+    NonCanonicalEncoding,
     CountExceeded,
     SnapshotTooLarge,
     EmbeddedBodyTooLarge,
@@ -4373,9 +5078,16 @@ pub(crate) enum ControllerJournalError {
     BootstrapResponseTooLarge,
     EmptySignedRequest,
     SignedRequestTooLarge,
+    InvalidQueryRequest,
+    MissingPreparedQuery,
+    InvalidQueryResponse,
     EmptyQueryResponse,
     QueryResponseTooLarge,
     InvalidQueryEvidence,
+    LegacyOpaqueQueryEvidenceUnavailable,
+    InvalidQueryClosure,
+    QueryAlreadyClosed,
+    QueryClosureChanged,
     QueryChannelMismatch,
     QueryIdentityConflict,
     QueryHighWaterMismatch,
@@ -4455,10 +5167,9 @@ pub(crate) mod tests {
         CONTROLLER_PAYLOAD_MAGIC, ControllerApplyRequestDigest, ControllerAuthKeyFingerprint,
         ControllerBootstrapResponseDigest, ControllerChannelAuthFingerprint,
         ControllerJournalError, ControllerJournalSnapshot, ControllerJournalState,
-        ControllerObservedTarget, ControllerOpaqueQueryObservationInput,
-        ControllerOpaqueRuntimeQueryId, ControllerOperationId, ControllerOperationPhase,
+        ControllerObservedTarget, ControllerOperationId, ControllerOperationPhase,
         ControllerOwnerIdentityFingerprint, ControllerPlanCommitIntentDigest,
-        ControllerQueryResponseDigest, ControllerReceiptRef, ControllerRequestAuthPin,
+        ControllerQueryClosureKind, ControllerReceiptRef, ControllerRequestAuthPin,
         ControllerRuntimeResponseAuthPin, ControllerSignedApplyIntentInput,
         ControllerTargetBinding, ControllerTargetBindingInput,
         ControllerTenureAuthorityDomainFingerprint, ControllerTenurePhase,
@@ -4495,7 +5206,12 @@ pub(crate) mod tests {
         ReferenceBootstrapFactsV1, ReferenceBootstrapRequestDraftV1, ReferenceBootstrapRequestIdV1,
         ReferenceBootstrapResponseAuthClaimV1, ReferenceBootstrapResponseDraftV1,
         ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1,
-        ReferenceBootstrapStateV1, ReferenceChannelBindingV1, ReferenceTargetExecutionPlanV4,
+        ReferenceBootstrapStateV1, ReferenceChannelBindingV1, ReferenceQueryDesiredHeadV1,
+        ReferenceQueryDesiredStateV1, ReferenceQueryFactsV1, ReferenceQueryIdV1,
+        ReferenceQueryLiveFactsV1, ReferenceQueryLiveStateV1, ReferenceQueryOperationLookupV1,
+        ReferenceQueryOperationStateV1, ReferenceQueryOwnerStateV1, ReferenceQueryRequestDraftV1,
+        ReferenceQueryRequestV1, ReferenceQueryResponseAuthClaimV1, ReferenceQueryResponseDraftV1,
+        ReferenceQueryResponseV1, ReferenceQuerySelectorV1, ReferenceTargetExecutionPlanV4,
     };
     use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
     use paraegox_runtime_contracts::wire::{
@@ -4509,6 +5225,58 @@ pub(crate) mod tests {
     const CONTROLLER_TENURE_SEED: [u8; 32] = [0x71; 32];
     const AUTHORITY_TENURE_SEED: [u8; 32] = [0x72; 32];
     const RUNTIME_RESPONSE_SEED: [u8; 32] = [0x73; 32];
+
+    pub(crate) fn decode_frozen_base64(source: &str) -> Box<[u8]> {
+        let compact = source
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        assert_eq!(compact.len() % 4, 0, "frozen base64 width");
+        let mut decoded = Vec::with_capacity(compact.len() / 4 * 3);
+        for (index, quartet) in compact.chunks_exact(4).enumerate() {
+            let last = index + 1 == compact.len() / 4;
+            let padding = usize::from(quartet[3] == b'=') + usize::from(quartet[2] == b'=');
+            assert!(
+                padding <= 2 && (padding == 0 || last),
+                "frozen base64 padding"
+            );
+            let value = |byte: u8| -> u8 {
+                match byte {
+                    b'A'..=b'Z' => byte - b'A',
+                    b'a'..=b'z' => byte - b'a' + 26,
+                    b'0'..=b'9' => byte - b'0' + 52,
+                    b'+' => 62,
+                    b'/' => 63,
+                    b'=' => 0,
+                    _ => panic!("invalid frozen base64 byte"),
+                }
+            };
+            let word = (u32::from(value(quartet[0])) << 18)
+                | (u32::from(value(quartet[1])) << 12)
+                | (u32::from(value(quartet[2])) << 6)
+                | u32::from(value(quartet[3]));
+            decoded.push((word >> 16) as u8);
+            if padding < 2 {
+                decoded.push((word >> 8) as u8);
+            }
+            if padding == 0 {
+                decoded.push(word as u8);
+            }
+        }
+        decoded.into_boxed_slice()
+    }
+
+    pub(crate) fn frozen_v7_zero_wire() -> Box<[u8]> {
+        decode_frozen_base64(include_str!("testdata/controller_v7_zero.b64"))
+    }
+
+    pub(crate) fn frozen_v7_opaque_query_wire() -> Box<[u8]> {
+        decode_frozen_base64(include_str!("testdata/controller_v7_opaque_query.b64"))
+    }
+
+    pub(crate) fn frozen_v8_zero_target_wire() -> Box<[u8]> {
+        decode_frozen_base64(include_str!("testdata/controller_v8_zero_target.b64"))
+    }
 
     fn digest(byte: u8) -> Digest32 {
         Digest32::from_bytes([byte; 32])
@@ -4704,7 +5472,7 @@ pub(crate) mod tests {
         let serving = ReferenceBootstrapServingIdentityV1::try_new(
             TARGET,
             runtime_store_instance_id,
-            11,
+            1,
             epoch,
             ClockDomainRef::from_bytes([0x84; 16]),
             ClockGeneration::try_new(3).expect("clock generation"),
@@ -4783,7 +5551,7 @@ pub(crate) mod tests {
             .expect("binding snapshot must succeed")
     }
 
-    fn signed_snapshot() -> ControllerJournalSnapshot {
+    pub(crate) fn signed_snapshot() -> ControllerJournalSnapshot {
         let bound = bound_snapshot();
         let state = bound
             .state
@@ -4841,30 +5609,175 @@ pub(crate) mod tests {
         }
     }
 
-    fn query_input(
-        sequence: u64,
-        response: &'static [u8],
-    ) -> ControllerOpaqueQueryObservationInput<'static> {
-        ControllerOpaqueQueryObservationInput {
-            query_id: ControllerOpaqueRuntimeQueryId::from_bytes(
-                [u8::try_from(sequence).expect("fixture query sequence must fit"); 16],
-            ),
+    #[derive(Clone, Copy)]
+    struct QueryInput {
+        query_id: ReferenceQueryIdV1,
+        query_snapshot_sequence: u64,
+        marker: u8,
+        channel: Option<ReferenceChannelBindingV1>,
+    }
+
+    fn query_input(sequence: u64, response: &'static [u8]) -> QueryInput {
+        let mut query_id = [0_u8; 16];
+        query_id[0] = 1;
+        query_id[8..].copy_from_slice(&sequence.to_be_bytes());
+        QueryInput {
+            query_id: ReferenceQueryIdV1::from_bytes(query_id),
             query_snapshot_sequence: sequence,
-            query_response: response,
-            query_response_digest: ControllerQueryResponseDigest::from_stored(digest(response[0])),
-            channel_peer_fingerprint: ControllerChannelAuthFingerprint::from_stored(digest(0x63)),
+            marker: response[0],
+            channel: None,
         }
+    }
+
+    fn query_contract_values(
+        state: &ControllerJournalState,
+        input: QueryInput,
+    ) -> (
+        ReferenceQueryRequestV1,
+        ReferenceQueryResponseV1,
+        ReferenceChannelBindingV1,
+    ) {
+        let binding = state
+            .target_binding()
+            .expect("query fixture target binding");
+        let intent = state
+            .current_signed_apply_intent()
+            .expect("query fixture signed apply intent");
+        let channel = input.channel.unwrap_or_else(|| {
+            binding
+                .runtime_response_auth()
+                .channel(TARGET)
+                .expect("query fixture channel")
+        });
+        let request_auth = state.request_auth();
+        let mut client_nonce = [input.marker; 32];
+        client_nonce[..16].copy_from_slice(input.query_id.as_bytes());
+        client_nonce[24..].copy_from_slice(&input.query_snapshot_sequence.to_be_bytes());
+        let claim = ApplyRequestAuthClaim::try_new(
+            PrincipalRef::from_bytes([0x88; 16]),
+            request_auth.key(),
+            request_auth.algorithm(),
+            request_auth.algorithm_version(),
+            &client_nonce,
+        )
+        .expect("query fixture request claim");
+        let selector = ReferenceQuerySelectorV1::try_new(
+            input.query_id,
+            TARGET,
+            SourceScopeRef::from_bytes(*state.scope().as_bytes()),
+            binding.runtime_store_instance_id(),
+            intent.apply_operation(),
+            Some(intent.request_digest().value()),
+        )
+        .expect("query fixture selector");
+        let draft = ReferenceQueryRequestDraftV1::try_new(
+            selector,
+            claim,
+            paraegox_runtime_contracts::reference_control::MAX_REFERENCE_QUERY_RESPONSE_BYTES
+                as u32,
+        )
+        .expect("query fixture request draft");
+        let signature = SigningKey::from_bytes(&CONTROLLER_TENURE_SEED).sign(
+            draft
+                .signing_transcript()
+                .expect("query fixture request transcript")
+                .as_bytes(),
+        );
+        let request = draft
+            .finalize(&signature.to_bytes())
+            .expect("query fixture request");
+
+        let bootstrap = ReferenceBootstrapResponseV1::decode(binding.bootstrap_response())
+            .expect("query fixture bootstrap");
+        let bootstrap_facts = bootstrap.facts();
+        let serving = ReferenceBootstrapServingIdentityV1::try_new(
+            TARGET,
+            binding.runtime_store_instance_id(),
+            input.query_snapshot_sequence,
+            bootstrap_facts.runtime_host_epoch(),
+            bootstrap_facts.clock_domain(),
+            bootstrap_facts.clock_generation(),
+        )
+        .expect("query fixture serving");
+        let operation = ReferenceQueryOperationStateV1::try_new(
+            ReferenceQueryOwnerStateV1::Operational,
+            None,
+            ReferenceQueryOperationLookupV1::Unknown,
+        )
+        .expect("query fixture operation");
+        let desired = ReferenceQueryDesiredStateV1::try_new(
+            ReferenceQueryDesiredHeadV1::None,
+            SourcePlanRevision::new(0),
+        )
+        .expect("query fixture desired");
+        let live = ReferenceQueryLiveFactsV1::try_new(
+            ReferenceQueryLiveStateV1::ExactZero,
+            0,
+            input.query_snapshot_sequence,
+            digest(input.marker),
+        )
+        .expect("query fixture live");
+        let facts = ReferenceQueryFactsV1::try_new(serving, operation, desired, live)
+            .expect("query fixture facts");
+        let response_claim = ReferenceQueryResponseAuthClaimV1::try_new(
+            channel,
+            binding.runtime_response_auth().key(),
+            binding.runtime_response_auth().algorithm(),
+            binding.runtime_response_auth().algorithm_version(),
+        )
+        .expect("query fixture response claim");
+        let response_draft =
+            ReferenceQueryResponseDraftV1::try_new(&request, facts, channel, response_claim)
+                .expect("query fixture response draft");
+        let response_signature = SigningKey::from_bytes(&RUNTIME_RESPONSE_SEED).sign(
+            response_draft
+                .signing_transcript()
+                .expect("query fixture response transcript")
+                .as_bytes(),
+        );
+        let response = response_draft
+            .finalize(&response_signature.to_bytes())
+            .expect("query fixture response");
+        (request, response, channel)
+    }
+
+    fn prepare_query(state: &ControllerJournalState, input: QueryInput) -> ControllerJournalState {
+        let (request, _, _) = query_contract_values(state, input);
+        state
+            .prepare_query_request(&request)
+            .expect("query fixture request must prepare")
+    }
+
+    fn record_query(state: &ControllerJournalState, input: QueryInput) -> ControllerJournalState {
+        let (request, response, channel) = query_contract_values(state, input);
+        state
+            .prepare_query_request(&request)
+            .expect("query fixture request must prepare")
+            .record_query_response(&response, channel)
+            .expect("query fixture response must record")
+    }
+
+    fn record_query_response(
+        state: &ControllerJournalState,
+        input: QueryInput,
+    ) -> ControllerJournalState {
+        let (_, response, channel) = query_contract_values(state, input);
+        state
+            .record_query_response(&response, channel)
+            .expect("query fixture response must record")
     }
 
     fn decided_snapshot() -> ControllerJournalSnapshot {
         let signed = signed_snapshot();
-        let query_state = signed
-            .state
-            .record_query_observation(query_input(9, b"query-nine"))
-            .expect("query evidence must record");
-        let queried = signed
-            .try_successor(query_state)
-            .expect("query snapshot must succeed");
+        let input = query_input(9, b"query-nine");
+        let prepared_state = prepare_query(&signed.state, input);
+        let prepared = signed
+            .try_successor(prepared_state)
+            .expect("query request snapshot must succeed");
+        let response_state = record_query_response(&prepared.state, input);
+        let queried = prepared
+            .try_successor(response_state)
+            .expect("query response snapshot must succeed");
         let decision_state = queried
             .state
             .record_rollout_decision(
@@ -5055,9 +5968,7 @@ pub(crate) mod tests {
         state = state
             .record_signed_apply_intent(different_signed_input(&state, 0x77, 0x78))
             .expect("second rollout intent must record");
-        state = state
-            .record_query_observation(query_input(10, b"query-ten"))
-            .expect("second rollout query must record");
+        state = record_query(&state, query_input(10, b"query-ten"));
         state = state
             .record_rollout_decision(
                 ControllerObservedTarget::Retired,
@@ -5082,7 +5993,7 @@ pub(crate) mod tests {
     }
 
     fn encode_unvalidated_state(state: &ControllerJournalState, snapshot_sequence: u64) -> Vec<u8> {
-        let payload = super::encode_payload_fields(state)
+        let payload = super::encode_payload_fields(state, super::CONTROLLER_PAYLOAD_VERSION)
             .expect("test-only semantic forgery must have bounded fields");
         let mut prefix = Vec::new();
         prefix.extend_from_slice(super::JOURNAL_MAGIC);
@@ -5113,14 +6024,14 @@ pub(crate) mod tests {
     #[test]
     fn full_snapshot_has_frozen_checksum_and_round_trips_byte_identically() {
         let snapshot = decided_snapshot();
-        assert_eq!(snapshot.snapshot_sequence, 7);
+        assert_eq!(snapshot.snapshot_sequence, 8);
         let encoded = snapshot.encode().expect("snapshot must encode");
         assert!(encoded.starts_with(b"PXJR\0\x01\0\x01"));
         assert_eq!(
             &encoded[super::JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES..super::JOURNAL_HEADER_BYTES],
             &[
-                97, 51, 121, 129, 124, 115, 180, 178, 194, 140, 117, 45, 205, 39, 28, 246, 108,
-                145, 5, 26, 106, 51, 182, 124, 128, 215, 16, 75, 91, 158, 85, 173,
+                172, 153, 190, 252, 234, 147, 148, 136, 139, 221, 172, 86, 104, 22, 26, 125, 188,
+                249, 170, 165, 182, 196, 46, 108, 233, 74, 40, 2, 236, 178, 120, 209,
             ]
         );
         let decoded = ControllerJournalSnapshot::decode(&encoded).expect("snapshot must decode");
@@ -6005,7 +6916,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn signed_query_and_decision_are_three_distinct_successor_transactions() {
+    fn signed_query_response_and_decision_are_four_distinct_successor_transactions() {
         let committed = committed_snapshot();
         let binding_and_intent = committed
             .state
@@ -6035,34 +6946,34 @@ pub(crate) mod tests {
         let signed = bound
             .try_successor(signed_state)
             .expect("signed-before-send snapshot must succeed");
-        let query_state = signed
-            .state
-            .record_query_observation(query_input(9, b"query-nine"))
-            .expect("query must record");
-        let premature_decision = query_state
-            .record_rollout_decision(
+        let input = query_input(9, b"query-nine");
+        let request_state = prepare_query(&signed.state, input);
+        assert_eq!(
+            request_state.record_rollout_decision(
                 ControllerObservedTarget::Active,
                 Some(ControllerReceiptRef::from_bytes([0x6c; 16])),
-            )
-            .expect("in-memory decision candidate must validate");
-        assert_eq!(
-            signed.try_successor(premature_decision),
+            ),
             Err(ControllerJournalError::QueryNotCommittedBeforeDecision)
         );
-        let queried = signed
-            .try_successor(query_state)
-            .expect("query evidence must commit separately");
+        let combined = record_query(&signed.state, input);
         assert_eq!(
-            queried
-                .state
-                .record_query_observation(query_input(8, b"query-eight")),
-            Err(ControllerJournalError::QuerySequenceRegression)
+            signed.clone().try_successor(combined),
+            Err(ControllerJournalError::QueryNotCommittedBeforeDecision),
+            "PXQR and PXQS cannot enter one Controller transaction"
         );
+        let requested = signed
+            .try_successor(request_state)
+            .expect("query request must commit before send");
+        let response_state = record_query_response(&requested.state, input);
+        let queried = requested
+            .try_successor(response_state)
+            .expect("query response must commit separately");
+        let mut conflicting = input;
+        conflicting.marker = b'c';
+        let (conflicting_request, _, _) = query_contract_values(&queried.state, conflicting);
         assert_eq!(
-            queried
-                .state
-                .record_query_observation(query_input(9, b"changed-nine")),
-            Err(ControllerJournalError::QueryEvidenceChanged)
+            queried.state.prepare_query_request(&conflicting_request),
+            Err(ControllerJournalError::QueryIdentityConflict)
         );
         let decided_state = queried
             .state
@@ -6073,11 +6984,11 @@ pub(crate) mod tests {
             .expect("decision must bind durable query");
         let decided = queried
             .try_successor(decided_state)
-            .expect("decision must be the third transaction");
+            .expect("decision must be the fourth transaction");
+        let (terminal_request, _, _) =
+            query_contract_values(&decided.state, query_input(10, b"query-ten"));
         assert_eq!(
-            decided
-                .state
-                .record_query_observation(query_input(10, b"query-ten")),
+            decided.state.prepare_query_request(&terminal_request),
             Err(ControllerJournalError::EvidenceAfterTerminalDecision)
         );
 
@@ -6091,6 +7002,144 @@ pub(crate) mod tests {
         assert_eq!(
             changed_request.validate_successor_of(&signed.state),
             Err(ControllerJournalError::RolloutIntentChanged)
+        );
+    }
+
+    #[test]
+    fn query_closure_is_a_distinct_exact_successor_and_never_revives_send_authority() {
+        let signed = signed_snapshot();
+        let input = query_input(9, b"query-nine");
+        let (request, response, channel) = query_contract_values(&signed.state, input);
+        let request_state = signed
+            .state
+            .prepare_query_request(&request)
+            .expect("query request must prepare");
+        let requested = signed
+            .clone()
+            .try_successor(request_state.clone())
+            .expect("query request must commit before closure");
+
+        let combined = request_state
+            .record_query_closure(ControllerQueryClosureKind::DeliveryUncertain)
+            .expect("in-memory combined request and closure can be constructed");
+        assert_eq!(
+            signed.try_successor(combined),
+            Err(ControllerJournalError::QueryNotCommittedBeforeDecision),
+            "PXQR and its closure cannot enter one Controller transaction"
+        );
+
+        for closure in [
+            ControllerQueryClosureKind::NotSent,
+            ControllerQueryClosureKind::DeliveryUncertain,
+            ControllerQueryClosureKind::ResidentAuthorityLostAfterRestart,
+            ControllerQueryClosureKind::ResponseRejected,
+        ] {
+            let closed_state = requested
+                .state
+                .record_query_closure(closure)
+                .expect("closure must record");
+            let closed = requested
+                .clone()
+                .try_successor(closed_state)
+                .expect("closure must be its own successor");
+            assert_eq!(closed.state.query_snapshot_high_water, 0);
+            assert_eq!(closed.state.current_query_closure(), Some(closure));
+            assert!(!closed.state.current_query_is_open());
+            let encoded = closed.encode().expect("closed snapshot must encode");
+            let decoded = ControllerJournalSnapshot::decode(&encoded)
+                .expect("closed snapshot must decode exactly");
+            assert_eq!(decoded, closed);
+            assert_eq!(
+                decoded.encode().expect("closed snapshot must reencode"),
+                encoded
+            );
+        }
+
+        let closed_state = requested
+            .state
+            .record_query_closure(ControllerQueryClosureKind::DeliveryUncertain)
+            .expect("delivery-uncertain closure must record");
+        let closed = requested
+            .try_successor(closed_state)
+            .expect("closure must commit separately");
+        assert_eq!(
+            closed.state.record_query_response(&response, channel),
+            Err(ControllerJournalError::QueryAlreadyClosed)
+        );
+        assert_eq!(
+            closed
+                .state
+                .record_rollout_decision(ControllerObservedTarget::Prepared, None),
+            Err(ControllerJournalError::InvalidQueryClosure)
+        );
+        assert_eq!(
+            closed
+                .state
+                .record_query_closure(ControllerQueryClosureKind::DeliveryUncertain),
+            Ok(closed.state.clone()),
+            "replaying the exact closure is an idempotent no-op"
+        );
+        assert_eq!(
+            closed
+                .state
+                .record_query_closure(ControllerQueryClosureKind::ResponseRejected),
+            Err(ControllerJournalError::QueryClosureChanged)
+        );
+        assert_eq!(
+            closed.state.prepare_query_request(&request),
+            Err(ControllerJournalError::QueryAlreadyClosed),
+            "an exact closed identity must never mint fresh resident send authority"
+        );
+
+        let next_input = query_input(10, b"query-ten");
+        let next_state = prepare_query(&closed.state, next_input);
+        let next = closed
+            .try_successor(next_state)
+            .expect("a later call may prepare a fresh identity after closure");
+        let attempts = &next
+            .state
+            .rollout
+            .as_ref()
+            .expect("rollout must remain current")
+            .reconcile_attempts;
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[0].prepared.request().canonical_wire(),
+            request.canonical_wire()
+        );
+        assert_eq!(
+            attempts[0].closure,
+            Some(ControllerQueryClosureKind::DeliveryUncertain)
+        );
+        assert_eq!(
+            attempts[1].prepared.request().query_id(),
+            next_input.query_id
+        );
+        assert!(next.state.current_query_is_open());
+
+        let mut forged = record_query_response(&requested.state, input);
+        forged
+            .rollout
+            .as_mut()
+            .expect("rollout must exist")
+            .reconcile_attempts
+            .last_mut()
+            .expect("query attempt must exist")
+            .closure = Some(ControllerQueryClosureKind::DeliveryUncertain);
+        assert_eq!(
+            forged.validate(),
+            Err(ControllerJournalError::InvalidQueryClosure)
+        );
+        let encoded_forgery = encode_unvalidated_state(
+            &forged,
+            requested
+                .snapshot_sequence
+                .checked_add(1)
+                .expect("fixture sequence has capacity"),
+        );
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&encoded_forgery),
+            Err(ControllerJournalError::InvalidQueryClosure)
         );
     }
 
@@ -6116,10 +7165,7 @@ pub(crate) mod tests {
         }
 
         let signed = signed_snapshot();
-        let query_only = signed
-            .state
-            .record_query_observation(query_input(9, b"query-nine"))
-            .expect("query-only state must validate");
+        let query_only = record_query(&signed.state, query_input(9, b"query-nine"));
         let prepared_decision = query_only
             .record_rollout_decision(ControllerObservedTarget::Prepared, None)
             .expect("Prepared is a nonterminal reconcile decision");
@@ -6177,13 +7223,13 @@ pub(crate) mod tests {
     #[test]
     fn prepared_and_uncertain_reconciliation_append_exact_evidence_until_terminal() {
         let signed = signed_snapshot();
-        let query_state = signed
-            .state
-            .record_query_observation(query_input(9, b"query-nine"))
-            .expect("first query must record");
-        let queried = signed
-            .try_successor(query_state)
-            .expect("query must be a separate successor");
+        let first_input = query_input(9, b"query-nine");
+        let query_request = signed
+            .try_successor(prepare_query(&signed.state, first_input))
+            .expect("query request must be a separate successor");
+        let queried = query_request
+            .try_successor(record_query_response(&query_request.state, first_input))
+            .expect("query response must be a separate successor");
         let prepared_state = queried
             .state
             .record_rollout_decision(ControllerObservedTarget::Prepared, None)
@@ -6203,14 +7249,16 @@ pub(crate) mod tests {
             .reconcile_attempts[0]
             .clone();
         let mut same_snapshot_query = query_input(9, b"query-nine-retry");
-        same_snapshot_query.query_id = ControllerOpaqueRuntimeQueryId::from_bytes([0x6b; 16]);
-        let second_query_state = restarted
-            .state
-            .record_query_observation(same_snapshot_query)
-            .expect("Prepared must remain queryable");
-        let second_query = restarted
-            .try_successor(second_query_state)
-            .expect("next query must append separately");
+        same_snapshot_query.query_id = ReferenceQueryIdV1::from_bytes([0x6b; 16]);
+        let second_request = restarted
+            .try_successor(prepare_query(&restarted.state, same_snapshot_query))
+            .expect("next request must append separately");
+        let second_query = second_request
+            .try_successor(record_query_response(
+                &second_request.state,
+                same_snapshot_query,
+            ))
+            .expect("next response must append separately");
         assert_eq!(
             second_query
                 .state
@@ -6242,16 +7290,12 @@ pub(crate) mod tests {
         );
 
         let uncertain_signed = signed_snapshot();
-        let uncertain_query = uncertain_signed
-            .state
-            .record_query_observation(query_input(20, b"query-twenty"))
-            .expect("Uncertain branch query must record");
+        let uncertain_query =
+            record_query(&uncertain_signed.state, query_input(20, b"query-twenty"));
         let uncertain_decision = uncertain_query
             .record_rollout_decision(ControllerObservedTarget::Uncertain, None)
             .expect("Uncertain decision must record");
-        let later_query = uncertain_decision
-            .record_query_observation(query_input(21, b"query-twenty-one"))
-            .expect("Uncertain must remain queryable");
+        let later_query = record_query(&uncertain_decision, query_input(21, b"query-twenty-one"));
         let retired = later_query
             .record_rollout_decision(
                 ControllerObservedTarget::Retired,
@@ -6351,10 +7395,7 @@ pub(crate) mod tests {
             original_auth
         );
 
-        let queried = restarted
-            .state
-            .record_query_observation(query_input(30, b"query-thirty"))
-            .expect("old signed pin remains reconcilable after rotation");
+        let queried = record_query(&restarted.state, query_input(30, b"query-thirty"));
         let terminal = queried
             .record_rollout_decision(
                 ControllerObservedTarget::Retired,
@@ -6412,9 +7453,7 @@ pub(crate) mod tests {
             state = state
                 .record_signed_apply_intent(input)
                 .expect("unique apply intent must record");
-            state = state
-                .record_query_observation(query_input(u64::from(index) + 1, b"capacity-query"))
-                .expect("capacity query must record");
+            state = record_query(&state, query_input(u64::from(index) + 1, b"capacity-query"));
             let mut receipt = [0_u8; 16];
             receipt[0] = 0x92;
             receipt[14..].copy_from_slice(&index.to_be_bytes());
@@ -6473,9 +7512,7 @@ pub(crate) mod tests {
         state = state
             .record_signed_apply_intent(different_signed_input(&state, 0xa3, 0xa4))
             .expect("a fresh current rollout is allowed after the prior one was archived");
-        state = state
-            .record_query_observation(query_input(200, b"capacity-final-query"))
-            .expect("final query must record");
+        state = record_query(&state, query_input(200, b"capacity-final-query"));
         state = state
             .record_rollout_decision(
                 ControllerObservedTarget::Retired,
@@ -6550,47 +7587,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn accumulated_query_evidence_cannot_return_an_unpersistable_state() {
+    fn exact_query_history_capacity_is_bounded_without_evicting_evidence() {
         let mut state = signed_snapshot().state;
-        let response = vec![0xc1; super::MAX_QUERY_RESPONSE_BYTES];
-        for sequence in 1..=3_u64 {
-            state = state
-                .record_query_observation(ControllerOpaqueQueryObservationInput {
-                    query_id: ControllerOpaqueRuntimeQueryId::from_bytes(
-                        [u8::try_from(sequence).expect("fixture sequence must fit"); 16],
-                    ),
-                    query_snapshot_sequence: sequence,
-                    query_response: &response,
-                    query_response_digest: ControllerQueryResponseDigest::from_stored(digest(
-                        u8::try_from(sequence).expect("fixture sequence must fit"),
-                    )),
-                    channel_peer_fingerprint: ControllerChannelAuthFingerprint::from_stored(
-                        digest(0x63),
-                    ),
-                })
-                .expect("the first three large observations fit the snapshot bound");
+        for sequence in
+            1..=u64::try_from(super::MAX_RECONCILE_ATTEMPTS).expect("query capacity fits u64")
+        {
+            state = record_query(&state, query_input(sequence, b"capacity-query"));
             state = state
                 .record_rollout_decision(ControllerObservedTarget::Prepared, None)
                 .expect("nonterminal decision permits the next query");
         }
         let before = state.clone();
+        let (request, _, _) = query_contract_values(
+            &state,
+            query_input(
+                u64::try_from(super::MAX_RECONCILE_ATTEMPTS).expect("capacity fits") + 1,
+                b"capacity-overflow",
+            ),
+        );
         assert_eq!(
-            state.record_query_observation(ControllerOpaqueQueryObservationInput {
-                query_id: ControllerOpaqueRuntimeQueryId::from_bytes([4; 16]),
-                query_snapshot_sequence: 4,
-                query_response: &response,
-                query_response_digest: ControllerQueryResponseDigest::from_stored(digest(4)),
-                channel_peer_fingerprint: ControllerChannelAuthFingerprint::from_stored(digest(
-                    0x63,
-                )),
-            }),
-            Err(ControllerJournalError::SnapshotTooLarge)
+            state.prepare_query_request(&request),
+            Err(ControllerJournalError::ReconcileCapacityExceeded)
         );
         assert_eq!(state, before);
         let persistable = ControllerJournalSnapshot::try_from_stored(
             [0x41; 32],
             ControllerOwnerIdentityFingerprint::from_stored(digest(0x42)),
-            10,
+            600,
             state,
         )
         .expect("the previous state remains valid");
@@ -6604,11 +7627,23 @@ pub(crate) mod tests {
     fn query_evidence_is_channel_bound_and_query_ids_are_scope_unique() {
         let signed = signed_snapshot();
         let mut wrong_peer = query_input(9, b"wrong-peer");
-        wrong_peer.channel_peer_fingerprint =
-            ControllerChannelAuthFingerprint::from_stored(digest(0x64));
+        wrong_peer.channel = Some(
+            ReferenceChannelBindingV1::try_new(
+                TARGET,
+                PrincipalRef::from_bytes([0x99; 16]),
+                digest(0x98),
+                digest(0x97),
+            )
+            .expect("wrong query channel fixture"),
+        );
+        let (request, response, wrong_channel) = query_contract_values(&signed.state, wrong_peer);
+        let prepared = signed
+            .state
+            .prepare_query_request(&request)
+            .expect("request itself uses the durable channel baseline");
         assert_eq!(
-            signed.state.record_query_observation(wrong_peer),
-            Err(ControllerJournalError::QueryChannelMismatch)
+            prepared.record_query_response(&response, wrong_channel),
+            Err(ControllerJournalError::InvalidQueryResponse)
         );
 
         let mut forged_current_peer = decided_snapshot().state;
@@ -6618,59 +7653,41 @@ pub(crate) mod tests {
             .expect("current rollout")
             .reconcile_attempts[0]
             .observation
-            .channel_peer_fingerprint = ControllerChannelAuthFingerprint::from_stored(digest(0x64));
+            .as_mut()
+            .expect("current response")
+            .channel_peer = wrong_channel;
         assert_eq!(
             ControllerJournalSnapshot::decode(&encode_unvalidated_state(&forged_current_peer, 7)),
-            Err(ControllerJournalError::QueryChannelMismatch)
+            Err(ControllerJournalError::InvalidQueryResponse)
         );
 
         let archived = state_with_two_archived_rollouts();
         let mut forged_history_peer = archived.clone();
         forged_history_peer.apply_history[0].reconcile_attempts[0]
             .observation
-            .channel_peer_fingerprint = ControllerChannelAuthFingerprint::from_stored(digest(0x64));
+            .as_mut()
+            .expect("archived response")
+            .channel_peer = wrong_channel;
         assert_eq!(
             ControllerJournalSnapshot::decode(&encode_unvalidated_state(&forged_history_peer, 12)),
-            Err(ControllerJournalError::QueryChannelMismatch)
+            Err(ControllerJournalError::InvalidQueryResponse)
         );
 
         let current = archived
             .record_signed_apply_intent(different_signed_input(&archived, 0x7a, 0x7b))
             .expect("fresh current rollout must record");
         let mut reused_archived_query = query_input(11, b"reused-archived-query");
-        reused_archived_query.query_id = ControllerOpaqueRuntimeQueryId::from_bytes([9; 16]);
+        reused_archived_query.query_id = query_input(9, b"query-nine").query_id;
+        let (reused_request, _, _) = query_contract_values(&current, reused_archived_query);
         assert_eq!(
-            current.record_query_observation(reused_archived_query),
+            current.prepare_query_request(&reused_request),
             Err(ControllerJournalError::QueryIdentityConflict)
         );
 
-        let current = current
-            .record_query_observation(query_input(11, b"query-eleven"))
-            .expect("unique current query must record")
+        let current = record_query(&current, query_input(11, b"query-eleven"))
             .record_rollout_decision(ControllerObservedTarget::Prepared, None)
             .expect("current query decision must record");
-        let archived_query_id = current.apply_history[0].reconcile_attempts[0]
-            .observation
-            .query_id;
-        let mut forged_current_history_reuse = current;
-        let attempt = &mut forged_current_history_reuse
-            .rollout
-            .as_mut()
-            .expect("current rollout")
-            .reconcile_attempts[0];
-        attempt.observation.query_id = archived_query_id;
-        attempt
-            .decision
-            .as_mut()
-            .expect("current decision")
-            .query_id = archived_query_id;
-        assert_eq!(
-            ControllerJournalSnapshot::decode(&encode_unvalidated_state(
-                &forged_current_history_reuse,
-                15,
-            )),
-            Err(ControllerJournalError::QueryIdentityConflict)
-        );
+        assert_eq!(current.apply_history.len(), 2);
     }
 
     #[test]
@@ -6681,16 +7698,18 @@ pub(crate) mod tests {
             .record_signed_apply_intent(different_signed_input(&archived, 0x7c, 0x7d))
             .expect("fresh current rollout must record");
         let mut regressed = query_input(9, b"cross-rollout-regression");
-        regressed.query_id = ControllerOpaqueRuntimeQueryId::from_bytes([0x7e; 16]);
+        regressed.query_id = ReferenceQueryIdV1::from_bytes([0x7e; 16]);
+        let (request, response, channel) = query_contract_values(&current, regressed);
+        let prepared = current
+            .prepare_query_request(&request)
+            .expect("regression is not visible until the signed response arrives");
         assert_eq!(
-            current.record_query_observation(regressed),
+            prepared.record_query_response(&response, channel),
             Err(ControllerJournalError::QuerySequenceRegression)
         );
         let mut equal_high_water = query_input(10, b"equal-high-water");
-        equal_high_water.query_id = ControllerOpaqueRuntimeQueryId::from_bytes([0x7f; 16]);
-        let equal = current
-            .record_query_observation(equal_high_water)
-            .expect("a distinct query may conservatively share the durable sequence");
+        equal_high_water.query_id = ReferenceQueryIdV1::from_bytes([0x7f; 16]);
+        let equal = record_query(&current, equal_high_water);
         assert_eq!(equal.query_snapshot_high_water, 10);
 
         let mut forged_jump = archived.clone();
@@ -7117,6 +8136,53 @@ pub(crate) mod tests {
         assert!(
             forged.is_err(),
             "Planner authority rejects duplicate allocation rows"
+        );
+    }
+
+    #[test]
+    fn explicit_v7_migration_is_zero_query_only_and_normal_decode_never_falls_back() {
+        let source_wire = frozen_v7_zero_wire();
+        assert_eq!(source_wire.len(), 3_088);
+        assert_eq!(
+            &source_wire[super::JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES..super::JOURNAL_HEADER_BYTES],
+            &[
+                0x06, 0x05, 0x8a, 0xbc, 0x8d, 0x49, 0xde, 0xa2, 0x07, 0x4e, 0xc3, 0xa1, 0x30, 0x2a,
+                0xb5, 0x11, 0xb2, 0x1e, 0xfb, 0x9f, 0xdc, 0x29, 0x7c, 0xa2, 0xc0, 0xa0, 0x57, 0x96,
+                0xe1, 0x0f, 0x85, 0xd5,
+            ]
+        );
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&source_wire),
+            Err(ControllerJournalError::UnknownPayloadVersion),
+            "normal open must remain v8-only"
+        );
+        let migrated = ControllerJournalSnapshot::migrate_payload_v7_with_metadata(&source_wire)
+            .expect("zero-query v7 fixture must migrate");
+        assert_eq!(migrated.source_payload_version(), 7);
+        assert_eq!(migrated.source_store_instance_id(), &[0x41; 32]);
+        assert_eq!(
+            migrated.source_owner_identity_fingerprint().value(),
+            Digest32::from_bytes([0x42; 32])
+        );
+        assert_eq!(migrated.source_snapshot_sequence(), 5);
+        let target_wire = migrated.snapshot().encode().expect("v8 target must encode");
+        assert_eq!(target_wire, frozen_v8_zero_target_wire());
+        assert_eq!(
+            ControllerJournalSnapshot::migrate_payload_v7(&target_wire),
+            Err(ControllerJournalError::UnknownPayloadVersion),
+            "the v7-only migration parser must never accept its v8 target"
+        );
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&target_wire).expect("v8 target must decode"),
+            migrated.snapshot().clone()
+        );
+
+        let queried_v7 = frozen_v7_opaque_query_wire();
+        assert_eq!(queried_v7.len(), 3_233);
+        assert_eq!(
+            ControllerJournalSnapshot::migrate_payload_v7(&queried_v7),
+            Err(ControllerJournalError::LegacyOpaqueQueryEvidenceUnavailable),
+            "v7 query evidence cannot be guessed into an exact PXQR/PXQS chain"
         );
     }
 }

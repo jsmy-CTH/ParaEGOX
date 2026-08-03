@@ -94,7 +94,7 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_future_rec
         (
             "paraegox-deploymentd initialize-reference-v1/commit-reference-loop-v1/"
             "commit-reference-empty-v1/acquire-tenure-v1/bootstrap-runtime-v1/"
-            "apply-reference-v1 CLI"
+            "apply-reference-v1/migrate-controller-journal-v7-to-v8-v1 CLI"
         ),
     ]
     assert package["consumers"] == [
@@ -109,6 +109,7 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_future_rec
         "acquire-tenure-v1",
         "bootstrap-runtime-v1",
         "apply-reference-v1",
+        "migrate-controller-journal-v7-to-v8-v1",
     ):
         assert command in package["responsibility"]
     assert "exact signed PXAR before one direct Runtime send" in package["responsibility"]
@@ -122,7 +123,8 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_future_rec
     ]
     assert "committed at 1ed704c" in package["responsibility"]
     assert "verified by Ubuntu CI run 30748840399" in package["responsibility"]
-    assert "Runtime query, Controller reconciliation" in package["responsibility"]
+    assert "owner-private exact PXQR/PXQS" in package["responsibility"]
+    assert "executable Runtime-query/reconciliation path" in package["responsibility"]
     assert "production restart reassembly/recovery" in package["responsibility"]
     assert "remain absent" in package["responsibility"]
     assert "does not constitute general live-state reassembly or recovery" in package[
@@ -146,9 +148,11 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_future_rec
         "acquire-tenure-v1",
         "bootstrap-runtime-v1",
         "apply-reference-v1",
+        "migrate-controller-journal-v7-to-v8-v1",
     ):
         assert command in compatibility
-    assert "no Runtime query, restart reassembly/recovery" in compatibility
+    assert "no executable Runtime-query command" in compatibility
+    assert "restart reassembly/recovery" in compatibility
     assert "Controller reconcile loop" in compatibility
     assert "communicate over a real strict versioned wire" in compatibility
 

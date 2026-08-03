@@ -1,4 +1,4 @@
-//! Owner-private Unix clients for authenticated Runtime bootstrap and apply.
+//! Owner-private Unix clients for authenticated Runtime bootstrap, query, and apply.
 //!
 //! Canonical request/response values, transcripts, digests, compatibility
 //! checks, and protocol bounds remain exclusively owned by
@@ -28,11 +28,14 @@ use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::{ClockDomainRef, ClockGeneration};
 use paraegox_runtime_contracts::reference_control::{
     MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES,
-    MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES, MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES,
+    MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES, MAX_REFERENCE_QUERY_REQUEST_BYTES,
+    MAX_REFERENCE_QUERY_RESPONSE_BYTES, MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES,
     ReferenceApplyRequestV1, ReferenceApplyTerminalFactsV1, ReferenceApplyTerminalReceiptV1,
     ReferenceBootstrapFactsV1, ReferenceBootstrapRequestV1, ReferenceBootstrapResponseV1,
-    ReferenceChannelBindingV1, ReferenceControlError, ReferenceControllerBootstrapExpectationV1,
-    ed25519_control_key_fingerprint, reference_local_control_endpoint_identity_digest_v1,
+    ReferenceBootstrapServingIdentityV1, ReferenceChannelBindingV1, ReferenceControlError,
+    ReferenceControllerBootstrapExpectationV1, ReferenceQueryFactsV1, ReferenceQueryRequestV1,
+    ReferenceQueryResponseV1, ed25519_control_key_fingerprint,
+    reference_local_control_endpoint_identity_digest_v1,
     reference_runtime_peer_credentials_digest_v1,
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
@@ -49,6 +52,7 @@ const ED25519_SIGNATURE_BYTES: usize = 64;
 const ED25519_ALGORITHM: u16 = 1;
 const ED25519_ALGORITHM_VERSION: u16 = 1;
 pub(crate) const MAX_RUNTIME_BOOTSTRAP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const MAX_RUNTIME_QUERY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_RUNTIME_APPLY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Immutable signed request plus its byte-identical length-prefixed transport.
@@ -94,6 +98,101 @@ fn length_prefix(payload: &[u8]) -> Box<[u8]> {
     debug_assert!(payload.len() <= MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES);
     let payload_length = u32::try_from(payload.len())
         .expect("canonical bootstrap request bound is smaller than u32::MAX");
+    let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    frame.extend_from_slice(&payload_length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame.into_boxed_slice()
+}
+
+/// Exact durable PXQR plus the request-time Runtime response-verification
+/// baseline. Construction does not allocate or sign a replacement request.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PreparedRuntimeQueryRequest {
+    request: ReferenceQueryRequestV1,
+    transport_frame: Box<[u8]>,
+    request_time_channel: ReferenceChannelBindingV1,
+    response_key: ApplyAuthKeyRef,
+    response_algorithm: ApplyAuthAlgorithm,
+    response_algorithm_version: u16,
+    serving_baseline: ReferenceBootstrapServingIdentityV1,
+}
+
+impl PreparedRuntimeQueryRequest {
+    pub(crate) fn try_new(
+        request: ReferenceQueryRequestV1,
+        request_time_channel: ReferenceChannelBindingV1,
+        response_key: ApplyAuthKeyRef,
+        response_algorithm: ApplyAuthAlgorithm,
+        response_algorithm_version: u16,
+        serving_baseline: ReferenceBootstrapServingIdentityV1,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        let decoded = ReferenceQueryRequestV1::decode(request.canonical_wire())
+            .map_err(RuntimeControlClientConfigurationError::ControlContract)?;
+        if decoded != request
+            || request.canonical_wire().is_empty()
+            || request.canonical_wire().len() > MAX_REFERENCE_QUERY_REQUEST_BYTES
+            || request.target() != request_time_channel.target()
+            || request.target() != serving_baseline.target()
+            || request.expected_runtime_store_instance_id()
+                != serving_baseline.runtime_store_instance_id()
+            || request_time_channel.runtime_peer().as_bytes() == &[0; 16]
+            || response_key.as_bytes() == &[0; 16]
+            || response_algorithm.value() != ED25519_ALGORITHM
+            || response_algorithm_version != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RuntimeControlClientConfigurationError::InvalidQueryExpectation);
+        }
+        Ok(Self {
+            transport_frame: length_prefix_query(request.canonical_wire()),
+            request,
+            request_time_channel,
+            response_key,
+            response_algorithm,
+            response_algorithm_version,
+            serving_baseline,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &ReferenceQueryRequestV1 {
+        &self.request
+    }
+
+    #[must_use]
+    pub(crate) fn transport_frame_bytes(&self) -> &[u8] {
+        &self.transport_frame
+    }
+
+    #[must_use]
+    pub(crate) const fn request_time_channel(&self) -> ReferenceChannelBindingV1 {
+        self.request_time_channel
+    }
+
+    #[must_use]
+    pub(crate) const fn serving_baseline(&self) -> ReferenceBootstrapServingIdentityV1 {
+        self.serving_baseline
+    }
+
+    #[must_use]
+    pub(crate) const fn response_key(&self) -> ApplyAuthKeyRef {
+        self.response_key
+    }
+
+    #[must_use]
+    pub(crate) const fn response_algorithm(&self) -> ApplyAuthAlgorithm {
+        self.response_algorithm
+    }
+
+    #[must_use]
+    pub(crate) const fn response_algorithm_version(&self) -> u16 {
+        self.response_algorithm_version
+    }
+}
+
+fn length_prefix_query(payload: &[u8]) -> Box<[u8]> {
+    debug_assert!(payload.len() <= MAX_REFERENCE_QUERY_REQUEST_BYTES);
+    let payload_length = u32::try_from(payload.len())
+        .expect("canonical query request bound is smaller than u32::MAX");
     let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
     frame.extend_from_slice(&payload_length.to_be_bytes());
     frame.extend_from_slice(payload);
@@ -287,6 +386,74 @@ impl RuntimeBootstrapResponseVerifier {
         self.verifying_key
             .verify_strict(transcript.as_bytes(), &Signature::from_bytes(&signature))
             .map_err(|_| RuntimeBootstrapClientFailure::InvalidResponseSignature)
+    }
+}
+
+/// Pinned Runtime query-response selector and Ed25519 verification key.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeQueryResponseVerifier {
+    runtime_principal: PrincipalRef,
+    key: ApplyAuthKeyRef,
+    verifying_key: VerifyingKey,
+}
+
+impl RuntimeQueryResponseVerifier {
+    pub(crate) fn try_new(
+        runtime_principal: PrincipalRef,
+        key: ApplyAuthKeyRef,
+        algorithm: ApplyAuthAlgorithm,
+        algorithm_version: u16,
+        expected_public_key_fingerprint: Digest32,
+        verifying_key: VerifyingKey,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        if bytes_are_zero(runtime_principal.as_bytes()) || bytes_are_zero(key.as_bytes()) {
+            return Err(RuntimeControlClientConfigurationError::InvalidResponseAuthPin);
+        }
+        if algorithm.value() != ED25519_ALGORITHM || algorithm_version != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RuntimeControlClientConfigurationError::UnsupportedResponseAuthProfile);
+        }
+        if verifying_key.is_weak() {
+            return Err(RuntimeControlClientConfigurationError::WeakRuntimeResponseKey);
+        }
+        let fingerprint = ed25519_control_key_fingerprint(&verifying_key.to_bytes())
+            .map_err(RuntimeControlClientConfigurationError::ControlContract)?;
+        if bytes_are_zero(expected_public_key_fingerprint.as_bytes())
+            || fingerprint != expected_public_key_fingerprint
+        {
+            return Err(RuntimeControlClientConfigurationError::ResponseKeyFingerprintMismatch);
+        }
+        Ok(Self {
+            runtime_principal,
+            key,
+            verifying_key,
+        })
+    }
+
+    /// Signature verification is intentionally a separate first step. The
+    /// caller must not inspect or correlate response facts before this passes.
+    fn verify(&self, response: &ReferenceQueryResponseV1) -> Result<(), RuntimeQueryClientFailure> {
+        if response.authentication_runtime_peer() != self.runtime_principal {
+            return Err(RuntimeQueryClientFailure::ResponsePrincipalMismatch);
+        }
+        if response.authentication_key() != self.key {
+            return Err(RuntimeQueryClientFailure::ResponseKeyMismatch);
+        }
+        if response.authentication_algorithm().value() != ED25519_ALGORITHM
+            || response.authentication_algorithm_version() != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RuntimeQueryClientFailure::UnsupportedResponseAuthProfile);
+        }
+        let signature: [u8; ED25519_SIGNATURE_BYTES] = response
+            .authentication_signature()
+            .try_into()
+            .map_err(|_| RuntimeQueryClientFailure::InvalidResponseSignature)?;
+        let transcript = response
+            .signing_transcript()
+            .map_err(RuntimeQueryClientFailure::ResponseContract)?;
+        self.verifying_key
+            .verify_strict(transcript.as_bytes(), &Signature::from_bytes(&signature))
+            .map_err(|_| RuntimeQueryClientFailure::InvalidResponseSignature)
     }
 }
 
@@ -572,6 +739,245 @@ impl UnixRuntimeBootstrapClient {
             return Err(RuntimeBootstrapClientFailure::RequestTargetMismatch);
         }
         self.request_auth.validate(request)
+    }
+}
+
+/// Canonical PXQS after pinned signature verification followed by exact
+/// request/channel/store/target/scope/epoch/sequence correlation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedRuntimeQueryResponse {
+    response: ReferenceQueryResponseV1,
+    facts: ReferenceQueryFactsV1,
+    request_time_channel: ReferenceChannelBindingV1,
+    current_channel: ReferenceChannelBindingV1,
+}
+
+impl ValidatedRuntimeQueryResponse {
+    #[cfg(test)]
+    pub(crate) fn try_from_contract_fixture(
+        response: ReferenceQueryResponseV1,
+        request: &ReferenceQueryRequestV1,
+        request_time_channel: ReferenceChannelBindingV1,
+        current_channel: ReferenceChannelBindingV1,
+        serving_baseline: ReferenceBootstrapServingIdentityV1,
+    ) -> Result<Self, ReferenceControlError> {
+        if current_channel != request_time_channel {
+            return Err(ReferenceControlError::Contract(
+                paraegox_runtime_contracts::reference_control::ReferenceControlContractErrorCode::InvalidChannelEvidence,
+            ));
+        }
+        let facts =
+            response.validate_against_request(request, request_time_channel, serving_baseline)?;
+        Ok(Self {
+            response,
+            facts,
+            request_time_channel,
+            current_channel,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn response(&self) -> &ReferenceQueryResponseV1 {
+        &self.response
+    }
+
+    #[must_use]
+    pub(crate) const fn facts(&self) -> ReferenceQueryFactsV1 {
+        self.facts
+    }
+
+    #[must_use]
+    pub(crate) const fn request_time_channel(&self) -> ReferenceChannelBindingV1 {
+        self.request_time_channel
+    }
+
+    #[must_use]
+    pub(crate) const fn current_channel(&self) -> ReferenceChannelBindingV1 {
+        self.current_channel
+    }
+}
+
+/// Read-only PXQR-to-PXQS client. It performs exactly one exchange and never
+/// allocates, signs, retries, journals, or interprets a rollout decision.
+#[derive(Clone, Debug)]
+pub(crate) struct UnixRuntimeQueryClient {
+    endpoint: UnixRuntimeControlEndpoint,
+    response_verifier: RuntimeQueryResponseVerifier,
+    exchange_timeout: Duration,
+}
+
+impl UnixRuntimeQueryClient {
+    pub(crate) fn try_new(
+        endpoint: UnixRuntimeControlEndpoint,
+        response_verifier: RuntimeQueryResponseVerifier,
+        exchange_timeout: Duration,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        if exchange_timeout.is_zero() || exchange_timeout > MAX_RUNTIME_QUERY_EXCHANGE_TIMEOUT {
+            return Err(RuntimeControlClientConfigurationError::InvalidExchangeTimeout);
+        }
+        if endpoint.runtime_principal != response_verifier.runtime_principal {
+            return Err(RuntimeControlClientConfigurationError::ResponsePrincipalMismatch);
+        }
+        Ok(Self {
+            endpoint,
+            response_verifier,
+            exchange_timeout,
+        })
+    }
+
+    /// Sends only one already-durable PXQR. Endpoint/channel failures before
+    /// writing are `NotSent`; any transport failure after writing begins is
+    /// `Uncertain`; a complete but invalid PXQS is `Rejected` and never becomes
+    /// query evidence.
+    pub(crate) async fn exchange(
+        &self,
+        prepared: PreparedRuntimeQueryRequest,
+    ) -> Result<ValidatedRuntimeQueryResponse, RuntimeQueryExchangeError> {
+        self.validate_request(&prepared)
+            .map_err(RuntimeQueryExchangeError::NotSent)?;
+        let deadline = Instant::now() + self.exchange_timeout;
+        let validated_endpoint = validate_endpoint_metadata(&self.endpoint)
+            .map_err(RuntimeQueryClientFailure::Endpoint)
+            .map_err(RuntimeQueryExchangeError::NotSent)?;
+
+        let mut stream = bounded_query_io(
+            deadline,
+            RuntimeQueryIoPhase::Connect,
+            QueryDeliveryState::NotSent,
+            UnixStream::connect(self.endpoint.socket_path()),
+        )
+        .await?;
+        validated_endpoint
+            .revalidate(&self.endpoint)
+            .map_err(RuntimeQueryClientFailure::Endpoint)
+            .map_err(RuntimeQueryExchangeError::NotSent)?;
+        let runtime_credentials =
+            validate_peer_credentials(&stream, self.endpoint.server_credentials)
+                .map_err(RuntimeQueryClientFailure::Endpoint)
+                .map_err(RuntimeQueryExchangeError::NotSent)?;
+        let current_channel = validated_endpoint
+            .channel(&self.endpoint, runtime_credentials)
+            .map_err(RuntimeQueryClientFailure::Endpoint)
+            .map_err(RuntimeQueryExchangeError::NotSent)?;
+        if current_channel != prepared.request_time_channel {
+            return Err(RuntimeQueryExchangeError::NotSent(
+                RuntimeQueryClientFailure::CurrentChannelMismatch,
+            ));
+        }
+
+        bounded_query_io(
+            deadline,
+            RuntimeQueryIoPhase::WriteRequest,
+            QueryDeliveryState::Uncertain,
+            stream.write_all(prepared.transport_frame_bytes()),
+        )
+        .await?;
+
+        let mut length_bytes = [0_u8; LENGTH_PREFIX_BYTES];
+        bounded_query_read_exact(
+            deadline,
+            RuntimeQueryIoPhase::ReadResponseLength,
+            &mut stream,
+            &mut length_bytes,
+        )
+        .await?;
+        let response_length = u32::from_be_bytes(length_bytes) as usize;
+        if response_length == 0 {
+            return Err(RuntimeQueryExchangeError::Rejected(
+                RuntimeQueryClientFailure::InvalidResponseLength,
+            ));
+        }
+        if response_length > MAX_REFERENCE_QUERY_RESPONSE_BYTES
+            || response_length > prepared.request.max_response_bytes() as usize
+        {
+            return Err(RuntimeQueryExchangeError::Rejected(
+                RuntimeQueryClientFailure::ResponseBoundExceeded,
+            ));
+        }
+
+        let mut response_bytes = vec![0_u8; response_length];
+        bounded_query_read_exact(
+            deadline,
+            RuntimeQueryIoPhase::ReadResponse,
+            &mut stream,
+            &mut response_bytes,
+        )
+        .await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_bytes = bounded_query_io(
+            deadline,
+            RuntimeQueryIoPhase::ReadTrailing,
+            QueryDeliveryState::Uncertain,
+            stream.read(&mut trailing),
+        )
+        .await?;
+        if trailing_bytes != 0 {
+            return Err(RuntimeQueryExchangeError::Rejected(
+                RuntimeQueryClientFailure::TrailingBytes,
+            ));
+        }
+
+        let response = ReferenceQueryResponseV1::decode(&response_bytes).map_err(|error| {
+            RuntimeQueryExchangeError::Rejected(RuntimeQueryClientFailure::ResponseContract(error))
+        })?;
+        // Security ordering: verify the pinned Runtime signature before any
+        // response correlation or freshness field is trusted.
+        self.response_verifier
+            .verify(&response)
+            .map_err(RuntimeQueryExchangeError::Rejected)?;
+        let facts = response
+            .validate_against_request(
+                &prepared.request,
+                prepared.request_time_channel,
+                prepared.serving_baseline,
+            )
+            .map_err(|error| {
+                RuntimeQueryExchangeError::Rejected(RuntimeQueryClientFailure::ResponseContract(
+                    error,
+                ))
+            })?;
+        Ok(ValidatedRuntimeQueryResponse {
+            response,
+            facts,
+            request_time_channel: prepared.request_time_channel,
+            current_channel,
+        })
+    }
+
+    fn validate_request(
+        &self,
+        prepared: &PreparedRuntimeQueryRequest,
+    ) -> Result<(), RuntimeQueryClientFailure> {
+        let request = prepared.request();
+        if request.canonical_wire().is_empty()
+            || request.canonical_wire().len() > MAX_REFERENCE_QUERY_REQUEST_BYTES
+        {
+            return Err(RuntimeQueryClientFailure::RequestBoundExceeded);
+        }
+        if request.target() != self.endpoint.target {
+            return Err(RuntimeQueryClientFailure::RequestTargetMismatch);
+        }
+        if prepared.request_time_channel.target() != request.target()
+            || prepared.request_time_channel.runtime_peer()
+                != self.response_verifier.runtime_principal
+        {
+            return Err(RuntimeQueryClientFailure::RequestTimeChannelMismatch);
+        }
+        if prepared.response_key != self.response_verifier.key {
+            return Err(RuntimeQueryClientFailure::ResponseKeyMismatch);
+        }
+        if prepared.response_algorithm.value() != ED25519_ALGORITHM
+            || prepared.response_algorithm_version != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RuntimeQueryClientFailure::UnsupportedResponseAuthProfile);
+        }
+        if request.expected_runtime_store_instance_id()
+            != prepared.serving_baseline.runtime_store_instance_id()
+            || request.target() != prepared.serving_baseline.target()
+        {
+            return Err(RuntimeQueryClientFailure::ServingBaselineMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -928,6 +1334,7 @@ pub(crate) enum RuntimeControlClientConfigurationError {
     ResponsePrincipalMismatch,
     CompatibilityTargetMismatch,
     InvalidServingExpectation,
+    InvalidQueryExpectation,
     ControlContract(ReferenceControlError),
 }
 
@@ -1019,6 +1426,66 @@ impl fmt::Display for RuntimeBootstrapClientFailure {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeQueryExchangeError {
+    NotSent(RuntimeQueryClientFailure),
+    Uncertain(RuntimeQueryClientFailure),
+    Rejected(RuntimeQueryClientFailure),
+}
+
+impl RuntimeQueryExchangeError {
+    #[must_use]
+    pub(crate) const fn failure(self) -> RuntimeQueryClientFailure {
+        match self {
+            Self::NotSent(failure) | Self::Uncertain(failure) | Self::Rejected(failure) => failure,
+        }
+    }
+}
+
+impl fmt::Display for RuntimeQueryExchangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Runtime query exchange failed: {self:?}")
+    }
+}
+
+impl std::error::Error for RuntimeQueryExchangeError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeQueryIoPhase {
+    Connect,
+    WriteRequest,
+    ReadResponseLength,
+    ReadResponse,
+    ReadTrailing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeQueryClientFailure {
+    RequestBoundExceeded,
+    RequestTargetMismatch,
+    RequestTimeChannelMismatch,
+    CurrentChannelMismatch,
+    ServingBaselineMismatch,
+    Endpoint(RuntimeBootstrapClientFailure),
+    DeadlineExceeded(RuntimeQueryIoPhase),
+    Io(RuntimeQueryIoPhase),
+    TruncatedResponse,
+    InvalidResponseLength,
+    ResponseBoundExceeded,
+    TrailingBytes,
+    ResponseContract(ReferenceControlError),
+    ResponsePrincipalMismatch,
+    ResponseKeyMismatch,
+    UnsupportedResponseAuthProfile,
+    InvalidResponseSignature,
+}
+
+impl fmt::Display for RuntimeQueryClientFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
 /// Apply delivery classification. There is intentionally no post-send
 /// `Rejected` state: even an invalid response cannot prove the PXAR was not
 /// executed.
@@ -1084,6 +1551,21 @@ impl fmt::Display for RuntimeApplyClientFailure {
 enum ApplyDeliveryState {
     NotSent,
     Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryDeliveryState {
+    NotSent,
+    Uncertain,
+}
+
+impl QueryDeliveryState {
+    const fn error(self, failure: RuntimeQueryClientFailure) -> RuntimeQueryExchangeError {
+        match self {
+            Self::NotSent => RuntimeQueryExchangeError::NotSent(failure),
+            Self::Uncertain => RuntimeQueryExchangeError::Uncertain(failure),
+        }
+    }
 }
 
 impl ApplyDeliveryState {
@@ -1422,6 +1904,41 @@ async fn bounded_read_exact(
     }
 }
 
+async fn bounded_query_io<Output, Operation>(
+    deadline: Instant,
+    phase: RuntimeQueryIoPhase,
+    delivery: QueryDeliveryState,
+    operation: Operation,
+) -> Result<Output, RuntimeQueryExchangeError>
+where
+    Operation: Future<Output = io::Result<Output>>,
+{
+    timeout_at(deadline, operation)
+        .await
+        .map_err(|_| delivery.error(RuntimeQueryClientFailure::DeadlineExceeded(phase)))?
+        .map_err(|_| delivery.error(RuntimeQueryClientFailure::Io(phase)))
+}
+
+async fn bounded_query_read_exact(
+    deadline: Instant,
+    phase: RuntimeQueryIoPhase,
+    stream: &mut UnixStream,
+    output: &mut [u8],
+) -> Result<(), RuntimeQueryExchangeError> {
+    match timeout_at(deadline, stream.read_exact(output)).await {
+        Err(_) => Err(RuntimeQueryExchangeError::Uncertain(
+            RuntimeQueryClientFailure::DeadlineExceeded(phase),
+        )),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => Err(
+            RuntimeQueryExchangeError::Uncertain(RuntimeQueryClientFailure::TruncatedResponse),
+        ),
+        Ok(Err(_)) => Err(RuntimeQueryExchangeError::Uncertain(
+            RuntimeQueryClientFailure::Io(phase),
+        )),
+        Ok(Ok(_)) => Ok(()),
+    }
+}
+
 async fn bounded_apply_io<Output, Operation>(
     deadline: Instant,
     phase: RuntimeApplyIoPhase,
@@ -1499,7 +2016,12 @@ mod tests {
         ReferenceBootstrapResponseAuthClaimV1, ReferenceBootstrapResponseDraftV1,
         ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1,
         ReferenceBootstrapStateV1, ReferenceChannelBindingV1,
-        ReferenceControllerBootstrapExpectationV1, ReferenceTargetExecutionPlanV4,
+        ReferenceControllerBootstrapExpectationV1, ReferenceQueryDesiredHeadV1,
+        ReferenceQueryDesiredStateV1, ReferenceQueryFactsV1, ReferenceQueryIdV1,
+        ReferenceQueryLiveFactsV1, ReferenceQueryLiveStateV1, ReferenceQueryOperationLookupV1,
+        ReferenceQueryOperationStateV1, ReferenceQueryOwnerStateV1, ReferenceQueryRequestDraftV1,
+        ReferenceQueryRequestV1, ReferenceQueryResponseAuthClaimV1, ReferenceQueryResponseDraftV1,
+        ReferenceQueryResponseV1, ReferenceQuerySelectorV1, ReferenceTargetExecutionPlanV4,
         ed25519_control_key_fingerprint, reference_admission_policy_fingerprint_v1,
         reference_local_control_endpoint_identity_digest_v1,
         reference_runtime_peer_credentials_digest_v1,
@@ -1513,15 +2035,18 @@ mod tests {
     use tokio::runtime::Builder as RuntimeBuilder;
 
     use super::{
-        PreparedRuntimeBootstrapRequest, RUNTIME_CONTROL_SOCKET_DIRECTORY_MODE,
-        RUNTIME_CONTROL_SOCKET_MODE, RuntimeApplyClientFailure, RuntimeApplyExchangeError,
-        RuntimeApplyIoPhase, RuntimeApplyResponseExpectation, RuntimeApplyResponseVerifier,
+        PreparedRuntimeBootstrapRequest, PreparedRuntimeQueryRequest,
+        RUNTIME_CONTROL_SOCKET_DIRECTORY_MODE, RUNTIME_CONTROL_SOCKET_MODE,
+        RuntimeApplyClientFailure, RuntimeApplyExchangeError, RuntimeApplyIoPhase,
+        RuntimeApplyResponseExpectation, RuntimeApplyResponseVerifier,
         RuntimeBootstrapClientFailure, RuntimeBootstrapExchangeError,
         RuntimeBootstrapRequestAuthPin, RuntimeBootstrapResponseVerifier,
         RuntimeBootstrapServingExpectation, RuntimeControlClientConfigurationError,
-        RuntimeControlSocketAcl, RuntimeUnixCredentials, UnixRuntimeApplyClient,
-        UnixRuntimeBootstrapClient, UnixRuntimeControlEndpoint,
-        ValidatedRuntimeApplyTerminalReceipt,
+        RuntimeControlSocketAcl, RuntimeQueryClientFailure, RuntimeQueryExchangeError,
+        RuntimeQueryIoPhase, RuntimeQueryResponseVerifier, RuntimeUnixCredentials,
+        UnixRuntimeApplyClient, UnixRuntimeBootstrapClient, UnixRuntimeControlEndpoint,
+        UnixRuntimeQueryClient, ValidatedRuntimeApplyTerminalReceipt,
+        ValidatedRuntimeQueryResponse,
     };
 
     const TARGET: RuntimeHostId = RuntimeHostId::from_bytes([0x11; 16]);
@@ -1871,6 +2396,193 @@ mod tests {
             std::time::Duration::from_millis(500),
         )
         .unwrap_or_else(|error| panic!("client failed: {error}"))
+    }
+
+    fn query_request(
+        query_marker: u8,
+        nonce_marker: u8,
+        store: [u8; 32],
+    ) -> ReferenceQueryRequestV1 {
+        let selector = ReferenceQuerySelectorV1::try_new(
+            ReferenceQueryIdV1::from_bytes([query_marker; 16]),
+            TARGET,
+            SCOPE,
+            store,
+            ApplyOperationId::from_bytes([0xa1; 16]),
+            Some(Digest32::from_bytes([0xa2; 32])),
+        )
+        .unwrap_or_else(|error| panic!("query selector failed: {error}"));
+        let claim = ApplyRequestAuthClaim::try_new(
+            CONTROLLER_PRINCIPAL,
+            CONTROLLER_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1)
+                .unwrap_or_else(|error| panic!("query request algorithm failed: {error}")),
+            1,
+            &[nonce_marker; 32],
+        )
+        .unwrap_or_else(|error| panic!("query request claim failed: {error}"));
+        let draft = ReferenceQueryRequestDraftV1::try_new(
+            selector,
+            claim,
+            paraegox_runtime_contracts::reference_control::MAX_REFERENCE_QUERY_RESPONSE_BYTES
+                as u32,
+        )
+        .unwrap_or_else(|error| panic!("query request draft failed: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED).sign(
+            draft
+                .signing_transcript()
+                .unwrap_or_else(|error| panic!("query request transcript failed: {error}"))
+                .as_bytes(),
+        );
+        draft
+            .finalize(&signature.to_bytes())
+            .unwrap_or_else(|error| panic!("query request finalize failed: {error}"))
+    }
+
+    fn query_baseline(
+        store: [u8; 32],
+        sequence: u64,
+        epoch: u64,
+    ) -> ReferenceBootstrapServingIdentityV1 {
+        ReferenceBootstrapServingIdentityV1::try_new(
+            TARGET,
+            store,
+            sequence,
+            epoch,
+            CLOCK_DOMAIN,
+            ClockGeneration::try_new(12)
+                .unwrap_or_else(|error| panic!("query clock generation failed: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("query serving baseline failed: {error}"))
+    }
+
+    fn prepared_query(
+        request: ReferenceQueryRequestV1,
+        channel: ReferenceChannelBindingV1,
+        baseline: ReferenceBootstrapServingIdentityV1,
+    ) -> PreparedRuntimeQueryRequest {
+        PreparedRuntimeQueryRequest::try_new(
+            request,
+            channel,
+            RESPONSE_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1)
+                .unwrap_or_else(|error| panic!("query response algorithm failed: {error}")),
+            1,
+            baseline,
+        )
+        .unwrap_or_else(|error| panic!("query request preparation failed: {error}"))
+    }
+
+    fn query_response(
+        request: &ReferenceQueryRequestV1,
+        response_channel: ReferenceChannelBindingV1,
+        store: [u8; 32],
+        snapshot_sequence: u64,
+        epoch: u64,
+        signature_override: Option<[u8; 64]>,
+    ) -> ReferenceQueryResponseV1 {
+        let serving = query_baseline(store, snapshot_sequence, epoch);
+        let operation = ReferenceQueryOperationStateV1::try_new(
+            ReferenceQueryOwnerStateV1::Operational,
+            None,
+            ReferenceQueryOperationLookupV1::Unknown,
+        )
+        .unwrap_or_else(|error| panic!("query operation facts failed: {error}"));
+        let desired = ReferenceQueryDesiredStateV1::try_new(
+            ReferenceQueryDesiredHeadV1::None,
+            SourcePlanRevision::new(0),
+        )
+        .unwrap_or_else(|error| panic!("query desired facts failed: {error}"));
+        let live = ReferenceQueryLiveFactsV1::try_new(
+            ReferenceQueryLiveStateV1::ExactZero,
+            0,
+            snapshot_sequence,
+            Digest32::from_bytes([0xb1; 32]),
+        )
+        .unwrap_or_else(|error| panic!("query live facts failed: {error}"));
+        let facts = ReferenceQueryFactsV1::try_new(serving, operation, desired, live)
+            .unwrap_or_else(|error| panic!("query facts failed: {error}"));
+        let claim = ReferenceQueryResponseAuthClaimV1::try_new(
+            response_channel,
+            RESPONSE_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1)
+                .unwrap_or_else(|error| panic!("query response algorithm failed: {error}")),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("query response claim failed: {error}"));
+        let draft = ReferenceQueryResponseDraftV1::try_new(request, facts, response_channel, claim)
+            .unwrap_or_else(|error| panic!("query response draft failed: {error}"));
+        let signature = signature_override.unwrap_or_else(|| {
+            SigningKey::from_bytes(&RUNTIME_SEED)
+                .sign(
+                    draft
+                        .signing_transcript()
+                        .unwrap_or_else(|error| panic!("query response transcript failed: {error}"))
+                        .as_bytes(),
+                )
+                .to_bytes()
+        });
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("query response finalize failed: {error}"))
+    }
+
+    fn query_response_verifier() -> RuntimeQueryResponseVerifier {
+        let verifying_key = SigningKey::from_bytes(&RUNTIME_SEED).verifying_key();
+        let fingerprint = ed25519_control_key_fingerprint(verifying_key.as_bytes())
+            .unwrap_or_else(|error| panic!("query key fingerprint failed: {error}"));
+        RuntimeQueryResponseVerifier::try_new(
+            RUNTIME_PRINCIPAL,
+            RESPONSE_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1)
+                .unwrap_or_else(|error| panic!("query verifier algorithm failed: {error}")),
+            1,
+            fingerprint,
+            verifying_key,
+        )
+        .unwrap_or_else(|error| panic!("query response verifier failed: {error}"))
+    }
+
+    fn query_client(
+        socket: &FakeRuntimeSocket,
+        timeout: std::time::Duration,
+    ) -> UnixRuntimeQueryClient {
+        UnixRuntimeQueryClient::try_new(
+            socket.endpoint(current_credentials()),
+            query_response_verifier(),
+            timeout,
+        )
+        .unwrap_or_else(|error| panic!("query client failed: {error}"))
+    }
+
+    fn query_response_frame(response: &ReferenceQueryResponseV1) -> Box<[u8]> {
+        let mut frame = Vec::with_capacity(4 + response.canonical_wire().len());
+        frame.extend_from_slice(
+            &u32::try_from(response.canonical_wire().len())
+                .unwrap_or_else(|error| panic!("query response length failed: {error}"))
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(response.canonical_wire());
+        frame.into_boxed_slice()
+    }
+
+    async fn perform_query_exchange(
+        socket: &FakeRuntimeSocket,
+        listener: UnixListener,
+        prepared: PreparedRuntimeQueryRequest,
+        frame: Box<[u8]>,
+        exchange_timeout: std::time::Duration,
+    ) -> (
+        Result<ValidatedRuntimeQueryResponse, RuntimeQueryExchangeError>,
+        Vec<u8>,
+    ) {
+        let client = query_client(socket, exchange_timeout);
+        let server = tokio::spawn(async move { serve_frame(&listener, &frame).await });
+        let result = client.exchange(prepared).await;
+        let observed = server
+            .await
+            .unwrap_or_else(|error| panic!("query server task failed: {error}"));
+        (result, observed)
     }
 
     fn apply_request(
@@ -2478,6 +3190,275 @@ mod tests {
                 serving_result,
                 Err(RuntimeBootstrapExchangeError::Rejected(
                     RuntimeBootstrapClientFailure::SnapshotSequenceRegression
+                ))
+            );
+        });
+    }
+
+    #[test]
+    fn query_exchange_sends_exact_pxqr_once_and_accepts_validated_pxqs() {
+        run_async(async {
+            let socket = FakeRuntimeSocket::new();
+            let listener = socket.bind();
+            let channel = live_channel(&socket);
+            let request = query_request(0x91, 0x92, STORE);
+            let response = query_response(&request, channel, STORE, 11, 11, None);
+            let expected_frame = {
+                let prepared =
+                    prepared_query(request.clone(), channel, query_baseline(STORE, 10, 11));
+                prepared.transport_frame_bytes().to_vec()
+            };
+            let (result, observed) = perform_query_exchange(
+                &socket,
+                listener,
+                prepared_query(request.clone(), channel, query_baseline(STORE, 10, 11)),
+                query_response_frame(&response),
+                std::time::Duration::from_millis(500),
+            )
+            .await;
+            let validated =
+                result.unwrap_or_else(|error| panic!("valid query exchange failed: {error}"));
+
+            assert_eq!(observed, expected_frame);
+            assert_eq!(validated.response(), &response);
+            assert_eq!(validated.facts(), response.facts());
+            assert_eq!(validated.request_time_channel(), channel);
+            assert_eq!(validated.current_channel(), channel);
+        });
+    }
+
+    #[test]
+    fn query_response_signature_is_checked_before_request_correlation() {
+        run_async(async {
+            let socket = FakeRuntimeSocket::new();
+            let listener = socket.bind();
+            let channel = live_channel(&socket);
+            let request = query_request(0x93, 0x94, STORE);
+            let unrelated = query_request(0x95, 0x96, STORE);
+            let response = query_response(&unrelated, channel, STORE, 11, 11, Some([0x7f; 64]));
+            let (result, _) = perform_query_exchange(
+                &socket,
+                listener,
+                prepared_query(request, channel, query_baseline(STORE, 10, 11)),
+                query_response_frame(&response),
+                std::time::Duration::from_millis(500),
+            )
+            .await;
+
+            assert_eq!(
+                result,
+                Err(RuntimeQueryExchangeError::Rejected(
+                    RuntimeQueryClientFailure::InvalidResponseSignature
+                ))
+            );
+        });
+    }
+
+    #[test]
+    fn signed_query_response_rejects_wrong_request_channel_store_epoch_and_sequence() {
+        run_async(async {
+            async fn assert_contract_rejected(
+                request: ReferenceQueryRequestV1,
+                response_builder: impl FnOnce(ReferenceChannelBindingV1) -> ReferenceQueryResponseV1,
+                baseline: ReferenceBootstrapServingIdentityV1,
+            ) {
+                let socket = FakeRuntimeSocket::new();
+                let listener = socket.bind();
+                let channel = live_channel(&socket);
+                let response = response_builder(channel);
+                let (result, _) = perform_query_exchange(
+                    &socket,
+                    listener,
+                    prepared_query(request, channel, baseline),
+                    query_response_frame(&response),
+                    std::time::Duration::from_millis(500),
+                )
+                .await;
+                assert!(matches!(
+                    result,
+                    Err(RuntimeQueryExchangeError::Rejected(
+                        RuntimeQueryClientFailure::ResponseContract(_)
+                    ))
+                ));
+            }
+
+            let actual = query_request(0xa1, 0xa2, STORE);
+            let unrelated = query_request(0xa3, 0xa4, STORE);
+            assert_contract_rejected(
+                actual.clone(),
+                |channel| query_response(&unrelated, channel, STORE, 11, 11, None),
+                query_baseline(STORE, 10, 11),
+            )
+            .await;
+
+            let channel_request = query_request(0xa5, 0xa6, STORE);
+            assert_contract_rejected(
+                channel_request.clone(),
+                |_| query_response(&channel_request, unrelated_channel(), STORE, 11, 11, None),
+                query_baseline(STORE, 10, 11),
+            )
+            .await;
+
+            let other_store = [0xab; 32];
+            let store_request = query_request(0xa7, 0xa8, STORE);
+            let other_store_request = query_request(0xa7, 0xa8, other_store);
+            assert_contract_rejected(
+                store_request,
+                |channel| query_response(&other_store_request, channel, other_store, 11, 11, None),
+                query_baseline(STORE, 10, 11),
+            )
+            .await;
+
+            let epoch_request = query_request(0xa9, 0xaa, STORE);
+            assert_contract_rejected(
+                epoch_request.clone(),
+                |channel| query_response(&epoch_request, channel, STORE, 11, 10, None),
+                query_baseline(STORE, 10, 11),
+            )
+            .await;
+
+            let sequence_request = query_request(0xac, 0xad, STORE);
+            assert_contract_rejected(
+                sequence_request.clone(),
+                |channel| query_response(&sequence_request, channel, STORE, 9, 11, None),
+                query_baseline(STORE, 10, 11),
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn query_framing_rejects_oversize_and_trailing_bytes() {
+        run_async(async {
+            let oversized_socket = FakeRuntimeSocket::new();
+            let oversized_listener = oversized_socket.bind();
+            let oversized_channel = live_channel(&oversized_socket);
+            let oversized_request = query_request(0xb1, 0xb2, STORE);
+            let oversized = u32::try_from(
+                paraegox_runtime_contracts::reference_control::MAX_REFERENCE_QUERY_RESPONSE_BYTES
+                    + 1,
+            )
+            .unwrap_or_else(|error| panic!("oversized PXQS length failed: {error}"))
+            .to_be_bytes();
+            let (oversized_result, _) = perform_query_exchange(
+                &oversized_socket,
+                oversized_listener,
+                prepared_query(
+                    oversized_request,
+                    oversized_channel,
+                    query_baseline(STORE, 10, 11),
+                ),
+                Box::from(oversized),
+                std::time::Duration::from_millis(500),
+            )
+            .await;
+            assert_eq!(
+                oversized_result,
+                Err(RuntimeQueryExchangeError::Rejected(
+                    RuntimeQueryClientFailure::ResponseBoundExceeded
+                ))
+            );
+
+            let trailing_socket = FakeRuntimeSocket::new();
+            let trailing_listener = trailing_socket.bind();
+            let trailing_channel = live_channel(&trailing_socket);
+            let trailing_request = query_request(0xb3, 0xb4, STORE);
+            let trailing_response =
+                query_response(&trailing_request, trailing_channel, STORE, 11, 11, None);
+            let mut trailing_frame = query_response_frame(&trailing_response).into_vec();
+            trailing_frame.push(0xee);
+            let (trailing_result, _) = perform_query_exchange(
+                &trailing_socket,
+                trailing_listener,
+                prepared_query(
+                    trailing_request,
+                    trailing_channel,
+                    query_baseline(STORE, 10, 11),
+                ),
+                trailing_frame.into_boxed_slice(),
+                std::time::Duration::from_millis(500),
+            )
+            .await;
+            assert_eq!(
+                trailing_result,
+                Err(RuntimeQueryExchangeError::Rejected(
+                    RuntimeQueryClientFailure::TrailingBytes
+                ))
+            );
+        });
+    }
+
+    #[test]
+    fn query_timeout_after_exact_send_is_uncertain_and_channel_mismatch_is_not_sent() {
+        run_async(async {
+            let timeout_socket = FakeRuntimeSocket::new();
+            let timeout_listener = timeout_socket.bind();
+            let timeout_channel = live_channel(&timeout_socket);
+            let timeout_request = query_request(0xb5, 0xb6, STORE);
+            let expected_wire = timeout_request.canonical_wire().to_vec();
+            let timeout_client =
+                query_client(&timeout_socket, std::time::Duration::from_millis(20));
+            let timeout_server = tokio::spawn(async move {
+                let (mut stream, _) = timeout_listener
+                    .accept()
+                    .await
+                    .unwrap_or_else(|error| panic!("query timeout accept failed: {error}"));
+                let observed = read_request_frame(&mut stream).await;
+                tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                observed
+            });
+            let timeout_result = timeout_client
+                .exchange(prepared_query(
+                    timeout_request,
+                    timeout_channel,
+                    query_baseline(STORE, 10, 11),
+                ))
+                .await;
+            let timeout_observed = timeout_server
+                .await
+                .unwrap_or_else(|error| panic!("query timeout server failed: {error}"));
+            assert_eq!(&timeout_observed[4..], expected_wire);
+            assert_eq!(
+                timeout_result,
+                Err(RuntimeQueryExchangeError::Uncertain(
+                    RuntimeQueryClientFailure::DeadlineExceeded(
+                        RuntimeQueryIoPhase::ReadResponseLength
+                    )
+                ))
+            );
+
+            let mismatch_socket = FakeRuntimeSocket::new();
+            let mismatch_listener = mismatch_socket.bind();
+            let mismatch_request = query_request(0xb7, 0xb8, STORE);
+            let mismatch_client =
+                query_client(&mismatch_socket, std::time::Duration::from_millis(500));
+            let mismatch_server = tokio::spawn(async move {
+                let (mut stream, _) = mismatch_listener
+                    .accept()
+                    .await
+                    .unwrap_or_else(|error| panic!("query mismatch accept failed: {error}"));
+                let mut observed = Vec::new();
+                stream
+                    .read_to_end(&mut observed)
+                    .await
+                    .unwrap_or_else(|error| panic!("query mismatch read failed: {error}"));
+                observed
+            });
+            let mismatch_result = mismatch_client
+                .exchange(prepared_query(
+                    mismatch_request,
+                    unrelated_channel(),
+                    query_baseline(STORE, 10, 11),
+                ))
+                .await;
+            let mismatch_observed = mismatch_server
+                .await
+                .unwrap_or_else(|error| panic!("query mismatch server failed: {error}"));
+            assert!(mismatch_observed.is_empty());
+            assert_eq!(
+                mismatch_result,
+                Err(RuntimeQueryExchangeError::NotSent(
+                    RuntimeQueryClientFailure::CurrentChannelMismatch
                 ))
             );
         });

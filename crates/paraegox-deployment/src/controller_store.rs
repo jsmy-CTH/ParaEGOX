@@ -17,25 +17,46 @@ use std::path::{Component, Path, PathBuf};
 
 use nix::dir::Dir;
 use nix::fcntl::{OFlag, open, openat, renameat};
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+use nix::fcntl::{RenameFlags, renameat2};
 use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
+use paraegox_kernel::digest::{Digest32, Digest32Builder};
 
 use crate::controller_journal::{
-    ControllerJournalError, ControllerJournalSnapshot, ControllerOwnerIdentityFingerprint,
-    MAX_CONTROLLER_SNAPSHOT_BYTES,
+    CONTROLLER_PAYLOAD_VERSION, ControllerJournalError, ControllerJournalPayloadV7Migration,
+    ControllerJournalSnapshot, ControllerOwnerIdentityFingerprint, MAX_CONTROLLER_SNAPSHOT_BYTES,
 };
 
 pub(crate) const CONTROLLER_LOCK_FILE_NAME: &str = "controller.lock";
 pub(crate) const CONTROLLER_ACTIVE_FILE_NAME: &str = "controller.snapshot";
 const TEMP_FILE_PREFIX: &str = ".controller.snapshot.tmp-";
+const MIGRATION_SOURCE_FILE_PREFIX: &str = "controller.snapshot.source-v7-";
+const MIGRATION_SOURCE_FILE_SUFFIX: &str = ".evidence";
+const MIGRATION_RECEIPT_FILE_PREFIX: &str = "controller.snapshot.migration-v1-";
+const MIGRATION_RECEIPT_FILE_SUFFIX: &str = ".receipt";
+const MIGRATION_EVIDENCE_TEMP_PREFIX: &str = ".controller.snapshot.migration.tmp-";
+const CONTROLLER_MIGRATION_RECEIPT_MAGIC: &[u8; 4] = b"PXCM";
+const CONTROLLER_MIGRATION_RECEIPT_VERSION: u16 = 1;
+const CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION: u16 = 7;
+const CONTROLLER_MIGRATION_EVIDENCE_DOMAIN: &[u8] =
+    b"paraegox.deployment.controller-journal.migration-evidence.sha256.v1";
+const CONTROLLER_MIGRATION_RECEIPT_DOMAIN: &[u8] =
+    b"paraegox.deployment.controller-journal.migration-receipt.sha256.v1";
+const MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES: usize = 226;
+const MIGRATION_RECEIPT_BYTES: usize = MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES + 32;
 pub(crate) const CONTROLLER_TEMP_TOKEN_BYTES: usize = 16;
 const TEMP_HEX_BYTES: usize = CONTROLLER_TEMP_TOKEN_BYTES * 2;
 const MAX_ORPHAN_TEMP_FILES: usize = 32;
+const MAX_MIGRATION_EVIDENCE_ORPHAN_TEMPS: usize = 16;
+const MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES: usize = 64;
 const STATE_DIRECTORY_MODE_BITS: u32 = 0o700;
 const STATE_DIRECTORY_MODE_MASK: u32 = 0o7777;
 const PRIVATE_FILE_MODE_BITS: u32 = 0o600;
 const PRIVATE_FILE_MODE_MASK: u32 = 0o7777;
 const PRIVATE_FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
+const READ_ONLY_EVIDENCE_MODE_BITS: u32 = 0o400;
+const READ_ONLY_EVIDENCE_MODE: Mode = Mode::S_IRUSR;
 #[cfg(any(target_os = "linux", test))]
 const MAX_LINUX_FDINFO_BYTES: usize = 64 * 1024;
 #[cfg(any(target_os = "linux", test))]
@@ -59,8 +80,24 @@ pub(crate) enum ControllerFilesystemPolicy {
 pub(crate) struct ControllerDirectoryHandle {
     path: PathBuf,
     file: File,
+    identity: FileIdentity,
     owner_uid: u32,
     owner_gid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
 }
 
 impl fmt::Debug for ControllerDirectoryHandle {
@@ -68,10 +105,258 @@ impl fmt::Debug for ControllerDirectoryHandle {
         formatter
             .debug_struct("ControllerDirectoryHandle")
             .field("path", &self.path)
+            .field("identity", &self.identity)
             .field("owner_uid", &self.owner_uid)
             .field("owner_gid", &self.owner_gid)
             .finish_non_exhaustive()
     }
+}
+
+/// Fixed-width receipt binding exact v7 source bytes to exact v8 target bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerStoreMigrationReceipt {
+    migration_id: [u8; 32],
+    source_payload_version: u16,
+    source_checksum: Digest32,
+    source_store_instance_id: [u8; 32],
+    source_owner_identity_fingerprint: Digest32,
+    source_snapshot_sequence: u64,
+    source_snapshot_length: u64,
+    source_snapshot_digest: Digest32,
+    target_payload_version: u16,
+    target_snapshot_length: u64,
+    target_snapshot_digest: Digest32,
+    canonical_wire: [u8; MIGRATION_RECEIPT_BYTES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControllerStoreMigrationDisposition {
+    Migrated,
+    AlreadyMigrated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerStoreMigrationOutcome {
+    pub(crate) disposition: ControllerStoreMigrationDisposition,
+    pub(crate) receipt: ControllerStoreMigrationReceipt,
+}
+
+impl ControllerStoreMigrationReceipt {
+    fn try_new(
+        migration_id: [u8; 32],
+        source: &ControllerJournalPayloadV7Migration,
+        source_wire: &[u8],
+        target: &ControllerJournalSnapshot,
+        target_wire: &[u8],
+    ) -> Result<Self, ControllerStoreMigrationError> {
+        if migration_id.iter().all(|byte| *byte == 0)
+            || source.source_payload_version() != CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION
+            || source.source_store_instance_id() != target.store_instance_id()
+            || source.source_owner_identity_fingerprint() != target.owner_identity_fingerprint()
+            || source.source_snapshot_sequence() != target.snapshot_sequence()
+            || source.snapshot() != target
+            || source_wire.is_empty()
+            || source_wire.len() > MAX_CONTROLLER_SNAPSHOT_BYTES
+            || target_wire.is_empty()
+            || target_wire.len() > MAX_CONTROLLER_SNAPSHOT_BYTES
+        {
+            return Err(ControllerStoreMigrationError::InvalidReceipt);
+        }
+        let source_snapshot_length = u64::try_from(source_wire.len())
+            .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
+        let target_snapshot_length = u64::try_from(target_wire.len())
+            .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
+        let source_snapshot_digest = migration_evidence_digest(source_wire)?;
+        let target_snapshot_digest = migration_evidence_digest(target_wire)?;
+        let mut prefix = Vec::with_capacity(MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES);
+        prefix.extend_from_slice(CONTROLLER_MIGRATION_RECEIPT_MAGIC);
+        prefix.extend_from_slice(&CONTROLLER_MIGRATION_RECEIPT_VERSION.to_be_bytes());
+        prefix.extend_from_slice(&migration_id);
+        prefix.extend_from_slice(&source.source_payload_version().to_be_bytes());
+        prefix.extend_from_slice(source.source_checksum().as_bytes());
+        prefix.extend_from_slice(source.source_store_instance_id());
+        prefix.extend_from_slice(
+            source
+                .source_owner_identity_fingerprint()
+                .value()
+                .as_bytes(),
+        );
+        prefix.extend_from_slice(&source.source_snapshot_sequence().to_be_bytes());
+        prefix.extend_from_slice(&source_snapshot_length.to_be_bytes());
+        prefix.extend_from_slice(source_snapshot_digest.as_bytes());
+        prefix.extend_from_slice(&CONTROLLER_PAYLOAD_VERSION.to_be_bytes());
+        prefix.extend_from_slice(&target_snapshot_length.to_be_bytes());
+        prefix.extend_from_slice(target_snapshot_digest.as_bytes());
+        if prefix.len() != MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES {
+            return Err(ControllerStoreMigrationError::InvalidReceipt);
+        }
+        let checksum = migration_receipt_checksum(&prefix)?;
+        prefix.extend_from_slice(checksum.as_bytes());
+        let canonical_wire = prefix
+            .try_into()
+            .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
+        Ok(Self {
+            migration_id,
+            source_payload_version: source.source_payload_version(),
+            source_checksum: source.source_checksum(),
+            source_store_instance_id: *source.source_store_instance_id(),
+            source_owner_identity_fingerprint: source.source_owner_identity_fingerprint().value(),
+            source_snapshot_sequence: source.source_snapshot_sequence(),
+            source_snapshot_length,
+            source_snapshot_digest,
+            target_payload_version: CONTROLLER_PAYLOAD_VERSION,
+            target_snapshot_length,
+            target_snapshot_digest,
+            canonical_wire,
+        })
+    }
+
+    fn decode(frame: &[u8]) -> Result<Self, ControllerStoreMigrationError> {
+        if frame.len() != MIGRATION_RECEIPT_BYTES {
+            return Err(ControllerStoreMigrationError::InvalidReceipt);
+        }
+        let mut cursor = MigrationReceiptCursor::new(frame);
+        if cursor.array::<4>()? != *CONTROLLER_MIGRATION_RECEIPT_MAGIC
+            || cursor.u16()? != CONTROLLER_MIGRATION_RECEIPT_VERSION
+        {
+            return Err(ControllerStoreMigrationError::InvalidReceipt);
+        }
+        let migration_id = cursor.array::<32>()?;
+        let source_payload_version = cursor.u16()?;
+        let source_checksum = Digest32::from_bytes(cursor.array::<32>()?);
+        let source_store_instance_id = cursor.array::<32>()?;
+        let source_owner_identity_fingerprint = Digest32::from_bytes(cursor.array::<32>()?);
+        let source_snapshot_sequence = cursor.u64()?;
+        let source_snapshot_length = cursor.u64()?;
+        let source_snapshot_digest = Digest32::from_bytes(cursor.array::<32>()?);
+        let target_payload_version = cursor.u16()?;
+        let target_snapshot_length = cursor.u64()?;
+        let target_snapshot_digest = Digest32::from_bytes(cursor.array::<32>()?);
+        let checksum = Digest32::from_bytes(cursor.array::<32>()?);
+        cursor.finish()?;
+        if migration_id.iter().all(|byte| *byte == 0)
+            || source_payload_version != CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION
+            || target_payload_version != CONTROLLER_PAYLOAD_VERSION
+            || source_store_instance_id.iter().all(|byte| *byte == 0)
+            || source_owner_identity_fingerprint
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || source_snapshot_sequence == 0
+            || source_snapshot_length == 0
+            || source_snapshot_length > MAX_CONTROLLER_SNAPSHOT_BYTES as u64
+            || target_snapshot_length == 0
+            || target_snapshot_length > MAX_CONTROLLER_SNAPSHOT_BYTES as u64
+            || migration_receipt_checksum(&frame[..MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES])?
+                != checksum
+        {
+            return Err(ControllerStoreMigrationError::InvalidReceipt);
+        }
+        Ok(Self {
+            migration_id,
+            source_payload_version,
+            source_checksum,
+            source_store_instance_id,
+            source_owner_identity_fingerprint,
+            source_snapshot_sequence,
+            source_snapshot_length,
+            source_snapshot_digest,
+            target_payload_version,
+            target_snapshot_length,
+            target_snapshot_digest,
+            canonical_wire: frame
+                .try_into()
+                .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?,
+        })
+    }
+
+    pub(crate) const fn migration_id(&self) -> &[u8; 32] {
+        &self.migration_id
+    }
+
+    pub(crate) const fn source_payload_version(&self) -> u16 {
+        self.source_payload_version
+    }
+
+    pub(crate) const fn source_checksum(&self) -> Digest32 {
+        self.source_checksum
+    }
+
+    pub(crate) const fn source_store_instance_id(&self) -> &[u8; 32] {
+        &self.source_store_instance_id
+    }
+
+    pub(crate) const fn source_owner_identity_fingerprint(&self) -> Digest32 {
+        self.source_owner_identity_fingerprint
+    }
+
+    pub(crate) const fn source_snapshot_sequence(&self) -> u64 {
+        self.source_snapshot_sequence
+    }
+
+    pub(crate) const fn canonical_wire(&self) -> &[u8; MIGRATION_RECEIPT_BYTES] {
+        &self.canonical_wire
+    }
+}
+
+struct MigrationReceiptCursor<'a> {
+    frame: &'a [u8],
+    position: usize,
+}
+
+impl<'a> MigrationReceiptCursor<'a> {
+    const fn new(frame: &'a [u8]) -> Self {
+        Self { frame, position: 0 }
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ControllerStoreMigrationError> {
+        let end = self
+            .position
+            .checked_add(N)
+            .ok_or(ControllerStoreMigrationError::InvalidReceipt)?;
+        let bytes = self
+            .frame
+            .get(self.position..end)
+            .ok_or(ControllerStoreMigrationError::InvalidReceipt)?;
+        self.position = end;
+        bytes
+            .try_into()
+            .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)
+    }
+
+    fn u16(&mut self) -> Result<u16, ControllerStoreMigrationError> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, ControllerStoreMigrationError> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    fn finish(self) -> Result<(), ControllerStoreMigrationError> {
+        if self.position == self.frame.len() {
+            Ok(())
+        } else {
+            Err(ControllerStoreMigrationError::InvalidReceipt)
+        }
+    }
+}
+
+fn migration_evidence_digest(bytes: &[u8]) -> Result<Digest32, ControllerStoreMigrationError> {
+    let mut builder = Digest32Builder::try_new(CONTROLLER_MIGRATION_EVIDENCE_DOMAIN)
+        .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
+    builder
+        .field_bytes(bytes)
+        .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
+    Ok(builder.finish())
+}
+
+fn migration_receipt_checksum(bytes: &[u8]) -> Result<Digest32, ControllerStoreMigrationError> {
+    let mut builder = Digest32Builder::try_new(CONTROLLER_MIGRATION_RECEIPT_DOMAIN)
+        .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
+    builder
+        .field_bytes(bytes)
+        .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
+    Ok(builder.finish())
 }
 
 pub(crate) struct ControllerStore {
@@ -79,6 +364,53 @@ pub(crate) struct ControllerStore {
     lock_file: File,
     snapshot: ControllerJournalSnapshot,
     state: ControllerStoreState,
+}
+
+#[derive(Clone, Copy)]
+struct ControllerMigrationRequest<'a> {
+    directory: &'a Path,
+    evidence_directory: &'a Path,
+    expected_store_instance_id: [u8; 32],
+    expected_owner_identity: ControllerOwnerIdentityFingerprint,
+    migration_id: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControllerMigrationEvidenceFailpoint {
+    None,
+    AfterRenameBeforeDirectorySync,
+}
+
+#[derive(Clone, Copy)]
+struct ControllerMigrationFailpoints {
+    source_evidence: ControllerMigrationEvidenceFailpoint,
+    receipt_evidence: ControllerMigrationEvidenceFailpoint,
+    active_snapshot: ControllerCommitFailpoint,
+}
+
+impl ControllerMigrationFailpoints {
+    const NONE: Self = Self {
+        source_evidence: ControllerMigrationEvidenceFailpoint::None,
+        receipt_evidence: ControllerMigrationEvidenceFailpoint::None,
+        active_snapshot: ControllerCommitFailpoint::None,
+    };
+}
+
+struct ControllerMigrationGuard {
+    directory: ControllerDirectoryHandle,
+    lock_file: File,
+    lock_identity: FileIdentity,
+}
+
+impl Drop for ControllerMigrationGuard {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
+}
+
+struct ActiveSnapshotBytes {
+    encoded: Vec<u8>,
+    identity: FileIdentity,
 }
 
 impl fmt::Debug for ControllerStore {
@@ -108,6 +440,85 @@ enum ControllerStoreState {
 }
 
 impl ControllerStore {
+    /// Explicitly migrates one stopped Controller store from payload v7 to v8.
+    ///
+    /// Normal store open never invokes this path. A retry against an already
+    /// published v8 snapshot succeeds only when the exact read-only v7 source
+    /// evidence and receipt prove the same migration id produced those bytes.
+    pub(crate) fn migrate_payload_v7_offline(
+        directory: &Path,
+        evidence_directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+        migration_id: [u8; 32],
+    ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+        Self::migrate_payload_v7_offline_with_policy(
+            ControllerMigrationRequest {
+                directory,
+                evidence_directory,
+                expected_store_instance_id,
+                expected_owner_identity,
+                migration_id,
+            },
+            ControllerFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    fn migrate_payload_v7_offline_with_policy(
+        request: ControllerMigrationRequest<'_>,
+        filesystem_policy: ControllerFilesystemPolicy,
+    ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+        Self::migrate_payload_v7_offline_with_policy_and_failpoints(
+            request,
+            filesystem_policy,
+            ControllerMigrationFailpoints::NONE,
+        )
+    }
+
+    fn migrate_payload_v7_offline_with_policy_and_failpoints(
+        request: ControllerMigrationRequest<'_>,
+        filesystem_policy: ControllerFilesystemPolicy,
+        failpoints: ControllerMigrationFailpoints,
+    ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+        validate_migration_inputs(
+            request.expected_store_instance_id,
+            request.expected_owner_identity,
+            request.migration_id,
+        )?;
+        let guard = acquire_controller_migration_guard(request.directory, filesystem_policy)?;
+        let evidence_directory =
+            open_controller_directory(request.evidence_directory, filesystem_policy)
+                .map_err(ControllerStoreMigrationError::EvidenceDirectory)?;
+        if guard.directory.identity == evidence_directory.identity {
+            return Err(ControllerStoreMigrationError::EvidenceDirectoryMatchesStore);
+        }
+        let active = read_active_controller_snapshot_bytes(&guard.directory)
+            .map_err(ControllerStoreMigrationError::Store)?;
+        match ControllerJournalSnapshot::decode(&active.encoded) {
+            Ok(target) => resume_completed_controller_migration(
+                &guard,
+                &evidence_directory,
+                request,
+                active,
+                target,
+            ),
+            Err(ControllerJournalError::UnknownPayloadVersion) => {
+                let source =
+                    ControllerJournalSnapshot::migrate_payload_v7_with_metadata(&active.encoded)
+                        .map_err(ControllerStoreMigrationError::Journal)?;
+                publish_controller_migration(
+                    &guard,
+                    &evidence_directory,
+                    request,
+                    active,
+                    source,
+                    failpoints,
+                )
+            }
+            Err(error) => Err(ControllerStoreMigrationError::Journal(error)),
+        }
+    }
+
     pub(crate) fn open(
         directory: &Path,
         expected_store_instance_id: [u8; 32],
@@ -254,6 +665,12 @@ impl ControllerStore {
                 ControllerStoreError::InvalidSuccessor(error)
             })?;
         self.revalidate_current()?;
+        let active_identity = read_active_controller_snapshot_bytes(&self.directory)
+            .map_err(|error| {
+                self.state = ControllerStoreState::Stopped;
+                ControllerStoreError::Open(error)
+            })?
+            .identity;
         let encoded = next.encode().map_err(|error| {
             self.state = ControllerStoreState::Stopped;
             ControllerStoreError::Codec(error)
@@ -268,7 +685,7 @@ impl ControllerStore {
             &self.directory,
             &encoded,
             token,
-            ControllerPublishMode::ReplaceExisting,
+            ControllerPublishMode::ReplaceExisting(active_identity),
             failpoint,
         ) {
             Ok(()) => {
@@ -292,6 +709,821 @@ impl ControllerStore {
         }
         Ok(())
     }
+}
+
+fn validate_migration_inputs(
+    expected_store_instance_id: [u8; 32],
+    expected_owner_identity: ControllerOwnerIdentityFingerprint,
+    migration_id: [u8; 32],
+) -> Result<(), ControllerStoreMigrationError> {
+    if expected_store_instance_id.iter().all(|byte| *byte == 0) {
+        return Err(ControllerStoreMigrationError::InvalidExpectedStoreIdentity);
+    }
+    if expected_owner_identity
+        .value()
+        .as_bytes()
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err(ControllerStoreMigrationError::InvalidExpectedOwnerIdentity);
+    }
+    if migration_id.iter().all(|byte| *byte == 0) {
+        return Err(ControllerStoreMigrationError::InvalidMigrationId);
+    }
+    Ok(())
+}
+
+fn acquire_controller_migration_guard(
+    path: &Path,
+    filesystem_policy: ControllerFilesystemPolicy,
+) -> Result<ControllerMigrationGuard, ControllerStoreMigrationError> {
+    let directory = open_controller_directory(path, filesystem_policy)
+        .map_err(ControllerStoreMigrationError::Store)?;
+    let lock_file = open_existing_regular(
+        &directory,
+        CONTROLLER_LOCK_FILE_NAME,
+        OFlag::O_RDWR,
+        ControllerFileStage::OpenLock,
+    )
+    .map_err(ControllerStoreMigrationError::Store)?;
+    let lock_identity = FileIdentity::from_metadata(&lock_file.metadata().map_err(|error| {
+        ControllerStoreMigrationError::Store(ControllerStoreOpenError::Io(
+            ControllerIoFailure::new(ControllerFileStage::OpenLock, &error),
+        ))
+    })?);
+    lock_file.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => ControllerStoreMigrationError::LockContended,
+        TryLockError::Error(error) => {
+            ControllerStoreMigrationError::Store(ControllerStoreOpenError::Io(
+                ControllerIoFailure::new(ControllerFileStage::AcquireLock, &error),
+            ))
+        }
+    })?;
+    validate_named_file_identity(
+        &directory,
+        CONTROLLER_LOCK_FILE_NAME,
+        lock_identity,
+        ControllerFileStage::ValidateLockIdentity,
+    )
+    .map_err(ControllerStoreMigrationError::Store)?;
+    Ok(ControllerMigrationGuard {
+        directory,
+        lock_file,
+        lock_identity,
+    })
+}
+
+fn validate_controller_directory_handle(
+    directory: &ControllerDirectoryHandle,
+) -> Result<(), ControllerStoreOpenError> {
+    let metadata = directory.file.metadata().map_err(|error| {
+        ControllerStoreOpenError::Io(ControllerIoFailure::new(
+            ControllerFileStage::ValidateDirectoryIdentity,
+            &error,
+        ))
+    })?;
+    validate_directory_metadata(&metadata, directory.owner_uid, directory.owner_gid)?;
+    if FileIdentity::from_metadata(&metadata) != directory.identity {
+        return Err(ControllerStoreOpenError::DirectoryIdentityChanged);
+    }
+    Ok(())
+}
+
+fn validate_migration_handles(
+    guard: &ControllerMigrationGuard,
+    evidence_directory: &ControllerDirectoryHandle,
+) -> Result<(), ControllerStoreMigrationError> {
+    validate_controller_directory_handle(&guard.directory)
+        .map_err(ControllerStoreMigrationError::Store)?;
+    let lock_metadata = guard.lock_file.metadata().map_err(|error| {
+        ControllerStoreMigrationError::Store(ControllerStoreOpenError::Io(
+            ControllerIoFailure::new(ControllerFileStage::ValidateLockIdentity, &error),
+        ))
+    })?;
+    validate_regular_file(
+        &lock_metadata,
+        guard.directory.owner_uid,
+        guard.directory.owner_gid,
+    )
+    .map_err(ControllerStoreMigrationError::Store)?;
+    if FileIdentity::from_metadata(&lock_metadata) != guard.lock_identity {
+        return Err(ControllerStoreMigrationError::Store(
+            ControllerStoreOpenError::NamedFileIdentityChanged,
+        ));
+    }
+    validate_named_file_identity(
+        &guard.directory,
+        CONTROLLER_LOCK_FILE_NAME,
+        guard.lock_identity,
+        ControllerFileStage::ValidateLockIdentity,
+    )
+    .map_err(ControllerStoreMigrationError::Store)?;
+    validate_controller_directory_handle(evidence_directory)
+        .map_err(ControllerStoreMigrationError::EvidenceDirectory)
+}
+
+fn validate_migration_source_identity(
+    source: &ControllerJournalPayloadV7Migration,
+    request: ControllerMigrationRequest<'_>,
+) -> Result<(), ControllerStoreMigrationError> {
+    if source.source_store_instance_id() != &request.expected_store_instance_id {
+        return Err(ControllerStoreMigrationError::StoreInstanceMismatch);
+    }
+    if source.source_owner_identity_fingerprint() != request.expected_owner_identity {
+        return Err(ControllerStoreMigrationError::OwnerIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_migration_target_identity(
+    target: &ControllerJournalSnapshot,
+    request: ControllerMigrationRequest<'_>,
+) -> Result<(), ControllerStoreMigrationError> {
+    if target.store_instance_id() != &request.expected_store_instance_id {
+        return Err(ControllerStoreMigrationError::StoreInstanceMismatch);
+    }
+    if target.owner_identity_fingerprint() != request.expected_owner_identity {
+        return Err(ControllerStoreMigrationError::OwnerIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn resume_completed_controller_migration(
+    guard: &ControllerMigrationGuard,
+    evidence_directory: &ControllerDirectoryHandle,
+    request: ControllerMigrationRequest<'_>,
+    active: ActiveSnapshotBytes,
+    target: ControllerJournalSnapshot,
+) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+    validate_migration_target_identity(&target, request)?;
+    let target_wire = target
+        .encode()
+        .map_err(ControllerStoreMigrationError::Journal)?;
+    if target_wire.as_ref() != active.encoded {
+        return Err(ControllerStoreMigrationError::TargetMismatch);
+    }
+    clean_controller_migration_evidence_temps(evidence_directory, request.migration_id)
+        .map_err(|_| published_but_unverified(ControllerFileStage::InspectMigrationEvidence))?;
+    let (source_wire, stored_receipt) =
+        read_controller_migration_evidence(evidence_directory, request.migration_id).map_err(
+            |_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence),
+        )?;
+    let source = ControllerJournalSnapshot::migrate_payload_v7_with_metadata(&source_wire)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence))?;
+    validate_migration_source_identity(&source, request)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence))?;
+    if source.snapshot() != &target {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackPublished,
+        ));
+    }
+    let expected_receipt = ControllerStoreMigrationReceipt::try_new(
+        request.migration_id,
+        &source,
+        &source_wire,
+        &target,
+        &target_wire,
+    )
+    .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence))?;
+    if stored_receipt != expected_receipt {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+    validate_migration_handles(guard, evidence_directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    clean_valid_orphan_temps(&guard.directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    let revalidated = read_active_controller_snapshot_bytes(&guard.directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
+    if revalidated.identity != active.identity || revalidated.encoded != active.encoded {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackPublished,
+        ));
+    }
+    Ok(ControllerStoreMigrationOutcome {
+        disposition: ControllerStoreMigrationDisposition::AlreadyMigrated,
+        receipt: stored_receipt,
+    })
+}
+
+fn publish_controller_migration(
+    guard: &ControllerMigrationGuard,
+    evidence_directory: &ControllerDirectoryHandle,
+    request: ControllerMigrationRequest<'_>,
+    active: ActiveSnapshotBytes,
+    source: ControllerJournalPayloadV7Migration,
+    failpoints: ControllerMigrationFailpoints,
+) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+    validate_migration_source_identity(&source, request)?;
+    let target_wire = source
+        .snapshot()
+        .encode()
+        .map_err(ControllerStoreMigrationError::Journal)?;
+    let target = ControllerJournalSnapshot::decode(&target_wire)
+        .map_err(ControllerStoreMigrationError::Journal)?;
+    validate_migration_target_identity(&target, request)?;
+    let receipt = ControllerStoreMigrationReceipt::try_new(
+        request.migration_id,
+        &source,
+        &active.encoded,
+        &target,
+        &target_wire,
+    )?;
+
+    clean_valid_orphan_temps(&guard.directory).map_err(ControllerStoreMigrationError::Store)?;
+    clean_controller_migration_evidence_temps(evidence_directory, request.migration_id)?;
+    ensure_read_only_migration_evidence(
+        evidence_directory,
+        request.migration_id,
+        &migration_source_file_name(request.migration_id),
+        &active.encoded,
+        MigrationEvidenceKind::Source,
+        migration_random_token()?,
+        failpoints.source_evidence,
+    )?;
+    ensure_read_only_migration_evidence(
+        evidence_directory,
+        request.migration_id,
+        &migration_receipt_file_name(request.migration_id),
+        receipt.canonical_wire(),
+        MigrationEvidenceKind::Receipt,
+        migration_random_token()?,
+        failpoints.receipt_evidence,
+    )?;
+    let (stored_source, stored_receipt) =
+        read_controller_migration_evidence(evidence_directory, request.migration_id).map_err(
+            |_| uncertain_migration_evidence(ControllerFileStage::ReadBackMigrationEvidence),
+        )?;
+    if stored_source != active.encoded || stored_receipt != receipt {
+        return Err(uncertain_migration_evidence(
+            ControllerFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+
+    validate_migration_handles(guard, evidence_directory)?;
+    let current = read_active_controller_snapshot_bytes(&guard.directory)
+        .map_err(ControllerStoreMigrationError::Store)?;
+    if current.identity != active.identity || current.encoded != active.encoded {
+        return Err(ControllerStoreMigrationError::TargetMismatch);
+    }
+    publish_controller_snapshot(
+        &guard.directory,
+        &target_wire,
+        migration_random_token()?,
+        ControllerPublishMode::ReplaceExisting(active.identity),
+        failpoints.active_snapshot,
+    )
+    .map_err(ControllerStoreMigrationError::Publish)?;
+    let published = read_active_controller_snapshot_bytes(&guard.directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
+    if published.encoded != target_wire.as_ref() {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackPublished,
+        ));
+    }
+    ControllerJournalSnapshot::decode(&published.encoded)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
+    validate_migration_handles(guard, evidence_directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    let (post_source, post_receipt) =
+        read_controller_migration_evidence(evidence_directory, request.migration_id)
+            .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    if post_source != active.encoded || post_receipt != receipt {
+        return Err(published_but_unverified(
+            ControllerFileStage::VerifyPublishedMigration,
+        ));
+    }
+    Ok(ControllerStoreMigrationOutcome {
+        disposition: ControllerStoreMigrationDisposition::Migrated,
+        receipt,
+    })
+}
+
+fn migration_random_token()
+-> Result<[u8; CONTROLLER_TEMP_TOKEN_BYTES], ControllerStoreMigrationError> {
+    system_random_token().map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::GenerateMigrationEvidenceTempName,
+            &error,
+        ))
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigrationEvidenceKind {
+    Source,
+    Receipt,
+}
+
+fn migration_source_file_name(migration_id: [u8; 32]) -> String {
+    let mut name = String::with_capacity(
+        MIGRATION_SOURCE_FILE_PREFIX.len() + 64 + MIGRATION_SOURCE_FILE_SUFFIX.len(),
+    );
+    name.push_str(MIGRATION_SOURCE_FILE_PREFIX);
+    append_lower_hex(&mut name, &migration_id);
+    name.push_str(MIGRATION_SOURCE_FILE_SUFFIX);
+    name
+}
+
+fn migration_receipt_file_name(migration_id: [u8; 32]) -> String {
+    let mut name = String::with_capacity(
+        MIGRATION_RECEIPT_FILE_PREFIX.len() + 64 + MIGRATION_RECEIPT_FILE_SUFFIX.len(),
+    );
+    name.push_str(MIGRATION_RECEIPT_FILE_PREFIX);
+    append_lower_hex(&mut name, &migration_id);
+    name.push_str(MIGRATION_RECEIPT_FILE_SUFFIX);
+    name
+}
+
+fn migration_evidence_temp_prefix(migration_id: [u8; 32]) -> String {
+    let mut prefix = String::with_capacity(MIGRATION_EVIDENCE_TEMP_PREFIX.len() + 65);
+    prefix.push_str(MIGRATION_EVIDENCE_TEMP_PREFIX);
+    append_lower_hex(&mut prefix, &migration_id);
+    prefix.push('-');
+    prefix
+}
+
+fn migration_evidence_temp_name(
+    migration_id: [u8; 32],
+    kind: MigrationEvidenceKind,
+    token: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+) -> String {
+    let label = match kind {
+        MigrationEvidenceKind::Source => "source-",
+        MigrationEvidenceKind::Receipt => "receipt-",
+    };
+    let mut name = migration_evidence_temp_prefix(migration_id);
+    name.push_str(label);
+    append_lower_hex(&mut name, &token);
+    name
+}
+
+fn append_lower_hex(output: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+}
+
+fn valid_migration_evidence_temp_name(name: &str, migration_id: [u8; 32]) -> bool {
+    let prefix = migration_evidence_temp_prefix(migration_id);
+    let Some(suffix) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some(token) = suffix
+        .strip_prefix("source-")
+        .or_else(|| suffix.strip_prefix("receipt-"))
+    else {
+        return false;
+    };
+    token.len() == TEMP_HEX_BYTES
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn clean_controller_migration_evidence_temps(
+    directory: &ControllerDirectoryHandle,
+    migration_id: [u8; 32],
+) -> Result<(), ControllerStoreMigrationError> {
+    let expected_prefix = migration_evidence_temp_prefix(migration_id);
+    let mut entries = duplicate_directory_stream(directory)
+        .map_err(ControllerStoreMigrationError::EvidenceDirectory)?;
+    let mut orphan_names = Vec::new();
+    let mut total_entries = 0_usize;
+    for entry in entries.iter() {
+        let entry = entry.map_err(|error| {
+            ControllerStoreMigrationError::EvidenceIo(nix_failure(
+                ControllerFileStage::InspectMigrationEvidence,
+                error,
+            ))
+        })?;
+        let name_bytes = entry.file_name().to_bytes();
+        if is_dot_entry(name_bytes) {
+            continue;
+        }
+        total_entries = total_entries
+            .checked_add(1)
+            .ok_or(ControllerStoreMigrationError::TooManyEvidenceDirectoryEntries)?;
+        if total_entries > MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES {
+            return Err(ControllerStoreMigrationError::TooManyEvidenceDirectoryEntries);
+        }
+        if !name_bytes.starts_with(expected_prefix.as_bytes()) {
+            continue;
+        }
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| ControllerStoreMigrationError::UnknownEvidenceEntry)?;
+        if !valid_migration_evidence_temp_name(name, migration_id) {
+            return Err(ControllerStoreMigrationError::UnknownEvidenceEntry);
+        }
+        orphan_names.push(name.to_owned());
+        if orphan_names.len() > MAX_MIGRATION_EVIDENCE_ORPHAN_TEMPS {
+            return Err(ControllerStoreMigrationError::TooManyEvidenceTemps);
+        }
+    }
+    let mut validated = Vec::with_capacity(orphan_names.len());
+    for name in orphan_names {
+        let (file, identity) = open_migration_evidence_temp(directory, &name)?;
+        validate_named_migration_evidence_temp_identity(directory, &name, identity)?;
+        validated.push((name, file));
+    }
+    for (name, file) in validated {
+        unlinkat(&directory.file, name.as_str(), UnlinkatFlags::NoRemoveDir).map_err(|error| {
+            ControllerStoreMigrationError::EvidenceIo(nix_failure(
+                ControllerFileStage::InspectMigrationEvidence,
+                error,
+            ))
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+                ControllerFileStage::InspectMigrationEvidence,
+                &error,
+            ))
+        })?;
+        if metadata.nlink() != 0 {
+            return Err(ControllerStoreMigrationError::EvidenceChangedDuringRead);
+        }
+    }
+    directory.file.sync_all().map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::SyncMigrationEvidenceDirectory,
+            &error,
+        ))
+    })
+}
+
+fn open_migration_evidence_temp(
+    directory: &ControllerDirectoryHandle,
+    name: &str,
+) -> Result<(File, FileIdentity), ControllerStoreMigrationError> {
+    let owned = openat(
+        &directory.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(nix_failure(
+            ControllerFileStage::InspectMigrationEvidence,
+            error,
+        ))
+    })?;
+    let file = File::from(owned);
+    let metadata = file.metadata().map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::InspectMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_migration_evidence_temp_metadata(&metadata, directory.owner_uid, directory.owner_gid)?;
+    Ok((file, FileIdentity::from_metadata(&metadata)))
+}
+
+fn validate_migration_evidence_temp_metadata(
+    metadata: &Metadata,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<(), ControllerStoreMigrationError> {
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(ControllerStoreMigrationError::UnsafeEvidenceFile);
+    }
+    if metadata.uid() != owner_uid || metadata.gid() != owner_gid {
+        return Err(ControllerStoreMigrationError::EvidenceOwnerMismatch);
+    }
+    let mode = metadata.mode() & PRIVATE_FILE_MODE_MASK;
+    if mode != PRIVATE_FILE_MODE_BITS && mode != READ_ONLY_EVIDENCE_MODE_BITS {
+        return Err(ControllerStoreMigrationError::UnsafeEvidenceMode);
+    }
+    Ok(())
+}
+
+fn validate_named_migration_evidence_temp_identity(
+    directory: &ControllerDirectoryHandle,
+    name: &str,
+    expected: FileIdentity,
+) -> Result<(), ControllerStoreMigrationError> {
+    let (file, identity) = open_migration_evidence_temp(directory, name)?;
+    drop(file);
+    if identity != expected {
+        return Err(ControllerStoreMigrationError::EvidenceChangedDuringRead);
+    }
+    Ok(())
+}
+
+fn ensure_read_only_migration_evidence(
+    directory: &ControllerDirectoryHandle,
+    migration_id: [u8; 32],
+    final_name: &str,
+    bytes: &[u8],
+    kind: MigrationEvidenceKind,
+    token: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+    failpoint: ControllerMigrationEvidenceFailpoint,
+) -> Result<(), ControllerStoreMigrationError> {
+    match read_read_only_migration_evidence(directory, final_name, bytes.len()) {
+        Ok(existing) => {
+            if existing != bytes {
+                return Err(ControllerStoreMigrationError::EvidenceMismatch);
+            }
+            validate_controller_directory_handle(directory)
+                .map_err(ControllerStoreMigrationError::EvidenceDirectory)?;
+            directory.file.sync_all().map_err(|error| {
+                ControllerStoreMigrationError::EvidencePublish(
+                    ControllerPublishFailure::UncertainAfterPublish(ControllerPublishFault::io(
+                        ControllerFileStage::SyncMigrationEvidenceDirectory,
+                        &error,
+                    )),
+                )
+            })?;
+            let durable = read_read_only_migration_evidence(directory, final_name, bytes.len())
+                .map_err(|_| {
+                    uncertain_migration_evidence(ControllerFileStage::ReadBackMigrationEvidence)
+                })?;
+            return if durable == bytes {
+                Ok(())
+            } else {
+                Err(uncertain_migration_evidence(
+                    ControllerFileStage::ReadBackMigrationEvidence,
+                ))
+            };
+        }
+        Err(ControllerStoreMigrationError::EvidenceMissing) => {}
+        Err(error) => return Err(error),
+    }
+    let temp_name = migration_evidence_temp_name(migration_id, kind, token);
+    let owned = openat(
+        &directory.file,
+        temp_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        PRIVATE_FILE_MODE,
+    )
+    .map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(nix_failure(
+            ControllerFileStage::CreateMigrationEvidenceTemp,
+            error,
+        ))
+    })?;
+    let mut temp = File::from(owned);
+    temp.write_all(bytes).map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::WriteMigrationEvidenceTemp,
+            &error,
+        ))
+    })?;
+    fchmod(&temp, READ_ONLY_EVIDENCE_MODE).map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(nix_failure(
+            ControllerFileStage::InspectMigrationEvidence,
+            error,
+        ))
+    })?;
+    let metadata = temp.metadata().map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::InspectMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_read_only_evidence_metadata(&metadata, directory.owner_uid, directory.owner_gid)?;
+    temp.sync_all().map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::SyncMigrationEvidenceTemp,
+            &error,
+        ))
+    })?;
+    validate_controller_directory_handle(directory)
+        .map_err(ControllerStoreMigrationError::EvidenceDirectory)?;
+    ensure_migration_evidence_missing(directory, final_name)?;
+    publish_migration_evidence_temp(directory, &temp_name, final_name)?;
+    if failpoint == ControllerMigrationEvidenceFailpoint::AfterRenameBeforeDirectorySync {
+        return Err(uncertain_migration_evidence(
+            ControllerFileStage::SyncMigrationEvidenceDirectory,
+        ));
+    }
+    directory.file.sync_all().map_err(|error| {
+        ControllerStoreMigrationError::EvidencePublish(
+            ControllerPublishFailure::UncertainAfterPublish(ControllerPublishFault::io(
+                ControllerFileStage::SyncMigrationEvidenceDirectory,
+                &error,
+            )),
+        )
+    })?;
+    let read_back =
+        read_read_only_migration_evidence(directory, final_name, bytes.len()).map_err(|_| {
+            uncertain_migration_evidence(ControllerFileStage::ReadBackMigrationEvidence)
+        })?;
+    if read_back != bytes {
+        return Err(uncertain_migration_evidence(
+            ControllerFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+    Ok(())
+}
+
+fn publish_migration_evidence_temp(
+    directory: &ControllerDirectoryHandle,
+    temp_name: &str,
+    final_name: &str,
+) -> Result<(), ControllerStoreMigrationError> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        renameat2(
+            &directory.file,
+            temp_name,
+            &directory.file,
+            final_name,
+            RenameFlags::RENAME_NOREPLACE,
+        )
+        .map_err(|error| {
+            ControllerStoreMigrationError::EvidenceIo(nix_failure(
+                ControllerFileStage::RenameMigrationEvidence,
+                error,
+            ))
+        })
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        renameat(&directory.file, temp_name, &directory.file, final_name).map_err(|error| {
+            ControllerStoreMigrationError::EvidenceIo(nix_failure(
+                ControllerFileStage::RenameMigrationEvidence,
+                error,
+            ))
+        })
+    }
+}
+
+fn ensure_migration_evidence_missing(
+    directory: &ControllerDirectoryHandle,
+    name: &str,
+) -> Result<(), ControllerStoreMigrationError> {
+    match openat(
+        &directory.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            Err(ControllerStoreMigrationError::EvidenceMismatch)
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(()),
+        Err(error) => Err(ControllerStoreMigrationError::EvidenceIo(nix_failure(
+            ControllerFileStage::OpenMigrationEvidence,
+            error,
+        ))),
+    }
+}
+
+fn read_controller_migration_evidence(
+    directory: &ControllerDirectoryHandle,
+    migration_id: [u8; 32],
+) -> Result<(Vec<u8>, ControllerStoreMigrationReceipt), ControllerStoreMigrationError> {
+    let source = read_read_only_migration_evidence(
+        directory,
+        &migration_source_file_name(migration_id),
+        MAX_CONTROLLER_SNAPSHOT_BYTES,
+    )?;
+    let receipt_wire = read_read_only_migration_evidence(
+        directory,
+        &migration_receipt_file_name(migration_id),
+        MIGRATION_RECEIPT_BYTES,
+    )?;
+    let receipt = ControllerStoreMigrationReceipt::decode(&receipt_wire)?;
+    if receipt.migration_id != migration_id
+        || receipt.source_snapshot_length != source.len() as u64
+        || receipt.source_snapshot_digest != migration_evidence_digest(&source)?
+    {
+        return Err(ControllerStoreMigrationError::EvidenceMismatch);
+    }
+    Ok((source, receipt))
+}
+
+fn read_read_only_migration_evidence(
+    directory: &ControllerDirectoryHandle,
+    name: &str,
+    maximum_length: usize,
+) -> Result<Vec<u8>, ControllerStoreMigrationError> {
+    let owned = match openat(
+        &directory.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => file,
+        Err(nix::errno::Errno::ENOENT) => {
+            return Err(ControllerStoreMigrationError::EvidenceMissing);
+        }
+        Err(error) => {
+            return Err(ControllerStoreMigrationError::EvidenceIo(nix_failure(
+                ControllerFileStage::OpenMigrationEvidence,
+                error,
+            )));
+        }
+    };
+    let mut file = File::from(owned);
+    let before = file.metadata().map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::InspectMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_read_only_evidence_metadata(&before, directory.owner_uid, directory.owner_gid)?;
+    let identity = FileIdentity::from_metadata(&before);
+    let length = usize::try_from(before.len())
+        .map_err(|_| ControllerStoreMigrationError::EvidenceTooLarge)?;
+    if length == 0 || length > maximum_length {
+        return Err(ControllerStoreMigrationError::EvidenceTooLarge);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| ControllerStoreMigrationError::EvidenceAllocationFailed)?;
+    bytes.resize(length, 0);
+    file.read_exact(&mut bytes).map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::ReadMigrationEvidence,
+            &error,
+        ))
+    })?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing).map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::ReadMigrationEvidence,
+            &error,
+        ))
+    })? != 0
+    {
+        return Err(ControllerStoreMigrationError::EvidenceChangedDuringRead);
+    }
+    let after = file.metadata().map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::InspectMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_read_only_evidence_metadata(&after, directory.owner_uid, directory.owner_gid)?;
+    if FileIdentity::from_metadata(&after) != identity || after.len() != before.len() {
+        return Err(ControllerStoreMigrationError::EvidenceChangedDuringRead);
+    }
+    validate_named_read_only_evidence_identity(directory, name, identity)?;
+    Ok(bytes)
+}
+
+fn validate_read_only_evidence_metadata(
+    metadata: &Metadata,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<(), ControllerStoreMigrationError> {
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(ControllerStoreMigrationError::UnsafeEvidenceFile);
+    }
+    if metadata.uid() != owner_uid || metadata.gid() != owner_gid {
+        return Err(ControllerStoreMigrationError::EvidenceOwnerMismatch);
+    }
+    if metadata.mode() & PRIVATE_FILE_MODE_MASK != READ_ONLY_EVIDENCE_MODE_BITS {
+        return Err(ControllerStoreMigrationError::UnsafeEvidenceMode);
+    }
+    Ok(())
+}
+
+fn validate_named_read_only_evidence_identity(
+    directory: &ControllerDirectoryHandle,
+    name: &str,
+    expected: FileIdentity,
+) -> Result<(), ControllerStoreMigrationError> {
+    let owned = openat(
+        &directory.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(nix_failure(
+            ControllerFileStage::OpenMigrationEvidence,
+            error,
+        ))
+    })?;
+    let file = File::from(owned);
+    let metadata = file.metadata().map_err(|error| {
+        ControllerStoreMigrationError::EvidenceIo(ControllerIoFailure::new(
+            ControllerFileStage::InspectMigrationEvidence,
+            &error,
+        ))
+    })?;
+    validate_read_only_evidence_metadata(&metadata, directory.owner_uid, directory.owner_gid)?;
+    if FileIdentity::from_metadata(&metadata) != expected {
+        return Err(ControllerStoreMigrationError::EvidenceChangedDuringRead);
+    }
+    Ok(())
+}
+
+fn uncertain_migration_evidence(stage: ControllerFileStage) -> ControllerStoreMigrationError {
+    ControllerStoreMigrationError::EvidencePublish(ControllerPublishFailure::UncertainAfterPublish(
+        ControllerPublishFault::injected(stage),
+    ))
+}
+
+const fn published_but_unverified(stage: ControllerFileStage) -> ControllerStoreMigrationError {
+    ControllerStoreMigrationError::PublishedButUnverified(stage)
 }
 
 pub(crate) fn open_controller_directory(
@@ -332,6 +1564,7 @@ pub(crate) fn open_controller_directory(
     Ok(ControllerDirectoryHandle {
         path: path.to_path_buf(),
         file,
+        identity: FileIdentity::from_metadata(&opened_metadata),
         owner_uid,
         owner_gid,
     })
@@ -516,6 +1749,19 @@ pub(crate) fn publish_initial_controller_snapshot(
 pub(crate) fn read_active_controller_snapshot(
     directory: &ControllerDirectoryHandle,
 ) -> Result<ControllerJournalSnapshot, ControllerStoreOpenError> {
+    let active = read_active_controller_snapshot_bytes(directory)?;
+    let snapshot = ControllerJournalSnapshot::decode(&active.encoded)
+        .map_err(ControllerStoreOpenError::Codec)?;
+    let canonical = snapshot.encode().map_err(ControllerStoreOpenError::Codec)?;
+    if canonical.as_ref() != active.encoded.as_slice() {
+        return Err(ControllerStoreOpenError::NonCanonicalActiveSnapshot);
+    }
+    Ok(snapshot)
+}
+
+fn read_active_controller_snapshot_bytes(
+    directory: &ControllerDirectoryHandle,
+) -> Result<ActiveSnapshotBytes, ControllerStoreOpenError> {
     let mut active = open_existing_regular(
         directory,
         CONTROLLER_ACTIVE_FILE_NAME,
@@ -557,13 +1803,24 @@ pub(crate) fn read_active_controller_snapshot(
     {
         return Err(ControllerStoreOpenError::ActiveChangedDuringRead);
     }
-    let snapshot =
-        ControllerJournalSnapshot::decode(&encoded).map_err(ControllerStoreOpenError::Codec)?;
-    let canonical = snapshot.encode().map_err(ControllerStoreOpenError::Codec)?;
-    if canonical.as_ref() != encoded.as_slice() {
-        return Err(ControllerStoreOpenError::NonCanonicalActiveSnapshot);
+    let identity = FileIdentity::from_metadata(&metadata);
+    let after = active.metadata().map_err(|error| {
+        ControllerStoreOpenError::Io(ControllerIoFailure::new(
+            ControllerFileStage::ReadActive,
+            &error,
+        ))
+    })?;
+    validate_regular_file(&after, directory.owner_uid, directory.owner_gid)?;
+    if FileIdentity::from_metadata(&after) != identity || after.len() != metadata.len() {
+        return Err(ControllerStoreOpenError::ActiveChangedDuringRead);
     }
-    Ok(snapshot)
+    validate_named_file_identity(
+        directory,
+        CONTROLLER_ACTIVE_FILE_NAME,
+        identity,
+        ControllerFileStage::ValidateActiveIdentity,
+    )?;
+    Ok(ActiveSnapshotBytes { encoded, identity })
 }
 
 fn open_existing_regular(
@@ -585,6 +1842,22 @@ fn open_existing_regular(
         .map_err(|error| ControllerStoreOpenError::Io(ControllerIoFailure::new(stage, &error)))?;
     validate_regular_file(&metadata, directory.owner_uid, directory.owner_gid)?;
     Ok(file)
+}
+
+fn validate_named_file_identity(
+    directory: &ControllerDirectoryHandle,
+    name: &str,
+    expected: FileIdentity,
+    stage: ControllerFileStage,
+) -> Result<(), ControllerStoreOpenError> {
+    let file = open_existing_regular(directory, name, OFlag::O_RDONLY, stage)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ControllerStoreOpenError::Io(ControllerIoFailure::new(stage, &error)))?;
+    if FileIdentity::from_metadata(&metadata) != expected {
+        return Err(ControllerStoreOpenError::NamedFileIdentityChanged);
+    }
+    Ok(())
 }
 
 fn validate_regular_file(
@@ -690,14 +1963,16 @@ fn publish_controller_snapshot(
     }
     match mode {
         ControllerPublishMode::RequireMissing => ensure_active_missing(directory)?,
-        ControllerPublishMode::ReplaceExisting => {
-            open_existing_regular(
+        ControllerPublishMode::ReplaceExisting(expected) => {
+            validate_named_file_identity(
                 directory,
                 CONTROLLER_ACTIVE_FILE_NAME,
-                OFlag::O_RDONLY,
-                ControllerFileStage::OpenActive,
+                expected,
+                ControllerFileStage::ValidateActiveIdentity,
             )
-            .map_err(|error| rejected_open_error(ControllerFileStage::OpenActive, error))?;
+            .map_err(|error| {
+                rejected_open_error(ControllerFileStage::ValidateActiveIdentity, error)
+            })?;
         }
     }
 
@@ -771,8 +2046,19 @@ fn publish_controller_snapshot(
     ) {
         return Err(rejected_injected(ControllerFileStage::Rename));
     }
-    if mode == ControllerPublishMode::RequireMissing {
-        ensure_active_missing(directory)?;
+    match mode {
+        ControllerPublishMode::RequireMissing => ensure_active_missing(directory)?,
+        ControllerPublishMode::ReplaceExisting(expected) => {
+            validate_named_file_identity(
+                directory,
+                CONTROLLER_ACTIVE_FILE_NAME,
+                expected,
+                ControllerFileStage::ValidateActiveIdentity,
+            )
+            .map_err(|error| {
+                rejected_open_error(ControllerFileStage::ValidateActiveIdentity, error)
+            })?;
+        }
     }
     renameat(
         &directory.file,
@@ -1240,7 +2526,7 @@ fn errno_to_io(error: nix::errno::Errno) -> io::Error {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControllerPublishMode {
     RequireMissing,
-    ReplaceExisting,
+    ReplaceExisting(FileIdentity),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1262,6 +2548,7 @@ pub(crate) enum ControllerFileStage {
     InspectAncestor,
     InspectDirectory,
     OpenDirectory,
+    ValidateDirectoryIdentity,
     InspectFilesystem,
     ScanDirectory,
     CreateLock,
@@ -1270,11 +2557,24 @@ pub(crate) enum ControllerFileStage {
     ValidateInitializerMarker,
     OpenLock,
     AcquireLock,
+    ValidateLockIdentity,
     OpenActive,
     ReadActive,
+    ValidateActiveIdentity,
     InspectOrphanTemp,
     RemoveOrphanTemp,
     SyncOrphanCleanup,
+    GenerateMigrationEvidenceTempName,
+    OpenMigrationEvidence,
+    CreateMigrationEvidenceTemp,
+    InspectMigrationEvidence,
+    ReadMigrationEvidence,
+    WriteMigrationEvidenceTemp,
+    SyncMigrationEvidenceTemp,
+    RenameMigrationEvidence,
+    SyncMigrationEvidenceDirectory,
+    ReadBackMigrationEvidence,
+    VerifyPublishedMigration,
     GenerateTempName,
     ValidateEncodedSnapshot,
     RequireMissingActive,
@@ -1284,6 +2584,7 @@ pub(crate) enum ControllerFileStage {
     SyncTemp,
     Rename,
     SyncDirectory,
+    ReadBackPublished,
     ReturnDurableCommit,
 }
 
@@ -1365,6 +2666,7 @@ pub(crate) enum ControllerStoreOpenError {
     UnsafeDirectoryMode,
     DirectoryOwnerMismatch,
     DirectoryIdentityChanged,
+    NamedFileIdentityChanged,
     UnsupportedFilesystem,
     DirectoryNotFresh,
     UnsafeFileType,
@@ -1398,6 +2700,37 @@ pub(crate) enum ControllerStoreError {
     Publish(ControllerPublishFailure),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControllerStoreMigrationError {
+    InvalidExpectedStoreIdentity,
+    InvalidExpectedOwnerIdentity,
+    InvalidMigrationId,
+    EvidenceDirectoryMatchesStore,
+    LockContended,
+    StoreInstanceMismatch,
+    OwnerIdentityMismatch,
+    Store(ControllerStoreOpenError),
+    EvidenceDirectory(ControllerStoreOpenError),
+    Journal(ControllerJournalError),
+    EvidenceMissing,
+    EvidenceTooLarge,
+    EvidenceAllocationFailed,
+    EvidenceChangedDuringRead,
+    UnknownEvidenceEntry,
+    TooManyEvidenceDirectoryEntries,
+    TooManyEvidenceTemps,
+    UnsafeEvidenceFile,
+    UnsafeEvidenceMode,
+    EvidenceOwnerMismatch,
+    EvidenceMismatch,
+    InvalidReceipt,
+    TargetMismatch,
+    EvidenceIo(ControllerIoFailure),
+    EvidencePublish(ControllerPublishFailure),
+    Publish(ControllerPublishFailure),
+    PublishedButUnverified(ControllerFileStage),
+}
+
 impl fmt::Display for ControllerStoreOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "Controller store cannot open: {self:?}")
@@ -1413,6 +2746,14 @@ impl fmt::Display for ControllerStoreError {
 }
 
 impl std::error::Error for ControllerStoreError {}
+
+impl fmt::Display for ControllerStoreMigrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Controller store migration failed: {self:?}")
+    }
+}
+
+impl std::error::Error for ControllerStoreMigrationError {}
 
 #[cfg(test)]
 mod tests {
@@ -1433,9 +2774,14 @@ mod tests {
     use tokio::runtime::Builder as RuntimeBuilder;
 
     use crate::controller_journal::{
-        ControllerAuthKeyFingerprint, ControllerJournalSnapshot, ControllerJournalState,
-        ControllerOperationId, ControllerOwnerIdentityFingerprint, ControllerRequestAuthPin,
-        ControllerTenurePhase, controller_test_manifest, refresh_controller_test_checksum,
+        ControllerAuthKeyFingerprint, ControllerJournalError, ControllerJournalSnapshot,
+        ControllerJournalState, ControllerOperationId, ControllerOwnerIdentityFingerprint,
+        ControllerRequestAuthPin, ControllerTenurePhase, controller_test_manifest,
+        refresh_controller_test_checksum,
+        tests::{
+            decode_frozen_base64, frozen_v7_opaque_query_wire, frozen_v7_zero_wire,
+            frozen_v8_zero_target_wire,
+        },
     };
     use crate::controller_tenure::{
         ControllerTenureError, acquire_tenure_once_with_test_exchange,
@@ -1456,7 +2802,8 @@ mod tests {
     use super::{
         CONTROLLER_ACTIVE_FILE_NAME, CONTROLLER_LOCK_FILE_NAME, ControllerCommitFailpoint,
         ControllerFilesystemPolicy, ControllerInitializerLockFailure, ControllerPublishFailure,
-        ControllerStore, ControllerStoreError, ControllerStoreOpenError, LinuxMountEvidenceError,
+        ControllerStore, ControllerStoreError, ControllerStoreMigrationDisposition,
+        ControllerStoreMigrationError, ControllerStoreOpenError, LinuxMountEvidenceError,
         MAX_LINUX_FDINFO_BYTES, MAX_LINUX_FDINFO_LINE_BYTES, MAX_LINUX_FDINFO_RECORDS,
         MAX_LINUX_MOUNTINFO_BYTES, MAX_LINUX_MOUNTINFO_LINE_BYTES, MAX_LINUX_MOUNTINFO_RECORDS,
         create_and_lock_controller_initializer_lock, ensure_fresh_controller_directory,
@@ -1652,6 +2999,13 @@ mod tests {
     }
 
     fn install(snapshot: &ControllerJournalSnapshot, directory: &TestDirectory) {
+        let encoded = snapshot
+            .encode()
+            .unwrap_or_else(|error| panic!("fixture encode failed: {error}"));
+        install_wire(&encoded, directory);
+    }
+
+    fn install_wire(encoded: &[u8], directory: &TestDirectory) {
         let handle = open_controller_directory(
             directory.path(),
             ControllerFilesystemPolicy::ExplicitFixture,
@@ -1661,12 +3015,9 @@ mod tests {
             .unwrap_or_else(|error| panic!("fixture directory not fresh: {error}"));
         let _lock = create_and_lock_controller_initializer_lock(&handle)
             .unwrap_or_else(|error| panic!("fixture lock failed: {error}"));
-        let encoded = snapshot
-            .encode()
-            .unwrap_or_else(|error| panic!("fixture encode failed: {error}"));
         publish_initial_controller_snapshot(
             &handle,
-            &encoded,
+            encoded,
             [0x51; 16],
             ControllerCommitFailpoint::None,
         )
@@ -1833,6 +3184,219 @@ mod tests {
                 .state()
                 .installed_manifest(),
             initial.state().installed_manifest()
+        );
+    }
+
+    #[test]
+    fn offline_v7_migration_retains_exact_read_only_evidence_and_resumes_exactly() {
+        let directory = TestDirectory::new();
+        let evidence = TestDirectory::new();
+        let source_wire = frozen_v7_zero_wire();
+        let expected_target = ControllerJournalSnapshot::decode(&frozen_v8_zero_target_wire())
+            .expect("frozen v8 target must decode");
+        install_wire(&source_wire, &directory);
+        assert_eq!(
+            ControllerStore::open_with_policy(
+                directory.path(),
+                STORE_ID,
+                owner(),
+                ControllerFilesystemPolicy::ExplicitFixture,
+            )
+            .expect_err("normal v8 open must reject v7"),
+            ControllerStoreOpenError::Codec(ControllerJournalError::UnknownPayloadVersion)
+        );
+
+        let request = super::ControllerMigrationRequest {
+            directory: directory.path(),
+            evidence_directory: evidence.path(),
+            expected_store_instance_id: STORE_ID,
+            expected_owner_identity: owner(),
+            migration_id: [0x91; 32],
+        };
+        let migrated = ControllerStore::migrate_payload_v7_offline_with_policy(
+            request,
+            ControllerFilesystemPolicy::ExplicitFixture,
+        )
+        .expect("v7 migration must succeed");
+        assert_eq!(
+            migrated.disposition,
+            ControllerStoreMigrationDisposition::Migrated
+        );
+        assert_eq!(migrated.receipt.migration_id(), &[0x91; 32]);
+        assert_eq!(
+            migrated.receipt.canonical_wire().as_slice(),
+            decode_frozen_base64(include_str!("testdata/controller_v7_v8_receipt.b64")).as_ref(),
+            "receipt bytes are frozen against the accepted HEAD-v7 source and exact v8 target"
+        );
+        assert_eq!(active_snapshot(&directory), expected_target);
+        let source_path = evidence
+            .path()
+            .join(super::migration_source_file_name([0x91; 32]));
+        let receipt_path = evidence
+            .path()
+            .join(super::migration_receipt_file_name([0x91; 32]));
+        assert_eq!(
+            fs::read(&source_path).expect("source evidence"),
+            source_wire.as_ref()
+        );
+        assert_eq!(
+            fs::metadata(&source_path)
+                .expect("source evidence metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o400
+        );
+        assert_eq!(
+            fs::metadata(&receipt_path)
+                .expect("receipt metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o400
+        );
+
+        let resumed = ControllerStore::migrate_payload_v7_offline_with_policy(
+            request,
+            ControllerFilesystemPolicy::ExplicitFixture,
+        )
+        .expect("exact migration retry must resume");
+        assert_eq!(
+            resumed.disposition,
+            ControllerStoreMigrationDisposition::AlreadyMigrated
+        );
+        assert_eq!(resumed.receipt, migrated.receipt);
+
+        let held = open_fixture(&directory);
+        assert_eq!(
+            ControllerStore::migrate_payload_v7_offline_with_policy(
+                request,
+                ControllerFilesystemPolicy::ExplicitFixture,
+            ),
+            Err(ControllerStoreMigrationError::LockContended)
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn offline_v7_migration_rejects_query_evidence_without_touching_active_or_evidence() {
+        let directory = TestDirectory::new();
+        let evidence = TestDirectory::new();
+        let source_wire = frozen_v7_opaque_query_wire();
+        install_wire(&source_wire, &directory);
+        let active_path = directory.path().join(CONTROLLER_ACTIVE_FILE_NAME);
+        let before = fs::read(&active_path).expect("legacy active bytes");
+        let result = ControllerStore::migrate_payload_v7_offline_with_policy(
+            super::ControllerMigrationRequest {
+                directory: directory.path(),
+                evidence_directory: evidence.path(),
+                expected_store_instance_id: STORE_ID,
+                expected_owner_identity: owner(),
+                migration_id: [0x92; 32],
+            },
+            ControllerFilesystemPolicy::ExplicitFixture,
+        );
+        assert_eq!(
+            result,
+            Err(ControllerStoreMigrationError::Journal(
+                ControllerJournalError::LegacyOpaqueQueryEvidenceUnavailable
+            ))
+        );
+        assert_eq!(fs::read(active_path).expect("unchanged active"), before);
+        assert_eq!(
+            fs::read_dir(evidence.path())
+                .expect("evidence directory")
+                .count(),
+            0,
+            "rejected legacy query evidence must not produce migration authority"
+        );
+    }
+
+    #[test]
+    fn offline_v7_migration_retries_evidence_and_active_publish_uncertainty() {
+        let evidence_uncertain_store = TestDirectory::new();
+        let evidence_uncertain_audit = TestDirectory::new();
+        let source = initial_snapshot();
+        let source_wire = source
+            .encode_payload_v7_for_test()
+            .expect("legacy source wire");
+        install_wire(&source_wire, &evidence_uncertain_store);
+        let source_request = super::ControllerMigrationRequest {
+            directory: evidence_uncertain_store.path(),
+            evidence_directory: evidence_uncertain_audit.path(),
+            expected_store_instance_id: STORE_ID,
+            expected_owner_identity: owner(),
+            migration_id: [0x93; 32],
+        };
+        let uncertain = ControllerStore::migrate_payload_v7_offline_with_policy_and_failpoints(
+            source_request,
+            ControllerFilesystemPolicy::ExplicitFixture,
+            super::ControllerMigrationFailpoints {
+                source_evidence:
+                    super::ControllerMigrationEvidenceFailpoint::AfterRenameBeforeDirectorySync,
+                receipt_evidence: super::ControllerMigrationEvidenceFailpoint::None,
+                active_snapshot: ControllerCommitFailpoint::None,
+            },
+        );
+        assert!(matches!(
+            uncertain,
+            Err(ControllerStoreMigrationError::EvidencePublish(
+                ControllerPublishFailure::UncertainAfterPublish(_)
+            ))
+        ));
+        assert_eq!(
+            fs::read(
+                evidence_uncertain_store
+                    .path()
+                    .join(CONTROLLER_ACTIVE_FILE_NAME)
+            )
+            .expect("old active after evidence uncertainty"),
+            source_wire.as_ref()
+        );
+        assert_eq!(
+            ControllerStore::migrate_payload_v7_offline_with_policy(
+                source_request,
+                ControllerFilesystemPolicy::ExplicitFixture,
+            )
+            .expect("existing exact evidence must be fsynced and resumed")
+            .disposition,
+            ControllerStoreMigrationDisposition::Migrated
+        );
+
+        let active_uncertain_store = TestDirectory::new();
+        let active_uncertain_audit = TestDirectory::new();
+        install_wire(&source_wire, &active_uncertain_store);
+        let active_request = super::ControllerMigrationRequest {
+            directory: active_uncertain_store.path(),
+            evidence_directory: active_uncertain_audit.path(),
+            expected_store_instance_id: STORE_ID,
+            expected_owner_identity: owner(),
+            migration_id: [0x94; 32],
+        };
+        let uncertain = ControllerStore::migrate_payload_v7_offline_with_policy_and_failpoints(
+            active_request,
+            ControllerFilesystemPolicy::ExplicitFixture,
+            super::ControllerMigrationFailpoints {
+                source_evidence: super::ControllerMigrationEvidenceFailpoint::None,
+                receipt_evidence: super::ControllerMigrationEvidenceFailpoint::None,
+                active_snapshot: ControllerCommitFailpoint::AfterDirectorySyncBeforeReturn,
+            },
+        );
+        assert!(matches!(
+            uncertain,
+            Err(ControllerStoreMigrationError::Publish(
+                ControllerPublishFailure::UncertainAfterPublish(_)
+            ))
+        ));
+        assert_eq!(active_snapshot(&active_uncertain_store), source);
+        assert_eq!(
+            ControllerStore::migrate_payload_v7_offline_with_policy(
+                active_request,
+                ControllerFilesystemPolicy::ExplicitFixture,
+            )
+            .expect("exact evidence must prove uncertain active publish")
+            .disposition,
+            ControllerStoreMigrationDisposition::AlreadyMigrated
         );
     }
 

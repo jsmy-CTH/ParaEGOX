@@ -13,6 +13,9 @@ mod controller_initializer;
 mod controller_journal;
 #[cfg(unix)]
 #[expect(dead_code, reason = "Awaiting admitted executable consumer")] // GOV-WAIVER-0002
+mod controller_query;
+#[cfg(unix)]
+#[expect(dead_code, reason = "Awaiting admitted executable consumer")] // GOV-WAIVER-0002
 mod controller_store;
 #[cfg(unix)]
 #[expect(dead_code, reason = "Awaiting admitted executable consumer")] // GOV-WAIVER-0002

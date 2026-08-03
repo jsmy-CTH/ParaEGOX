@@ -46,6 +46,9 @@ impl fmt::Display for DeploymentdProcessError {
                 ("PXDC-INITIALIZATION-FAILED", "initialize_controller")
             }
             ProcessErrorKind::Store => ("PXDC-STORE-FAILED-CLOSED", "operate_controller_store"),
+            ProcessErrorKind::Migration => {
+                ("PXDC-MIGRATION-FAILED-CLOSED", "migrate_controller_store")
+            }
             ProcessErrorKind::Planning => ("PXDC-PLANNING-REJECTED", "compile_reference_plan"),
             ProcessErrorKind::Commit => ("PXDC-COMMIT-FAILED-CLOSED", "commit_reference_plan"),
             ProcessErrorKind::Tenure => ("PXDC-TENURE-FAILED-CLOSED", "acquire_tenure"),
@@ -74,6 +77,7 @@ enum ProcessErrorKind {
     Provisioning,
     Initialization,
     Store,
+    Migration,
     Planning,
     Commit,
     Tenure,
@@ -148,7 +152,7 @@ mod platform {
         ControllerOwnerIdentityFingerprint, ControllerRequestAuthPin,
         ControllerTenureAuthorityDomainFingerprint, ControllerTenureTransaction,
     };
-    use crate::controller_store::ControllerStore;
+    use crate::controller_store::{ControllerStore, ControllerStoreMigrationDisposition};
     use crate::controller_tenure::{ControllerAcquiredTenure, acquire_tenure_once};
     use crate::deck::{
         CardDefinitionVersionRequirement, CardUseKey, DeckCardConfig, DeckCardRole, DeckCardSpec,
@@ -212,12 +216,91 @@ mod platform {
     fn execute(command: ProcessCommand) -> Result<(), DeploymentdProcessError> {
         match command {
             ProcessCommand::Initialize(arguments) => initialize(arguments),
+            ProcessCommand::MigrateControllerJournal(arguments) => {
+                migrate_controller_journal(arguments)
+            }
             ProcessCommand::CommitReferenceLoop(arguments) => commit_reference_loop(arguments),
             ProcessCommand::CommitReferenceEmpty(arguments) => commit_reference_empty(arguments),
             ProcessCommand::AcquireTenure(arguments) => acquire_tenure(arguments),
             ProcessCommand::BootstrapRuntime(arguments) => bootstrap_runtime(arguments),
             ProcessCommand::ApplyReference(arguments) => apply_reference(arguments),
         }
+    }
+
+    fn migrate_controller_journal(
+        arguments: ControllerJournalMigrationArguments,
+    ) -> Result<(), DeploymentdProcessError> {
+        let outcome = ControllerStore::migrate_payload_v7_offline(
+            &arguments.state_directory,
+            &arguments.evidence_directory,
+            arguments.expected_store_id,
+            ControllerOwnerIdentityFingerprint::from_stored(Digest32::from_bytes(
+                arguments.expected_owner_identity,
+            )),
+            arguments.migration_id,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Migration))?;
+        let disposition = match outcome.disposition {
+            ControllerStoreMigrationDisposition::Migrated => b"migrated".as_slice(),
+            ControllerStoreMigrationDisposition::AlreadyMigrated => b"already_migrated".as_slice(),
+        };
+        let receipt = outcome.receipt;
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(b"controller_journal_migration_v1 disposition=")
+            .and_then(|()| stdout.write_all(disposition))
+            .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        write_labeled_hex_inline(&mut stdout, b" migration_id=", receipt.migration_id())?;
+        write!(
+            stdout,
+            " source_payload_version={}",
+            receipt.source_payload_version()
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        write_labeled_hex_inline(
+            &mut stdout,
+            b" source_checksum=",
+            receipt.source_checksum().as_bytes(),
+        )?;
+        write_labeled_hex_inline(
+            &mut stdout,
+            b" store_instance_id=",
+            receipt.source_store_instance_id(),
+        )?;
+        write_labeled_hex_inline(
+            &mut stdout,
+            b" owner_identity_fingerprint=",
+            receipt.source_owner_identity_fingerprint().as_bytes(),
+        )?;
+        write!(
+            stdout,
+            " source_snapshot_sequence={}",
+            receipt.source_snapshot_sequence()
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        write_labeled_hex_inline(&mut stdout, b" receipt=", receipt.canonical_wire())?;
+        stdout
+            .write_all(b"\n")
+            .map_err(|_| process_error(ProcessErrorKind::Output))
+    }
+
+    fn write_labeled_hex_inline(
+        output: &mut impl Write,
+        label: &[u8],
+        bytes: &[u8],
+    ) -> Result<(), DeploymentdProcessError> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        output
+            .write_all(label)
+            .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        let mut encoded = Vec::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            encoded.push(HEX[usize::from(byte >> 4)]);
+            encoded.push(HEX[usize::from(byte & 0x0f)]);
+        }
+        output
+            .write_all(&encoded)
+            .map_err(|_| process_error(ProcessErrorKind::Output))
     }
 
     fn initialize(arguments: InitializeArguments) -> Result<(), DeploymentdProcessError> {
@@ -2227,11 +2310,21 @@ mod platform {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum ProcessCommand {
         Initialize(InitializeArguments),
+        MigrateControllerJournal(ControllerJournalMigrationArguments),
         CommitReferenceLoop(CommitArguments),
         CommitReferenceEmpty(CommitEmptyArguments),
         AcquireTenure(AcquireTenureArguments),
         BootstrapRuntime(BootstrapArguments),
         ApplyReference(BootstrapArguments),
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ControllerJournalMigrationArguments {
+        state_directory: PathBuf,
+        evidence_directory: PathBuf,
+        expected_store_id: [u8; 32],
+        expected_owner_identity: [u8; 32],
+        migration_id: [u8; 32],
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2319,6 +2412,15 @@ mod platform {
             return Err(process_error(ProcessErrorKind::Arguments));
         };
         match command {
+            "migrate-controller-journal-v7-to-v8-v1" if arguments.len() == 6 => Ok(
+                ProcessCommand::MigrateControllerJournal(ControllerJournalMigrationArguments {
+                    state_directory: parse_absolute_path(&arguments[1])?,
+                    evidence_directory: parse_absolute_path(&arguments[2])?,
+                    expected_store_id: parse_nonzero_hex(&arguments[3])?,
+                    expected_owner_identity: parse_nonzero_hex(&arguments[4])?,
+                    migration_id: parse_nonzero_hex(&arguments[5])?,
+                }),
+            ),
             "initialize-reference-v1" if arguments.len() == 10 => {
                 Ok(ProcessCommand::Initialize(InitializeArguments {
                     common: CommonArguments {
@@ -2812,8 +2914,36 @@ mod platform {
             ]
         }
 
+        fn migration_arguments() -> Vec<OsString> {
+            vec![
+                "migrate-controller-journal-v7-to-v8-v1".into(),
+                "/tmp/paraegox-controller".into(),
+                "/tmp/paraegox-controller-migration-evidence".into(),
+                hex(0x61, 32),
+                hex(0x62, 32),
+                hex(0x63, 32),
+            ]
+        }
+
         #[test]
         fn exact_versioned_positional_grammars_accept_only_complete_commands() {
+            assert!(matches!(
+                parse_arguments(migration_arguments()),
+                Ok(ProcessCommand::MigrateControllerJournal(_))
+            ));
+            let mut missing_migration = migration_arguments();
+            missing_migration.pop();
+            assert!(parse_arguments(missing_migration).is_err());
+            let mut extra_migration = migration_arguments();
+            extra_migration.push("unexpected".into());
+            assert!(parse_arguments(extra_migration).is_err());
+            let mut uppercase_migration = migration_arguments();
+            uppercase_migration[5] = OsString::from("AA".repeat(32));
+            assert!(parse_arguments(uppercase_migration).is_err());
+            let mut unversioned_migration = migration_arguments();
+            unversioned_migration[0] = "migrate-controller-journal-v7-to-v8".into();
+            assert!(parse_arguments(unversioned_migration).is_err());
+
             assert!(matches!(
                 parse_arguments(initialize_arguments()),
                 Ok(ProcessCommand::Initialize(_))
