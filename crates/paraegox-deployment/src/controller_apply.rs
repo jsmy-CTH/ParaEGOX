@@ -1945,31 +1945,30 @@ mod tests {
             ReferenceApplyTerminalHeadV1::PreservedNone,
         );
         commit_terminal_receipt(&mut store, &terminal);
-        commit_empty_plan(&mut store, 0xc5);
+        let terminal_state = store.snapshot().expect("failed terminal snapshot");
         assert_eq!(
-            store
-                .snapshot()
-                .expect("empty committed snapshot")
+            terminal_state
                 .state()
-                .last_terminal_target_slice_digest(),
+                .current_active_target_slice_digest_for_plan_advance(),
             Ok(None)
         );
-        let empty = prepare_reference_apply_v1(
-            &mut store,
-            owner(),
-            &controller,
-            &provisioning,
-            fresh(0xc8),
+        let candidate = journal_test_candidate(
+            TARGET,
+            terminal_state.state().installed_manifest().projection(),
+            terminal_state.state().allocation(),
+            None,
+            0xc5,
         )
-        .expect("prepare Empty after failed Loop");
-        assert_ne!(empty.request().target_slice_digest(), failed_slice);
+        .expect("failed apply empty candidate");
+        let operation = ControllerOperationId::from_bytes([0xc5; 16]);
+        let prepared = terminal_state
+            .state()
+            .prepare_plan_candidate(operation, &candidate)
+            .expect("failed apply plan preparation remains durable");
         assert_eq!(
-            empty
-                .request()
-                .control_commitment()
-                .control()
-                .expected_active(),
-            paraegox_runtime_contracts::apply::ExpectedActive::None
+            prepared.commit_plan_candidate(operation, &candidate),
+            Err(ControllerJournalError::NonTerminalRolloutBlocksPlanCommit),
+            "a failure PXRT cannot promote slice {failed_slice:?} or advance the plan"
         );
     }
 
@@ -2100,15 +2099,23 @@ mod tests {
         // mutable bootstrap binding.
         commit_terminal_receipt(&mut store, &old_receipt);
         drop(store);
-        let mut reopened = open_snapshot(&ready, &directory);
-        commit_empty_plan(&mut reopened, 0xd5);
+        let reopened = open_snapshot(&ready, &directory);
+        let reopened_state = reopened.snapshot().expect("reopened terminal snapshot");
         assert_eq!(
-            reopened
-                .snapshot()
-                .expect("reopened terminal snapshot")
+            reopened_state.state().current_direct_terminal_receipt(),
+            Some(&old_receipt),
+            "the exact historical-channel PXRT remains valid audit evidence"
+        );
+        assert_eq!(
+            reopened_state
                 .state()
-                .last_terminal_target_slice_digest(),
-            Ok(Some(desired_head))
+                .current_active_target_slice_digest_for_plan_advance(),
+            Ok(None),
+            "the newer Runtime epoch requires a fresh terminal query before plan advance"
+        );
+        assert_eq!(
+            old_receipt.facts().desired_head_digest(),
+            Some(desired_head)
         );
     }
 

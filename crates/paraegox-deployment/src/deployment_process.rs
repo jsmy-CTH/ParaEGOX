@@ -54,6 +54,9 @@ impl fmt::Display for DeploymentdProcessError {
             ProcessErrorKind::Tenure => ("PXDC-TENURE-FAILED-CLOSED", "acquire_tenure"),
             ProcessErrorKind::Bootstrap => ("PXDC-BOOTSTRAP-FAILED-CLOSED", "bootstrap_runtime"),
             ProcessErrorKind::Apply => ("PXDC-APPLY-FAILED-CLOSED", "apply_reference"),
+            ProcessErrorKind::Reconcile => {
+                ("PXDC-RECONCILE-FAILED-CLOSED", "reconcile_reference_once")
+            }
             ProcessErrorKind::Output => ("PXDC-OUTPUT-FAILED", "write_receipt"),
         };
         write!(
@@ -83,6 +86,7 @@ enum ProcessErrorKind {
     Tenure,
     Bootstrap,
     Apply,
+    Reconcile,
     Output,
 }
 
@@ -152,6 +156,8 @@ mod platform {
         ControllerOwnerIdentityFingerprint, ControllerRequestAuthPin,
         ControllerTenureAuthorityDomainFingerprint, ControllerTenureTransaction,
     };
+    use crate::controller_query::ControllerQueryProvisioningV1;
+    use crate::controller_reconcile::{ControllerReconcileOutcomeV1, reconcile_reference_once_v1};
     use crate::controller_store::{ControllerStore, ControllerStoreMigrationDisposition};
     use crate::controller_tenure::{ControllerAcquiredTenure, acquire_tenure_once};
     use crate::deck::{
@@ -167,8 +173,9 @@ mod platform {
         ValidatedReferenceLifecycleBudgets,
     };
     use crate::runtime_control_client::{
-        RuntimeApplyResponseVerifier, RuntimeControlSocketAcl, RuntimeUnixCredentials,
-        UnixRuntimeApplyClient, UnixRuntimeControlEndpoint,
+        RuntimeApplyResponseVerifier, RuntimeControlSocketAcl, RuntimeQueryResponseVerifier,
+        RuntimeUnixCredentials, UnixRuntimeApplyClient, UnixRuntimeControlEndpoint,
+        UnixRuntimeQueryClient,
     };
     use crate::tenure_client::{
         AcquireTenureRequestToSign, AuthorityProofVerifier, AuthoritySocketAcl,
@@ -207,6 +214,7 @@ mod platform {
     const TENURE_ENTROPY_BYTES: usize = 48;
     const APPLY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
     const APPLY_ENTROPY_BYTES: usize = 64;
+    const QUERY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub(super) fn run() -> Result<(), DeploymentdProcessError> {
         let command = parse_arguments(std::env::args_os().skip(1))?;
@@ -224,6 +232,7 @@ mod platform {
             ProcessCommand::AcquireTenure(arguments) => acquire_tenure(arguments),
             ProcessCommand::BootstrapRuntime(arguments) => bootstrap_runtime(arguments),
             ProcessCommand::ApplyReference(arguments) => apply_reference(arguments),
+            ProcessCommand::ReconcileReferenceOnce(arguments) => reconcile_reference(arguments),
         }
     }
 
@@ -612,26 +621,16 @@ mod platform {
         let intent = state
             .current_signed_apply_intent()
             .ok_or_else(|| process_error(ProcessErrorKind::Commit))?;
-        let receipt = state
-            .current_direct_terminal_receipt()
+        let expected_active = state
+            .current_active_target_slice_digest_for_plan_advance()
+            .map_err(|_| process_error(ProcessErrorKind::Commit))?
             .ok_or_else(|| process_error(ProcessErrorKind::Commit))?;
-        let facts = receipt.facts();
         if state.current_revision() != 1
             || plan.revision().value() != 1
             || plan.content().shape() != TargetIntent::OneSourceLoop
             || !state.current_apply_is_terminal()
             || intent.source_plan_digest() != plan.deployment_plan_digest()
-            || receipt.target() != plan.target()
-            || receipt.source_scope()
-                != paraegox_runtime_contracts::provenance::SourceScopeRef::from_bytes(
-                    *state.scope().as_bytes(),
-                )
-            || receipt.operation_id() != intent.apply_operation()
-            || receipt.request_digest() != intent.request_digest().value()
-            || facts.outcome() != ReferenceApplyTerminalOutcomeV1::OneSourceLoopActive
-            || facts.lifecycle_effect() != ReferenceApplyTerminalLifecycleEffectV1::MayHaveStarted
-            || facts.head() != ReferenceApplyTerminalHeadV1::CommittedIncoming
-            || facts.desired_head_digest() != Some(intent.target_slice_digest())
+            || expected_active != intent.target_slice_digest()
         {
             return Err(process_error(ProcessErrorKind::Commit));
         }
@@ -659,13 +658,9 @@ mod platform {
         let plan = state
             .committed_plan()
             .ok_or_else(|| process_error(ProcessErrorKind::Commit))?;
-        let archived = state
-            .last_archived_direct_terminal_receipt()
+        let expected_active = state
+            .last_archived_active_target_slice_digest()
             .map_err(|_| process_error(ProcessErrorKind::Commit))?
-            .ok_or_else(|| process_error(ProcessErrorKind::Commit))?;
-        let facts = archived.facts();
-        let expected_active = facts
-            .desired_head_digest()
             .ok_or_else(|| process_error(ProcessErrorKind::Commit))?;
         if state.current_revision() != 2
             || plan.revision().value() != 2
@@ -679,14 +674,6 @@ mod platform {
                 .records()
                 .iter()
                 .any(|record| record.state() == AllocationState::Active)
-            || archived.target() != plan.target()
-            || archived.source_scope()
-                != paraegox_runtime_contracts::provenance::SourceScopeRef::from_bytes(
-                    *state.scope().as_bytes(),
-                )
-            || facts.outcome() != ReferenceApplyTerminalOutcomeV1::OneSourceLoopActive
-            || facts.lifecycle_effect() != ReferenceApplyTerminalLifecycleEffectV1::MayHaveStarted
-            || facts.head() != ReferenceApplyTerminalHeadV1::CommittedIncoming
             || state
                 .last_terminal_target_slice_digest()
                 .map_err(|_| process_error(ProcessErrorKind::Commit))?
@@ -1341,6 +1328,148 @@ mod platform {
             .block_on(apply_reference_once_v1(&mut store, &client, &prepared))
             .map_err(|_| process_error(ProcessErrorKind::Apply))?;
         write_apply_receipt(&prepared, &applied)
+    }
+
+    fn reconcile_reference(arguments: BootstrapArguments) -> Result<(), DeploymentdProcessError> {
+        validate_service_identity(arguments.common.expected_uid, arguments.common.expected_gid)?;
+        validate_bootstrap_separation(&arguments)?;
+
+        let controller_public = read_pinned_file(
+            &arguments.common.public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let runtime_response_public = read_pinned_file(
+            &arguments.runtime_response_public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let authority_public = read_pinned_file(
+            &arguments.authority_public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let request_auth = request_auth_pin(&arguments.common, &controller_public.bytes)?;
+        let owner_identity = owner_identity(&arguments.common, request_auth.fingerprint)?;
+        let controller_public_bytes = exact_public_key(&controller_public.bytes)?;
+        let runtime_response_public_bytes = exact_public_key(&runtime_response_public.bytes)?;
+        let authority_public_bytes = exact_public_key(&authority_public.bytes)?;
+        if controller_public_bytes == runtime_response_public_bytes
+            || controller_public_bytes == authority_public_bytes
+            || runtime_response_public_bytes == authority_public_bytes
+        {
+            return Err(process_error(ProcessErrorKind::Key));
+        }
+
+        let controller_seed_file = read_pinned_file(
+            &arguments.controller_private_seed_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PrivateSeed,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let file_identities = [
+            controller_public.identity,
+            controller_seed_file.identity,
+            runtime_response_public.identity,
+            authority_public.identity,
+        ];
+        if file_identities
+            .iter()
+            .enumerate()
+            .any(|(index, identity)| file_identities[index + 1..].contains(identity))
+        {
+            return Err(process_error(ProcessErrorKind::Path));
+        }
+        let mut seed = Zeroizing::new([0_u8; PUBLIC_KEY_BYTES]);
+        seed.copy_from_slice(&controller_seed_file.bytes);
+        let controller_signer = SigningKey::from_bytes(&seed);
+        if controller_signer.verifying_key().to_bytes() != controller_public_bytes
+            || controller_signer.verifying_key().is_weak()
+        {
+            return Err(process_error(ProcessErrorKind::Key));
+        }
+
+        let mut store = ControllerStore::open(
+            &arguments.common.state_directory,
+            arguments.expected_store_id,
+            owner_identity,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Store))?;
+        let target = {
+            let state = store
+                .snapshot()
+                .map_err(|_| process_error(ProcessErrorKind::Store))?
+                .state();
+            if state.scope() != DeploymentScopeId::from_bytes(arguments.common.scope)
+                || state.plan_lineage() != DeploymentId::from_bytes(arguments.common.plan)
+                || state.request_auth() != request_auth.pin
+                || state.committed_plan().is_none()
+                || state.target_binding().is_none()
+            {
+                return Err(process_error(ProcessErrorKind::Provisioning));
+            }
+            validate_apply_protected_policy(
+                &arguments,
+                state,
+                &request_auth,
+                &controller_public_bytes,
+                &runtime_response_public_bytes,
+                &authority_public_bytes,
+            )?;
+            state.installed_manifest().target()
+        };
+
+        let endpoint = UnixRuntimeControlEndpoint::try_new(
+            arguments.runtime_socket_path,
+            RuntimeControlSocketAcl::new(arguments.runtime_uid, arguments.common.expected_gid),
+            RuntimeUnixCredentials::new(arguments.runtime_uid, arguments.runtime_gid),
+            target,
+            PrincipalRef::from_bytes(arguments.runtime_principal),
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let runtime_verifying_key = VerifyingKey::from_bytes(&runtime_response_public_bytes)
+            .map_err(|_| process_error(ProcessErrorKind::Key))?;
+        let runtime_key_fingerprint =
+            ed25519_control_key_fingerprint(runtime_verifying_key.as_bytes())
+                .map_err(|_| process_error(ProcessErrorKind::Key))?;
+        let response_verifier = RuntimeQueryResponseVerifier::try_new(
+            PrincipalRef::from_bytes(arguments.runtime_principal),
+            ApplyAuthKeyRef::from_bytes(arguments.runtime_response_key_ref),
+            request_auth.pin.algorithm(),
+            request_auth.pin.algorithm_version(),
+            runtime_key_fingerprint,
+            runtime_verifying_key,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let client =
+            UnixRuntimeQueryClient::try_new(endpoint, response_verifier, QUERY_EXCHANGE_TIMEOUT)
+                .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let provisioning = ControllerQueryProvisioningV1::try_new(PrincipalRef::from_bytes(
+            arguments.controller_principal,
+        ))
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| process_error(ProcessErrorKind::Reconcile))?;
+        let outcome = runtime
+            .block_on(reconcile_reference_once_v1(
+                &mut store,
+                &client,
+                owner_identity,
+                &controller_signer,
+                provisioning,
+            ))
+            .map_err(|_| process_error(ProcessErrorKind::Reconcile))?;
+        write_reconcile_outcome(outcome)
     }
 
     fn validate_apply_protected_policy(
@@ -2254,6 +2383,30 @@ mod platform {
             .map_err(|_| process_error(ProcessErrorKind::Output))
     }
 
+    fn write_reconcile_outcome(
+        outcome: ControllerReconcileOutcomeV1,
+    ) -> Result<(), DeploymentdProcessError> {
+        let (label, receipt) = match outcome {
+            ControllerReconcileOutcomeV1::Prepared => (b"prepared".as_slice(), None),
+            ControllerReconcileOutcomeV1::Active(receipt) => (b"active".as_slice(), Some(receipt)),
+            ControllerReconcileOutcomeV1::Retired(receipt) => {
+                (b"retired".as_slice(), Some(receipt))
+            }
+            ControllerReconcileOutcomeV1::Uncertain => (b"uncertain".as_slice(), None),
+        };
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(b"controller_reconcile_v1 outcome=")
+            .and_then(|()| stdout.write_all(label))
+            .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        if let Some(receipt) = receipt {
+            write_labeled_hex_inline(&mut stdout, b" receipt=", receipt.as_bytes())?;
+        }
+        stdout
+            .write_all(b"\n")
+            .map_err(|_| process_error(ProcessErrorKind::Output))
+    }
+
     const fn terminal_head_code(head: ReferenceApplyTerminalHeadV1) -> u16 {
         match head {
             ReferenceApplyTerminalHeadV1::PreservedNone => 1,
@@ -2316,6 +2469,7 @@ mod platform {
         AcquireTenure(AcquireTenureArguments),
         BootstrapRuntime(BootstrapArguments),
         ApplyReference(BootstrapArguments),
+        ReconcileReferenceOnce(BootstrapArguments),
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2495,7 +2649,11 @@ mod platform {
                     authority_gid: parse_nonzero_u32(&arguments[17])?,
                 }))
             }
-            command @ ("bootstrap-runtime-v1" | "apply-reference-v1") if arguments.len() == 24 => {
+            command @ ("bootstrap-runtime-v1"
+            | "apply-reference-v1"
+            | "reconcile-reference-once-v1")
+                if arguments.len() == 24 =>
+            {
                 let parsed = BootstrapArguments {
                     common: CommonArguments {
                         state_directory: parse_absolute_path(&arguments[1])?,
@@ -2525,8 +2683,10 @@ mod platform {
                 };
                 if command == "bootstrap-runtime-v1" {
                     Ok(ProcessCommand::BootstrapRuntime(parsed))
-                } else {
+                } else if command == "apply-reference-v1" {
                     Ok(ProcessCommand::ApplyReference(parsed))
+                } else {
+                    Ok(ProcessCommand::ReconcileReferenceOnce(parsed))
                 }
             }
             _ => Err(process_error(ProcessErrorKind::Arguments)),
@@ -2817,7 +2977,7 @@ mod platform {
             ControllerAuthKeyFingerprint, ControllerJournalError, ControllerJournalState,
             ControllerOperationId, ControllerRequestAuthPin,
             ControllerTenureAuthorityDomainFingerprint, controller_test_manifest,
-            tests::direct_active_snapshot,
+            tests::{decided_snapshot, direct_active_snapshot},
         };
         use crate::controller_store::{
             ControllerCommitFailpoint, ControllerFilesystemPolicy, ControllerStore,
@@ -2838,7 +2998,7 @@ mod platform {
             build_reference_empty_candidate, commit_reference_empty_in_store,
             fresh_apply_request_from_entropy, fresh_tenure_request_from_entropy, parse_arguments,
             parse_nonzero_hex, read_pinned_file, recover_tenure_request,
-            select_durable_tenure_request,
+            select_durable_tenure_request, validate_committed_empty_state,
         };
 
         static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -3046,6 +3206,20 @@ mod platform {
             assert_eq!(
                 parse_arguments(apply)
                     .expect_err("apply must reject caller operation/temporal/nonce entropy")
+                    .kind,
+                ProcessErrorKind::Arguments
+            );
+
+            let mut reconcile = bootstrap_arguments();
+            reconcile[0] = "reconcile-reference-once-v1".into();
+            assert!(matches!(
+                parse_arguments(reconcile.clone()),
+                Ok(ProcessCommand::ReconcileReferenceOnce(_))
+            ));
+            reconcile.push(hex(0x42, 16));
+            assert_eq!(
+                parse_arguments(reconcile)
+                    .expect_err("reconcile must reject caller query-id/nonce entropy")
                     .kind,
                 ProcessErrorKind::Arguments
             );
@@ -3521,6 +3695,42 @@ mod platform {
                     .expect("reopened snapshot"),
                 &committed,
                 "rejected operation must not mutate durable state"
+            );
+        }
+
+        #[test]
+        fn lost_direct_receipt_active_query_can_commit_empty() {
+            let terminal = decided_snapshot();
+            assert!(terminal.state().current_direct_terminal_receipt().is_none());
+            let operation = ControllerOperationId::from_bytes([0x33; 16]);
+            let candidate = build_reference_empty_candidate(terminal.state())
+                .expect("query-derived Active must plan an Empty successor");
+            let prepared = terminal
+                .clone()
+                .try_successor(
+                    terminal
+                        .state()
+                        .prepare_plan_candidate(operation, &candidate)
+                        .expect("query-derived Empty candidate must prepare"),
+                )
+                .expect("query-derived Empty prepared snapshot");
+            let committed = prepared
+                .clone()
+                .try_successor(
+                    prepared
+                        .state()
+                        .commit_plan_candidate(operation, &candidate)
+                        .expect("query-derived Active must archive and commit Empty"),
+                )
+                .expect("query-derived Empty committed snapshot");
+            assert_eq!(
+                validate_committed_empty_state(committed.state(), operation)
+                    .expect("query-derived Empty committed state"),
+                terminal
+                    .state()
+                    .current_signed_apply_intent()
+                    .expect("query-derived Active intent")
+                    .target_slice_digest()
             );
         }
 

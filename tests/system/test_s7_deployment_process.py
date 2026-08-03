@@ -208,6 +208,25 @@ class InstalledControllerProfile:
             str(runtime_gid),
         ]
 
+    def reconcile_command(
+        self,
+        store_instance_id: bytes,
+        *,
+        runtime_socket_path: Path | None = None,
+        runtime_uid: int | None = None,
+        runtime_gid: int | None = None,
+    ) -> list[str]:
+        command = self.apply_command(
+            store_instance_id,
+            runtime_socket_path=runtime_socket_path,
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
+        )
+        subcommand_index = len(self.service.command_prefix) + 1
+        assert command[subcommand_index] == "apply-reference-v1"
+        command[subcommand_index] = "reconcile-reference-once-v1"
+        return command
+
     def commit_empty_command(
         self,
         store_instance_id: bytes,
@@ -687,8 +706,50 @@ def _run_controller(
     return _run_text(command, cwd=profile.root)
 
 
+def _runtime_socket_identity(profile: InstalledControllerProfile) -> str | None:
+    observed = _run_text(
+        [
+            *profile.service.command_prefix,
+            "stat",
+            "-Lc",
+            "%d:%i:%z",
+            "--",
+            os.fspath(profile.runtime.provisioning.socket_path),
+        ],
+        cwd=profile.root,
+        timeout=2,
+    )
+    if observed.returncode != 0:
+        return None
+    identity = observed.stdout.strip()
+    assert identity and observed.stderr == ""
+    return identity
+
+
+def _runtime_socket_accepts_probe(profile: InstalledControllerProfile) -> bool:
+    probe = _run_text(
+        [
+            *profile.service.command_prefix,
+            os.fspath(Path(sys.executable).resolve()),
+            "-c",
+            (
+                "import socket,sys; "
+                "stream=socket.socket(socket.AF_UNIX); "
+                "stream.settimeout(1); stream.connect(sys.argv[1]); "
+                "stream.sendall(bytes(4)); stream.close()"
+            ),
+            os.fspath(profile.runtime.provisioning.socket_path),
+        ],
+        cwd=profile.root,
+        timeout=2,
+    )
+    return probe.returncode == 0
+
+
 def _wait_for_runtime_socket(
-    process: subprocess.Popen[str], profile: InstalledControllerProfile
+    process: subprocess.Popen[str],
+    profile: InstalledControllerProfile,
+    previous_socket_identity: str | None = None,
 ) -> None:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -711,7 +772,13 @@ def _wait_for_runtime_socket(
             timeout=2,
         )
         if observed.returncode == 0:
-            return
+            current_identity = _runtime_socket_identity(profile)
+            if (
+                current_identity is not None
+                and current_identity != previous_socket_identity
+                and _runtime_socket_accepts_probe(profile)
+            ):
+                return
         time.sleep(0.02)
     pytest.fail("Runtime bootstrap socket did not become ready")
 
@@ -752,6 +819,7 @@ def _runtime_server(
     command = profile.runtime_serve_command()
     subcommand_index = len(profile.runtime.service.command_prefix) + 1
     assert command[subcommand_index] == "serve-bootstrap-v1"
+    previous_socket_identity = _runtime_socket_identity(profile)
     process = subprocess.Popen(
         command,
         cwd=profile.root,
@@ -762,7 +830,7 @@ def _runtime_server(
         close_fds=True,
     )
     try:
-        _wait_for_runtime_socket(process, profile)
+        _wait_for_runtime_socket(process, profile, previous_socket_identity)
         yield process
     finally:
         if process.poll() is None:
@@ -856,6 +924,199 @@ def _authority_server(
             )
             process.kill()
             process.wait(timeout=5)
+
+
+def _initialize_and_commit_loop(profile: InstalledControllerProfile) -> bytes:
+    initialized = _run_controller(profile.initialize_command(), profile)
+    assert initialized.returncode == 0, initialized.stdout + initialized.stderr
+    assert initialized.stderr == ""
+    initialization = _receipt(initialized.stdout, "controller_initialize_v1")
+    store_instance_id = _hex_field(initialization, "store_instance_id", 32)
+
+    committed = _run_controller(
+        profile.commit_command(store_instance_id, definition_version=7), profile
+    )
+    assert committed.returncode == 0, committed.stdout + committed.stderr
+    assert committed.stderr == ""
+    commit = _receipt(committed.stdout, "controller_commit_reference_loop_v1")
+    assert commit["plan_revision"] == "1"
+    assert _hex_field(commit, "operation_id", 16) == OPERATION_ID
+    return store_instance_id
+
+
+def _bootstrap_runtime(
+    profile: InstalledControllerProfile, store_instance_id: bytes
+) -> dict[str, str]:
+    bootstrapped = _run_controller(profile.bootstrap_command(store_instance_id), profile)
+    assert bootstrapped.returncode == 0, bootstrapped.stdout + bootstrapped.stderr
+    assert bootstrapped.stderr == ""
+    receipt = _receipt(bootstrapped.stdout, "controller_bootstrap_runtime_v1")
+    assert _hex_field(receipt, "runtime_store_instance_id", 32) == profile.runtime_store_id
+    assert int(receipt["runtime_host_epoch"]) > 0
+    return receipt
+
+
+def _acquire_tenure(
+    profile: InstalledControllerProfile, store_instance_id: bytes
+) -> dict[str, str]:
+    with _authority_server(profile):
+        acquired = _run_controller(profile.acquire_tenure_command(store_instance_id), profile)
+    assert acquired.returncode == 0, acquired.stdout + acquired.stderr
+    assert acquired.stderr == ""
+    receipt = _receipt(acquired.stdout, "controller_acquire_tenure_v1")
+    assert receipt["writer_epoch"] == "1"
+    assert receipt["supersedes_through_epoch"] == "0"
+    return receipt
+
+
+def _kill_runtime_process_group(
+    profile: InstalledControllerProfile, process: subprocess.Popen[str]
+) -> None:
+    assert process.poll() is None
+    killed = _run_text(
+        [
+            "sudo",
+            "-n",
+            "/bin/kill",
+            "-s",
+            signal.SIGKILL.name,
+            "--",
+            f"-{process.pid}",
+        ],
+        cwd=profile.root,
+    )
+    assert killed.returncode == 0, killed.stdout + killed.stderr
+    stdout, stderr = process.communicate(timeout=8)
+    assert process.returncode not in {None, 0}, stdout + stderr
+
+
+@contextmanager
+def _runtime_request_sink(
+    profile: InstalledControllerProfile, *, expected_connections: int
+) -> Iterator[tuple[subprocess.Popen[str], Path]]:
+    runtime = profile.runtime.service
+    socket_path = profile.runtime.provisioning.socket_path
+    capture_directory = profile.root / "runtime-request-sink"
+    capture_path = capture_directory / "request-magics.txt"
+    _run_checked(
+        [
+            "sudo",
+            "-n",
+            "install",
+            "-d",
+            "-o",
+            str(runtime.uid),
+            "-g",
+            str(runtime.gid),
+            "-m",
+            "0700",
+            os.fspath(capture_directory),
+        ]
+    )
+    sink_source = """
+import os
+import socket
+import sys
+
+
+def read_exact(stream, length):
+    chunks = bytearray()
+    while len(chunks) < length:
+        chunk = stream.recv(length - len(chunks))
+        if not chunk:
+            raise EOFError(f"closed after {len(chunks)} of {length} bytes")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+socket_path, capture_path, connection_count = sys.argv[1:]
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    listener.bind(socket_path)
+    os.chmod(socket_path, 0o660)
+    listener.listen(1)
+    with open(capture_path, "wb", buffering=0) as capture:
+        captured = 0
+        while captured < int(connection_count):
+            stream, _ = listener.accept()
+            with stream:
+                length = int.from_bytes(read_exact(stream, 4), "big")
+                if length == 0:
+                    continue
+                payload = read_exact(stream, length)
+                capture.write(payload[:4].hex().encode("ascii") + b"\\n")
+                os.fsync(capture.fileno())
+                captured += 1
+finally:
+    listener.close()
+    try:
+        os.unlink(socket_path)
+    except FileNotFoundError:
+        pass
+"""
+    process = subprocess.Popen(
+        [
+            *runtime.command_prefix,
+            os.fspath(Path(sys.executable).resolve()),
+            "-c",
+            sink_source,
+            os.fspath(socket_path),
+            os.fspath(capture_path),
+            str(expected_connections),
+        ],
+        cwd=profile.root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        close_fds=True,
+    )
+    try:
+        _wait_for_runtime_socket(process, profile)
+        yield process, capture_path
+    finally:
+        if process.poll() is None:
+            subprocess.run(
+                [
+                    "sudo",
+                    "-n",
+                    "/bin/kill",
+                    "-s",
+                    signal.SIGTERM.name,
+                    "--",
+                    f"-{process.pid}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            subprocess.run(
+                [
+                    "sudo",
+                    "-n",
+                    "/bin/kill",
+                    "-s",
+                    signal.SIGKILL.name,
+                    "--",
+                    f"-{process.pid}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            process.wait(timeout=5)
+        _run_checked(["sudo", "-n", "rm", "-f", "--", os.fspath(socket_path)])
+
+
+def _request_magics(capture_path: Path) -> list[bytes]:
+    encoded = _root_read(capture_path).splitlines()
+    assert all(len(value) == 8 for value in encoded)
+    return [bytes.fromhex(value.decode("ascii")) for value in encoded]
 
 
 def test_real_deployment_process_initializes_commits_replays_and_rejects_conflict_without_mutation(
@@ -1474,4 +1735,132 @@ def test_real_deployment_process_initializes_commits_replays_and_rejects_conflic
     assert offline_empty_commit_replay.stderr == ""
     assert offline_empty_commit_replay.stdout == committed_empty.stdout
     assert _controller_store_bytes(profile) == empty_applied_store
+    _assert_only_controller_store_files(profile)
+
+
+def test_lost_runtime_response_reconcile_sends_one_query_and_no_additional_apply(
+    installed_controller_profile: InstalledControllerProfile,
+) -> None:
+    profile = installed_controller_profile
+    store_instance_id = _initialize_and_commit_loop(profile)
+    with _runtime_server(profile):
+        _bootstrap_runtime(profile, store_instance_id)
+    _acquire_tenure(profile, store_instance_id)
+
+    before_apply = _controller_store_bytes(profile)
+    with _runtime_request_sink(profile, expected_connections=2) as (
+        sink,
+        capture_path,
+    ):
+        lost_response = _run_controller(profile.apply_command(store_instance_id), profile)
+        assert lost_response.returncode != 0
+        assert lost_response.stdout == ""
+        assert lost_response.stderr == (
+            "paraegox-deploymentd failed closed; code=PXDC-APPLY-FAILED-CLOSED "
+            "stage=apply_reference\n"
+        )
+        after_lost_response = _controller_store_bytes(profile)
+        assert after_lost_response != before_apply
+
+        reconciled = _run_controller(profile.reconcile_command(store_instance_id), profile)
+        assert reconciled.returncode == 0, reconciled.stdout + reconciled.stderr
+        assert reconciled.stderr == ""
+        assert reconciled.stdout == "controller_reconcile_v1 outcome=uncertain\n"
+        after_reconcile = _controller_store_bytes(profile)
+        assert after_reconcile != after_lost_response
+
+        stdout, stderr = sink.communicate(timeout=5)
+        assert sink.returncode == 0, stdout + stderr
+        assert _request_magics(capture_path) == [b"PXAR", b"PXQR"]
+
+    _assert_only_controller_store_files(profile)
+
+
+def test_runtime_active_sigkill_restart_reconciles_new_epoch_then_empty_exact_zero(
+    installed_controller_profile: InstalledControllerProfile,
+) -> None:
+    profile = installed_controller_profile
+    store_instance_id = _initialize_and_commit_loop(profile)
+
+    with _runtime_server(profile) as runtime_process:
+        initial_bootstrap = _bootstrap_runtime(profile, store_instance_id)
+        initial_epoch = int(initial_bootstrap["runtime_host_epoch"])
+        _acquire_tenure(profile, store_instance_id)
+
+        applied = _run_controller(profile.apply_command(store_instance_id), profile)
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+        assert applied.stderr == ""
+        active_receipt = _receipt(applied.stdout, "controller_apply_reference_v1")
+        active_terminal_ref = _hex_field(active_receipt, "terminal_result_ref", 16)
+        assert active_receipt["terminal_outcome"] == "1"
+        assert active_receipt["terminal_head"] == "3"
+        assert int(active_receipt["completion_runtime_host_epoch"]) == initial_epoch
+
+        _kill_runtime_process_group(profile, runtime_process)
+
+    with _runtime_server(profile):
+        restarted_bootstrap = _bootstrap_runtime(profile, store_instance_id)
+        restarted_epoch = int(restarted_bootstrap["runtime_host_epoch"])
+        assert restarted_epoch == initial_epoch + 1
+
+        # The historical direct PXRT is evidence about the completed apply, not
+        # a substitute for querying the restarted Runtime's current live state.
+        runtime_socket = profile.runtime.provisioning.socket_path
+        before_blocked_query = _controller_store_bytes(profile)
+        _run_checked(["sudo", "-n", "chmod", "0600", os.fspath(runtime_socket)])
+        try:
+            blocked_query = _run_controller(
+                profile.reconcile_command(store_instance_id), profile
+            )
+            assert blocked_query.returncode == 0, (
+                blocked_query.stdout + blocked_query.stderr
+            )
+            assert blocked_query.stderr == ""
+            assert blocked_query.stdout == "controller_reconcile_v1 outcome=uncertain\n"
+            assert _controller_store_bytes(profile) != before_blocked_query
+        finally:
+            _run_checked(["sudo", "-n", "chmod", "0660", os.fspath(runtime_socket)])
+
+        active = _run_controller(profile.reconcile_command(store_instance_id), profile)
+        assert active.returncode == 0, active.stdout + active.stderr
+        assert active.stderr == ""
+        assert active.stdout == (
+            f"controller_reconcile_v1 outcome=active receipt={active_terminal_ref.hex()}\n"
+        )
+        active_decision_store = _controller_store_bytes(profile)
+
+        _run_checked(["sudo", "-n", "chmod", "0600", os.fspath(runtime_socket)])
+        try:
+            replayed_active = _run_controller(profile.reconcile_command(store_instance_id), profile)
+            assert replayed_active.returncode == 0, replayed_active.stdout + replayed_active.stderr
+            assert replayed_active.stderr == ""
+            assert replayed_active.stdout == active.stdout
+            assert _controller_store_bytes(profile) == active_decision_store
+        finally:
+            _run_checked(["sudo", "-n", "chmod", "0660", os.fspath(runtime_socket)])
+
+        committed_empty = _run_controller(profile.commit_empty_command(store_instance_id), profile)
+        assert committed_empty.returncode == 0, committed_empty.stdout + committed_empty.stderr
+        assert committed_empty.stderr == ""
+        empty_commit = _receipt(committed_empty.stdout, "controller_commit_reference_empty_v1")
+        assert empty_commit["plan_revision"] == "2"
+
+        applied_empty = _run_controller(profile.apply_command(store_instance_id), profile)
+        assert applied_empty.returncode == 0, applied_empty.stdout + applied_empty.stderr
+        assert applied_empty.stderr == ""
+        empty_receipt = _receipt(applied_empty.stdout, "controller_apply_reference_v1")
+        empty_terminal_ref = _hex_field(empty_receipt, "terminal_result_ref", 16)
+        empty_slice_digest = _hex_field(empty_receipt, "target_slice_digest", 32)
+        assert empty_receipt["source_plan_revision"] == "2"
+        assert empty_receipt["terminal_outcome"] == "2"
+        assert empty_receipt["terminal_head"] == "3"
+        assert _hex_field(empty_receipt, "desired_head_digest", 32) == empty_slice_digest
+
+        retired = _run_controller(profile.reconcile_command(store_instance_id), profile)
+        assert retired.returncode == 0, retired.stdout + retired.stderr
+        assert retired.stderr == ""
+        assert retired.stdout == (
+            f"controller_reconcile_v1 outcome=retired receipt={empty_terminal_ref.hex()}\n"
+        )
+
     _assert_only_controller_store_files(profile)

@@ -264,7 +264,7 @@ where
         if current.response.is_some()
             || current.closure.is_some()
             || !before.state().current_query_is_open()
-            || before.state().current_apply_is_terminal()
+            || before.state().current_query_decision_is_terminal()
         {
             return Err(ControllerQueryError::RecoveredQueryEvidenceChanged);
         }
@@ -350,7 +350,7 @@ pub(crate) async fn query_reference_once_v1(
     .await
 }
 
-async fn query_reference_once_v1_with<Exchange, ExchangeFuture, Commit>(
+pub(crate) async fn query_reference_once_v1_with<Exchange, ExchangeFuture, Commit>(
     store: &mut ControllerStore,
     prepared: PreparedControllerQueryAttemptV1,
     exchange: Exchange,
@@ -455,7 +455,7 @@ where
     let committed = store.snapshot()?.clone();
     let completion = query_completion_from_snapshot(&committed, false)?;
     if completion.response() != response {
-        return Err(ControllerReferenceQueryError::ValidatedResponseMismatch);
+        return Err(ControllerReferenceQueryError::DurableResponseCompletionMismatch);
     }
     Ok(completion)
 }
@@ -673,7 +673,9 @@ fn validate_resident_query_attempt(
     {
         return Err(ControllerQueryError::PreparedAttemptMismatch);
     }
-    if !snapshot.state().current_query_is_open() || snapshot.state().current_apply_is_terminal() {
+    if !snapshot.state().current_query_is_open()
+        || snapshot.state().current_query_decision_is_terminal()
+    {
         return Err(ControllerQueryError::PreparedAttemptNoLongerOpen);
     }
     Ok(())
@@ -776,6 +778,7 @@ pub(crate) enum ControllerReferenceQueryError {
         store: ControllerStoreError,
     },
     ValidatedResponseMismatch,
+    DurableResponseCompletionMismatch,
     VerifiedResponsePersistence {
         response_digest: paraegox_kernel::digest::Digest32,
         store: ControllerStoreError,
@@ -808,6 +811,17 @@ impl fmt::Display for ControllerReferenceQueryError {
 
 impl std::error::Error for ControllerReferenceQueryError {}
 
+impl ControllerReferenceQueryError {
+    /// Reports only failures whose exact no-response closure is already
+    /// durable.  A one-shot reconciler may safely surface these as
+    /// `Uncertain`; every persistence or post-commit ambiguity remains a hard
+    /// fail-closed error.
+    #[must_use]
+    pub(crate) const fn has_durable_no_response_closure(&self) -> bool {
+        matches!(self, Self::Exchange(_) | Self::ValidatedResponseMismatch)
+    }
+}
+
 const fn bytes_are_zero(bytes: &[u8]) -> bool {
     let mut index = 0;
     while index < bytes.len() {
@@ -820,7 +834,7 @@ const fn bytes_are_zero(bytes: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::Cell;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -842,7 +856,8 @@ mod tests {
 
     use crate::controller_journal::{
         ControllerAuthKeyFingerprint, ControllerJournalError, ControllerJournalSnapshot,
-        ControllerQueryClosureKind, ControllerRequestAuthPin, tests::signed_snapshot,
+        ControllerQueryClosureKind, ControllerRequestAuthPin,
+        tests::{canonical_empty_signed_snapshot, canonical_signed_snapshot, signed_snapshot},
     };
     use crate::controller_store::{
         ControllerCommitFailpoint, ControllerFilesystemPolicy, ControllerStore,
@@ -898,8 +913,19 @@ mod tests {
         }
     }
 
-    fn query_ready_snapshot() -> ControllerJournalSnapshot {
-        let signed = signed_snapshot();
+    pub(crate) fn query_ready_snapshot() -> ControllerJournalSnapshot {
+        query_ready_from(canonical_signed_snapshot(0x67))
+    }
+
+    pub(crate) fn query_ready_empty_snapshot() -> ControllerJournalSnapshot {
+        query_ready_from(canonical_empty_signed_snapshot(0x77))
+    }
+
+    pub(crate) fn invalid_query_ready_snapshot() -> ControllerJournalSnapshot {
+        query_ready_from(signed_snapshot())
+    }
+
+    fn query_ready_from(signed: ControllerJournalSnapshot) -> ControllerJournalSnapshot {
         let signer = SigningKey::from_bytes(&CONTROLLER_SEED);
         let fingerprint = ed25519_control_key_fingerprint(signer.verifying_key().as_bytes())
             .unwrap_or_else(|error| panic!("Controller fingerprint failed: {error}"));

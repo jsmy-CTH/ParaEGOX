@@ -14,9 +14,12 @@ RUNTIME_SRC = RUNTIME_ROOT / "src"
 INTERNAL_DEPLOYMENT_MODULES = (
     "controller_initializer",
     "controller_journal",
+    "controller_query",
+    "controller_reconcile",
     "controller_store",
     "controller_tenure",
     "manifest_ingress",
+    "runtime_control_client",
     "tenure_authority",
     "tenure_client",
     "tenure_protocol",
@@ -95,7 +98,8 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         (
             "paraegox-deploymentd initialize-reference-v1/commit-reference-loop-v1/"
             "commit-reference-empty-v1/acquire-tenure-v1/bootstrap-runtime-v1/"
-            "apply-reference-v1/migrate-controller-journal-v7-to-v8-v1 CLI"
+            "apply-reference-v1/reconcile-reference-once-v1/"
+            "migrate-controller-journal-v7-to-v8-v1 CLI"
         ),
     ]
     assert package["consumers"] == [
@@ -110,14 +114,15 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         "acquire-tenure-v1",
         "bootstrap-runtime-v1",
         "apply-reference-v1",
+        "reconcile-reference-once-v1",
         "migrate-controller-journal-v7-to-v8-v1",
     ):
         assert command in package["responsibility"]
     assert "exact signed PXAR before one direct Runtime send" in package["responsibility"]
     assert "strictly correlated Runtime-signed PXRT" in package["responsibility"]
-    assert "Tenure, terminal apply, and committed Empty-plan replays" in package[
-        "responsibility"
-    ]
+    assert "Tenure, terminal apply, terminal reconcile, and committed Empty-plan replays" in (
+        package["responsibility"]
+    )
     assert "Loop-plan replay is byte-identical only while" in package["responsibility"]
     assert "bootstrap refresh may legitimately pin a newer Runtime epoch" in package[
         "responsibility"
@@ -125,8 +130,14 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
     assert "committed at 1ed704c" in package["responsibility"]
     assert "verified by Ubuntu CI run 30748840399" in package["responsibility"]
     assert "owner-private exact PXQR/PXQS" in package["responsibility"]
-    assert "executable Runtime-query/reconciliation path" in package["responsibility"]
-    assert "remain absent" in package["responsibility"]
+    assert "commits an authenticated PXQS before its separately durable typed decision" in package[
+        "responsibility"
+    ]
+    assert "never sends PXAR" in package["responsibility"]
+    assert "continuous reconciler" in package["responsibility"]
+    assert "general workload admission and wider deployment profiles remain absent" in package[
+        "responsibility"
+    ]
     assert "Runtime alone owns fixed-profile Loop/Empty restart reassembly" in package[
         "responsibility"
     ]
@@ -151,23 +162,32 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         "acquire-tenure-v1",
         "bootstrap-runtime-v1",
         "apply-reference-v1",
+        "reconcile-reference-once-v1",
         "migrate-controller-journal-v7-to-v8-v1",
     ):
         assert command in compatibility
-    assert "no executable Runtime-query command" in compatibility
-    assert "Controller reconcile loop" in compatibility
+    assert "commits an exact validated PXQS before a separate" in compatibility
+    assert "sends no PXAR" in compatibility
+    assert "no daemon or continuous reconcile loop" in compatibility
+    assert (
+        "A current terminal decision or response-only recovery uses no network or fresh entropy"
+        in compatibility
+    )
+    assert "only a later invocation may create and send one fresh attempt" in compatibility
     assert "second restart authority" in compatibility
     assert (
         "Fixed-profile Loop/Empty restart reassembly remains exclusively Runtime-owned"
         in compatibility
     )
-    assert "communicate over a real strict versioned wire" in compatibility
+    assert "communicate over real strict versioned wires" in compatibility
 
     waiver_reasons = {
         waiver["id"]: waiver["reason"] for waiver in governance["waivers"]
     }
     assert "exact one-shot deploymentd consumers" in waiver_reasons["GOV-WAIVER-0002"]
-    assert "cross-process wires are executable" in waiver_reasons["GOV-WAIVER-0002"]
+    assert "exact `reconcile-reference-once-v1` executable consumer" in waiver_reasons[
+        "GOV-WAIVER-0002"
+    ]
     assert "three distinct non-root Runtime, Controller, and Authority" in waiver_reasons[
         "GOV-WAIVER-0009"
     ]
@@ -175,6 +195,8 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         "GOV-WAIVER-0009"
     ]
     assert "372 pytest passes and no skips" in waiver_reasons["GOV-WAIVER-0009"]
+    assert "remain pending a fresh Ubuntu CI run" in waiver_reasons["GOV-WAIVER-0009"]
+    assert "not claimed Linux-validated here" in waiver_reasons["GOV-WAIVER-0009"]
 
     forbidden_claims = {
         "AcquireTenureRequestV1",
@@ -208,7 +230,7 @@ def test_authority_cli_has_no_environment_secret_or_production_test_backdoor() -
     assert "AcquireTenureResponseV1" not in binary
 
 
-def test_s7_f_query_contracts_are_registered_without_claiming_an_endpoint() -> None:
+def test_s7_f_query_contracts_are_registered_with_exact_endpoint_consumers() -> None:
     governance = _load_toml(REPO_ROOT / "governance.toml")["registry"]
     package = next(
         package
@@ -234,7 +256,8 @@ def test_s7_f_query_contracts_are_registered_without_claiming_an_endpoint() -> N
         "ReferenceQueryFactsV1",
     }.issubset(symbols)
     assert "cannot recover or fabricate missing provenance" in api["compatibility"]
-    assert "do not claim that a Runtime endpoint" in api["compatibility"]
+    assert "Runtime's authenticated local endpoint" in api["compatibility"]
+    assert "deploymentd's bounded one-shot reconciler" in api["compatibility"]
 
 
 def test_exact_process_binaries_are_thin_and_runtime_control_stays_behind_runtimehost() -> None:
@@ -318,7 +341,8 @@ def test_s7_runtime_store_query_and_migration_stay_private_behind_real_entrypoin
     ]
     assert "Runtime-signed and request-correlated PXQS" in runtime_package["responsibility"]
     assert "canonical Runtime-signed PXRT terminal Receipt" in runtime_package["responsibility"]
-    assert "Executable Controller query/reconciliation" in runtime_package["responsibility"]
+    assert "deploymentd facade now consumes PXQR/PXQS" in runtime_package["responsibility"]
+    assert "continuous Controller reconciler" in runtime_package["responsibility"]
     assert "remain unimplemented" in runtime_package["responsibility"]
     assert "Before a listener capability exists" in runtime_package["responsibility"]
     assert "fixed-profile startup" in runtime_package["responsibility"]

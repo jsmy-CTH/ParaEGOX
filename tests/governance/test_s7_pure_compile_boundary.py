@@ -184,7 +184,8 @@ def test_s7_c_pure_compile_types_remain_private_behind_exact_process_facades() -
         (
             "paraegox-deploymentd initialize-reference-v1/commit-reference-loop-v1/"
             "commit-reference-empty-v1/acquire-tenure-v1/bootstrap-runtime-v1/"
-            "apply-reference-v1/migrate-controller-journal-v7-to-v8-v1 CLI"
+            "apply-reference-v1/reconcile-reference-once-v1/"
+            "migrate-controller-journal-v7-to-v8-v1 CLI"
         ),
     ]
     assert deployment_row["consumers"] == [

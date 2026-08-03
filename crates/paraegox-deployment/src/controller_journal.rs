@@ -13,12 +13,18 @@ use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::{ClockDomainRef, ClockGeneration};
 use paraegox_runtime_contracts::apply::{ApplyOperationId, PlanWriterRef, WriterTenureProof};
 use paraegox_runtime_contracts::installation::MAX_INSTALLED_RUNTIME_MANIFEST_BYTES;
-use paraegox_runtime_contracts::provenance::{SourcePlanDigest, TargetSliceDigest};
+use paraegox_runtime_contracts::provenance::{
+    SourcePlanDigest, SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetSliceDigest,
+};
 use paraegox_runtime_contracts::reference_control::{
     MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, MAX_REFERENCE_QUERY_REQUEST_BYTES,
-    MAX_REFERENCE_QUERY_RESPONSE_BYTES, ReferenceApplyRequestV1, ReferenceApplyTerminalReceiptV1,
-    ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1, ReferenceChannelBindingV1,
-    ReferenceControlError, ReferenceQueryIdV1, ReferenceQueryRequestV1, ReferenceQueryResponseV1,
+    MAX_REFERENCE_QUERY_RESPONSE_BYTES, ReferenceApplyRequestV1, ReferenceApplyTerminalHeadV1,
+    ReferenceApplyTerminalLifecycleEffectV1, ReferenceApplyTerminalOutcomeV1,
+    ReferenceApplyTerminalReceiptV1, ReferenceAssemblyModeV1, ReferenceBootstrapResponseV1,
+    ReferenceBootstrapServingIdentityV1, ReferenceChannelBindingV1, ReferenceControlError,
+    ReferenceQueryDesiredHeadV1, ReferenceQueryDurablePhaseV1, ReferenceQueryIdV1,
+    ReferenceQueryLiveStateV1, ReferenceQueryOperationLookupV1, ReferenceQueryOwnerStateV1,
+    ReferenceQueryRequestV1, ReferenceQueryResponseV1,
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
@@ -875,6 +881,8 @@ impl ControllerPreparedQuery {
         intent: &ControllerSignedApplyIntent,
     ) -> Result<Self, ControllerJournalError> {
         let decoded = ReferenceQueryRequestV1::decode(request.canonical_wire())?;
+        let apply = ReferenceApplyRequestV1::decode(intent.signed_request())
+            .map_err(|_| ControllerJournalError::InvalidQueryRequest)?;
         let claim = request.authentication().claim();
         let runtime_response_auth = binding.runtime_response_auth();
         let request_time_channel = runtime_response_auth.channel(binding.target())?;
@@ -897,9 +905,8 @@ impl ControllerPreparedQuery {
             || request.source_scope() != source_scope
             || request.expected_runtime_store_instance_id() != binding.runtime_store_instance_id()
             || request.requested_operation_id() != intent.apply_operation()
-            || request
-                .expected_request_digest()
-                .is_some_and(|digest| digest != intent.request_digest().value())
+            || request.expected_request_digest() != Some(intent.request_digest().value())
+            || claim.principal() != apply.authentication().claim().principal()
             || claim.key() != request_auth.key()
             || claim.algorithm() != request_auth.algorithm()
             || claim.algorithm_version() != request_auth.algorithm_version()
@@ -931,6 +938,8 @@ impl ControllerPreparedQuery {
         intent: &ControllerSignedApplyIntent,
     ) -> Result<(), ControllerJournalError> {
         let decoded = ReferenceQueryRequestV1::decode(self.request.canonical_wire())?;
+        let apply = ReferenceApplyRequestV1::decode(intent.signed_request())
+            .map_err(|_| ControllerJournalError::InvalidQueryRequest)?;
         let claim = self.request.authentication().claim();
         if decoded != self.request
             || self.request.canonical_wire().is_empty()
@@ -942,10 +951,8 @@ impl ControllerPreparedQuery {
             || self.request.expected_runtime_store_instance_id()
                 != binding.runtime_store_instance_id()
             || self.request.requested_operation_id() != intent.apply_operation()
-            || self
-                .request
-                .expected_request_digest()
-                .is_some_and(|digest| digest != intent.request_digest().value())
+            || self.request.expected_request_digest() != Some(intent.request_digest().value())
+            || claim.principal() != apply.authentication().claim().principal()
             || claim.key() != self.request_auth.key()
             || claim.algorithm() != self.request_auth.algorithm()
             || claim.algorithm_version() != self.request_auth.algorithm_version()
@@ -1082,6 +1089,14 @@ impl ControllerRolloutDecision {
             }
             _ => {}
         }
+        if let (
+            ControllerObservedTarget::Active | ControllerObservedTarget::Retired,
+            Some(terminal_receipt),
+        ) = (observed, receipt)
+            && !terminal_decision_matches_observation(observation, observed, terminal_receipt)
+        {
+            return Err(ControllerJournalError::InvalidRolloutEvidence);
+        }
         Ok(Self {
             query_id: observation.response.query_id(),
             query_snapshot_sequence: observation.query_snapshot_sequence(),
@@ -1096,6 +1111,40 @@ impl ControllerRolloutDecision {
             ControllerObservedTarget::Active | ControllerObservedTarget::Retired
         ) && self.receipt.is_some()
     }
+}
+
+fn terminal_decision_matches_observation(
+    observation: &ControllerQueryObservation,
+    observed: ControllerObservedTarget,
+    receipt: ControllerReceiptRef,
+) -> bool {
+    let facts = observation.response().facts();
+    if facts.operation().owner_state() != ReferenceQueryOwnerStateV1::Operational {
+        return false;
+    }
+    let ReferenceQueryOperationLookupV1::Known {
+        durable_phase: ReferenceQueryDurablePhaseV1::Terminal,
+        terminal_result: Some(result),
+        ..
+    } = facts.operation().lookup()
+    else {
+        return false;
+    };
+    if result.as_bytes() != receipt.as_bytes() {
+        return false;
+    }
+    matches!(
+        (observed, facts.desired().head(), facts.live().state()),
+        (
+            ControllerObservedTarget::Active,
+            ReferenceQueryDesiredHeadV1::OneSourceLoop { .. },
+            ReferenceQueryLiveStateV1::LiveReady,
+        ) | (
+            ControllerObservedTarget::Retired,
+            ReferenceQueryDesiredHeadV1::EmptyDeactivate { .. },
+            ReferenceQueryLiveStateV1::ExactZero,
+        )
+    )
 }
 
 /// Stable reason that one durable PXQR ended without an authenticated PXQS.
@@ -1140,7 +1189,15 @@ impl ControllerReconcileAttempt {
             (Some(observation), Some(decision))
                 if decision.query_id != observation.response.query_id()
                     || decision.query_snapshot_sequence
-                        != observation.query_snapshot_sequence() =>
+                        != observation.query_snapshot_sequence()
+                    || (decision.is_terminal()
+                        && !terminal_decision_matches_observation(
+                            observation,
+                            decision.observed,
+                            decision
+                                .receipt
+                                .ok_or(ControllerJournalError::DanglingRolloutDecision)?,
+                        )) =>
             {
                 return Err(ControllerJournalError::DanglingRolloutDecision);
             }
@@ -1248,24 +1305,46 @@ impl ControllerRolloutRecord {
             {
                 return Err(ControllerJournalError::DanglingQueryObservation);
             }
-            if attempt
-                .decision
-                .is_some_and(|decision| decision.is_terminal())
-                && index + 1 != self.reconcile_attempts.len()
+        }
+        if let (Some(direct), Some(decision)) = (
+            self.direct_terminal_receipt.as_ref(),
+            self.reconcile_attempts
+                .last()
+                .and_then(|attempt| attempt.decision),
+        ) {
+            if decision.is_terminal() && !direct_terminal_decision_matches(direct, decision) {
+                return Err(ControllerJournalError::ConflictingTerminalEvidence);
+            }
+            if decision.observed == ControllerObservedTarget::Prepared
+                && !direct_follows_prepared_query(
+                    direct,
+                    self.reconcile_attempts
+                        .last()
+                        .ok_or(ControllerJournalError::DanglingRolloutDecision)?,
+                    decision,
+                )
             {
-                return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
+                return Err(ControllerJournalError::ConflictingTerminalEvidence);
             }
         }
-        if self.direct_terminal_receipt.is_some()
-            && self
-                .reconcile_attempts
-                .last()
-                .and_then(|attempt| attempt.decision)
-                .is_some_and(ControllerRolloutDecision::is_terminal)
+        if let Some(direct) = self.direct_terminal_receipt.as_ref()
+            && self.reconcile_attempts.iter().any(|attempt| {
+                attempt.decision.is_some()
+                    && attempt_has_conflicting_terminal_observation(direct, attempt)
+            })
         {
             return Err(ControllerJournalError::ConflictingTerminalEvidence);
         }
         Ok(())
+    }
+
+    fn has_conflicting_terminal_observation(&self) -> bool {
+        let Some(direct) = self.direct_terminal_receipt.as_ref() else {
+            return false;
+        };
+        self.reconcile_attempts
+            .iter()
+            .any(|attempt| attempt_has_conflicting_terminal_observation(direct, attempt))
     }
 
     fn is_terminal(&self) -> bool {
@@ -1276,6 +1355,200 @@ impl ControllerRolloutRecord {
                 .and_then(|attempt| attempt.decision)
                 .is_some_and(ControllerRolloutDecision::is_terminal)
     }
+}
+
+fn attempt_has_conflicting_terminal_observation(
+    direct: &ControllerDirectTerminalReceipt,
+    attempt: &ControllerReconcileAttempt,
+) -> bool {
+    let Some(observation) = attempt.observation.as_ref() else {
+        return false;
+    };
+    let ReferenceQueryOperationLookupV1::Known {
+        durable_phase: ReferenceQueryDurablePhaseV1::Terminal,
+        terminal_result: Some(queried),
+        ..
+    } = observation.response().facts().operation().lookup()
+    else {
+        return false;
+    };
+    queried.as_bytes() != direct.receipt().facts().terminal_result_ref().as_bytes()
+}
+
+fn rollout_permits_plan_advance(
+    rollout: &ControllerRolloutRecord,
+    binding: &ControllerTargetBinding,
+) -> Result<bool, ControllerJournalError> {
+    if rollout.has_conflicting_terminal_observation() {
+        return Err(ControllerJournalError::ConflictingTerminalEvidence);
+    }
+    let current_epoch = binding.last_runtime_host_epoch;
+    let latest = rollout.reconcile_attempts.last();
+    let Some(direct) = rollout.direct_terminal_receipt.as_ref() else {
+        return Ok(latest.is_some_and(|attempt| {
+            let Some(observation) = attempt.observation.as_ref() else {
+                return false;
+            };
+            attempt
+                .decision
+                .is_some_and(ControllerRolloutDecision::is_terminal)
+                && observation
+                    .response()
+                    .facts()
+                    .serving()
+                    .runtime_host_epoch()
+                    >= current_epoch
+        }));
+    };
+    if !direct_terminal_is_success(direct, &rollout.signed_intent) {
+        return Ok(false);
+    }
+
+    let direct_epoch = direct.receipt().facts().completion_runtime_host_epoch();
+    if direct_epoch > current_epoch {
+        return Ok(false);
+    }
+    if direct_epoch == current_epoch && latest.is_none() {
+        return Ok(true);
+    }
+    let Some(latest) = latest else {
+        return Ok(false);
+    };
+    if latest.closure.is_some() || latest.observation.is_none() || latest.decision.is_none() {
+        return Ok(false);
+    }
+    if direct_epoch < current_epoch {
+        return Ok(terminal_attempt_matches_current_direct(
+            direct,
+            latest,
+            current_epoch,
+        ));
+    }
+    if direct_follows_query_observation(direct, latest) {
+        return Ok(true);
+    }
+    Ok(terminal_attempt_matches_current_direct(
+        direct,
+        latest,
+        current_epoch,
+    ))
+}
+
+fn direct_terminal_is_success(
+    direct: &ControllerDirectTerminalReceipt,
+    intent: &ControllerSignedApplyIntent,
+) -> bool {
+    let Ok(apply) = ReferenceApplyRequestV1::decode(&intent.signed_request) else {
+        return false;
+    };
+    let facts = direct.receipt().facts();
+    if facts.head() != ReferenceApplyTerminalHeadV1::CommittedIncoming
+        || facts.desired_head_digest() != Some(intent.target_slice_digest)
+    {
+        return false;
+    }
+    match (apply.target_execution().mode(), facts.outcome()) {
+        (
+            ReferenceAssemblyModeV1::OneSourceLoop,
+            ReferenceApplyTerminalOutcomeV1::OneSourceLoopActive,
+        ) => facts.lifecycle_effect() == ReferenceApplyTerminalLifecycleEffectV1::MayHaveStarted,
+        (
+            ReferenceAssemblyModeV1::EmptyDeactivate,
+            ReferenceApplyTerminalOutcomeV1::EmptyDeactivateExactZero,
+        ) => true,
+        _ => false,
+    }
+}
+
+fn terminal_attempt_matches_current_direct(
+    direct: &ControllerDirectTerminalReceipt,
+    attempt: &ControllerReconcileAttempt,
+    current_epoch: u64,
+) -> bool {
+    let Some(observation) = attempt.observation.as_ref() else {
+        return false;
+    };
+    let Some(decision) = attempt.decision else {
+        return false;
+    };
+    if !decision.is_terminal() || !direct_terminal_decision_matches(direct, decision) {
+        return false;
+    }
+    let serving = observation.response().facts().serving();
+    let terminal = direct.receipt().facts();
+    serving.runtime_host_epoch() >= current_epoch
+        && (serving.runtime_host_epoch() != terminal.completion_runtime_host_epoch()
+            || serving.snapshot_sequence() >= terminal.completion_snapshot_sequence())
+}
+
+fn direct_terminal_decision_matches(
+    direct: &ControllerDirectTerminalReceipt,
+    decision: ControllerRolloutDecision,
+) -> bool {
+    let facts = direct.receipt().facts();
+    let expected_observed = match facts.outcome() {
+        ReferenceApplyTerminalOutcomeV1::OneSourceLoopActive => ControllerObservedTarget::Active,
+        ReferenceApplyTerminalOutcomeV1::EmptyDeactivateExactZero => {
+            ControllerObservedTarget::Retired
+        }
+        _ => return false,
+    };
+    decision.observed == expected_observed
+        && decision.receipt
+            == Some(ControllerReceiptRef::from_bytes(
+                *facts.terminal_result_ref().as_bytes(),
+            ))
+}
+
+fn terminal_query_decision_is_current(
+    attempt: &ControllerReconcileAttempt,
+    binding: &ControllerTargetBinding,
+) -> bool {
+    attempt
+        .decision
+        .is_some_and(ControllerRolloutDecision::is_terminal)
+        && attempt.observation.as_ref().is_some_and(|observation| {
+            observation
+                .response()
+                .facts()
+                .serving()
+                .runtime_host_epoch()
+                >= binding.last_runtime_host_epoch
+        })
+}
+
+fn direct_follows_prepared_query(
+    direct: &ControllerDirectTerminalReceipt,
+    attempt: &ControllerReconcileAttempt,
+    decision: ControllerRolloutDecision,
+) -> bool {
+    decision.query_snapshot_sequence
+        == attempt
+            .observation
+            .as_ref()
+            .map_or(0, ControllerQueryObservation::query_snapshot_sequence)
+        && direct_follows_query_observation(direct, attempt)
+}
+
+fn direct_follows_query_observation(
+    direct: &ControllerDirectTerminalReceipt,
+    attempt: &ControllerReconcileAttempt,
+) -> bool {
+    let receipt = direct.receipt();
+    let request = attempt.prepared.request();
+    let Some(observation) = attempt.observation.as_ref() else {
+        return false;
+    };
+    let serving = observation.response().facts().serving();
+    let terminal = receipt.facts();
+    request.target() == receipt.target()
+        && request.expected_runtime_store_instance_id() == receipt.runtime_store_instance_id()
+        && request.requested_operation_id() == receipt.operation_id()
+        && request.expected_request_digest() == Some(receipt.request_digest())
+        && serving.target() == receipt.target()
+        && serving.runtime_store_instance_id() == receipt.runtime_store_instance_id()
+        && serving.runtime_host_epoch() == terminal.completion_runtime_host_epoch()
+        && observation.query_snapshot_sequence() < terminal.completion_snapshot_sequence()
 }
 
 /// Durable phase of one exact Controller-to-Authority tenure exchange.
@@ -1936,11 +2209,12 @@ impl ControllerJournalState {
                 Err(ControllerJournalError::DirectTerminalReceiptChanged)
             };
         }
-        if rollout
+        if let Some(decision) = rollout
             .reconcile_attempts
             .last()
             .and_then(|attempt| attempt.decision)
-            .is_some_and(ControllerRolloutDecision::is_terminal)
+            .filter(|decision| decision.is_terminal())
+            && !direct_terminal_decision_matches(&direct, decision)
         {
             return Err(ControllerJournalError::ConflictingTerminalEvidence);
         }
@@ -1972,9 +2246,6 @@ impl ControllerJournalState {
             .rollout
             .clone()
             .ok_or(ControllerJournalError::DanglingRollout)?;
-        if rollout.direct_terminal_receipt.is_some() {
-            return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
-        }
         let source_scope = paraegox_runtime_contracts::provenance::SourceScopeRef::from_bytes(
             *self.scope.as_bytes(),
         );
@@ -2026,10 +2297,7 @@ impl ControllerJournalState {
             {
                 return Err(ControllerJournalError::DanglingQueryObservation);
             }
-            if previous
-                .decision
-                .is_some_and(ControllerRolloutDecision::is_terminal)
-            {
+            if terminal_query_decision_is_current(previous, binding) {
                 return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
             }
         }
@@ -2068,9 +2336,6 @@ impl ControllerJournalState {
             .rollout
             .clone()
             .ok_or(ControllerJournalError::DanglingRollout)?;
-        if rollout.direct_terminal_receipt.is_some() {
-            return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
-        }
         let attempt_index = rollout
             .reconcile_attempts
             .len()
@@ -2128,9 +2393,6 @@ impl ControllerJournalState {
             .rollout
             .clone()
             .ok_or(ControllerJournalError::DanglingRollout)?;
-        if rollout.direct_terminal_receipt.is_some() {
-            return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
-        }
         let attempt = rollout
             .reconcile_attempts
             .last_mut()
@@ -2169,7 +2431,7 @@ impl ControllerJournalState {
             .rollout
             .clone()
             .ok_or(ControllerJournalError::DanglingRollout)?;
-        if rollout.direct_terminal_receipt.is_some() {
+        if rollout.has_conflicting_terminal_observation() {
             return Err(ControllerJournalError::ConflictingTerminalEvidence);
         }
         let attempt = rollout
@@ -2184,6 +2446,17 @@ impl ControllerJournalState {
             .as_ref()
             .ok_or(ControllerJournalError::QueryNotCommittedBeforeDecision)?;
         let decision = ControllerRolloutDecision::try_new(observation, observed, receipt)?;
+        if let Some(direct) = rollout.direct_terminal_receipt.as_ref() {
+            if decision.is_terminal() {
+                if !direct_terminal_decision_matches(direct, decision) {
+                    return Err(ControllerJournalError::ConflictingTerminalEvidence);
+                }
+            } else if observed == ControllerObservedTarget::Prepared
+                && !direct_follows_prepared_query(direct, attempt, decision)
+            {
+                return Err(ControllerJournalError::ConflictingTerminalEvidence);
+            }
+        }
         if let Some(previous) = attempt.decision {
             return if previous == decision {
                 Ok(self.clone())
@@ -2263,7 +2536,11 @@ impl ControllerJournalState {
         let Some(rollout) = &self.rollout else {
             return Ok(self.apply_history.to_vec());
         };
-        if !rollout.is_terminal() {
+        let binding = self
+            .target_binding
+            .as_ref()
+            .ok_or(ControllerJournalError::DanglingRollout)?;
+        if !rollout_permits_plan_advance(rollout, binding)? {
             return Err(ControllerJournalError::NonTerminalRolloutBlocksPlanCommit);
         }
         if self.apply_history.len() == MAX_APPLY_OPERATION_HISTORY {
@@ -2389,6 +2666,20 @@ impl ControllerJournalState {
             .is_some_and(|attempt| attempt.decision.is_some())
     }
 
+    /// Reports only a terminal query-derived decision. A direct PXRT remains
+    /// historical operation evidence and does not suppress a fresh current-
+    /// epoch PXQR.
+    #[must_use]
+    pub(crate) fn current_query_decision_is_terminal(&self) -> bool {
+        let Some(binding) = self.target_binding.as_ref() else {
+            return false;
+        };
+        self.rollout
+            .as_ref()
+            .and_then(|rollout| rollout.reconcile_attempts.last())
+            .is_some_and(|attempt| terminal_query_decision_is_current(attempt, binding))
+    }
+
     /// Reports whether the current exact apply operation already has durable
     /// terminal evidence. Callers must suppress any second transport send.
     #[must_use]
@@ -2410,6 +2701,48 @@ impl ControllerJournalState {
             .map(ControllerDirectTerminalReceipt::receipt)
     }
 
+    /// Returns the exact active desired Slice only when the current rollout is
+    /// independently eligible to advance the plan. Direct PXRT remains
+    /// separately available for audit; a lost PXRT can be replaced only by an
+    /// exact current-epoch terminal Active query decision.
+    pub(crate) fn current_active_target_slice_digest_for_plan_advance(
+        &self,
+    ) -> Result<Option<TargetSliceDigest>, ControllerJournalError> {
+        let Some(rollout) = self.rollout.as_ref() else {
+            return Ok(None);
+        };
+        let binding = self
+            .target_binding
+            .as_ref()
+            .ok_or(ControllerJournalError::DanglingRollout)?;
+        if !rollout_permits_plan_advance(rollout, binding)? {
+            return Ok(None);
+        }
+        if let Some(attempt) = rollout.reconcile_attempts.last()
+            && attempt.decision.is_some_and(|decision| {
+                decision.is_terminal() && decision.observed == ControllerObservedTarget::Active
+            })
+            && let Some(ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                target_slice_digest,
+                ..
+            }) = attempt
+                .observation
+                .as_ref()
+                .map(|observation| observation.response().facts().desired().head())
+        {
+            return Ok(Some(target_slice_digest));
+        }
+        Ok(rollout
+            .direct_terminal_receipt
+            .as_ref()
+            .filter(|direct| {
+                direct_terminal_is_success(direct, &rollout.signed_intent)
+                    && direct.receipt().facts().outcome()
+                        == ReferenceApplyTerminalOutcomeV1::OneSourceLoopActive
+            })
+            .and_then(|direct| direct.receipt().facts().desired_head_digest()))
+    }
+
     /// Returns the exact direct PXRT from the last plan-chronological archive.
     ///
     /// The full archived rollout chronology is revalidated before selecting
@@ -2423,10 +2756,15 @@ impl ControllerJournalState {
             self.rollout.as_ref(),
             ApplyHistoryValidationContext {
                 scope: self.scope,
+                plan_lineage: self.plan_lineage,
                 target: self.allocation.target(),
                 binding: self.target_binding.as_ref(),
                 operations: &self.operations,
                 current_revision: self.current_revision(),
+                current_shape: self
+                    .committed_plan
+                    .as_ref()
+                    .map(|plan| plan.content.shape()),
                 query_snapshot_high_water: self.query_snapshot_high_water,
             },
         )?;
@@ -2444,9 +2782,87 @@ impl ControllerJournalState {
     pub(crate) fn last_terminal_target_slice_digest(
         &self,
     ) -> Result<Option<TargetSliceDigest>, ControllerJournalError> {
-        Ok(self
-            .last_archived_direct_terminal_receipt()?
-            .and_then(|receipt| receipt.facts().desired_head_digest()))
+        validate_apply_history(
+            &self.apply_history,
+            self.rollout.as_ref(),
+            ApplyHistoryValidationContext {
+                scope: self.scope,
+                plan_lineage: self.plan_lineage,
+                target: self.allocation.target(),
+                binding: self.target_binding.as_ref(),
+                operations: &self.operations,
+                current_revision: self.current_revision(),
+                current_shape: self
+                    .committed_plan
+                    .as_ref()
+                    .map(|plan| plan.content.shape()),
+                query_snapshot_high_water: self.query_snapshot_high_water,
+            },
+        )?;
+        let Some(rollout) = self.apply_history.last() else {
+            return Ok(None);
+        };
+        if let Some(attempt) = rollout.reconcile_attempts.last()
+            && attempt
+                .decision
+                .is_some_and(ControllerRolloutDecision::is_terminal)
+            && let Some(head) = attempt
+                .observation
+                .as_ref()
+                .map(|observation| observation.response().facts().desired().head())
+        {
+            return Ok(match head {
+                ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                    target_slice_digest,
+                    ..
+                }
+                | ReferenceQueryDesiredHeadV1::EmptyDeactivate {
+                    target_slice_digest,
+                    ..
+                } => Some(target_slice_digest),
+                ReferenceQueryDesiredHeadV1::None => None,
+            });
+        }
+        Ok(rollout
+            .direct_terminal_receipt
+            .as_ref()
+            .filter(|direct| direct_terminal_is_success(direct, &rollout.signed_intent))
+            .and_then(|direct| direct.receipt().facts().desired_head_digest()))
+    }
+
+    /// Returns the exact desired Slice from the last archived Active rollout,
+    /// whether its terminal evidence was a direct PXRT or a current-epoch
+    /// terminal PXQS decision.
+    pub(crate) fn last_archived_active_target_slice_digest(
+        &self,
+    ) -> Result<Option<TargetSliceDigest>, ControllerJournalError> {
+        let _ = self.last_terminal_target_slice_digest()?;
+        let Some(rollout) = self.apply_history.last() else {
+            return Ok(None);
+        };
+        if let Some(attempt) = rollout.reconcile_attempts.last()
+            && attempt.decision.is_some_and(|decision| {
+                decision.is_terminal() && decision.observed == ControllerObservedTarget::Active
+            })
+            && let Some(ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                target_slice_digest,
+                ..
+            }) = attempt
+                .observation
+                .as_ref()
+                .map(|observation| observation.response().facts().desired().head())
+        {
+            return Ok(Some(target_slice_digest));
+        }
+        Ok(rollout
+            .direct_terminal_receipt
+            .as_ref()
+            .filter(|direct| {
+                direct_terminal_is_success(direct, &rollout.signed_intent)
+                    && direct.receipt().facts().outcome()
+                        == ReferenceApplyTerminalOutcomeV1::OneSourceLoopActive
+            })
+            .and_then(|direct| direct.receipt().facts().desired_head_digest()))
     }
 
     /// Returns the globally highest committed Authority proof only when its
@@ -2703,10 +3119,15 @@ impl ControllerJournalState {
             self.rollout.as_ref(),
             ApplyHistoryValidationContext {
                 scope: self.scope,
+                plan_lineage: self.plan_lineage,
                 target: self.allocation.target(),
                 binding: self.target_binding.as_ref(),
                 operations: &self.operations,
                 current_revision,
+                current_shape: self
+                    .committed_plan
+                    .as_ref()
+                    .map(|plan| plan.content.shape()),
                 query_snapshot_high_water: self.query_snapshot_high_water,
             },
         )?;
@@ -2809,11 +3230,13 @@ impl ControllerJournalState {
             &previous.apply_history,
             self.rollout.as_ref(),
             previous.rollout.as_ref(),
+            self.target_binding.as_ref(),
             plan_changed,
         )?;
         validate_rollout_successor(
             self.rollout.as_ref(),
             previous.rollout.as_ref(),
+            self.target_binding.as_ref(),
             plan_changed,
         )?;
         self.validate()
@@ -3190,10 +3613,12 @@ fn validate_request_auth_pin(pin: ControllerRequestAuthPin) -> Result<(), Contro
 #[derive(Clone, Copy)]
 struct ApplyHistoryValidationContext<'a> {
     scope: DeploymentScopeId,
+    plan_lineage: DeploymentId,
     target: RuntimeHostId,
     binding: Option<&'a ControllerTargetBinding>,
     operations: &'a [ControllerOperationRecord],
     current_revision: u64,
+    current_shape: Option<TargetIntent>,
     query_snapshot_high_water: u64,
 }
 
@@ -3212,6 +3637,9 @@ fn validate_apply_history(
     let mut maximum_query_sequence = 0_u64;
     for record in history {
         record.validate()?;
+        if record.has_conflicting_terminal_observation() {
+            return Err(ControllerJournalError::ConflictingTerminalEvidence);
+        }
         if !record.is_terminal() {
             return Err(ControllerJournalError::NonTerminalApplyHistory);
         }
@@ -3243,6 +3671,13 @@ fn validate_apply_history(
             .expected_revision
             .checked_add(1)
             .ok_or(ControllerJournalError::RevisionExhausted)?;
+        validate_terminal_decision_context(
+            record,
+            context.scope,
+            context.plan_lineage,
+            archived_plan_revision,
+            None,
+        )?;
         if archived_plan_revision >= context.current_revision
             || last_archived_plan_revision
                 .is_some_and(|previous| previous >= archived_plan_revision)
@@ -3270,6 +3705,13 @@ fn validate_apply_history(
             &mut query_client_nonces,
             &mut maximum_query_sequence,
         )?;
+        validate_terminal_decision_context(
+            record,
+            context.scope,
+            context.plan_lineage,
+            context.current_revision,
+            context.current_shape,
+        )?;
         if !apply_operations.insert(record.signed_intent.apply_operation)
             || !request_digests.insert(record.signed_intent.request_digest)
         {
@@ -3278,6 +3720,111 @@ fn validate_apply_history(
     }
     if context.query_snapshot_high_water != maximum_query_sequence {
         return Err(ControllerJournalError::QueryHighWaterMismatch);
+    }
+    Ok(())
+}
+
+fn validate_terminal_decision_context(
+    record: &ControllerRolloutRecord,
+    expected_scope: DeploymentScopeId,
+    expected_plan: DeploymentId,
+    expected_revision: u64,
+    expected_shape: Option<TargetIntent>,
+) -> Result<(), ControllerJournalError> {
+    let expected_revision = SourcePlanRevision::new(expected_revision);
+    for attempt in &record.reconcile_attempts {
+        let Some(decision) = attempt.decision.filter(|decision| decision.is_terminal()) else {
+            continue;
+        };
+        let observation = attempt
+            .observation
+            .as_ref()
+            .ok_or(ControllerJournalError::DanglingRolloutDecision)?;
+        let apply = ReferenceApplyRequestV1::decode(&record.signed_intent.signed_request)
+            .map_err(|_| ControllerJournalError::InvalidRolloutEvidence)?;
+        let query = attempt.prepared.request();
+        let provenance = apply.provenance();
+        let execution = apply.target_execution();
+        let expected_mode = match decision.observed {
+            ControllerObservedTarget::Active => ReferenceAssemblyModeV1::OneSourceLoop,
+            ControllerObservedTarget::Retired => ReferenceAssemblyModeV1::EmptyDeactivate,
+            ControllerObservedTarget::Prepared | ControllerObservedTarget::Uncertain => {
+                return Err(ControllerJournalError::InvalidRolloutEvidence);
+            }
+        };
+        let mode_matches_plan = match expected_shape {
+            Some(TargetIntent::OneSourceLoop) => {
+                expected_mode == ReferenceAssemblyModeV1::OneSourceLoop
+            }
+            Some(TargetIntent::EmptyTarget) => {
+                expected_mode == ReferenceAssemblyModeV1::EmptyDeactivate
+            }
+            Some(TargetIntent::Omitted) => false,
+            None => true,
+        };
+        if !mode_matches_plan
+            || apply.canonical_wire() != record.signed_intent.signed_request.as_ref()
+            || apply.target() != record.signed_intent.target
+            || apply.target_slice_digest() != record.signed_intent.target_slice_digest
+            || apply.envelope_request_digest() != record.signed_intent.request_digest.value()
+            || apply.expected_runtime_store_instance_id()
+                != record.signed_intent.runtime_store_instance_id
+            || provenance.source_scope() != SourceScopeRef::from_bytes(*expected_scope.as_bytes())
+            || provenance.source_plan() != SourcePlanRef::from_bytes(*expected_plan.as_bytes())
+            || provenance.source_revision() != expected_revision
+            || provenance.source_plan_digest() != record.signed_intent.source_plan_digest
+            || apply.control_commitment().control().operation_id()
+                != record.signed_intent.apply_operation
+            || execution.mode() != expected_mode
+            || execution.target() != record.signed_intent.target
+            || execution.manifest_digest() != record.signed_intent.binding_manifest_digest.value()
+            || query.expected_request_digest() != Some(record.signed_intent.request_digest.value())
+            || query.authentication().claim().principal()
+                != apply.authentication().claim().principal()
+        {
+            return Err(ControllerJournalError::InvalidRolloutEvidence);
+        }
+        let ReferenceQueryOperationLookupV1::Known {
+            request_digest,
+            durable_phase: ReferenceQueryDurablePhaseV1::Terminal,
+            terminal_result: Some(_),
+        } = observation.response().facts().operation().lookup()
+        else {
+            return Err(ControllerJournalError::InvalidRolloutEvidence);
+        };
+        if request_digest != record.signed_intent.request_digest.value() {
+            return Err(ControllerJournalError::InvalidRolloutEvidence);
+        }
+        let desired = observation.response().facts().desired();
+        if desired.source_revision_high_water() != expected_revision {
+            return Err(ControllerJournalError::InvalidRolloutEvidence);
+        }
+        let exact = match (decision.observed, desired.head()) {
+            (
+                ControllerObservedTarget::Active,
+                ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                    source_revision,
+                    target_slice_digest,
+                    manifest_digest,
+                },
+            )
+            | (
+                ControllerObservedTarget::Retired,
+                ReferenceQueryDesiredHeadV1::EmptyDeactivate {
+                    source_revision,
+                    target_slice_digest,
+                    manifest_digest,
+                },
+            ) => {
+                source_revision == expected_revision
+                    && target_slice_digest == record.signed_intent.target_slice_digest
+                    && manifest_digest == record.signed_intent.binding_manifest_digest.value()
+            }
+            _ => false,
+        };
+        if !exact {
+            return Err(ControllerJournalError::InvalidRolloutEvidence);
+        }
     }
     Ok(())
 }
@@ -3294,7 +3841,7 @@ fn validate_rollout_query_lineage(
     let binding = binding.ok_or(ControllerJournalError::DanglingRollout)?;
     let source_scope =
         paraegox_runtime_contracts::provenance::SourceScopeRef::from_bytes(*scope.as_bytes());
-    for attempt in &record.reconcile_attempts {
+    for (index, attempt) in record.reconcile_attempts.iter().enumerate() {
         attempt
             .prepared
             .validate(binding, source_scope, &record.signed_intent)?;
@@ -3317,6 +3864,27 @@ fn validate_rollout_query_lineage(
             }
             *maximum_query_sequence =
                 (*maximum_query_sequence).max(observation.query_snapshot_sequence());
+        }
+        if attempt
+            .decision
+            .is_some_and(ControllerRolloutDecision::is_terminal)
+            && index + 1 != record.reconcile_attempts.len()
+        {
+            let terminal_epoch = attempt
+                .observation
+                .as_ref()
+                .ok_or(ControllerJournalError::DanglingRolloutDecision)?
+                .response()
+                .facts()
+                .serving()
+                .runtime_host_epoch();
+            let next_epoch = record.reconcile_attempts[index + 1]
+                .prepared
+                .serving_baseline()
+                .runtime_host_epoch();
+            if terminal_epoch >= binding.last_runtime_host_epoch() || next_epoch <= terminal_epoch {
+                return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
+            }
         }
     }
     Ok(())
@@ -3344,6 +3912,7 @@ fn validate_apply_history_successor(
     previous_history: &[ControllerRolloutRecord],
     current_rollout: Option<&ControllerRolloutRecord>,
     previous_rollout: Option<&ControllerRolloutRecord>,
+    current_binding: Option<&ControllerTargetBinding>,
     plan_changed: bool,
 ) -> Result<(), ControllerJournalError> {
     for old in previous_history {
@@ -3371,7 +3940,8 @@ fn validate_apply_history_successor(
         return Err(ControllerJournalError::ApplyHistoryArchiveMismatch);
     }
     if let Some(previous_rollout) = previous_rollout {
-        if !previous_rollout.is_terminal() {
+        let binding = current_binding.ok_or(ControllerJournalError::DanglingRollout)?;
+        if !rollout_permits_plan_advance(previous_rollout, binding)? {
             return Err(ControllerJournalError::NonTerminalRolloutBlocksPlanCommit);
         }
         let Some(archived) = current_history.iter().find(|record| {
@@ -3389,6 +3959,7 @@ fn validate_apply_history_successor(
 fn validate_rollout_successor(
     current: Option<&ControllerRolloutRecord>,
     previous: Option<&ControllerRolloutRecord>,
+    current_binding: Option<&ControllerTargetBinding>,
     plan_changed: bool,
 ) -> Result<(), ControllerJournalError> {
     if plan_changed {
@@ -3425,9 +3996,7 @@ fn validate_rollout_successor(
                 (Some(previous), Some(current)) if previous != current => {
                     return Err(ControllerJournalError::DirectTerminalReceiptChanged);
                 }
-                (Some(_), Some(_)) => {
-                    return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
-                }
+                (Some(_), Some(_)) => {}
                 (None, None) => {}
                 (None, Some(_)) => {
                     return Err(ControllerJournalError::QueryEvidenceRemoved);
@@ -3478,13 +4047,32 @@ fn validate_rollout_successor(
                 }
                 if let Some(last) = old_attempts.last()
                     && !last.is_closed_without_response()
-                    && (last.observation.is_none()
-                        || last.decision.is_none()
-                        || last
-                            .decision
-                            .is_some_and(ControllerRolloutDecision::is_terminal))
+                    && (last.observation.is_none() || last.decision.is_none())
                 {
                     return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
+                }
+                if let Some(last) = old_attempts.last()
+                    && last
+                        .decision
+                        .is_some_and(ControllerRolloutDecision::is_terminal)
+                {
+                    let binding = current_binding.ok_or(ControllerJournalError::DanglingRollout)?;
+                    if terminal_query_decision_is_current(last, binding) {
+                        return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
+                    }
+                    let terminal_epoch = last
+                        .observation
+                        .as_ref()
+                        .ok_or(ControllerJournalError::DanglingRolloutDecision)?
+                        .response()
+                        .facts()
+                        .serving()
+                        .runtime_host_epoch();
+                    if new_attempts.last().is_none_or(|attempt| {
+                        attempt.prepared.serving_baseline().runtime_host_epoch() <= terminal_epoch
+                    }) {
+                        return Err(ControllerJournalError::EvidenceAfterTerminalDecision);
+                    }
                 }
             } else {
                 return Err(ControllerJournalError::QueryEvidenceRemoved);
@@ -5163,21 +5751,25 @@ impl std::error::Error for ControllerJournalError {}
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::OnceLock;
+
     use super::{
         CONTROLLER_PAYLOAD_MAGIC, ControllerApplyRequestDigest, ControllerAuthKeyFingerprint,
         ControllerBootstrapResponseDigest, ControllerChannelAuthFingerprint,
         ControllerJournalError, ControllerJournalSnapshot, ControllerJournalState,
         ControllerObservedTarget, ControllerOperationId, ControllerOperationPhase,
         ControllerOwnerIdentityFingerprint, ControllerPlanCommitIntentDigest,
-        ControllerQueryClosureKind, ControllerReceiptRef, ControllerRequestAuthPin,
-        ControllerRuntimeResponseAuthPin, ControllerSignedApplyIntentInput,
-        ControllerTargetBinding, ControllerTargetBindingInput,
+        ControllerPreparedQuery, ControllerQueryClosureKind, ControllerQueryObservation,
+        ControllerReceiptRef, ControllerReconcileAttempt, ControllerRequestAuthPin,
+        ControllerRolloutDecision, ControllerRuntimeResponseAuthPin,
+        ControllerSignedApplyIntentInput, ControllerTargetBinding, ControllerTargetBindingInput,
         ControllerTenureAuthorityDomainFingerprint, ControllerTenurePhase,
         ControllerTenureTransaction, MAX_CONTROLLER_TENURE_TRANSACTIONS, controller_checksum,
     };
     use crate::plan::{DeploymentId, DeploymentScopeId, DeploymentWriterRef};
     use crate::planner::{
-        AllocationState, PlanManifestDigest, StableAllocationSnapshot, journal_test_candidate,
+        AllocationState, PlanManifestDigest, StableAllocationSnapshot, TargetIntent,
+        journal_test_candidate,
     };
     use crate::tenure_protocol::{
         AcquireTenureIntentV1, AcquireTenureOperationId, AcquireTenureRequestDraftV1,
@@ -5199,7 +5791,7 @@ pub(crate) mod tests {
     };
     use paraegox_runtime_contracts::reference_control::{
         MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES, ReferenceApplyRequestDraftV1,
-        ReferenceApplyTerminalFactsV1, ReferenceApplyTerminalHeadV1,
+        ReferenceApplyRequestV1, ReferenceApplyTerminalFactsV1, ReferenceApplyTerminalHeadV1,
         ReferenceApplyTerminalLifecycleEffectV1, ReferenceApplyTerminalOutcomeV1,
         ReferenceApplyTerminalReceiptAuthClaimV1, ReferenceApplyTerminalReceiptDraftV1,
         ReferenceApplyTerminalReceiptV1, ReferenceBootstrapCompatibilityV1,
@@ -5207,11 +5799,12 @@ pub(crate) mod tests {
         ReferenceBootstrapResponseAuthClaimV1, ReferenceBootstrapResponseDraftV1,
         ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1,
         ReferenceBootstrapStateV1, ReferenceChannelBindingV1, ReferenceQueryDesiredHeadV1,
-        ReferenceQueryDesiredStateV1, ReferenceQueryFactsV1, ReferenceQueryIdV1,
-        ReferenceQueryLiveFactsV1, ReferenceQueryLiveStateV1, ReferenceQueryOperationLookupV1,
-        ReferenceQueryOperationStateV1, ReferenceQueryOwnerStateV1, ReferenceQueryRequestDraftV1,
-        ReferenceQueryRequestV1, ReferenceQueryResponseAuthClaimV1, ReferenceQueryResponseDraftV1,
-        ReferenceQueryResponseV1, ReferenceQuerySelectorV1, ReferenceTargetExecutionPlanV4,
+        ReferenceQueryDesiredStateV1, ReferenceQueryDurablePhaseV1, ReferenceQueryFactsV1,
+        ReferenceQueryIdV1, ReferenceQueryLiveFactsV1, ReferenceQueryLiveStateV1,
+        ReferenceQueryOperationLookupV1, ReferenceQueryOperationStateV1,
+        ReferenceQueryOwnerStateV1, ReferenceQueryRequestDraftV1, ReferenceQueryRequestV1,
+        ReferenceQueryResponseAuthClaimV1, ReferenceQueryResponseDraftV1, ReferenceQueryResponseV1,
+        ReferenceQuerySelectorV1, ReferenceTargetExecutionPlanV4,
     };
     use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
     use paraegox_runtime_contracts::wire::{
@@ -5384,7 +5977,7 @@ pub(crate) mod tests {
         AcquireTenureResponseV1::try_new(request, proof).expect("tenure response must validate")
     }
 
-    fn binding(last_epoch: u64, response: &'static [u8]) -> ControllerTargetBinding {
+    pub(crate) fn binding(last_epoch: u64, response: &'static [u8]) -> ControllerTargetBinding {
         binding_with_store_and_build(
             [0x62; 32],
             last_epoch,
@@ -5562,6 +6155,184 @@ pub(crate) mod tests {
             .expect("signed snapshot must succeed")
     }
 
+    fn canonical_apply_request(
+        state: &ControllerJournalState,
+        operation_marker: u8,
+    ) -> ReferenceApplyRequestV1 {
+        let plan = state.committed_plan().expect("fixture committed plan");
+        let execution = match plan.content().shape() {
+            TargetIntent::OneSourceLoop => {
+                let (_, instance, domain) = plan
+                    .content()
+                    .stable_allocation_subject()
+                    .expect("fixture Loop allocation subject");
+                let budgets = plan
+                    .content()
+                    .reference_lifecycle()
+                    .expect("fixture Loop lifecycle");
+                ReferenceTargetExecutionPlanV4::try_one_source_loop(
+                    state.installed_manifest().verified_manifest(),
+                    instance,
+                    domain,
+                    budgets,
+                )
+                .expect("fixture Loop execution plan")
+            }
+            TargetIntent::EmptyTarget => ReferenceTargetExecutionPlanV4::try_empty_deactivate(
+                state.installed_manifest().verified_manifest(),
+            )
+            .expect("fixture empty execution plan"),
+            TargetIntent::Omitted => panic!("omitted plan is not an apply fixture"),
+        };
+        let provenance = PlanProvenance::new(
+            SourceScopeRef::from_bytes(*plan.scope().as_bytes()),
+            SourcePlanRef::from_bytes(*plan.plan().as_bytes()),
+            SourcePlanRevision::new(plan.revision().value()),
+            plan.deployment_plan_digest(),
+        );
+        static TENURE_PROOF: OnceLock<WriterTenureProof> = OnceLock::new();
+        let tenure_proof = TENURE_PROOF
+            .get_or_init(|| {
+                let request = tenure_request(0x31, [0x91; 16], &[0x92; 32]);
+                tenure_response(&request, 1, 0).proof().clone()
+            })
+            .clone();
+        let writer_context = PlanWriterContext::try_new(
+            tenure_proof.claim().writer(),
+            tenure_proof.claim().epoch(),
+            tenure_proof,
+        )
+        .expect("fixture writer context");
+        let apply_operation = ApplyOperationId::from_bytes([operation_marker; 16]);
+        let control =
+            RuntimeApplyControl::new(writer_context, ExpectedActive::None, apply_operation);
+        let bootstrap = ReferenceBootstrapResponseV1::decode(
+            state
+                .target_binding()
+                .expect("fixture target binding")
+                .bootstrap_response(),
+        )
+        .expect("fixture bootstrap response");
+        let bootstrap_facts = bootstrap.facts();
+        let budget = BoundedDuration::from_nanos(1_000);
+        let temporal = ApplyTemporalConstraint::try_new(
+            TemporalConstraintId::from_bytes([operation_marker.wrapping_add(3); 16]),
+            bootstrap_facts.clock_domain(),
+            bootstrap_facts.clock_generation(),
+            budget,
+            budget,
+        )
+        .expect("fixture temporal constraint");
+        let request_auth = state.request_auth();
+        let auth_claim = ApplyRequestAuthClaim::try_new(
+            PrincipalRef::from_bytes([0xc3; 16]),
+            request_auth.key(),
+            request_auth.algorithm(),
+            request_auth.algorithm_version(),
+            &[operation_marker.wrapping_add(4); 32],
+        )
+        .expect("fixture request auth claim");
+        let request_draft = ReferenceApplyRequestDraftV1::try_new(
+            execution,
+            provenance,
+            control,
+            temporal,
+            state
+                .target_binding()
+                .expect("fixture target binding")
+                .runtime_store_instance_id(),
+            auth_claim,
+        )
+        .expect("fixture apply request draft");
+        let controller = SigningKey::from_bytes(&CONTROLLER_TENURE_SEED);
+        let request_signature = controller.sign(
+            request_draft
+                .signing_transcript()
+                .expect("fixture request transcript")
+                .as_bytes(),
+        );
+        request_draft
+            .finalize(&request_signature.to_bytes())
+            .expect("fixture apply request")
+    }
+
+    fn record_canonical_signed_apply(
+        state: &ControllerJournalState,
+        operation_marker: u8,
+    ) -> (ControllerJournalState, ReferenceApplyRequestV1) {
+        let request = canonical_apply_request(state, operation_marker);
+        let next = state
+            .record_signed_apply_intent(ControllerSignedApplyIntentInput {
+                target: request.target(),
+                source_plan_digest: request.provenance().source_plan_digest(),
+                target_slice_digest: request.target_slice_digest(),
+                apply_operation: request.control_commitment().control().operation_id(),
+                request_digest: ControllerApplyRequestDigest::from_stored(
+                    request.envelope_request_digest(),
+                ),
+                signed_request: request.canonical_wire(),
+            })
+            .expect("canonical signed apply intent must record");
+        (next, request)
+    }
+
+    pub(crate) fn canonical_signed_snapshot(operation_marker: u8) -> ControllerJournalSnapshot {
+        let bound = bound_snapshot();
+        let (state, _) = record_canonical_signed_apply(bound.state(), operation_marker);
+        bound
+            .try_successor(state)
+            .expect("canonical signed snapshot must succeed")
+    }
+
+    fn empty_bound_snapshot() -> ControllerJournalSnapshot {
+        let initial = initial_snapshot();
+        let candidate = journal_test_candidate(
+            TARGET,
+            initial.state.installed_manifest().projection(),
+            &initial.state.allocation,
+            None,
+            0x50,
+        )
+        .expect("empty fixture candidate must validate");
+        let prepared = initial
+            .clone()
+            .try_successor(
+                initial
+                    .state
+                    .prepare_plan_candidate(PLAN_OPERATION, &candidate)
+                    .expect("empty fixture candidate must prepare"),
+            )
+            .expect("empty fixture prepared snapshot");
+        let committed = prepared
+            .clone()
+            .try_successor(
+                prepared
+                    .state
+                    .commit_plan_candidate(PLAN_OPERATION, &candidate)
+                    .expect("empty fixture candidate must commit"),
+            )
+            .expect("empty fixture committed snapshot");
+        committed
+            .clone()
+            .try_successor(
+                committed
+                    .state
+                    .record_target_binding(binding(3, b"bootstrap-empty"))
+                    .expect("empty fixture binding must record"),
+            )
+            .expect("empty fixture bound snapshot")
+    }
+
+    pub(crate) fn canonical_empty_signed_snapshot(
+        operation_marker: u8,
+    ) -> ControllerJournalSnapshot {
+        let bound = empty_bound_snapshot();
+        let (state, _) = record_canonical_signed_apply(bound.state(), operation_marker);
+        bound
+            .try_successor(state)
+            .expect("canonical empty signed snapshot must succeed")
+    }
+
     fn signed_input(state: &ControllerJournalState) -> ControllerSignedApplyIntentInput<'static> {
         ControllerSignedApplyIntentInput {
             target: TARGET,
@@ -5610,11 +6381,28 @@ pub(crate) mod tests {
     }
 
     #[derive(Clone, Copy)]
+    struct QueryDesiredOverride {
+        source_revision: SourcePlanRevision,
+        target_slice_digest: TargetSliceDigest,
+        manifest_digest: Digest32,
+        high_water: SourcePlanRevision,
+    }
+
+    #[derive(Clone, Copy)]
     struct QueryInput {
         query_id: ReferenceQueryIdV1,
         query_snapshot_sequence: u64,
         marker: u8,
         channel: Option<ReferenceChannelBindingV1>,
+        nonterminal_known: bool,
+        terminal_observed: Option<ControllerObservedTarget>,
+        terminal_result_override: Option<
+            paraegox_runtime_contracts::reference_control::ReferenceApplyTerminalResultRefV1,
+        >,
+        bind_expected_request_digest: bool,
+        principal: PrincipalRef,
+        lookup_request_digest_override: Option<Digest32>,
+        desired_override: Option<QueryDesiredOverride>,
     }
 
     fn query_input(sequence: u64, response: &'static [u8]) -> QueryInput {
@@ -5626,7 +6414,49 @@ pub(crate) mod tests {
             query_snapshot_sequence: sequence,
             marker: response[0],
             channel: None,
+            nonterminal_known: false,
+            terminal_observed: None,
+            terminal_result_override: None,
+            bind_expected_request_digest: true,
+            principal: PrincipalRef::from_bytes([0xc3; 16]),
+            lookup_request_digest_override: None,
+            desired_override: None,
         }
+    }
+
+    fn prepared_query_input(sequence: u64, response: &'static [u8]) -> QueryInput {
+        QueryInput {
+            nonterminal_known: true,
+            ..query_input(sequence, response)
+        }
+    }
+
+    fn terminal_query_input(
+        sequence: u64,
+        response: &'static [u8],
+        observed: ControllerObservedTarget,
+    ) -> QueryInput {
+        assert!(matches!(
+            observed,
+            ControllerObservedTarget::Active | ControllerObservedTarget::Retired
+        ));
+        QueryInput {
+            nonterminal_known: false,
+            terminal_observed: Some(observed),
+            ..query_input(sequence, response)
+        }
+    }
+
+    fn fixture_terminal_result_ref()
+    -> paraegox_runtime_contracts::reference_control::ReferenceApplyTerminalResultRefV1 {
+        static RESULT: OnceLock<
+            paraegox_runtime_contracts::reference_control::ReferenceApplyTerminalResultRefV1,
+        > = OnceLock::new();
+        *RESULT.get_or_init(|| direct_active_snapshot().1.facts().terminal_result_ref())
+    }
+
+    fn fixture_controller_receipt_ref() -> ControllerReceiptRef {
+        ControllerReceiptRef::from_bytes(*fixture_terminal_result_ref().as_bytes())
     }
 
     fn query_contract_values(
@@ -5650,11 +6480,18 @@ pub(crate) mod tests {
                 .expect("query fixture channel")
         });
         let request_auth = state.request_auth();
+        let source_revision = SourcePlanRevision::new(
+            state
+                .committed_plan()
+                .expect("query fixture committed plan")
+                .revision()
+                .value(),
+        );
         let mut client_nonce = [input.marker; 32];
         client_nonce[..16].copy_from_slice(input.query_id.as_bytes());
         client_nonce[24..].copy_from_slice(&input.query_snapshot_sequence.to_be_bytes());
         let claim = ApplyRequestAuthClaim::try_new(
-            PrincipalRef::from_bytes([0x88; 16]),
+            input.principal,
             request_auth.key(),
             request_auth.algorithm(),
             request_auth.algorithm_version(),
@@ -5667,7 +6504,9 @@ pub(crate) mod tests {
             SourceScopeRef::from_bytes(*state.scope().as_bytes()),
             binding.runtime_store_instance_id(),
             intent.apply_operation(),
-            Some(intent.request_digest().value()),
+            input
+                .bind_expected_request_digest
+                .then_some(intent.request_digest().value()),
         )
         .expect("query fixture selector");
         let draft = ReferenceQueryRequestDraftV1::try_new(
@@ -5699,20 +6538,135 @@ pub(crate) mod tests {
             bootstrap_facts.clock_generation(),
         )
         .expect("query fixture serving");
+        let (lookup, desired_head, desired_high_water, live_state, resource_generation) =
+            match input.terminal_observed {
+                None if !input.nonterminal_known => (
+                    ReferenceQueryOperationLookupV1::Unknown,
+                    ReferenceQueryDesiredHeadV1::None,
+                    SourcePlanRevision::new(0),
+                    ReferenceQueryLiveStateV1::ExactZero,
+                    0,
+                ),
+                None => {
+                    let (desired_head, live_state, resource_generation) = match state
+                        .committed_plan()
+                        .expect("query fixture committed plan")
+                        .content()
+                        .shape()
+                    {
+                        TargetIntent::OneSourceLoop => (
+                            ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                                source_revision,
+                                target_slice_digest: intent.target_slice_digest(),
+                                manifest_digest: binding.manifest_digest().value(),
+                            },
+                            ReferenceQueryLiveStateV1::LiveReady,
+                            1,
+                        ),
+                        TargetIntent::EmptyTarget => (
+                            ReferenceQueryDesiredHeadV1::EmptyDeactivate {
+                                source_revision,
+                                target_slice_digest: intent.target_slice_digest(),
+                                manifest_digest: binding.manifest_digest().value(),
+                            },
+                            ReferenceQueryLiveStateV1::ExactZero,
+                            0,
+                        ),
+                        TargetIntent::Omitted => panic!("query fixture plan must be actionable"),
+                    };
+                    (
+                        ReferenceQueryOperationLookupV1::Known {
+                            request_digest: intent.request_digest().value(),
+                            durable_phase: ReferenceQueryDurablePhaseV1::PreparedNoEffects,
+                            terminal_result: None,
+                        },
+                        desired_head,
+                        source_revision,
+                        live_state,
+                        resource_generation,
+                    )
+                }
+                Some(ControllerObservedTarget::Active) => (
+                    ReferenceQueryOperationLookupV1::Known {
+                        request_digest: input
+                            .lookup_request_digest_override
+                            .unwrap_or_else(|| intent.request_digest().value()),
+                        durable_phase: ReferenceQueryDurablePhaseV1::Terminal,
+                        terminal_result: Some(
+                            input
+                                .terminal_result_override
+                                .unwrap_or_else(fixture_terminal_result_ref),
+                        ),
+                    },
+                    ReferenceQueryDesiredHeadV1::OneSourceLoop {
+                        source_revision: input
+                            .desired_override
+                            .map_or(source_revision, |value| value.source_revision),
+                        target_slice_digest: input
+                            .desired_override
+                            .map_or(intent.target_slice_digest(), |value| {
+                                value.target_slice_digest
+                            }),
+                        manifest_digest: input
+                            .desired_override
+                            .map_or(binding.manifest_digest().value(), |value| {
+                                value.manifest_digest
+                            }),
+                    },
+                    input
+                        .desired_override
+                        .map_or(source_revision, |value| value.high_water),
+                    ReferenceQueryLiveStateV1::LiveReady,
+                    1,
+                ),
+                Some(ControllerObservedTarget::Retired) => (
+                    ReferenceQueryOperationLookupV1::Known {
+                        request_digest: input
+                            .lookup_request_digest_override
+                            .unwrap_or_else(|| intent.request_digest().value()),
+                        durable_phase: ReferenceQueryDurablePhaseV1::Terminal,
+                        terminal_result: Some(
+                            input
+                                .terminal_result_override
+                                .unwrap_or_else(fixture_terminal_result_ref),
+                        ),
+                    },
+                    ReferenceQueryDesiredHeadV1::EmptyDeactivate {
+                        source_revision: input
+                            .desired_override
+                            .map_or(source_revision, |value| value.source_revision),
+                        target_slice_digest: input
+                            .desired_override
+                            .map_or(intent.target_slice_digest(), |value| {
+                                value.target_slice_digest
+                            }),
+                        manifest_digest: input
+                            .desired_override
+                            .map_or(binding.manifest_digest().value(), |value| {
+                                value.manifest_digest
+                            }),
+                    },
+                    input
+                        .desired_override
+                        .map_or(source_revision, |value| value.high_water),
+                    ReferenceQueryLiveStateV1::ExactZero,
+                    0,
+                ),
+                Some(ControllerObservedTarget::Prepared | ControllerObservedTarget::Uncertain) => {
+                    unreachable!("terminal query fixture shape is checked at construction")
+                }
+            };
         let operation = ReferenceQueryOperationStateV1::try_new(
             ReferenceQueryOwnerStateV1::Operational,
             None,
-            ReferenceQueryOperationLookupV1::Unknown,
+            lookup,
         )
         .expect("query fixture operation");
-        let desired = ReferenceQueryDesiredStateV1::try_new(
-            ReferenceQueryDesiredHeadV1::None,
-            SourcePlanRevision::new(0),
-        )
-        .expect("query fixture desired");
+        let desired = ReferenceQueryDesiredStateV1::try_new(desired_head, desired_high_water)
+            .expect("query fixture desired");
         let live = ReferenceQueryLiveFactsV1::try_new(
-            ReferenceQueryLiveStateV1::ExactZero,
-            0,
+            live_state,
+            resource_generation,
             input.query_snapshot_sequence,
             digest(input.marker),
         )
@@ -5767,9 +6721,9 @@ pub(crate) mod tests {
             .expect("query fixture response must record")
     }
 
-    fn decided_snapshot() -> ControllerJournalSnapshot {
-        let signed = signed_snapshot();
-        let input = query_input(9, b"query-nine");
+    pub(crate) fn decided_snapshot() -> ControllerJournalSnapshot {
+        let signed = canonical_signed_snapshot(0x67);
+        let input = terminal_query_input(9, b"query-nine", ControllerObservedTarget::Active);
         let prepared_state = prepare_query(&signed.state, input);
         let prepared = signed
             .try_successor(prepared_state)
@@ -5782,7 +6736,7 @@ pub(crate) mod tests {
             .state
             .record_rollout_decision(
                 ControllerObservedTarget::Active,
-                Some(ControllerReceiptRef::from_bytes([0x6c; 16])),
+                Some(fixture_controller_receipt_ref()),
             )
             .expect("decision must record");
         queried
@@ -5795,39 +6749,19 @@ pub(crate) mod tests {
         ReferenceApplyTerminalReceiptV1,
         TargetSliceDigest,
     ) {
+        direct_active_snapshot_with_operation(0x93)
+    }
+
+    pub(crate) fn direct_active_snapshot_with_operation(
+        operation_marker: u8,
+    ) -> (
+        ControllerJournalSnapshot,
+        ReferenceApplyTerminalReceiptV1,
+        TargetSliceDigest,
+    ) {
         let bound = bound_snapshot();
         let state = bound.state();
-        let plan = state.committed_plan().expect("fixture committed plan");
-        let (_, instance, domain) = plan
-            .content()
-            .stable_allocation_subject()
-            .expect("fixture Loop allocation subject");
-        let budgets = plan
-            .content()
-            .reference_lifecycle()
-            .expect("fixture Loop lifecycle");
-        let execution = ReferenceTargetExecutionPlanV4::try_one_source_loop(
-            state.installed_manifest().verified_manifest(),
-            instance,
-            domain,
-            budgets,
-        )
-        .expect("fixture execution plan");
-        let provenance = PlanProvenance::new(
-            SourceScopeRef::from_bytes(*plan.scope().as_bytes()),
-            SourcePlanRef::from_bytes(*plan.plan().as_bytes()),
-            SourcePlanRevision::new(plan.revision().value()),
-            plan.deployment_plan_digest(),
-        );
-        let tenure_request = tenure_request(0x31, [0x91; 16], &[0x92; 32]);
-        let tenure_proof = tenure_response(&tenure_request, 1, 0).proof().clone();
-        let writer = tenure_proof.claim().writer();
-        let writer_context =
-            PlanWriterContext::try_new(writer, tenure_proof.claim().epoch(), tenure_proof)
-                .expect("fixture writer context");
-        let apply_operation = ApplyOperationId::from_bytes([0x93; 16]);
-        let control =
-            RuntimeApplyControl::new(writer_context, ExpectedActive::None, apply_operation);
+        let request = canonical_apply_request(state, operation_marker);
         let bootstrap = ReferenceBootstrapResponseV1::decode(
             state
                 .target_binding()
@@ -5836,59 +6770,8 @@ pub(crate) mod tests {
         )
         .expect("fixture bootstrap response");
         let bootstrap_facts = bootstrap.facts();
-        let budget = BoundedDuration::from_nanos(1_000);
-        let temporal = ApplyTemporalConstraint::try_new(
-            TemporalConstraintId::from_bytes([0x94; 16]),
-            bootstrap_facts.clock_domain(),
-            bootstrap_facts.clock_generation(),
-            budget,
-            budget,
-        )
-        .expect("fixture temporal constraint");
-        let request_auth = state.request_auth();
-        let auth_claim = ApplyRequestAuthClaim::try_new(
-            PrincipalRef::from_bytes([0x95; 16]),
-            request_auth.key(),
-            request_auth.algorithm(),
-            request_auth.algorithm_version(),
-            &[0x96; 32],
-        )
-        .expect("fixture request auth claim");
-        let request_draft = ReferenceApplyRequestDraftV1::try_new(
-            execution,
-            provenance,
-            control,
-            temporal,
-            state
-                .target_binding()
-                .expect("fixture target binding")
-                .runtime_store_instance_id(),
-            auth_claim,
-        )
-        .expect("fixture apply request draft");
-        let controller = SigningKey::from_bytes(&CONTROLLER_TENURE_SEED);
-        let request_signature = controller.sign(
-            request_draft
-                .signing_transcript()
-                .expect("fixture request transcript")
-                .as_bytes(),
-        );
-        let request = request_draft
-            .finalize(&request_signature.to_bytes())
-            .expect("fixture apply request");
         let target_slice = request.target_slice_digest();
-        let signed_state = state
-            .record_signed_apply_intent(ControllerSignedApplyIntentInput {
-                target: request.target(),
-                source_plan_digest: request.provenance().source_plan_digest(),
-                target_slice_digest: target_slice,
-                apply_operation,
-                request_digest: ControllerApplyRequestDigest::from_stored(
-                    request.envelope_request_digest(),
-                ),
-                signed_request: request.canonical_wire(),
-            })
-            .expect("fixture signed apply intent");
+        let (signed_state, _) = record_canonical_signed_apply(state, operation_marker);
         let signed = bound
             .try_successor(signed_state)
             .expect("fixture signed apply successor");
@@ -5948,6 +6831,58 @@ pub(crate) mod tests {
         (terminal, receipt, target_slice)
     }
 
+    fn direct_receipt_for_signed_snapshot(
+        signed: &ControllerJournalSnapshot,
+        outcome: ReferenceApplyTerminalOutcomeV1,
+        lifecycle: ReferenceApplyTerminalLifecycleEffectV1,
+        head: ReferenceApplyTerminalHeadV1,
+    ) -> ReferenceApplyTerminalReceiptV1 {
+        let state = signed.state();
+        let intent = state
+            .current_signed_apply_intent()
+            .expect("fixture signed intent");
+        let request = ReferenceApplyRequestV1::decode(intent.signed_request())
+            .expect("fixture canonical apply request");
+        let binding = state.target_binding().expect("fixture target binding");
+        let bootstrap = ReferenceBootstrapResponseV1::decode(binding.bootstrap_response())
+            .expect("fixture bootstrap response");
+        let runtime_auth = binding.runtime_response_auth();
+        let channel = runtime_auth
+            .channel(TARGET)
+            .expect("fixture Runtime response channel");
+        let facts = ReferenceApplyTerminalFactsV1::try_new(
+            &request,
+            outcome,
+            lifecycle,
+            head,
+            digest(0xa7),
+            digest(0xa8),
+            bootstrap.facts().runtime_host_epoch(),
+            10,
+            bootstrap.facts().clock_generation(),
+            12_000,
+        )
+        .expect("fixture terminal facts");
+        let claim = ReferenceApplyTerminalReceiptAuthClaimV1::try_new(
+            channel,
+            runtime_auth.key(),
+            runtime_auth.algorithm(),
+            runtime_auth.algorithm_version(),
+        )
+        .expect("fixture terminal claim");
+        let draft = ReferenceApplyTerminalReceiptDraftV1::try_new(&request, facts, channel, claim)
+            .expect("fixture terminal receipt draft");
+        let signature = SigningKey::from_bytes(&RUNTIME_RESPONSE_SEED).sign(
+            draft
+                .signing_transcript()
+                .expect("fixture terminal receipt transcript")
+                .as_bytes(),
+        );
+        draft
+            .finalize(&signature.to_bytes())
+            .expect("fixture terminal receipt")
+    }
+
     fn state_with_two_archived_rollouts() -> ControllerJournalState {
         let mut state = decided_snapshot().state;
         let second_plan = journal_test_candidate(
@@ -5965,14 +6900,15 @@ pub(crate) mod tests {
         state = state
             .commit_plan_candidate(second_plan_operation, &second_plan)
             .expect("first rollout must archive");
-        state = state
-            .record_signed_apply_intent(different_signed_input(&state, 0x77, 0x78))
-            .expect("second rollout intent must record");
-        state = record_query(&state, query_input(10, b"query-ten"));
+        state = record_canonical_signed_apply(&state, 0x77).0;
+        state = record_query(
+            &state,
+            terminal_query_input(10, b"query-ten", ControllerObservedTarget::Retired),
+        );
         state = state
             .record_rollout_decision(
                 ControllerObservedTarget::Retired,
-                Some(ControllerReceiptRef::from_bytes([0x79; 16])),
+                Some(fixture_controller_receipt_ref()),
             )
             .expect("second rollout must become terminal");
         let third_plan = journal_test_candidate(
@@ -5990,6 +6926,24 @@ pub(crate) mod tests {
         state
             .commit_plan_candidate(third_plan_operation, &third_plan)
             .expect("second rollout must archive")
+    }
+
+    fn commit_empty_after_rollout(
+        state: &ControllerJournalState,
+        operation_marker: u8,
+    ) -> Result<ControllerJournalState, ControllerJournalError> {
+        let candidate = journal_test_candidate(
+            TARGET,
+            state.installed_manifest().projection(),
+            &state.allocation,
+            None,
+            0x50,
+        )
+        .expect("Empty successor fixture must validate");
+        let operation = ControllerOperationId::from_bytes([operation_marker; 16]);
+        state
+            .prepare_plan_candidate(operation, &candidate)?
+            .commit_plan_candidate(operation, &candidate)
     }
 
     fn encode_unvalidated_state(state: &ControllerJournalState, snapshot_sequence: u64) -> Vec<u8> {
@@ -6017,6 +6971,101 @@ pub(crate) mod tests {
         prefix
     }
 
+    fn forge_latest_decision(
+        state: &mut ControllerJournalState,
+        observed: ControllerObservedTarget,
+        receipt: Option<ControllerReceiptRef>,
+    ) {
+        let attempt = state
+            .rollout
+            .as_mut()
+            .expect("forged decision rollout")
+            .reconcile_attempts
+            .last_mut()
+            .expect("forged decision attempt");
+        let observation = attempt
+            .observation
+            .as_ref()
+            .expect("forged decision observation");
+        attempt.decision = Some(ControllerRolloutDecision {
+            query_id: observation.response().query_id(),
+            query_snapshot_sequence: observation.query_snapshot_sequence(),
+            observed,
+            receipt,
+        });
+    }
+
+    fn archive_forged_first_rollout(forged: &ControllerJournalState) -> ControllerJournalState {
+        let (direct, _, _) = direct_active_snapshot();
+        let mut archived = commit_empty_after_rollout(direct.state(), 0xd0)
+            .expect("valid direct terminal rollout must archive");
+        archived.apply_history[0] = forged
+            .rollout
+            .clone()
+            .expect("forged current rollout must exist");
+        archived.query_snapshot_high_water = forged.query_snapshot_high_water;
+        archived
+    }
+
+    fn append_unvalidated_query_attempt(
+        state: &ControllerJournalState,
+        input: QueryInput,
+        response_committed: bool,
+        closure: Option<ControllerQueryClosureKind>,
+        observed: Option<ControllerObservedTarget>,
+    ) -> ControllerJournalState {
+        assert!(closure.is_none() || observed.is_none());
+        assert!(observed.is_none() || response_committed);
+        let (request, response, channel) = query_contract_values(state, input);
+        let binding = state
+            .target_binding()
+            .expect("unvalidated query fixture binding");
+        let bootstrap = ReferenceBootstrapResponseV1::decode(binding.bootstrap_response())
+            .expect("unvalidated query fixture bootstrap");
+        let facts = bootstrap.facts();
+        let prepared = ControllerPreparedQuery {
+            request,
+            request_auth: state.request_auth(),
+            request_time_channel: channel,
+            runtime_response_auth: binding.runtime_response_auth(),
+            serving_baseline: ReferenceBootstrapServingIdentityV1::try_new(
+                facts.target(),
+                facts.runtime_store_instance_id(),
+                facts.snapshot_sequence(),
+                facts.runtime_host_epoch(),
+                facts.clock_domain(),
+                facts.clock_generation(),
+            )
+            .expect("unvalidated query fixture serving baseline"),
+        };
+        let observation = response_committed.then(|| {
+            ControllerQueryObservation::try_new(response, channel, &prepared)
+                .expect("unvalidated query fixture response remains contract-valid")
+        });
+        let decision = observed.map(|value| ControllerRolloutDecision {
+            query_id: prepared.request().query_id(),
+            query_snapshot_sequence: input.query_snapshot_sequence,
+            observed: value,
+            receipt: None,
+        });
+        let mut forged = state.clone();
+        let rollout = forged.rollout.as_mut().expect("unvalidated query rollout");
+        let mut attempts = rollout.reconcile_attempts.to_vec();
+        attempts.push(ControllerReconcileAttempt {
+            prepared,
+            observation,
+            closure,
+            decision,
+        });
+        rollout.reconcile_attempts = attempts.into_boxed_slice();
+        if response_committed {
+            forged.query_snapshot_high_water = forged
+                .query_snapshot_high_water
+                .max(input.query_snapshot_sequence);
+        }
+        forged
+    }
+
     fn refresh_checksum(encoded: &mut [u8]) {
         super::refresh_controller_test_checksum(encoded).expect("mutated envelope must checksum");
     }
@@ -6030,8 +7079,8 @@ pub(crate) mod tests {
         assert_eq!(
             &encoded[super::JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES..super::JOURNAL_HEADER_BYTES],
             &[
-                172, 153, 190, 252, 234, 147, 148, 136, 139, 221, 172, 86, 104, 22, 26, 125, 188,
-                249, 170, 165, 182, 196, 46, 108, 233, 74, 40, 2, 236, 178, 120, 209,
+                26, 154, 249, 7, 72, 123, 98, 147, 96, 181, 222, 149, 71, 2, 213, 253, 189, 86, 56,
+                0, 32, 131, 180, 0, 47, 40, 80, 45, 75, 187, 161, 37,
             ]
         );
         let decoded = ControllerJournalSnapshot::decode(&encoded).expect("snapshot must decode");
@@ -6931,10 +7980,7 @@ pub(crate) mod tests {
         );
 
         let bound = bound_snapshot();
-        let signed_state = bound
-            .state
-            .record_signed_apply_intent(signed_input(&bound.state))
-            .expect("signed intent must record");
+        let signed_state = record_canonical_signed_apply(&bound.state, 0x67).0;
         assert!(
             signed_state
                 .rollout
@@ -6946,12 +7992,12 @@ pub(crate) mod tests {
         let signed = bound
             .try_successor(signed_state)
             .expect("signed-before-send snapshot must succeed");
-        let input = query_input(9, b"query-nine");
+        let input = terminal_query_input(9, b"query-nine", ControllerObservedTarget::Active);
         let request_state = prepare_query(&signed.state, input);
         assert_eq!(
             request_state.record_rollout_decision(
                 ControllerObservedTarget::Active,
-                Some(ControllerReceiptRef::from_bytes([0x6c; 16])),
+                Some(fixture_controller_receipt_ref()),
             ),
             Err(ControllerJournalError::QueryNotCommittedBeforeDecision)
         );
@@ -6979,7 +8025,7 @@ pub(crate) mod tests {
             .state
             .record_rollout_decision(
                 ControllerObservedTarget::Active,
-                Some(ControllerReceiptRef::from_bytes([0x6c; 16])),
+                Some(fixture_controller_receipt_ref()),
             )
             .expect("decision must bind durable query");
         let decided = queried
@@ -7007,7 +8053,7 @@ pub(crate) mod tests {
 
     #[test]
     fn query_closure_is_a_distinct_exact_successor_and_never_revives_send_authority() {
-        let signed = signed_snapshot();
+        let signed = canonical_signed_snapshot(0x67);
         let input = query_input(9, b"query-nine");
         let (request, response, channel) = query_contract_values(&signed.state, input);
         let request_state = signed
@@ -7164,7 +8210,7 @@ pub(crate) mod tests {
             );
         }
 
-        let signed = signed_snapshot();
+        let signed = canonical_signed_snapshot(0x67);
         let query_only = record_query(&signed.state, query_input(9, b"query-nine"));
         let prepared_decision = query_only
             .record_rollout_decision(ControllerObservedTarget::Prepared, None)
@@ -7172,10 +8218,15 @@ pub(crate) mod tests {
         let uncertain_decision = query_only
             .record_rollout_decision(ControllerObservedTarget::Uncertain, None)
             .expect("Uncertain is a nonterminal reconcile decision");
-        let terminal_decision = query_only
+        let terminal_signed = canonical_signed_snapshot(0x67);
+        let terminal_query_only = record_query(
+            &terminal_signed.state,
+            terminal_query_input(9, b"terminal-nine", ControllerObservedTarget::Active),
+        );
+        let terminal_decision = terminal_query_only
             .record_rollout_decision(
                 ControllerObservedTarget::Active,
-                Some(ControllerReceiptRef::from_bytes([0x6c; 16])),
+                Some(fixture_controller_receipt_ref()),
             )
             .expect("Active with a receipt is terminal");
 
@@ -7222,7 +8273,7 @@ pub(crate) mod tests {
 
     #[test]
     fn prepared_and_uncertain_reconciliation_append_exact_evidence_until_terminal() {
-        let signed = signed_snapshot();
+        let signed = canonical_signed_snapshot(0x67);
         let first_input = query_input(9, b"query-nine");
         let query_request = signed
             .try_successor(prepare_query(&signed.state, first_input))
@@ -7248,7 +8299,8 @@ pub(crate) mod tests {
             .expect("rollout must remain current")
             .reconcile_attempts[0]
             .clone();
-        let mut same_snapshot_query = query_input(9, b"query-nine-retry");
+        let mut same_snapshot_query =
+            terminal_query_input(9, b"query-nine-retry", ControllerObservedTarget::Active);
         same_snapshot_query.query_id = ReferenceQueryIdV1::from_bytes([0x6b; 16]);
         let second_request = restarted
             .try_successor(prepare_query(&restarted.state, same_snapshot_query))
@@ -7272,7 +8324,7 @@ pub(crate) mod tests {
             .state
             .record_rollout_decision(
                 ControllerObservedTarget::Active,
-                Some(ControllerReceiptRef::from_bytes([0x6c; 16])),
+                Some(fixture_controller_receipt_ref()),
             )
             .expect("Active terminal decision must record");
         let active = second_query
@@ -7289,17 +8341,20 @@ pub(crate) mod tests {
             2
         );
 
-        let uncertain_signed = signed_snapshot();
+        let uncertain_signed = canonical_empty_signed_snapshot(0x77);
         let uncertain_query =
             record_query(&uncertain_signed.state, query_input(20, b"query-twenty"));
         let uncertain_decision = uncertain_query
             .record_rollout_decision(ControllerObservedTarget::Uncertain, None)
             .expect("Uncertain decision must record");
-        let later_query = record_query(&uncertain_decision, query_input(21, b"query-twenty-one"));
+        let later_query = record_query(
+            &uncertain_decision,
+            terminal_query_input(21, b"query-twenty-one", ControllerObservedTarget::Retired),
+        );
         let retired = later_query
             .record_rollout_decision(
                 ControllerObservedTarget::Retired,
-                Some(ControllerReceiptRef::from_bytes([0x6e; 16])),
+                Some(fixture_controller_receipt_ref()),
             )
             .expect("Retired with receipt must be terminal");
         assert!(retired.rollout.as_ref().is_some_and(|rollout| {
@@ -7325,6 +8380,481 @@ pub(crate) mod tests {
                 .reconcile_attempts
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn checksum_valid_terminal_decision_context_tampers_are_rejected() {
+        let signed = canonical_signed_snapshot(0x67);
+        let state = signed.state();
+        let intent = state
+            .current_signed_apply_intent()
+            .expect("terminal tamper fixture intent");
+        let binding = state
+            .target_binding()
+            .expect("terminal tamper fixture binding");
+        let revision = SourcePlanRevision::new(
+            state
+                .committed_plan()
+                .expect("terminal tamper fixture plan")
+                .revision()
+                .value(),
+        );
+        let later_revision = SourcePlanRevision::new(
+            revision
+                .value()
+                .checked_add(1)
+                .expect("terminal tamper fixture revision capacity"),
+        );
+        let exact = QueryDesiredOverride {
+            source_revision: revision,
+            target_slice_digest: intent.target_slice_digest(),
+            manifest_digest: binding.manifest_digest().value(),
+            high_water: revision,
+        };
+
+        let mut wrong_revision = terminal_query_input(
+            9,
+            b"wrong-source-revision",
+            ControllerObservedTarget::Active,
+        );
+        wrong_revision.desired_override = Some(QueryDesiredOverride {
+            source_revision: later_revision,
+            high_water: later_revision,
+            ..exact
+        });
+        let mut wrong_slice =
+            terminal_query_input(9, b"wrong-target-slice", ControllerObservedTarget::Active);
+        wrong_slice.desired_override = Some(QueryDesiredOverride {
+            target_slice_digest: TargetSliceDigest::new(digest(0xb1)),
+            ..exact
+        });
+        let mut wrong_manifest =
+            terminal_query_input(9, b"wrong-manifest", ControllerObservedTarget::Active);
+        wrong_manifest.desired_override = Some(QueryDesiredOverride {
+            manifest_digest: digest(0xb2),
+            ..exact
+        });
+        let mut wrong_high_water =
+            terminal_query_input(9, b"wrong-high-water", ControllerObservedTarget::Active);
+        wrong_high_water.desired_override = Some(QueryDesiredOverride {
+            high_water: later_revision,
+            ..exact
+        });
+        let mut wrong_principal =
+            terminal_query_input(9, b"wrong-principal", ControllerObservedTarget::Active);
+        wrong_principal.principal = PrincipalRef::from_bytes([0xd0; 16]);
+
+        for (name, input) in [
+            ("source revision", wrong_revision),
+            ("target slice", wrong_slice),
+            ("manifest", wrong_manifest),
+            ("high water", wrong_high_water),
+            ("principal", wrong_principal),
+        ] {
+            let mut forged = append_unvalidated_query_attempt(state, input, true, None, None);
+            forge_latest_decision(
+                &mut forged,
+                ControllerObservedTarget::Active,
+                Some(fixture_controller_receipt_ref()),
+            );
+            let expected = if name == "principal" {
+                ControllerJournalError::InvalidQueryRequest
+            } else {
+                ControllerJournalError::InvalidRolloutEvidence
+            };
+            assert_eq!(
+                ControllerJournalSnapshot::decode(&encode_unvalidated_state(&forged, 20)),
+                Err(expected),
+                "checksum-valid {name} forgery must fail reopen",
+            );
+        }
+    }
+
+    #[test]
+    fn checksum_valid_selector_and_lookup_tampers_fail_current_and_archived_reopen() {
+        let signed = canonical_signed_snapshot(0x67);
+        let mut missing_selector_digest = terminal_query_input(
+            9,
+            b"missing-selector-digest",
+            ControllerObservedTarget::Active,
+        );
+        missing_selector_digest.bind_expected_request_digest = false;
+        let mut wrong_known_digest = terminal_query_input(
+            9,
+            b"wrong-known-request-digest",
+            ControllerObservedTarget::Active,
+        );
+        wrong_known_digest.bind_expected_request_digest = false;
+        wrong_known_digest.lookup_request_digest_override = Some(digest(0xb3));
+
+        for (name, input) in [
+            ("missing selector digest", missing_selector_digest),
+            ("wrong Known digest", wrong_known_digest),
+        ] {
+            let mut forged =
+                append_unvalidated_query_attempt(signed.state(), input, true, None, None);
+            forge_latest_decision(
+                &mut forged,
+                ControllerObservedTarget::Active,
+                Some(fixture_controller_receipt_ref()),
+            );
+            assert_eq!(
+                ControllerJournalSnapshot::decode(&encode_unvalidated_state(&forged, 20)),
+                Err(ControllerJournalError::InvalidQueryRequest),
+                "checksum-valid current {name} forgery must fail reopen",
+            );
+
+            let archived = archive_forged_first_rollout(&forged);
+            assert_eq!(
+                ControllerJournalSnapshot::decode(&encode_unvalidated_state(&archived, 21)),
+                Err(ControllerJournalError::InvalidQueryRequest),
+                "checksum-valid archived {name} forgery must fail reopen",
+            );
+        }
+    }
+
+    #[test]
+    fn checksum_valid_nonterminal_and_closure_query_binding_tampers_fail_every_reopen() {
+        let (direct, _, _) = direct_active_snapshot();
+        let scenarios = [
+            (
+                "open",
+                query_input(9, b"bad-binding-open"),
+                false,
+                None,
+                None,
+            ),
+            (
+                "closure",
+                query_input(9, b"bad-binding-closure"),
+                false,
+                Some(ControllerQueryClosureKind::DeliveryUncertain),
+                None,
+            ),
+            (
+                "Prepared",
+                prepared_query_input(9, b"bad-binding-prepared"),
+                true,
+                None,
+                Some(ControllerObservedTarget::Prepared),
+            ),
+            (
+                "Uncertain",
+                query_input(9, b"bad-binding-uncertain"),
+                true,
+                None,
+                Some(ControllerObservedTarget::Uncertain),
+            ),
+        ];
+
+        for (scenario, base_input, response_committed, closure, observed) in scenarios {
+            for tamper in ["selector digest", "principal"] {
+                let mut input = base_input;
+                match tamper {
+                    "selector digest" => input.bind_expected_request_digest = false,
+                    "principal" => input.principal = PrincipalRef::from_bytes([0xd1; 16]),
+                    _ => unreachable!("closed tamper fixture set"),
+                }
+                let forged = append_unvalidated_query_attempt(
+                    direct.state(),
+                    input,
+                    response_committed,
+                    closure,
+                    observed,
+                );
+                let expected = if scenario == "Prepared" && tamper == "selector digest" {
+                    ControllerJournalError::ConflictingTerminalEvidence
+                } else {
+                    ControllerJournalError::InvalidQueryRequest
+                };
+                assert_eq!(
+                    ControllerJournalSnapshot::decode(&encode_unvalidated_state(&forged, 20)),
+                    Err(expected),
+                    "checksum-valid current {scenario} {tamper} forgery must fail reopen",
+                );
+
+                let archived = archive_forged_first_rollout(&forged);
+                assert_eq!(
+                    ControllerJournalSnapshot::decode(&encode_unvalidated_state(&archived, 21)),
+                    Err(expected),
+                    "checksum-valid archived {scenario} {tamper} forgery must fail reopen",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checksum_valid_observed_kind_and_receipt_ref_tampers_are_rejected() {
+        let mut receipt_forged = decided_snapshot().state;
+        forge_latest_decision(
+            &mut receipt_forged,
+            ControllerObservedTarget::Active,
+            Some(ControllerReceiptRef::from_bytes([0xb4; 16])),
+        );
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&encode_unvalidated_state(&receipt_forged, 20)),
+            Err(ControllerJournalError::InvalidRolloutEvidence)
+        );
+
+        let mut active_as_retired = decided_snapshot().state;
+        forge_latest_decision(
+            &mut active_as_retired,
+            ControllerObservedTarget::Retired,
+            Some(fixture_controller_receipt_ref()),
+        );
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&encode_unvalidated_state(&active_as_retired, 20)),
+            Err(ControllerJournalError::InvalidRolloutEvidence)
+        );
+
+        let empty = canonical_empty_signed_snapshot(0x77);
+        let mut retired_as_active = record_query(
+            empty.state(),
+            terminal_query_input(20, b"retired-as-active", ControllerObservedTarget::Retired),
+        );
+        forge_latest_decision(
+            &mut retired_as_active,
+            ControllerObservedTarget::Active,
+            Some(fixture_controller_receipt_ref()),
+        );
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&encode_unvalidated_state(&retired_as_active, 20)),
+            Err(ControllerJournalError::InvalidRolloutEvidence)
+        );
+    }
+
+    #[test]
+    fn direct_plus_prepared_codec_accepts_only_strictly_older_query_evidence() {
+        let (direct, _, _) = direct_active_snapshot();
+        let older = record_query(
+            direct.state(),
+            prepared_query_input(9, b"codec-prepared-before-direct"),
+        )
+        .record_rollout_decision(ControllerObservedTarget::Prepared, None)
+        .expect("strictly older Prepared decision remains historical");
+        let older_wire = encode_unvalidated_state(&older, 20);
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&older_wire)
+                .expect("strictly older Prepared decision must reopen")
+                .state,
+            older
+        );
+
+        for sequence in [10_u64, 11] {
+            let mut forged = record_query(
+                direct.state(),
+                prepared_query_input(sequence, b"codec-prepared-not-before-direct"),
+            );
+            forge_latest_decision(&mut forged, ControllerObservedTarget::Prepared, None);
+            assert_eq!(
+                ControllerJournalSnapshot::decode(&encode_unvalidated_state(&forged, 20)),
+                Err(ControllerJournalError::ConflictingTerminalEvidence),
+                "equal or newer Prepared decision must fail reopen",
+            );
+        }
+    }
+
+    #[test]
+    fn plan_advance_gate_tracks_direct_query_chronology_and_current_epoch() {
+        let (direct, _, target_slice) = direct_active_snapshot();
+        assert_eq!(
+            direct
+                .state()
+                .current_active_target_slice_digest_for_plan_advance(),
+            Ok(Some(target_slice))
+        );
+        assert!(commit_empty_after_rollout(direct.state(), 0x40).is_ok());
+
+        let older = record_query(
+            direct.state(),
+            prepared_query_input(9, b"prepared-before-direct"),
+        )
+        .record_rollout_decision(ControllerObservedTarget::Prepared, None)
+        .expect("same-epoch Prepared before direct completion is historical");
+        assert_eq!(
+            older.current_active_target_slice_digest_for_plan_advance(),
+            Ok(Some(target_slice))
+        );
+        assert!(commit_empty_after_rollout(&older, 0x41).is_ok());
+
+        for sequence in [10_u64, 11] {
+            let queried = record_query(
+                direct.state(),
+                prepared_query_input(sequence, b"prepared-not-before-direct"),
+            );
+            assert_eq!(
+                queried.record_rollout_decision(ControllerObservedTarget::Prepared, None),
+                Err(ControllerJournalError::ConflictingTerminalEvidence)
+            );
+            assert_eq!(
+                commit_empty_after_rollout(
+                    &queried,
+                    u8::try_from(sequence).expect("sequence marker") + 0x40,
+                ),
+                Err(ControllerJournalError::NonTerminalRolloutBlocksPlanCommit)
+            );
+        }
+
+        let uncertain = record_query(direct.state(), query_input(11, b"uncertain-after-direct"))
+            .record_rollout_decision(ControllerObservedTarget::Uncertain, None)
+            .expect("an uncertain observation remains durable");
+        assert_eq!(
+            commit_empty_after_rollout(&uncertain, 0x50),
+            Err(ControllerJournalError::NonTerminalRolloutBlocksPlanCommit)
+        );
+
+        let open = prepare_query(direct.state(), query_input(11, b"closed-after-direct"));
+        let closed = open
+            .record_query_closure(ControllerQueryClosureKind::DeliveryUncertain)
+            .expect("latest closure remains durable");
+        assert_eq!(
+            commit_empty_after_rollout(&closed, 0x51),
+            Err(ControllerJournalError::NonTerminalRolloutBlocksPlanCommit)
+        );
+        let settled = record_query(
+            &closed,
+            terminal_query_input(
+                12,
+                b"settled-after-closure",
+                ControllerObservedTarget::Active,
+            ),
+        )
+        .record_rollout_decision(
+            ControllerObservedTarget::Active,
+            Some(fixture_controller_receipt_ref()),
+        )
+        .expect("fresh terminal decision settles the historical closure");
+        assert!(commit_empty_after_rollout(&settled, 0x52).is_ok());
+
+        let refreshed = direct
+            .state()
+            .record_target_binding(binding(4, b"bootstrap-four"))
+            .expect("binding epoch may advance");
+        assert_eq!(
+            commit_empty_after_rollout(&refreshed, 0x53),
+            Err(ControllerJournalError::NonTerminalRolloutBlocksPlanCommit)
+        );
+        let current = record_query(
+            &refreshed,
+            terminal_query_input(11, b"terminal-epoch-four", ControllerObservedTarget::Active),
+        )
+        .record_rollout_decision(
+            ControllerObservedTarget::Active,
+            Some(fixture_controller_receipt_ref()),
+        )
+        .expect("current-epoch terminal query refreshes direct evidence");
+        assert!(commit_empty_after_rollout(&current, 0x54).is_ok());
+    }
+
+    #[test]
+    fn terminal_failure_receipt_cannot_advance_or_bypass_successor_validation() {
+        let signed = canonical_signed_snapshot(0x67);
+        let failure_receipt = direct_receipt_for_signed_snapshot(
+            &signed,
+            ReferenceApplyTerminalOutcomeV1::StartTimedOutBeforeIntentNoEffects,
+            ReferenceApplyTerminalLifecycleEffectV1::ProvenNotStarted,
+            ReferenceApplyTerminalHeadV1::PreservedNone,
+        );
+        let failure = signed
+            .state()
+            .record_direct_terminal_receipt(&failure_receipt)
+            .expect("terminal failure remains exact durable evidence");
+        assert!(failure.current_apply_is_terminal());
+        assert_eq!(
+            failure.current_active_target_slice_digest_for_plan_advance(),
+            Ok(None)
+        );
+        assert_eq!(
+            commit_empty_after_rollout(&failure, 0x55),
+            Err(ControllerJournalError::NonTerminalRolloutBlocksPlanCommit)
+        );
+
+        let (success, _, _) = direct_active_snapshot_with_operation(0x67);
+        let candidate = journal_test_candidate(
+            TARGET,
+            failure.installed_manifest().projection(),
+            &failure.allocation,
+            None,
+            0x50,
+        )
+        .expect("forged successor Empty candidate");
+        let operation = ControllerOperationId::from_bytes([0x56; 16]);
+        let failure_prepared = failure
+            .prepare_plan_candidate(operation, &candidate)
+            .expect("failure evidence does not block plan prepare");
+        let success_prepared = success
+            .state()
+            .prepare_plan_candidate(operation, &candidate)
+            .expect("successful evidence plan prepare");
+        let valid_next = success_prepared
+            .commit_plan_candidate(operation, &candidate)
+            .expect("successful direct receipt may advance");
+        let mut forged_next = valid_next;
+        let archived = forged_next
+            .apply_history
+            .last_mut()
+            .expect("forged successor archived rollout");
+        *archived = failure
+            .rollout
+            .clone()
+            .expect("failure rollout remains current");
+        assert_eq!(
+            forged_next.validate_successor_of(&failure_prepared),
+            Err(ControllerJournalError::NonTerminalRolloutBlocksPlanCommit)
+        );
+    }
+
+    #[test]
+    fn raw_terminal_ref_conflict_survives_prior_decision_and_blocks_plan_advance() {
+        let signed = canonical_signed_snapshot(0x93);
+        let prepared = record_query(
+            signed.state(),
+            prepared_query_input(9, b"prepared-before-conflict"),
+        )
+        .record_rollout_decision(ControllerObservedTarget::Prepared, None)
+        .expect("historical Prepared decision");
+        let (_, direct_receipt, _) = direct_active_snapshot();
+        let with_direct = prepared
+            .record_direct_terminal_receipt(&direct_receipt)
+            .expect("matching direct receipt after historical Prepared");
+        let conflicting_result = direct_active_snapshot_with_operation(0x99)
+            .1
+            .facts()
+            .terminal_result_ref();
+        let mut conflicting_input = terminal_query_input(
+            11,
+            b"conflicting-terminal-ref",
+            ControllerObservedTarget::Active,
+        );
+        conflicting_input.terminal_result_override = Some(conflicting_result);
+        let conflicting = record_query(&with_direct, conflicting_input);
+        assert_eq!(
+            conflicting.record_rollout_decision(
+                ControllerObservedTarget::Active,
+                Some(ControllerReceiptRef::from_bytes(
+                    *conflicting_result.as_bytes(),
+                )),
+            ),
+            Err(ControllerJournalError::ConflictingTerminalEvidence)
+        );
+        assert_eq!(
+            commit_empty_after_rollout(&conflicting, 0x57),
+            Err(ControllerJournalError::ConflictingTerminalEvidence)
+        );
+
+        let snapshot = ControllerJournalSnapshot::try_from_stored(
+            [0x41; 32],
+            ControllerOwnerIdentityFingerprint::from_stored(digest(0x42)),
+            20,
+            conflicting,
+        )
+        .expect("raw conflict without a decision remains valid current evidence");
+        let encoded = snapshot.encode().expect("raw conflict snapshot encoding");
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&encoded)
+                .expect("raw conflict must survive restart exactly"),
+            snapshot
         );
     }
 
@@ -7360,7 +8890,7 @@ pub(crate) mod tests {
             Err(ControllerJournalError::ManifestBindingMismatch)
         );
 
-        let signed = signed_snapshot();
+        let signed = canonical_signed_snapshot(0x67);
         let original_auth = signed.state.request_auth;
         let rotated_state = signed
             .state
@@ -7395,13 +8925,16 @@ pub(crate) mod tests {
             original_auth
         );
 
-        let queried = record_query(&restarted.state, query_input(30, b"query-thirty"));
+        let queried = record_query(
+            &restarted.state,
+            terminal_query_input(30, b"query-thirty", ControllerObservedTarget::Active),
+        );
         let terminal = queried
             .record_rollout_decision(
-                ControllerObservedTarget::Retired,
-                Some(ControllerReceiptRef::from_bytes([0x6f; 16])),
+                ControllerObservedTarget::Active,
+                Some(fixture_controller_receipt_ref()),
             )
-            .expect("Retired decision must record");
+            .expect("Active decision must record");
         let candidate = journal_test_candidate(
             TARGET,
             terminal.installed_manifest().projection(),
@@ -7430,38 +8963,27 @@ pub(crate) mod tests {
         let mut state = bound_snapshot().state;
         for index in 0..super::MAX_APPLY_OPERATION_HISTORY {
             let index = u16::try_from(index).expect("history fixture index must fit");
-            let mut apply_operation = [0_u8; 16];
-            apply_operation[0] = 0x90;
-            apply_operation[14..].copy_from_slice(&index.to_be_bytes());
-            let mut request_digest = [0_u8; 32];
-            request_digest[0] = 0x91;
-            request_digest[30..].copy_from_slice(&index.to_be_bytes());
-            let input = ControllerSignedApplyIntentInput {
-                target: TARGET,
-                source_plan_digest: state
-                    .committed_plan
-                    .as_ref()
-                    .expect("plan")
-                    .deployment_plan_digest,
-                target_slice_digest: TargetSliceDigest::new(digest(0x76)),
-                apply_operation: ApplyOperationId::from_bytes(apply_operation),
-                request_digest: ControllerApplyRequestDigest::from_stored(Digest32::from_bytes(
-                    request_digest,
-                )),
-                signed_request: b"capacity-signed-request",
+            let operation_marker = u8::try_from(index)
+                .expect("history fixture marker must fit")
+                .checked_add(0x20)
+                .expect("history fixture marker has capacity");
+            state = record_canonical_signed_apply(&state, operation_marker).0;
+            let observed = match state
+                .committed_plan()
+                .expect("capacity fixture committed plan")
+                .content()
+                .shape()
+            {
+                TargetIntent::OneSourceLoop => ControllerObservedTarget::Active,
+                TargetIntent::EmptyTarget => ControllerObservedTarget::Retired,
+                TargetIntent::Omitted => panic!("capacity fixture plan must be actionable"),
             };
+            state = record_query(
+                &state,
+                terminal_query_input(u64::from(index) + 1, b"capacity-query", observed),
+            );
             state = state
-                .record_signed_apply_intent(input)
-                .expect("unique apply intent must record");
-            state = record_query(&state, query_input(u64::from(index) + 1, b"capacity-query"));
-            let mut receipt = [0_u8; 16];
-            receipt[0] = 0x92;
-            receipt[14..].copy_from_slice(&index.to_be_bytes());
-            state = state
-                .record_rollout_decision(
-                    ControllerObservedTarget::Active,
-                    Some(ControllerReceiptRef::from_bytes(receipt)),
-                )
+                .record_rollout_decision(observed, Some(fixture_controller_receipt_ref()))
                 .expect("capacity terminal decision must record");
             let candidate = journal_test_candidate(
                 TARGET,
@@ -7509,14 +9031,19 @@ pub(crate) mod tests {
             Err(ControllerJournalError::ApplyOperationConflict)
         );
 
-        state = state
-            .record_signed_apply_intent(different_signed_input(&state, 0xa3, 0xa4))
-            .expect("a fresh current rollout is allowed after the prior one was archived");
-        state = record_query(&state, query_input(200, b"capacity-final-query"));
+        state = record_canonical_signed_apply(&state, 0xa3).0;
+        state = record_query(
+            &state,
+            terminal_query_input(
+                200,
+                b"capacity-final-query",
+                ControllerObservedTarget::Retired,
+            ),
+        );
         state = state
             .record_rollout_decision(
                 ControllerObservedTarget::Retired,
-                Some(ControllerReceiptRef::from_bytes([0xa5; 16])),
+                Some(fixture_controller_receipt_ref()),
             )
             .expect("final terminal decision must record");
         assert_eq!(
@@ -7588,7 +9115,7 @@ pub(crate) mod tests {
 
     #[test]
     fn exact_query_history_capacity_is_bounded_without_evicting_evidence() {
-        let mut state = signed_snapshot().state;
+        let mut state = canonical_signed_snapshot(0x67).state;
         for sequence in
             1..=u64::try_from(super::MAX_RECONCILE_ATTEMPTS).expect("query capacity fits u64")
         {
@@ -7625,7 +9152,7 @@ pub(crate) mod tests {
 
     #[test]
     fn query_evidence_is_channel_bound_and_query_ids_are_scope_unique() {
-        let signed = signed_snapshot();
+        let signed = canonical_signed_snapshot(0x67);
         let mut wrong_peer = query_input(9, b"wrong-peer");
         wrong_peer.channel = Some(
             ReferenceChannelBindingV1::try_new(
@@ -7673,9 +9200,7 @@ pub(crate) mod tests {
             Err(ControllerJournalError::InvalidQueryResponse)
         );
 
-        let current = archived
-            .record_signed_apply_intent(different_signed_input(&archived, 0x7a, 0x7b))
-            .expect("fresh current rollout must record");
+        let (current, _) = record_canonical_signed_apply(&archived, 0x7a);
         let mut reused_archived_query = query_input(11, b"reused-archived-query");
         reused_archived_query.query_id = query_input(9, b"query-nine").query_id;
         let (reused_request, _, _) = query_contract_values(&current, reused_archived_query);
@@ -7694,9 +9219,7 @@ pub(crate) mod tests {
     fn query_snapshot_high_water_is_exact_and_survives_rollout_boundaries() {
         let archived = state_with_two_archived_rollouts();
         assert_eq!(archived.query_snapshot_high_water, 10);
-        let current = archived
-            .record_signed_apply_intent(different_signed_input(&archived, 0x7c, 0x7d))
-            .expect("fresh current rollout must record");
+        let (current, _) = record_canonical_signed_apply(&archived, 0x7c);
         let mut regressed = query_input(9, b"cross-rollout-regression");
         regressed.query_id = ReferenceQueryIdV1::from_bytes([0x7e; 16]);
         let (request, response, channel) = query_contract_values(&current, regressed);
@@ -7763,7 +9286,7 @@ pub(crate) mod tests {
                 &swapped_archive_digests,
                 12,
             )),
-            Err(ControllerJournalError::NonCanonicalApplyHistory)
+            Err(ControllerJournalError::InvalidRolloutEvidence)
         );
 
         let mut swapped_commit_digests = archived.clone();
@@ -7776,7 +9299,7 @@ pub(crate) mod tests {
                 &swapped_commit_digests,
                 12,
             )),
-            Err(ControllerJournalError::NonCanonicalApplyHistory)
+            Err(ControllerJournalError::InvalidRolloutEvidence)
         );
 
         let mut unknown_archive_digest = archived;
