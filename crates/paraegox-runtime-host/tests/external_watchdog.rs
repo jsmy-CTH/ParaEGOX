@@ -522,13 +522,16 @@ impl SameGroupDescendantFixture {
 #[test]
 fn executable_quarantine_stays_signal_responsive_instead_of_falling_into_drop() {
     let fixture = FixtureDirectory::create("quarantine");
+    let delayed_failure = fixture.path().join("delayed-runtime-host-failure.sh");
+    // Keep every spawned generation alive long enough for the manager to
+    // install its initial control probe. An immediately exiting child races
+    // that post-spawn boundary on Linux and can correctly make `try_start`
+    // fail before the executable has entered its signal-driven owner loop.
+    install_executable_script(&delayed_failure, "#!/bin/sh\nsleep 0.25\nexit 23\n");
     let quarantine_log = fixture.path().join("watchdog.stderr");
     let log = fs::File::create(&quarantine_log).expect("watchdog log must be created");
     let child = Command::new(watchdog_executable())
-        // A nested watchdog has no RuntimeHost argument and exits immediately.
-        // It is a stable Cargo-built failing executable, not a freshly written
-        // script subject to the integration-test write-to-exec race.
-        .arg(watchdog_executable())
+        .arg(&delayed_failure)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
@@ -543,7 +546,10 @@ fn executable_quarantine_stays_signal_responsive_instead_of_falling_into_drop() 
             .try_wait()
             .expect("watchdog executable wait must succeed")
         {
-            panic!("watchdog exited before operator-controlled quarantine shutdown: {status:?}");
+            let evidence = fs::read_to_string(&quarantine_log).unwrap_or_default();
+            panic!(
+                "watchdog exited before operator-controlled quarantine shutdown: {status:?}; evidence={evidence}"
+            );
         }
         let evidence = fs::read_to_string(&quarantine_log).unwrap_or_default();
         if evidence.contains("entered quarantine") {
