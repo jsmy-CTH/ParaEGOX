@@ -5,8 +5,8 @@
 //! for this exact executable, the install operation is the only producer of the
 //! singleton manifest before it initializes the Runtime store, and the Linux
 //! bootstrap service consumes exact provisioned key and service identities,
-//! while the explicit offline migration command upgrades only a stopped v3
-//! journal after retaining exact read-only evidence.
+//! while the two explicit offline migration commands advance only one stopped
+//! journal payload version at a time after retaining exact read-only evidence.
 
 use core::fmt;
 use std::env;
@@ -64,6 +64,7 @@ const RELEASE_DESCRIPTOR_COMMAND: &str = "release-descriptor-v1";
 const INSTALL_COMMAND: &str = "install-v1";
 const SERVE_BOOTSTRAP_COMMAND: &str = "serve-bootstrap-v1";
 const MIGRATE_JOURNAL_V3_TO_V4_COMMAND: &str = "migrate-journal-v3-to-v4-v1";
+const MIGRATE_JOURNAL_V4_TO_V5_COMMAND: &str = "migrate-journal-v4-to-v5-v1";
 
 /// Runs the exact RuntimeHost executable mode selected by process arguments.
 ///
@@ -99,17 +100,23 @@ pub fn run_runtime_host_entrypoint(
         RuntimeHostCommand::MigrateJournalV3ToV4(arguments) => {
             run_journal_v3_to_v4_migration(*arguments)
         }
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        RuntimeHostCommand::MigrateJournalV4ToV5(arguments) => {
+            run_journal_v4_to_v5_migration(*arguments)
+        }
         #[cfg(all(unix, not(target_os = "linux"), not(test)))]
         RuntimeHostCommand::Install(_)
         | RuntimeHostCommand::ServeBootstrap(_)
-        | RuntimeHostCommand::MigrateJournalV3ToV4(_) => {
+        | RuntimeHostCommand::MigrateJournalV3ToV4(_)
+        | RuntimeHostCommand::MigrateJournalV4ToV5(_) => {
             Err(RuntimeHostEntrypointFailure::UnsupportedPlatform.into())
         }
         #[cfg(not(unix))]
         RuntimeHostCommand::ReleaseDescriptor { .. }
         | RuntimeHostCommand::Install(_)
         | RuntimeHostCommand::ServeBootstrap(_)
-        | RuntimeHostCommand::MigrateJournalV3ToV4(_) => {
+        | RuntimeHostCommand::MigrateJournalV3ToV4(_)
+        | RuntimeHostCommand::MigrateJournalV4ToV5(_) => {
             Err(RuntimeHostEntrypointFailure::UnsupportedPlatform.into())
         }
     }
@@ -122,6 +129,14 @@ enum RuntimeHostCommand {
     Install(Box<RuntimeInstallArgumentsV1>),
     ServeBootstrap(Box<RuntimeBootstrapArgumentsV1>),
     MigrateJournalV3ToV4(Box<RuntimeJournalMigrationArgumentsV1>),
+    MigrateJournalV4ToV5(Box<RuntimeJournalMigrationArgumentsV1>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "linux", all(test, unix)))]
+enum RuntimeJournalMigrationStep {
+    PayloadV3ToV4,
+    PayloadV4ToV5,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -247,24 +262,30 @@ fn parse_runtime_host_command(
         )));
     }
     if command == OsStr::new(MIGRATE_JOURNAL_V3_TO_V4_COMMAND) {
-        let state_directory = PathBuf::from(required_argument(&mut arguments)?);
-        let evidence_directory = PathBuf::from(required_argument(&mut arguments)?);
-        let expected_store_instance_id = parse_hex_array(required_argument(&mut arguments)?)?;
-        let expected_target_fingerprint =
-            parse_digest_argument(required_argument(&mut arguments)?)?;
-        let migration_id = parse_hex_array(required_argument(&mut arguments)?)?;
-        reject_additional_arguments(&mut arguments)?;
         return Ok(RuntimeHostCommand::MigrateJournalV3ToV4(Box::new(
-            RuntimeJournalMigrationArgumentsV1 {
-                state_directory,
-                evidence_directory,
-                expected_store_instance_id,
-                expected_target_fingerprint,
-                migration_id,
-            },
+            parse_runtime_journal_migration_arguments(&mut arguments)?,
+        )));
+    }
+    if command == OsStr::new(MIGRATE_JOURNAL_V4_TO_V5_COMMAND) {
+        return Ok(RuntimeHostCommand::MigrateJournalV4ToV5(Box::new(
+            parse_runtime_journal_migration_arguments(&mut arguments)?,
         )));
     }
     Err(RuntimeHostEntrypointFailure::InvalidArguments.into())
+}
+
+fn parse_runtime_journal_migration_arguments(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<RuntimeJournalMigrationArgumentsV1, RuntimeHostEntrypointError> {
+    let parsed = RuntimeJournalMigrationArgumentsV1 {
+        state_directory: PathBuf::from(required_argument(arguments)?),
+        evidence_directory: PathBuf::from(required_argument(arguments)?),
+        expected_store_instance_id: parse_hex_array(required_argument(arguments)?)?,
+        expected_target_fingerprint: parse_digest_argument(required_argument(arguments)?)?,
+        migration_id: parse_hex_array(required_argument(arguments)?)?,
+    };
+    reject_additional_arguments(arguments)?;
+    Ok(parsed)
 }
 
 fn parse_provisioning_arguments(
@@ -477,41 +498,93 @@ fn run_bootstrap_service(
 fn run_journal_v3_to_v4_migration(
     arguments: RuntimeJournalMigrationArgumentsV1,
 ) -> Result<(), RuntimeHostEntrypointError> {
-    let outcome = RuntimeStore::migrate_payload_v3_offline(
-        &arguments.state_directory,
-        &arguments.evidence_directory,
-        arguments.expected_store_instance_id,
-        arguments.expected_target_fingerprint,
-        arguments.migration_id,
-    )?;
-    let disposition = match outcome.disposition {
+    run_journal_migration(RuntimeJournalMigrationStep::PayloadV3ToV4, arguments)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn run_journal_v4_to_v5_migration(
+    arguments: RuntimeJournalMigrationArgumentsV1,
+) -> Result<(), RuntimeHostEntrypointError> {
+    run_journal_migration(RuntimeJournalMigrationStep::PayloadV4ToV5, arguments)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn run_journal_migration(
+    step: RuntimeJournalMigrationStep,
+    arguments: RuntimeJournalMigrationArgumentsV1,
+) -> Result<(), RuntimeHostEntrypointError> {
+    let outcome = match step {
+        RuntimeJournalMigrationStep::PayloadV3ToV4 => RuntimeStore::migrate_payload_v3_offline(
+            &arguments.state_directory,
+            &arguments.evidence_directory,
+            arguments.expected_store_instance_id,
+            arguments.expected_target_fingerprint,
+            arguments.migration_id,
+        ),
+        RuntimeJournalMigrationStep::PayloadV4ToV5 => RuntimeStore::migrate_payload_v4_offline(
+            &arguments.state_directory,
+            &arguments.evidence_directory,
+            arguments.expected_store_instance_id,
+            arguments.expected_target_fingerprint,
+            arguments.migration_id,
+        ),
+    }?;
+    let receipt = outcome.receipt;
+    let output = RuntimeJournalMigrationOutputV1 {
+        disposition: outcome.disposition,
+        migration_id: receipt.migration_id(),
+        source_payload_version: receipt.source_payload_version(),
+        source_checksum: receipt.source_checksum(),
+        source_store_instance_id: receipt.source_store_instance_id(),
+        source_target_fingerprint: receipt.source_target_fingerprint(),
+        source_sequence: receipt.source_sequence(),
+        canonical_receipt: receipt.canonical_wire(),
+    };
+    let mut stdout = io::stdout().lock();
+    write_runtime_journal_migration_output(&mut stdout, output)
+        .map_err(|error| RuntimeHostEntrypointFailure::Output(error.kind()).into())
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+struct RuntimeJournalMigrationOutputV1<'a> {
+    disposition: RuntimeStoreMigrationDisposition,
+    migration_id: &'a [u8; 32],
+    source_payload_version: u16,
+    source_checksum: Digest32,
+    source_store_instance_id: &'a [u8; 32],
+    source_target_fingerprint: Digest32,
+    source_sequence: u64,
+    canonical_receipt: &'a [u8],
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn write_runtime_journal_migration_output(
+    output: &mut impl Write,
+    facts: RuntimeJournalMigrationOutputV1<'_>,
+) -> Result<(), io::Error> {
+    let disposition = match facts.disposition {
         RuntimeStoreMigrationDisposition::Migrated => b"migrated".as_slice(),
         RuntimeStoreMigrationDisposition::AlreadyMigrated => b"already_migrated".as_slice(),
     };
-    let receipt = outcome.receipt;
-    let mut stdout = io::stdout().lock();
-    let result = (|| -> io::Result<()> {
-        stdout.write_all(b"runtime_journal_migration_v1 disposition=")?;
-        stdout.write_all(disposition)?;
-        stdout.write_all(b" migration_id=")?;
-        write_lower_hex(&mut stdout, receipt.migration_id())?;
-        write!(
-            stdout,
-            " source_payload_version={}",
-            receipt.source_payload_version()
-        )?;
-        stdout.write_all(b" source_checksum=")?;
-        write_lower_hex(&mut stdout, receipt.source_checksum().as_bytes())?;
-        stdout.write_all(b" store_instance_id=")?;
-        write_lower_hex(&mut stdout, receipt.source_store_instance_id())?;
-        stdout.write_all(b" target_fingerprint=")?;
-        write_lower_hex(&mut stdout, receipt.source_target_fingerprint().as_bytes())?;
-        write!(stdout, " source_sequence={}", receipt.source_sequence())?;
-        stdout.write_all(b" receipt=")?;
-        write_lower_hex(&mut stdout, receipt.canonical_wire())?;
-        stdout.write_all(b"\n")
-    })();
-    result.map_err(|error| RuntimeHostEntrypointFailure::Output(error.kind()).into())
+    output.write_all(b"runtime_journal_migration_v1 disposition=")?;
+    output.write_all(disposition)?;
+    output.write_all(b" migration_id=")?;
+    write_lower_hex(output, facts.migration_id)?;
+    write!(
+        output,
+        " source_payload_version={}",
+        facts.source_payload_version
+    )?;
+    output.write_all(b" source_checksum=")?;
+    write_lower_hex(output, facts.source_checksum.as_bytes())?;
+    output.write_all(b" store_instance_id=")?;
+    write_lower_hex(output, facts.source_store_instance_id)?;
+    output.write_all(b" target_fingerprint=")?;
+    write_lower_hex(output, facts.source_target_fingerprint.as_bytes())?;
+    write!(output, " source_sequence={}", facts.source_sequence)?;
+    output.write_all(b" receipt=")?;
+    write_lower_hex(output, facts.canonical_receipt)?;
+    output.write_all(b"\n")
 }
 
 #[cfg(unix)]
@@ -790,15 +863,33 @@ mod tests {
         command
     }
 
-    fn valid_migration_command() -> Vec<OsString> {
+    fn valid_migration_command_for(command: &str) -> Vec<OsString> {
         vec![
-            os(MIGRATE_JOURNAL_V3_TO_V4_COMMAND),
+            os(command),
             os("/tmp/runtime-state"),
             os("/tmp/runtime-migration-evidence"),
             os(&"41".repeat(32)),
             os(&"42".repeat(32)),
             os(&"43".repeat(32)),
         ]
+    }
+
+    fn valid_migration_command() -> Vec<OsString> {
+        valid_migration_command_for(MIGRATE_JOURNAL_V3_TO_V4_COMMAND)
+    }
+
+    fn valid_v4_to_v5_migration_command() -> Vec<OsString> {
+        valid_migration_command_for(MIGRATE_JOURNAL_V4_TO_V5_COMMAND)
+    }
+
+    fn expected_migration_arguments() -> RuntimeJournalMigrationArgumentsV1 {
+        RuntimeJournalMigrationArgumentsV1 {
+            state_directory: PathBuf::from("/tmp/runtime-state"),
+            evidence_directory: PathBuf::from("/tmp/runtime-migration-evidence"),
+            expected_store_instance_id: [0x41; 32],
+            expected_target_fingerprint: Digest32::from_bytes([0x42; 32]),
+            migration_id: [0x43; 32],
+        }
     }
 
     #[test]
@@ -827,36 +918,286 @@ mod tests {
     }
 
     #[test]
-    fn journal_migration_command_is_exact_versioned_and_lower_hex_only() {
+    fn journal_migration_commands_are_exact_versioned_and_lower_hex_only() {
         assert_eq!(
             parse_runtime_host_command(valid_migration_command().into_iter())
                 .unwrap_or_else(|error| panic!("migration command rejected: {error}")),
-            RuntimeHostCommand::MigrateJournalV3ToV4(Box::new(
-                RuntimeJournalMigrationArgumentsV1 {
-                    state_directory: PathBuf::from("/tmp/runtime-state"),
-                    evidence_directory: PathBuf::from("/tmp/runtime-migration-evidence"),
-                    expected_store_instance_id: [0x41; 32],
-                    expected_target_fingerprint: Digest32::from_bytes([0x42; 32]),
-                    migration_id: [0x43; 32],
-                }
-            ))
+            RuntimeHostCommand::MigrateJournalV3ToV4(Box::new(expected_migration_arguments()))
+        );
+        assert_eq!(
+            parse_runtime_host_command(valid_v4_to_v5_migration_command().into_iter())
+                .unwrap_or_else(|error| panic!("v4-to-v5 migration command rejected: {error}")),
+            RuntimeHostCommand::MigrateJournalV4ToV5(Box::new(expected_migration_arguments()))
+        );
+    }
+
+    fn parse_mutation_sentinel(label: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "paraegox-runtime-entrypoint-parse-must-not-create-{}-{label}",
+            std::process::id(),
+        ));
+        (root.join("state"), root.join("evidence"))
+    }
+
+    fn migration_command_with_paths(
+        command: &str,
+        state_directory: &std::path::Path,
+        evidence_directory: &std::path::Path,
+    ) -> Vec<OsString> {
+        vec![
+            os(command),
+            state_directory.as_os_str().to_os_string(),
+            evidence_directory.as_os_str().to_os_string(),
+            os(&"41".repeat(32)),
+            os(&"42".repeat(32)),
+            os(&"43".repeat(32)),
+        ]
+    }
+
+    fn assert_parse_rejected_without_path_mutation(
+        arguments: Vec<OsString>,
+        state_directory: &std::path::Path,
+        evidence_directory: &std::path::Path,
+    ) {
+        assert!(!state_directory.exists(), "state sentinel already exists");
+        assert!(
+            !evidence_directory.exists(),
+            "evidence sentinel already exists"
+        );
+        assert!(parse_runtime_host_command(arguments.into_iter()).is_err());
+        assert!(!state_directory.exists(), "parser created the state path");
+        assert!(
+            !evidence_directory.exists(),
+            "parser created the evidence path"
+        );
+    }
+
+    #[test]
+    fn both_migration_grammars_reject_unknown_unversioned_missing_additional_and_noncanonical_input_before_mutation()
+     {
+        for (label, command, unversioned) in [
+            (
+                "v3-v4",
+                MIGRATE_JOURNAL_V3_TO_V4_COMMAND,
+                "migrate-journal-v3-to-v4",
+            ),
+            (
+                "v4-v5",
+                MIGRATE_JOURNAL_V4_TO_V5_COMMAND,
+                "migrate-journal-v4-to-v5",
+            ),
+        ] {
+            let (state_directory, evidence_directory) = parse_mutation_sentinel(label);
+            let valid =
+                migration_command_with_paths(command, &state_directory, &evidence_directory);
+
+            for prefix_length in 1..valid.len() {
+                assert_parse_rejected_without_path_mutation(
+                    valid[..prefix_length].to_vec(),
+                    &state_directory,
+                    &evidence_directory,
+                );
+            }
+
+            let mut additional = valid.clone();
+            additional.push(os("additional"));
+            assert_parse_rejected_without_path_mutation(
+                additional,
+                &state_directory,
+                &evidence_directory,
+            );
+
+            for field_index in 3..=5 {
+                let mut uppercase = valid.clone();
+                uppercase[field_index] = os(&"AA".repeat(32));
+                assert_parse_rejected_without_path_mutation(
+                    uppercase,
+                    &state_directory,
+                    &evidence_directory,
+                );
+
+                let mut wrong_width = valid.clone();
+                wrong_width[field_index] = os(&"44".repeat(31));
+                assert_parse_rejected_without_path_mutation(
+                    wrong_width,
+                    &state_directory,
+                    &evidence_directory,
+                );
+
+                let mut prefixed = valid.clone();
+                prefixed[field_index] = os(&format!("0x{}", "44".repeat(32)));
+                assert_parse_rejected_without_path_mutation(
+                    prefixed,
+                    &state_directory,
+                    &evidence_directory,
+                );
+            }
+
+            let mut old_unversioned_name = valid.clone();
+            old_unversioned_name[0] = os(unversioned);
+            assert_parse_rejected_without_path_mutation(
+                old_unversioned_name,
+                &state_directory,
+                &evidence_directory,
+            );
+
+            let mut noncanonical_command_case = valid.clone();
+            noncanonical_command_case[0] = os(&command.to_ascii_uppercase());
+            assert_parse_rejected_without_path_mutation(
+                noncanonical_command_case,
+                &state_directory,
+                &evidence_directory,
+            );
+
+            let mut unknown = valid;
+            unknown[0] = os("migrate-journal-v5-to-v6-v1");
+            assert_parse_rejected_without_path_mutation(
+                unknown,
+                &state_directory,
+                &evidence_directory,
+            );
+        }
+    }
+
+    fn migration_arguments_for_runner(
+        state_directory: PathBuf,
+        evidence_directory: PathBuf,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+        migration_id: [u8; 32],
+    ) -> RuntimeJournalMigrationArgumentsV1 {
+        RuntimeJournalMigrationArgumentsV1 {
+            state_directory,
+            evidence_directory,
+            expected_store_instance_id,
+            expected_target_fingerprint,
+            migration_id,
+        }
+    }
+
+    #[test]
+    fn both_migration_runners_reject_invalid_identity_inputs_before_opening_paths() {
+        for (label, step) in [
+            ("runner-v3-v4", RuntimeJournalMigrationStep::PayloadV3ToV4),
+            ("runner-v4-v5", RuntimeJournalMigrationStep::PayloadV4ToV5),
+        ] {
+            let (state_directory, evidence_directory) = parse_mutation_sentinel(label);
+            for (expected_error, arguments) in [
+                (
+                    RuntimeStoreMigrationError::InvalidExpectedStoreInstanceId,
+                    migration_arguments_for_runner(
+                        state_directory.clone(),
+                        evidence_directory.clone(),
+                        [0; 32],
+                        Digest32::from_bytes([0x42; 32]),
+                        [0x43; 32],
+                    ),
+                ),
+                (
+                    RuntimeStoreMigrationError::InvalidExpectedTargetFingerprint,
+                    migration_arguments_for_runner(
+                        state_directory.clone(),
+                        evidence_directory.clone(),
+                        [0x41; 32],
+                        Digest32::from_bytes([0; 32]),
+                        [0x43; 32],
+                    ),
+                ),
+                (
+                    RuntimeStoreMigrationError::InvalidMigrationId,
+                    migration_arguments_for_runner(
+                        state_directory.clone(),
+                        evidence_directory.clone(),
+                        [0x41; 32],
+                        Digest32::from_bytes([0x42; 32]),
+                        [0; 32],
+                    ),
+                ),
+            ] {
+                assert!(!state_directory.exists());
+                assert!(!evidence_directory.exists());
+                let result = match step {
+                    RuntimeJournalMigrationStep::PayloadV3ToV4 => {
+                        run_journal_v3_to_v4_migration(arguments)
+                    }
+                    RuntimeJournalMigrationStep::PayloadV4ToV5 => {
+                        run_journal_v4_to_v5_migration(arguments)
+                    }
+                };
+                let error =
+                    result.expect_err("invalid migration identity unexpectedly reached the store");
+                assert!(matches!(
+                    error.failure,
+                    RuntimeHostEntrypointFailure::Migration(actual)
+                        if core::mem::discriminant(&actual)
+                            == core::mem::discriminant(&expected_error)
+                ));
+                assert!(!state_directory.exists(), "runner created the state path");
+                assert!(
+                    !evidence_directory.exists(),
+                    "runner created the evidence path"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn migration_output_keeps_the_v3_v4_wire_and_encodes_v4_v5_disposition_exactly() {
+        let migration_id = [0x11; 32];
+        let store_instance_id = [0x22; 32];
+        let canonical_receipt = [0x55, 0xaa];
+
+        let mut old_output = Vec::new();
+        write_runtime_journal_migration_output(
+            &mut old_output,
+            RuntimeJournalMigrationOutputV1 {
+                disposition: RuntimeStoreMigrationDisposition::Migrated,
+                migration_id: &migration_id,
+                source_payload_version: 3,
+                source_checksum: Digest32::from_bytes([0x33; 32]),
+                source_store_instance_id: &store_instance_id,
+                source_target_fingerprint: Digest32::from_bytes([0x44; 32]),
+                source_sequence: 7,
+                canonical_receipt: &canonical_receipt,
+            },
+        )
+        .expect("v3-to-v4 output must encode");
+        assert_eq!(
+            String::from_utf8(old_output).expect("operator output must be UTF-8"),
+            format!(
+                "runtime_journal_migration_v1 disposition=migrated migration_id={} source_payload_version=3 source_checksum={} store_instance_id={} target_fingerprint={} source_sequence=7 receipt=55aa\n",
+                "11".repeat(32),
+                "33".repeat(32),
+                "22".repeat(32),
+                "44".repeat(32),
+            ),
         );
 
-        let mut missing = valid_migration_command();
-        missing.pop();
-        assert!(parse_runtime_host_command(missing.into_iter()).is_err());
-        let mut extra = valid_migration_command();
-        extra.push(os("extra"));
-        assert!(parse_runtime_host_command(extra.into_iter()).is_err());
-        let mut uppercase = valid_migration_command();
-        uppercase[4] = os(&"AA".repeat(32));
-        assert!(parse_runtime_host_command(uppercase.into_iter()).is_err());
-        let mut wrong_width = valid_migration_command();
-        wrong_width[5] = os(&"43".repeat(31));
-        assert!(parse_runtime_host_command(wrong_width.into_iter()).is_err());
-        let mut old_unversioned_name = valid_migration_command();
-        old_unversioned_name[0] = os("migrate-journal-v3-to-v4");
-        assert!(parse_runtime_host_command(old_unversioned_name.into_iter()).is_err());
+        let mut new_output = Vec::new();
+        write_runtime_journal_migration_output(
+            &mut new_output,
+            RuntimeJournalMigrationOutputV1 {
+                disposition: RuntimeStoreMigrationDisposition::AlreadyMigrated,
+                migration_id: &migration_id,
+                source_payload_version: 4,
+                source_checksum: Digest32::from_bytes([0x33; 32]),
+                source_store_instance_id: &store_instance_id,
+                source_target_fingerprint: Digest32::from_bytes([0x44; 32]),
+                source_sequence: 8,
+                canonical_receipt: &canonical_receipt,
+            },
+        )
+        .expect("v4-to-v5 output must encode");
+        assert_eq!(
+            String::from_utf8(new_output).expect("operator output must be UTF-8"),
+            format!(
+                "runtime_journal_migration_v1 disposition=already_migrated migration_id={} source_payload_version=4 source_checksum={} store_instance_id={} target_fingerprint={} source_sequence=8 receipt=55aa\n",
+                "11".repeat(32),
+                "33".repeat(32),
+                "22".repeat(32),
+                "44".repeat(32),
+            ),
+        );
     }
 
     #[test]

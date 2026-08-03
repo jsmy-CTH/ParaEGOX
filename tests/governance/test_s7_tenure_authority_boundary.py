@@ -78,7 +78,7 @@ def test_only_the_two_real_process_facades_are_promoted() -> None:
     assert symbols == PUBLIC_DEPLOYMENTD_SYMBOLS
 
 
-def test_governance_claims_exact_one_shot_controller_vertical_without_future_recovery() -> None:
+def test_governance_claims_exact_one_shot_controller_vertical_without_second_restart_owner() -> None:
     governance = _load_toml(REPO_ROOT / "governance.toml")["registry"]
     packages = [
         package
@@ -125,9 +125,11 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_future_rec
     assert "verified by Ubuntu CI run 30748840399" in package["responsibility"]
     assert "owner-private exact PXQR/PXQS" in package["responsibility"]
     assert "executable Runtime-query/reconciliation path" in package["responsibility"]
-    assert "production restart reassembly/recovery" in package["responsibility"]
     assert "remain absent" in package["responsibility"]
-    assert "does not constitute general live-state reassembly or recovery" in package[
+    assert "Runtime alone owns fixed-profile Loop/Empty restart reassembly" in package[
+        "responsibility"
+    ]
+    assert "does not constitute general Thread/Process live-state recovery" in package[
         "responsibility"
     ]
 
@@ -152,8 +154,12 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_future_rec
     ):
         assert command in compatibility
     assert "no executable Runtime-query command" in compatibility
-    assert "restart reassembly/recovery" in compatibility
     assert "Controller reconcile loop" in compatibility
+    assert "second restart authority" in compatibility
+    assert (
+        "Fixed-profile Loop/Empty restart reassembly remains exclusively Runtime-owned"
+        in compatibility
+    )
     assert "communicate over a real strict versioned wire" in compatibility
 
     waiver_reasons = {
@@ -299,20 +305,25 @@ def test_s7_runtime_store_query_and_migration_stay_private_behind_real_entrypoin
     assert "release-descriptor-v1" in runtime_package["responsibility"]
     assert "install-v1" in runtime_package["responsibility"]
     assert "migrate-journal-v3-to-v4-v1" in runtime_package["responsibility"]
-    assert "payload v4 persists complete contract-owned Slice provenance" in runtime_package[
+    assert "migrate-journal-v4-to-v5-v1" in runtime_package["responsibility"]
+    assert "payload v5 persists complete contract-owned Slice provenance" in runtime_package[
         "responsibility"
     ]
+    assert "exact prepared request-time response channel" in runtime_package["responsibility"]
+    assert "reserved-at-crash exact-zero resource shape" in runtime_package["responsibility"]
     assert "same bounded four-byte-framed channel" in runtime_package["responsibility"]
     assert "canonical PXBR bootstrap, PXQR query, and PXAR v5 apply requests" in runtime_package[
         "responsibility"
     ]
     assert "Runtime-signed and request-correlated PXQS" in runtime_package["responsibility"]
     assert "canonical Runtime-signed PXRT terminal Receipt" in runtime_package["responsibility"]
-    assert (
-        "Controller query/reconciliation, production restart reassembly/recovery"
-        in runtime_package["responsibility"]
-    )
+    assert "Executable Controller query/reconciliation" in runtime_package["responsibility"]
     assert "remain unimplemented" in runtime_package["responsibility"]
+    assert "Before a listener capability exists" in runtime_package["responsibility"]
+    assert "fixed-profile startup" in runtime_package["responsibility"]
+    assert "does not add general readiness, recover Thread/Process assembly" in runtime_package[
+        "responsibility"
+    ]
 
     runtime_cli = next(
         row
@@ -324,9 +335,15 @@ def test_s7_runtime_store_query_and_migration_stay_private_behind_real_entrypoin
         "install-v1",
         "serve-bootstrap-v1",
         "migrate-journal-v3-to-v4-v1",
+        "migrate-journal-v4-to-v5-v1",
     ]
     assert "authenticated local PXBR/PXQR/PXAR endpoint" in runtime_cli["compatibility"]
     assert "canonical PXMR receipt" in runtime_cli["compatibility"]
+    assert "five versioned commands" in runtime_cli["compatibility"]
+    assert "fixed-profile Loop/Empty restart reassembly before listener publication" in runtime_cli[
+        "compatibility"
+    ]
+    assert "no prepared or recovery action" in runtime_cli["compatibility"]
     assert "migration is neither rollback nor recovery" in runtime_cli["compatibility"]
 
     public_symbols = {str(symbol) for row in governance["public_apis"] for symbol in row["symbols"]}

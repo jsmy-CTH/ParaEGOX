@@ -54,7 +54,7 @@ use paraegox_runtime_contracts::{
         ReferenceQueryLiveFactsV1, ReferenceQueryLiveStateV1, ReferenceQueryOperationLookupV1,
         ReferenceQueryOperationStateV1, ReferenceQueryOwnerStateV1, ReferenceQueryRequestV1,
         ReferenceQueryResponseAuthClaimV1, ReferenceQueryResponseDraftV1,
-        reference_local_control_endpoint_identity_digest_v1,
+        ReferenceTargetExecutionPlanV4, reference_local_control_endpoint_identity_digest_v1,
         reference_runtime_peer_credentials_digest_v1, verify_reference_durable_slice_v1,
     },
     wire::ApplyAuthAlgorithm,
@@ -77,7 +77,8 @@ use crate::{
             RuntimeReferenceApplyClock, RuntimeReferenceApplyClockError, RuntimeReferenceApplyCore,
             RuntimeReferenceApplyError, RuntimeReferenceApplyOutcome, RuntimeReferenceApplySigner,
             RuntimeReferenceApplyStore, RuntimeReferenceMaterializationOwner,
-            RuntimeStoredReferenceApplyReceipt,
+            RuntimeRestartReassemblyError, RuntimeStoredReferenceApplyReceipt,
+            run_runtime_restart_reassembly,
         },
         runtime_reference_owner::RuntimeFixedReferenceMaterializationOwner,
     },
@@ -223,6 +224,9 @@ impl RuntimeBootstrapStore for RuntimeStore {
 struct StartedRuntimeBootstrapService<Store> {
     store: Store,
     state: RuntimeControlState,
+    clock: RuntimeClock,
+    owner: RuntimeFixedReferenceMaterializationOwner,
+    signer: RuntimeReferenceApplySigner,
     compiled: RuntimeCompiledInstallationFactsV1,
     compatibility: ReferenceBootstrapCompatibilityV1,
     provisioning: RuntimeProvisioningV1,
@@ -248,13 +252,48 @@ where
             previous.state().host.admission_policy_fingerprint,
         )?;
         let state = RuntimeControlState::try_start(&previous)?;
+        let active_execution = startup_active_execution(&previous, &manifest, compiled)?;
 
-        // This is the readiness boundary. No listener object can be obtained
-        // before the exact successor is durably accepted by the store owner.
+        // Startup invalidation is the first durable boundary. Reassembly and
+        // every exact-zero/quarantine successor below also finish before this
+        // capability can be converted into a listener.
         store.commit(state.snapshot().clone())?;
+        let journal = state.bootstrap_facts()?;
+        let generation = ClockGeneration::try_new(journal.clock_generation())
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        let clock = RuntimeClock::new(
+            ClockDomainRef::from_bytes(journal.clock_domain()),
+            generation,
+            1,
+        );
+        let owner =
+            RuntimeFixedReferenceMaterializationOwner::try_new(compiled, clock, state.snapshot())
+                .map_err(|error| {
+                RuntimeBootstrapEndpointError::Apply(RuntimeReferenceApplyError::Owner(error))
+            })?;
+        let signer = RuntimeReferenceApplySigner::try_new(
+            provisioning.response_signer().clone(),
+            provisioning.runtime_response_key_ref(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?,
+            ED25519_ALGORITHM_VERSION,
+        )
+        .map_err(RuntimeBootstrapEndpointError::Apply)?;
+        let parts = run_runtime_restart_reassembly(
+            store,
+            state,
+            RuntimeEndpointApplyClock { clock },
+            owner,
+            &signer,
+            active_execution.as_ref(),
+        )?;
+        let (store, state, owner) = (parts.store, parts.state, parts.owner);
         Ok(Self {
             store,
             state,
+            clock,
+            owner,
+            signer,
             compiled,
             compatibility,
             provisioning,
@@ -497,6 +536,7 @@ where
             &self.provisioning,
             self.apply.snapshot(),
             self.clock,
+            self.channel,
             &request,
         )?;
         let outcome = self
@@ -736,7 +776,7 @@ fn query_live_projection(
     let nonterminal_generation = state
         .owned_resources
         .iter()
-        .filter(|resource| resource.phase != ResourcePhase::Terminal)
+        .filter(|resource| !resource.phase.is_terminal())
         .map(|resource| resource.generation)
         .max()
         .unwrap_or(0);
@@ -900,6 +940,7 @@ fn reference_apply_fresh_preflight(
     provisioning: &RuntimeProvisioningV1,
     snapshot: &RuntimeJournalSnapshot,
     clock: RuntimeClock,
+    channel: ReferenceChannelBindingV1,
     request: &ReferenceApplyRequestV1,
 ) -> Result<RuntimeReferenceApplyPreflight, RuntimeControlRequestError> {
     let state = RuntimeControlState::try_from_started_snapshot(snapshot).map_err(|error| {
@@ -932,6 +973,7 @@ fn reference_apply_fresh_preflight(
         request_nonce_identity: identities.request_nonce_identity(),
         temporal_lineage_digest: identities.temporal_lineage_digest(),
         admitted_at_nanos: verified.admitted_at_nanos(),
+        response_channel: channel,
     })
 }
 
@@ -1004,37 +1046,12 @@ where
         self,
         channel: ReferenceChannelBindingV1,
     ) -> Result<RuntimeControlService<Store>, RuntimeBootstrapEndpointError> {
-        let journal = self.state.bootstrap_facts()?;
-        let generation = ClockGeneration::try_new(journal.clock_generation())
-            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
-        // Tick zero is reserved as invalid durable evidence. Both copies retain
-        // the same reactor origin and therefore map to one owner-local clock.
-        let clock = RuntimeClock::new(
-            ClockDomainRef::from_bytes(journal.clock_domain()),
-            generation,
-            1,
-        );
-        let signer = RuntimeReferenceApplySigner::try_new(
-            self.provisioning.response_signer().clone(),
-            self.provisioning.runtime_response_key_ref(),
-            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
-                .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?,
-            ED25519_ALGORITHM_VERSION,
-        )
-        .map_err(RuntimeBootstrapEndpointError::Apply)?;
-        let owner = RuntimeFixedReferenceMaterializationOwner::try_new(
-            self.compiled,
-            clock,
-            self.state.snapshot(),
-        )
-        .map_err(|error| {
-            RuntimeBootstrapEndpointError::Apply(RuntimeReferenceApplyError::Owner(error))
-        })?;
+        let clock = self.clock;
         let apply = RuntimeReferenceApplyCore::try_new_with_owner(
             self.store,
             RuntimeEndpointApplyClock { clock },
-            owner,
-            signer,
+            self.owner,
+            self.signer,
             channel,
         )
         .map_err(RuntimeBootstrapEndpointError::Apply)?;
@@ -1574,6 +1591,15 @@ fn validate_startup_durable_control_state(
     }
 
     if let Some(prepared) = state.prepared.as_ref() {
+        let historical_channel = prepared
+            .response_channel
+            .to_contract()
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        if historical_channel.target() != provisioning.target()
+            || historical_channel.runtime_peer() != provisioning.runtime_principal()
+        {
+            return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+        }
         let request = ReferenceApplyRequestV1::decode(&prepared.request.canonical_bytes)
             .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
         let authenticated = provisioning
@@ -1593,6 +1619,34 @@ fn validate_startup_durable_control_state(
         let control = request.control_commitment().control();
         let temporal = request.temporal();
         let identities = authenticated.identities();
+        let writer = control.writer_context();
+        let proof_digest = writer
+            .proof()
+            .envelope_digest()
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        let fence = state
+            .writer_fence
+            .ok_or(RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        let prepared_tenure_recorded = state.host.tenure_nonces.iter().any(|record| {
+            record.identity == identities.tenure_nonce_identity()
+                && record.value_digest == proof_digest
+        });
+        let prepared_tenure_is_current = identities.tenure_nonce_identity()
+            == fence.tenure_nonce_identity
+            && proof_digest == fence.proof_envelope_digest
+            && writer.writer().as_bytes() == &fence.writer
+            && writer.epoch().value() == fence.epoch
+            && request.authentication().claim().principal().as_bytes() == &fence.principal;
+        let prepared_tenure_is_superseded = prepared_tenure_recorded
+            && fence.source_scope == prepared.source_scope
+            && fence.epoch > writer.epoch().value()
+            && matches!(
+                prepared.phase,
+                PreparedPhase::SupersededBeforeEffects
+                    | PreparedPhase::SupersededReconcileRequired
+                    | PreparedPhase::StartupExpiredNoEffects
+                    | PreparedPhase::StartupReconcileRequired
+            );
         let expected_active_matches = match (control.expected_active(), prepared.expected_active) {
             (ExpectedActive::None, ExpectedActiveCas::None) => true,
             (ExpectedActive::Exact(left), ExpectedActiveCas::Exact(right)) => left == right,
@@ -1624,9 +1678,8 @@ fn validate_startup_durable_control_state(
             || temporal.constraint_id().as_bytes() != &prepared.temporal_constraint_id
             || temporal.target_clock_domain().as_bytes() != &state.host.clock_domain
             || temporal.target_clock_generation().value() != prepared.installed_clock_generation
-            || state.writer_fence.is_none_or(|fence| {
-                identities.tenure_nonce_identity() != fence.tenure_nonce_identity
-            })
+            || !prepared_tenure_recorded
+            || (!prepared_tenure_is_current && !prepared_tenure_is_superseded)
         {
             return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
         }
@@ -1723,6 +1776,66 @@ fn validate_startup_durable_slice(
         return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
     }
     Ok(())
+}
+
+fn startup_active_execution(
+    snapshot: &RuntimeJournalSnapshot,
+    manifest: &VerifiedRuntimeManifestIngressV1,
+    compiled: RuntimeCompiledInstallationFactsV1,
+) -> Result<Option<ReferenceTargetExecutionPlanV4>, RuntimeBootstrapEndpointError> {
+    let state = snapshot.state();
+    let slice = if let Some(prepared) = state.prepared.as_ref() {
+        if let Some(retiring) = prepared.retiring.as_ref() {
+            Some((
+                retiring.old_slice.canonical_bytes.as_ref(),
+                retiring.old_slice_provenance,
+            ))
+        } else if prepared.incoming_kind == DesiredHeadKind::OneSourceLoop {
+            let request = ReferenceApplyRequestV1::decode(&prepared.request.canonical_bytes)
+                .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+            request
+                .target_execution()
+                .validate_compiled_fixture(compiled)
+                .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+            return Ok(Some(request.target_execution().clone()));
+        } else {
+            state
+                .active_desired
+                .as_ref()
+                .filter(|active| active.kind == DesiredHeadKind::OneSourceLoop)
+                .map(|active| {
+                    (
+                        active.slice.canonical_bytes.as_ref(),
+                        active.slice_provenance,
+                    )
+                })
+        }
+    } else {
+        state
+            .active_desired
+            .as_ref()
+            .filter(|active| active.kind == DesiredHeadKind::OneSourceLoop)
+            .map(|active| {
+                (
+                    active.slice.canonical_bytes.as_ref(),
+                    active.slice_provenance,
+                )
+            })
+    };
+    let Some((canonical_slice, provenance)) = slice else {
+        return Ok(None);
+    };
+    let execution = verify_reference_durable_slice_v1(
+        canonical_slice,
+        provenance.plan_provenance(),
+        provenance.target_slice_digest,
+        manifest,
+    )
+    .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+    execution
+        .validate_compiled_fixture(compiled)
+        .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+    Ok(Some(execution))
 }
 
 fn validate_startup_terminal_producer(
@@ -1882,6 +1995,7 @@ pub(crate) enum RuntimeBootstrapEndpointError {
     ControlContract(ReferenceControlError),
     ControlState(RuntimeControlStateError),
     Apply(RuntimeReferenceApplyError),
+    RestartReassembly(RuntimeRestartReassemblyError),
     StoreOpen(RuntimeStoreOpenError),
     Store(RuntimeStoreError),
     Socket(io::ErrorKind),
@@ -1923,6 +2037,12 @@ impl From<RuntimeStoreError> for RuntimeBootstrapEndpointError {
     }
 }
 
+impl From<RuntimeRestartReassemblyError> for RuntimeBootstrapEndpointError {
+    fn from(error: RuntimeRestartReassemblyError) -> Self {
+        Self::RestartReassembly(error)
+    }
+}
+
 impl fmt::Display for RuntimeBootstrapEndpointError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1948,6 +2068,9 @@ impl fmt::Display for RuntimeBootstrapEndpointError {
             Self::ControlContract(error) => write!(formatter, "bootstrap contract: {error}"),
             Self::ControlState(error) => write!(formatter, "Runtime control state: {error:?}"),
             Self::Apply(error) => write!(formatter, "Runtime reference apply: {error:?}"),
+            Self::RestartReassembly(error) => {
+                write!(formatter, "Runtime restart reassembly: {error:?}")
+            }
             Self::StoreOpen(error) => write!(formatter, "Runtime store open: {error}"),
             Self::Store(error) => write!(formatter, "Runtime store: {error}"),
             Self::Socket(kind) => write!(formatter, "bootstrap socket I/O: {kind:?}"),
@@ -1959,7 +2082,7 @@ impl std::error::Error for RuntimeBootstrapEndpointError {}
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1992,10 +2115,15 @@ mod tests {
         RuntimeEmptyRetireOwnerPlan, RuntimeOneSourceOwnerPlan, RuntimeReferenceApplyStoreError,
         RuntimeReferenceMaterializationOwnerError,
     };
+    use crate::runtime_control_state::runtime_reference_owner::{
+        fixed_owner_start_callback_actions_for_test, fixed_owner_stop_callback_actions_for_test,
+        reset_fixed_owner_callback_actions_for_test,
+    };
     use crate::runtime_journal::{
-        JournalActionRef, LiveMaterialization, OpaqueCanonicalValue, RuntimeJournalSequenceOne,
-        RuntimeOneSourceOwnershipInput, RuntimeOneSourceResourceRefs,
-        RuntimeOneSourceTombstonesInput, RuntimeTenureAdmissionInput, StorePinnedBuildIdentity,
+        CallbackOutcome, JournalActionRef, LiveMaterialization, OpaqueCanonicalValue,
+        RecoveryPhase, RuntimeJournalSequenceOne, RuntimeOneSourceOwnershipInput,
+        RuntimeOneSourceResourceRefs, RuntimeOneSourceTombstonesInput, RuntimeTenureAdmissionInput,
+        StorePinnedBuildIdentity, TerminalOutcome,
     };
     use crate::runtime_provisioning::RuntimeProvisioningInputV1;
 
@@ -2224,7 +2352,68 @@ mod tests {
             &mut self,
             next: RuntimeJournalSnapshot,
         ) -> Result<(), RuntimeReferenceApplyStoreError> {
+            assert!(
+                !self.socket_path.exists(),
+                "socket became visible before restart reassembly commit"
+            );
+            self.commit_attempts
+                .set(self.commit_attempts.get().saturating_add(1));
+            if self.fail_commit {
+                return Err(RuntimeReferenceApplyStoreError::Unavailable);
+            }
             self.snapshot = next;
+            Ok(())
+        }
+    }
+
+    struct StartupCrashStore {
+        snapshot: RuntimeJournalSnapshot,
+        durable_snapshot: Rc<RefCell<RuntimeJournalSnapshot>>,
+        commit_attempts: Rc<Cell<u32>>,
+        fail_after_publish_on: u32,
+        socket_path: PathBuf,
+    }
+
+    impl RuntimeBootstrapStore for StartupCrashStore {
+        fn snapshot(&self) -> Result<&RuntimeJournalSnapshot, RuntimeBootstrapEndpointError> {
+            Ok(&self.snapshot)
+        }
+
+        fn commit(
+            &mut self,
+            next: RuntimeJournalSnapshot,
+        ) -> Result<(), RuntimeBootstrapEndpointError> {
+            assert!(!self.socket_path.exists());
+            let attempt = self.commit_attempts.get().saturating_add(1);
+            self.commit_attempts.set(attempt);
+            self.snapshot = next.clone();
+            *self.durable_snapshot.borrow_mut() = next;
+            if attempt == self.fail_after_publish_on {
+                return Err(RuntimeBootstrapEndpointError::Runtime);
+            }
+            Ok(())
+        }
+    }
+
+    impl RuntimeReferenceApplyStore for StartupCrashStore {
+        fn current_snapshot(
+            &self,
+        ) -> Result<RuntimeJournalSnapshot, RuntimeReferenceApplyStoreError> {
+            Ok(self.snapshot.clone())
+        }
+
+        fn commit_snapshot(
+            &mut self,
+            next: RuntimeJournalSnapshot,
+        ) -> Result<(), RuntimeReferenceApplyStoreError> {
+            assert!(!self.socket_path.exists());
+            let attempt = self.commit_attempts.get().saturating_add(1);
+            self.commit_attempts.set(attempt);
+            self.snapshot = next.clone();
+            *self.durable_snapshot.borrow_mut() = next;
+            if attempt == self.fail_after_publish_on {
+                return Err(RuntimeReferenceApplyStoreError::Unavailable);
+            }
             Ok(())
         }
     }
@@ -2293,8 +2482,8 @@ mod tests {
     }
 
     fn started_service(socket_path: PathBuf) -> StartedRuntimeBootstrapService<MockStore> {
-        let provisioning = provisioning(socket_path.clone());
-        let (snapshot, compiled) = installed_snapshot(&provisioning);
+        let initial_provisioning = provisioning(socket_path.clone());
+        let (snapshot, compiled) = installed_snapshot(&initial_provisioning);
         StartedRuntimeBootstrapService::try_start(
             MockStore {
                 snapshot,
@@ -2303,7 +2492,7 @@ mod tests {
                 socket_path,
             },
             compiled,
-            provisioning,
+            initial_provisioning,
         )
         .unwrap_or_else(|error| panic!("startup rejected: {error}"))
     }
@@ -2441,6 +2630,122 @@ mod tests {
             LiveMaterialization::Draining { .. }
         ));
         (service, retire_request, channel)
+    }
+
+    fn active_loop_restart_fixture(
+        socket_path: PathBuf,
+        request_nonce: &'static [u8],
+    ) -> (RuntimeJournalSnapshot, RuntimeCompiledInstallationFactsV1) {
+        let started = started_service(socket_path);
+        let initial = started.state.snapshot().clone();
+        let request = signed_apply_request(
+            &initial,
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                request_nonce,
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xb4),
+            digest(0xb5),
+        )
+        .unwrap_or_else(|error| panic!("active restart channel rejected: {error}"));
+        let mut service = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("active restart service rejected: {error}"));
+        service
+            .handle_request(request.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("active restart apply failed: {error:?}"))
+            .unwrap_or_else(|| panic!("active restart apply returned no PXRT"));
+        assert!(matches!(
+            service.apply.snapshot().state().live_materialization,
+            LiveMaterialization::LiveReady { .. }
+        ));
+        (service.apply.snapshot().clone(), service.compiled)
+    }
+
+    fn higher_tenure_successor(
+        current: &RuntimeJournalSnapshot,
+        evidence_byte: u8,
+    ) -> RuntimeJournalSnapshot {
+        let fence = current
+            .state()
+            .writer_fence
+            .unwrap_or_else(|| panic!("takeover fixture lost writer fence"));
+        current
+            .try_tenure_only_successor(RuntimeTenureAdmissionInput {
+                expected_store_instance_id: *current.store_instance_id(),
+                owner_target_fingerprint: *current.owner_target_fingerprint(),
+                source_scope: fence.source_scope,
+                writer: fence.writer,
+                epoch: fence
+                    .epoch
+                    .checked_add(1)
+                    .unwrap_or_else(|| panic!("takeover epoch overflow")),
+                supersedes_through_epoch: fence.epoch,
+                proof_envelope_digest: digest(evidence_byte),
+                tenure_nonce_identity: digest(evidence_byte.wrapping_add(1)),
+                principal: fence.principal,
+            })
+            .unwrap_or_else(|error| panic!("takeover successor failed: {error:?}"))
+    }
+
+    fn assert_reserved_crash_generation_is_exact_zero(
+        snapshot: &RuntimeJournalSnapshot,
+        generation: u64,
+    ) {
+        let resources = snapshot
+            .state()
+            .owned_resources
+            .iter()
+            .filter(|resource| resource.generation == generation)
+            .collect::<Vec<_>>();
+        assert_eq!(resources.len(), 2, "reserved generation census changed");
+        assert!(resources.iter().all(|resource| {
+            resource.phase == ResourcePhase::ReservedAtCrashExactZero
+                && resource.action_id.is_none()
+                && resource.os_identity.is_none()
+                && resource.workspace_identity.is_none()
+                && resource.containment_identity.is_none()
+                && resource.tombstone_evidence.is_some()
+        }));
+    }
+
+    fn assert_owned_crash_generation_is_tombstoned(
+        snapshot: &RuntimeJournalSnapshot,
+        generation: u64,
+    ) {
+        let resources = snapshot
+            .state()
+            .owned_resources
+            .iter()
+            .filter(|resource| resource.generation == generation)
+            .collect::<Vec<_>>();
+        assert_eq!(resources.len(), 2, "owned generation census changed");
+        assert!(resources.iter().all(|resource| {
+            resource.phase == ResourcePhase::Terminal
+                && resource.action_id.is_none()
+                && resource.os_identity.is_some()
+                && resource.workspace_identity.is_some()
+                && resource.containment_identity.is_some()
+                && resource.tombstone_evidence.is_some()
+        }));
+    }
+
+    fn terminal_for_request<'a>(
+        snapshot: &'a RuntimeJournalSnapshot,
+        request: &ReferenceApplyRequestV1,
+    ) -> &'a crate::runtime_journal::TerminalOperationRecord {
+        let operation_id = request.control_commitment().control().operation_id();
+        snapshot
+            .state()
+            .terminal_operations
+            .iter()
+            .find(|terminal| terminal.operation_id == *operation_id.as_bytes())
+            .unwrap_or_else(|| panic!("restart terminal for operation is missing"))
     }
 
     fn signed_bootstrap_request(
@@ -2768,6 +3073,883 @@ mod tests {
             Err(RuntimeBootstrapEndpointError::Runtime)
         ));
         assert_eq!(attempts.get(), 1);
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn restart_reassembles_live_loop_before_socket_capability_exists() {
+        let socket_path = PathBuf::from("/tmp/paraegox-restart-reassembly-order-test.sock");
+        let started = started_service(socket_path.clone());
+        let initial = started.state.snapshot().clone();
+        let request = signed_apply_request(
+            &initial,
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                request_nonce: b"restart-reassembly-active-nonce",
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x74),
+            digest(0x75),
+        )
+        .unwrap_or_else(|error| panic!("restart channel rejected: {error}"));
+        let mut active = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("active service rejected: {error}"));
+        active
+            .handle_request(request.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("active apply failed: {error:?}"))
+            .unwrap_or_else(|| panic!("active apply returned no PXRT"));
+        let old_epoch = active
+            .apply
+            .snapshot()
+            .state()
+            .host
+            .runtime_host_epoch_high_water;
+        let snapshot = active.apply.snapshot().clone();
+        let compiled = active.compiled;
+        drop(active);
+
+        let attempts = Rc::new(Cell::new(0));
+        let restarted = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot,
+                commit_attempts: Rc::clone(&attempts),
+                fail_commit: false,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            provisioning(socket_path.clone()),
+        )
+        .unwrap_or_else(|error| panic!("restart reassembly failed: {error}"));
+        let state = restarted.state.snapshot().state();
+        assert_eq!(state.host.runtime_host_epoch_high_water, old_epoch + 1);
+        match state.live_materialization {
+            LiveMaterialization::LiveReady {
+                runtime_host_epoch, ..
+            } => assert_eq!(runtime_host_epoch, old_epoch + 1),
+            other => panic!("restart did not publish current-epoch Ready: {other:?}"),
+        }
+        assert!(state.recovery_action.is_none());
+        assert_eq!(state.recovery_terminals.len(), 1);
+        assert!(state.owned_resources.iter().all(|resource| {
+            resource.phase == ResourcePhase::Terminal
+                || resource.runtime_host_epoch == old_epoch + 1
+        }));
+        assert!(attempts.get() >= 9, "all reassembly steps must be durable");
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn restart_after_durable_recovery_intent_never_replays_start() {
+        let socket_path = PathBuf::from("/tmp/paraegox-recovery-intent-crash-test.sock");
+        let started = started_service(socket_path.clone());
+        let initial = started.state.snapshot().clone();
+        let request = signed_apply_request(
+            &initial,
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                request_nonce: b"recovery-intent-crash-active-nonce",
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x76),
+            digest(0x77),
+        )
+        .unwrap_or_else(|error| panic!("crash channel rejected: {error}"));
+        let mut active = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("crash active service rejected: {error}"));
+        active
+            .handle_request(request.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("crash active apply failed: {error:?}"))
+            .unwrap_or_else(|| panic!("crash active apply returned no PXRT"));
+        let snapshot = active.apply.snapshot().clone();
+        let compiled = active.compiled;
+        drop(active);
+
+        let durable_snapshot = Rc::new(RefCell::new(snapshot.clone()));
+        let attempts = Rc::new(Cell::new(0));
+        let first_restart = StartedRuntimeBootstrapService::try_start(
+            StartupCrashStore {
+                snapshot,
+                durable_snapshot: Rc::clone(&durable_snapshot),
+                commit_attempts: Rc::clone(&attempts),
+                // startup, old cleanup begin/tombstone, recovery plan, intent
+                fail_after_publish_on: 5,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            provisioning(socket_path.clone()),
+        );
+        assert!(matches!(
+            first_restart,
+            Err(RuntimeBootstrapEndpointError::RestartReassembly(
+                RuntimeRestartReassemblyError::Store(_)
+            ))
+        ));
+        let post_intent = durable_snapshot.borrow().clone();
+        assert!(post_intent.state().recovery_action.is_some_and(|recovery| {
+            recovery.phase == RecoveryPhase::StartCallIntent && recovery.raw_outcome.is_none()
+        }));
+        assert!(
+            post_intent
+                .state()
+                .owned_resources
+                .iter()
+                .all(|resource| { resource.phase == ResourcePhase::Terminal })
+        );
+
+        let second_attempts = Rc::new(Cell::new(0));
+        let recovered = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: post_intent,
+                commit_attempts: Rc::clone(&second_attempts),
+                fail_commit: false,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            provisioning(socket_path.clone()),
+        )
+        .unwrap_or_else(|error| panic!("post-intent recovery failed: {error}"));
+        assert!(matches!(
+            recovered.state.snapshot().state().live_materialization,
+            LiveMaterialization::RecoveryFailedNotReady { .. }
+        ));
+        assert!(recovered.state.snapshot().state().recovery_action.is_none());
+        assert_eq!(second_attempts.get(), 2);
+
+        let terminal_count = recovered.state.snapshot().state().recovery_terminals.len();
+        let final_snapshot = recovered.state.snapshot().clone();
+        let third = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: final_snapshot,
+                commit_attempts: Rc::new(Cell::new(0)),
+                fail_commit: false,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            provisioning(socket_path.clone()),
+        )
+        .unwrap_or_else(|error| panic!("permanent failure reopen failed: {error}"));
+        assert_eq!(
+            third.state.snapshot().state().recovery_terminals.len(),
+            terminal_count
+        );
+        assert!(matches!(
+            third.state.snapshot().state().live_materialization,
+            LiveMaterialization::StartupInvalidated { .. }
+        ));
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn production_restart_closes_every_recovery_commit_boundary_without_callback_replay() {
+        let fixture_path = PathBuf::from("/tmp/paraegox-recovery-boundary-fixture.sock");
+        reset_fixed_owner_callback_actions_for_test();
+        let (active_snapshot, compiled) = active_loop_restart_fixture(
+            fixture_path.clone(),
+            b"production-recovery-boundary-active-nonce",
+        );
+
+        // Startup reassembly publishes, in order: invalidation, old cleanup
+        // begin, old tombstones, recovery plan, start intent, reservations,
+        // ownership, callback latch, and Ready.
+        for boundary in 1..=9_u32 {
+            reset_fixed_owner_callback_actions_for_test();
+            // The socket path is part of the immutable channel-policy pin, so
+            // every reopen of this one installed snapshot uses the exact path
+            // with which the fixture was initialized.
+            let socket_path = fixture_path.clone();
+            let durable_snapshot = Rc::new(RefCell::new(active_snapshot.clone()));
+            let attempts = Rc::new(Cell::new(0));
+            let interrupted = StartedRuntimeBootstrapService::try_start(
+                StartupCrashStore {
+                    snapshot: active_snapshot.clone(),
+                    durable_snapshot: Rc::clone(&durable_snapshot),
+                    commit_attempts: Rc::clone(&attempts),
+                    fail_after_publish_on: boundary,
+                    socket_path: socket_path.clone(),
+                },
+                compiled,
+                provisioning(socket_path.clone()),
+            );
+            let error = match interrupted {
+                Err(error) => error,
+                Ok(_) => panic!("boundary {boundary} did not crash"),
+            };
+            assert_eq!(
+                attempts.get(),
+                boundary,
+                "boundary {boundary} failed at the wrong stage: {error}"
+            );
+            assert!(!socket_path.exists());
+
+            let crashed = durable_snapshot.borrow().clone();
+            let crashed_recovery = crashed.state().recovery_action.or_else(|| {
+                crashed
+                    .state()
+                    .recovery_terminals
+                    .last()
+                    .map(|value| value.recovery)
+            });
+            let callback_actions_before_restart = fixed_owner_start_callback_actions_for_test();
+            if boundary <= 7 {
+                assert!(callback_actions_before_restart.is_empty());
+            } else {
+                let action = crashed_recovery
+                    .unwrap_or_else(|| panic!("boundary {boundary} lost recovery action"))
+                    .action
+                    .action_id;
+                assert_eq!(callback_actions_before_restart, vec![action]);
+            }
+            if boundary == 8 {
+                assert!(crashed.state().recovery_action.is_some_and(|recovery| {
+                    recovery.phase == RecoveryPhase::StartCallIntent
+                        && recovery
+                            .raw_outcome
+                            .is_some_and(|raw| raw.callback == CallbackOutcome::KnownSuccess)
+                }));
+            }
+
+            let restarted = StartedRuntimeBootstrapService::try_start(
+                MockStore {
+                    snapshot: crashed,
+                    commit_attempts: Rc::new(Cell::new(0)),
+                    fail_commit: false,
+                    socket_path: socket_path.clone(),
+                },
+                compiled,
+                provisioning(socket_path.clone()),
+            )
+            .unwrap_or_else(|error| {
+                panic!("boundary {boundary} production restart failed: {error}")
+            });
+            assert!(!socket_path.exists());
+            let recovered = restarted.state.snapshot();
+            let callback_actions_after_restart = fixed_owner_start_callback_actions_for_test();
+
+            match boundary {
+                1..=3 => {
+                    assert!(matches!(
+                        recovered.state().live_materialization,
+                        LiveMaterialization::LiveReady { .. }
+                    ));
+                    assert_eq!(callback_actions_after_restart.len(), 1);
+                }
+                4 => {
+                    let crashed_recovery =
+                        crashed_recovery.unwrap_or_else(|| panic!("plan action missing"));
+                    assert!(matches!(
+                        recovered.state().live_materialization,
+                        LiveMaterialization::LiveReady { .. }
+                    ));
+                    assert_eq!(callback_actions_after_restart.len(), 1);
+                    assert_ne!(
+                        callback_actions_after_restart[0], crashed_recovery.action.action_id,
+                        "invalidated pre-intent action was replayed"
+                    );
+                    assert!(recovered.state().recovery_terminals.iter().any(|terminal| {
+                        terminal.recovery.action.action_id == crashed_recovery.action.action_id
+                            && terminal.selection.primary
+                                == TerminalOutcome::AbortedBeforeIntentNoEffects
+                    }));
+                }
+                5..=8 => {
+                    let crashed_recovery = crashed_recovery
+                        .unwrap_or_else(|| panic!("post-intent action missing at {boundary}"));
+                    assert!(matches!(
+                        recovered.state().live_materialization,
+                        LiveMaterialization::RecoveryFailedNotReady { .. }
+                    ));
+                    assert_eq!(
+                        callback_actions_after_restart, callback_actions_before_restart,
+                        "post-intent callback was replayed at boundary {boundary}"
+                    );
+                    let terminal = recovered
+                        .state()
+                        .recovery_terminals
+                        .iter()
+                        .find(|terminal| {
+                            terminal.recovery.action.action_id == crashed_recovery.action.action_id
+                        })
+                        .unwrap_or_else(|| panic!("post-intent terminal missing at {boundary}"));
+                    assert_eq!(
+                        terminal.selection.primary,
+                        TerminalOutcome::AbortedBeforeHeadCommitExactZero
+                    );
+                    if boundary == 8 {
+                        assert_eq!(
+                            terminal.selection.raw.callback,
+                            CallbackOutcome::KnownSuccess
+                        );
+                    }
+                    if boundary == 6 {
+                        assert_reserved_crash_generation_is_exact_zero(
+                            recovered,
+                            crashed_recovery.action.resource_generation,
+                        );
+                    }
+                    if boundary >= 7 {
+                        assert_owned_crash_generation_is_tombstoned(
+                            recovered,
+                            crashed_recovery.action.resource_generation,
+                        );
+                    }
+                }
+                9 => {
+                    let completed = crashed_recovery
+                        .unwrap_or_else(|| panic!("published recovery action missing"));
+                    assert!(matches!(
+                        recovered.state().live_materialization,
+                        LiveMaterialization::LiveReady { .. }
+                    ));
+                    assert_eq!(callback_actions_after_restart.len(), 2);
+                    assert_eq!(
+                        callback_actions_after_restart[0],
+                        completed.action.action_id
+                    );
+                    assert_ne!(
+                        callback_actions_after_restart[1],
+                        completed.action.action_id
+                    );
+                    assert_owned_crash_generation_is_tombstoned(
+                        recovered,
+                        completed.action.resource_generation,
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn restart_terminalizes_normal_start_intent_without_replaying_callback() {
+        let socket_path = PathBuf::from("/tmp/paraegox-normal-start-intent-crash-test.sock");
+        let initial_provisioning = provisioning(socket_path.clone());
+        let (snapshot, compiled) = installed_snapshot(&initial_provisioning);
+        let durable_snapshot = Rc::new(RefCell::new(snapshot.clone()));
+        let started = StartedRuntimeBootstrapService::try_start(
+            StartupCrashStore {
+                snapshot,
+                durable_snapshot: Rc::clone(&durable_snapshot),
+                commit_attempts: Rc::new(Cell::new(0)),
+                // startup, tenure, full admission, normal FirstActionIntent
+                fail_after_publish_on: 4,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            initial_provisioning,
+        )
+        .unwrap_or_else(|error| panic!("normal crash startup failed: {error}"));
+        let initial = started.state.snapshot().clone();
+        let request = signed_apply_request(
+            &initial,
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                request_nonce: b"normal-start-intent-crash-nonce",
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x78),
+            digest(0x79),
+        )
+        .unwrap_or_else(|error| panic!("normal crash channel rejected: {error}"));
+        let mut service = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("normal crash service failed: {error}"));
+        assert!(matches!(
+            service.handle_request(request.canonical_wire(), channel),
+            Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::Apply(RuntimeReferenceApplyError::Store(_))
+            ))
+        ));
+        drop(service);
+        let post_intent = durable_snapshot.borrow().clone();
+        assert!(
+            post_intent
+                .state()
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| { prepared.phase == PreparedPhase::FirstActionIntent })
+        );
+        assert!(post_intent.state().owned_resources.is_empty());
+
+        let restarted = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: post_intent,
+                commit_attempts: Rc::new(Cell::new(0)),
+                fail_commit: false,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            provisioning(socket_path.clone()),
+        )
+        .unwrap_or_else(|error| panic!("normal post-intent restart failed: {error}"));
+        let state = restarted.state.snapshot().state();
+        assert!(state.prepared.is_none());
+        assert!(state.owned_resources.is_empty());
+        assert_eq!(
+            state
+                .terminal_operations
+                .last()
+                .unwrap_or_else(|| panic!("normal crash terminal missing"))
+                .selection
+                .primary,
+            crate::runtime_journal::TerminalOutcome::AbortedBeforeHeadCommitExactZero
+        );
+        assert!(matches!(
+            state.live_materialization,
+            LiveMaterialization::None
+        ));
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn production_restart_closes_normal_intent_reserved_and_owned_boundaries() {
+        // A fresh process start is commit one; normal start then publishes
+        // tenure, admission, intent, reservations, ownership, and terminal.
+        for boundary in [4_u32, 5, 6] {
+            reset_fixed_owner_callback_actions_for_test();
+            let socket_path =
+                PathBuf::from(format!("/tmp/paraegox-normal-boundary-{boundary}.sock"));
+            let initial_provisioning = provisioning(socket_path.clone());
+            let (snapshot, compiled) = installed_snapshot(&initial_provisioning);
+            let durable_snapshot = Rc::new(RefCell::new(snapshot.clone()));
+            let attempts = Rc::new(Cell::new(0));
+            let started = StartedRuntimeBootstrapService::try_start(
+                StartupCrashStore {
+                    snapshot,
+                    durable_snapshot: Rc::clone(&durable_snapshot),
+                    commit_attempts: Rc::clone(&attempts),
+                    fail_after_publish_on: boundary,
+                    socket_path: socket_path.clone(),
+                },
+                compiled,
+                initial_provisioning,
+            )
+            .unwrap_or_else(|error| panic!("boundary {boundary} startup failed: {error}"));
+            let initial = started.state.snapshot().clone();
+            let request = signed_apply_request(
+                &initial,
+                ApplyRequestFixture {
+                    mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                    request_nonce: match boundary {
+                        4 => b"normal-boundary-intent-nonce",
+                        5 => b"normal-boundary-reserved-nonce",
+                        6 => b"normal-boundary-owned-nonce",
+                        _ => unreachable!(),
+                    },
+                    ..ApplyRequestFixture::valid()
+                },
+            );
+            let channel = ReferenceChannelBindingV1::try_new(
+                TARGET,
+                RUNTIME_PRINCIPAL,
+                digest(0xc4),
+                digest(boundary as u8),
+            )
+            .unwrap_or_else(|error| panic!("normal boundary channel rejected: {error}"));
+            let mut service = started
+                .into_control_service(channel)
+                .unwrap_or_else(|error| panic!("normal boundary service failed: {error}"));
+            assert!(matches!(
+                service.handle_request(request.canonical_wire(), channel),
+                Err(RuntimeControlRequestError::Internal(
+                    RuntimeBootstrapEndpointError::Apply(RuntimeReferenceApplyError::Store(_))
+                ))
+            ));
+            drop(service);
+            assert_eq!(attempts.get(), boundary);
+            assert!(fixed_owner_start_callback_actions_for_test().is_empty());
+            assert!(!socket_path.exists());
+
+            let crashed = durable_snapshot.borrow().clone();
+            let prepared = crashed
+                .state()
+                .prepared
+                .as_ref()
+                .unwrap_or_else(|| panic!("boundary {boundary} lost prepared action"));
+            let action = prepared
+                .action
+                .unwrap_or_else(|| panic!("boundary {boundary} lost action identity"));
+            assert_eq!(prepared.phase, PreparedPhase::FirstActionIntent);
+            match boundary {
+                4 => assert!(crashed.state().owned_resources.is_empty()),
+                5 => assert!(crashed.state().owned_resources.iter().all(|resource| {
+                    resource.generation == action.resource_generation
+                        && resource.phase == ResourcePhase::Reserved
+                        && resource.os_identity.is_none()
+                        && resource.workspace_identity.is_none()
+                        && resource.containment_identity.is_none()
+                })),
+                6 => assert!(crashed.state().owned_resources.iter().all(|resource| {
+                    resource.generation == action.resource_generation
+                        && resource.phase == ResourcePhase::Owned
+                        && resource.os_identity.is_some()
+                        && resource.workspace_identity.is_some()
+                        && resource.containment_identity.is_some()
+                })),
+                _ => unreachable!(),
+            }
+
+            let restarted = StartedRuntimeBootstrapService::try_start(
+                MockStore {
+                    snapshot: crashed,
+                    commit_attempts: Rc::new(Cell::new(0)),
+                    fail_commit: false,
+                    socket_path: socket_path.clone(),
+                },
+                compiled,
+                provisioning(socket_path.clone()),
+            )
+            .unwrap_or_else(|error| panic!("normal boundary {boundary} restart failed: {error}"));
+            let recovered = restarted.state.snapshot();
+            assert!(!socket_path.exists());
+            assert!(recovered.state().prepared.is_none());
+            assert!(matches!(
+                recovered.state().live_materialization,
+                LiveMaterialization::None
+            ));
+            let terminal = terminal_for_request(recovered, &request);
+            assert_eq!(
+                terminal.selection.primary,
+                TerminalOutcome::AbortedBeforeHeadCommitExactZero
+            );
+            let receipt = ReferenceApplyTerminalReceiptV1::decode(
+                &terminal.canonical_response.canonical_bytes,
+            )
+            .unwrap_or_else(|error| panic!("restart PXRT decode failed: {error}"));
+            assert_eq!(
+                receipt.authentication_channel_binding_digest(),
+                channel.binding_digest(),
+                "restart PXRT did not retain the admitted historical channel"
+            );
+            // The durable intent makes callback truth conservative after a
+            // real process loss; the test-only owner trace proves this
+            // particular restart did not invoke the old action again.
+            assert_eq!(
+                terminal.selection.raw.callback,
+                CallbackOutcome::UnknownAfterIntent
+            );
+            assert!(fixed_owner_start_callback_actions_for_test().is_empty());
+            if boundary == 5 {
+                assert_reserved_crash_generation_is_exact_zero(
+                    recovered,
+                    action.resource_generation,
+                );
+            }
+            if boundary == 6 {
+                assert_owned_crash_generation_is_tombstoned(recovered, action.resource_generation);
+            }
+        }
+    }
+
+    #[test]
+    fn higher_tenure_normal_start_restart_terminalizes_superseded_exact_zero() {
+        reset_fixed_owner_callback_actions_for_test();
+        let socket_path = PathBuf::from("/tmp/paraegox-normal-takeover-restart.sock");
+        let initial_provisioning = provisioning(socket_path.clone());
+        let (snapshot, compiled) = installed_snapshot(&initial_provisioning);
+        let durable_snapshot = Rc::new(RefCell::new(snapshot.clone()));
+        let started = StartedRuntimeBootstrapService::try_start(
+            StartupCrashStore {
+                snapshot,
+                durable_snapshot: Rc::clone(&durable_snapshot),
+                commit_attempts: Rc::new(Cell::new(0)),
+                // startup, tenure, admission, intent, reserve, ownership
+                fail_after_publish_on: 6,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            initial_provisioning,
+        )
+        .unwrap_or_else(|error| panic!("normal takeover startup failed: {error}"));
+        let request = signed_apply_request(
+            started.state.snapshot(),
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                request_nonce: b"normal-takeover-restart-nonce",
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xd4),
+            digest(0xd5),
+        )
+        .unwrap_or_else(|error| panic!("normal takeover channel rejected: {error}"));
+        let mut service = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("normal takeover service failed: {error}"));
+        assert!(matches!(
+            service.handle_request(request.canonical_wire(), channel),
+            Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::Apply(RuntimeReferenceApplyError::Store(_))
+            ))
+        ));
+        drop(service);
+        assert!(fixed_owner_start_callback_actions_for_test().is_empty());
+
+        let owned = durable_snapshot.borrow().clone();
+        let action = owned
+            .state()
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.action)
+            .unwrap_or_else(|| panic!("normal takeover action missing"));
+        let takeover = higher_tenure_successor(&owned, 0xd6);
+        assert!(takeover.state().prepared.as_ref().is_some_and(|prepared| {
+            prepared.phase == PreparedPhase::SupersededReconcileRequired
+                && prepared
+                    .raw_outcome
+                    .is_some_and(|raw| raw.higher_tenure_takeover)
+        }));
+
+        let restarted = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: takeover,
+                commit_attempts: Rc::new(Cell::new(0)),
+                fail_commit: false,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            provisioning(socket_path.clone()),
+        )
+        .unwrap_or_else(|error| panic!("normal takeover restart failed: {error}"));
+        let recovered = restarted.state.snapshot();
+        assert!(!socket_path.exists());
+        assert!(recovered.state().prepared.is_none());
+        assert!(matches!(
+            recovered.state().live_materialization,
+            LiveMaterialization::None
+        ));
+        let terminal = terminal_for_request(recovered, &request);
+        assert_eq!(
+            terminal.selection.primary,
+            TerminalOutcome::SupersededAfterIntentExactZero
+        );
+        assert!(terminal.selection.raw.higher_tenure_takeover);
+        let receipt =
+            ReferenceApplyTerminalReceiptV1::decode(&terminal.canonical_response.canonical_bytes)
+                .unwrap_or_else(|error| panic!("takeover PXRT decode failed: {error}"));
+        assert_eq!(
+            receipt.authentication_channel_binding_digest(),
+            channel.binding_digest()
+        );
+        assert_eq!(
+            terminal.selection.raw.callback,
+            CallbackOutcome::UnknownAfterIntent
+        );
+        assert_owned_crash_generation_is_tombstoned(recovered, action.resource_generation);
+        assert!(fixed_owner_start_callback_actions_for_test().is_empty());
+    }
+
+    #[test]
+    fn production_restart_preserves_validated_quarantine_without_listener_or_callback() {
+        let socket_path = PathBuf::from("/tmp/paraegox-quarantine-restart.sock");
+        reset_fixed_owner_callback_actions_for_test();
+        let (active, compiled) =
+            active_loop_restart_fixture(socket_path.clone(), b"quarantine-restart-active-nonce");
+        reset_fixed_owner_callback_actions_for_test();
+        let old_generation = match active.state().live_materialization {
+            LiveMaterialization::LiveReady {
+                resource_generation,
+                ..
+            } => resource_generation,
+            other => panic!("quarantine fixture not live: {other:?}"),
+        };
+        let invalidated = active
+            .try_startup_invalidation_successor()
+            .unwrap_or_else(|error| panic!("quarantine invalidation failed: {error:?}"));
+        let quarantined = invalidated
+            .try_operational_quarantine_successor(digest(0xda))
+            .unwrap_or_else(|error| panic!("quarantine fixture failed: {error:?}"));
+        let restarted = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: quarantined,
+                commit_attempts: Rc::new(Cell::new(0)),
+                fail_commit: false,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            provisioning(socket_path.clone()),
+        )
+        .unwrap_or_else(|error| panic!("quarantine restart failed: {error}"));
+        let recovered = restarted.state.snapshot();
+        assert!(!socket_path.exists());
+        assert!(matches!(
+            recovered.state().live_materialization,
+            LiveMaterialization::Quarantined { .. }
+        ));
+        assert_owned_crash_generation_is_tombstoned(recovered, old_generation);
+        let live = query_live_projection(recovered, 1)
+            .unwrap_or_else(|error| panic!("quarantine projection failed: {error}"));
+        assert_eq!(
+            live.state(),
+            ReferenceQueryLiveStateV1::ValidatedOperationalQuarantine
+        );
+        assert_eq!(live.resource_generation(), 0);
+        assert!(fixed_owner_start_callback_actions_for_test().is_empty());
+        assert!(fixed_owner_stop_callback_actions_for_test().is_empty());
+    }
+
+    #[test]
+    fn pre_intent_empty_crash_aborts_incoming_then_reassembles_old_loop() {
+        let socket_path = PathBuf::from("/tmp/paraegox-empty-pre-intent-crash-test.sock");
+        let started = started_service(socket_path.clone());
+        let initial = started.state.snapshot().clone();
+        let active_request = signed_apply_request(
+            &initial,
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::OneSourceLoop,
+                request_nonce: b"empty-pre-intent-old-loop-nonce",
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x7a),
+            digest(0x7b),
+        )
+        .unwrap_or_else(|error| panic!("empty pre-intent channel rejected: {error}"));
+        let mut active_service = started
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("empty pre-intent active service failed: {error}"));
+        active_service
+            .handle_request(active_request.canonical_wire(), channel)
+            .unwrap_or_else(|error| panic!("old loop apply failed: {error:?}"))
+            .unwrap_or_else(|| panic!("old loop apply returned no PXRT"));
+        let active_snapshot = active_service.apply.snapshot().clone();
+        let active_slice_digest = match active_snapshot.state().live_materialization {
+            LiveMaterialization::LiveReady {
+                active_slice_digest,
+                ..
+            } => active_slice_digest,
+            other => panic!("old loop not live before crash: {other:?}"),
+        };
+        let compiled = active_service.compiled;
+        let compatibility = active_service.compatibility.clone();
+        let clock = active_service.clock;
+        drop(active_service);
+
+        let durable_snapshot = Rc::new(RefCell::new(active_snapshot.clone()));
+        let owner =
+            RuntimeFixedReferenceMaterializationOwner::try_new(compiled, clock, &active_snapshot)
+                .unwrap_or_else(|error| panic!("empty pre-intent owner failed: {error:?}"));
+        let crash_provisioning = provisioning(socket_path.clone());
+        let signer = RuntimeReferenceApplySigner::try_new(
+            crash_provisioning.response_signer().clone(),
+            crash_provisioning.runtime_response_key_ref(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("empty signer algorithm failed: {error}")),
+            ED25519_ALGORITHM_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("empty pre-intent signer failed: {error:?}"));
+        let apply = RuntimeReferenceApplyCore::try_new_with_owner(
+            StartupCrashStore {
+                snapshot: active_snapshot.clone(),
+                durable_snapshot: Rc::clone(&durable_snapshot),
+                commit_attempts: Rc::new(Cell::new(0)),
+                // tenure then full admission; fail after PreparedNoEffects.
+                fail_after_publish_on: 2,
+                socket_path: socket_path.clone(),
+            },
+            RuntimeEndpointApplyClock { clock },
+            owner,
+            signer,
+            channel,
+        )
+        .unwrap_or_else(|error| panic!("empty crash apply core failed: {error:?}"));
+        let mut crash_service = RuntimeControlService {
+            apply,
+            clock,
+            compiled,
+            compatibility,
+            provisioning: crash_provisioning,
+            channel,
+        };
+        let empty_request = signed_apply_request(
+            &active_snapshot,
+            ApplyRequestFixture {
+                mode: ReferenceAssemblyModeV1::EmptyDeactivate,
+                operation: 0x7c,
+                request_nonce: b"empty-pre-intent-incoming-nonce",
+                tenure_nonce: b"empty-pre-intent-incoming-tenure",
+                writer_epoch: 2,
+                supersedes_epoch: 1,
+                source_revision: 2,
+                temporal_constraint: 0x7d,
+                expected_active: ExpectedActive::Exact(active_slice_digest),
+                ..ApplyRequestFixture::valid()
+            },
+        );
+        assert!(matches!(
+            crash_service.handle_request(empty_request.canonical_wire(), channel),
+            Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::Apply(RuntimeReferenceApplyError::Store(_))
+            ))
+        ));
+        drop(crash_service);
+        let admitted = durable_snapshot.borrow().clone();
+        assert!(
+            admitted
+                .state()
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| { prepared.phase == PreparedPhase::PreparedNoEffects })
+        );
+        assert!(matches!(
+            admitted.state().live_materialization,
+            LiveMaterialization::LiveReady { .. }
+        ));
+
+        let restarted = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: admitted,
+                commit_attempts: Rc::new(Cell::new(0)),
+                fail_commit: false,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            provisioning(socket_path.clone()),
+        )
+        .unwrap_or_else(|error| panic!("empty pre-intent restart failed: {error}"));
+        let state = restarted.state.snapshot().state();
+        assert!(state.prepared.is_none());
+        assert_eq!(
+            state
+                .terminal_operations
+                .iter()
+                .find(|terminal| {
+                    terminal.operation_id
+                        == *empty_request
+                            .control_commitment()
+                            .control()
+                            .operation_id()
+                            .as_bytes()
+                })
+                .unwrap_or_else(|| panic!("empty abort terminal missing"))
+                .selection
+                .primary,
+            crate::runtime_journal::TerminalOutcome::AbortedBeforeIntentNoEffects
+        );
+        assert_eq!(state.recovery_terminals.len(), 1);
+        assert!(matches!(
+            state.live_materialization,
+            LiveMaterialization::LiveReady { .. }
+        ));
         assert!(!socket_path.exists());
     }
 
@@ -3578,7 +4760,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_keeps_head_committed_truth_while_pxqs_reports_ownership_uncertain() {
+    fn restart_terminalizes_head_committed_empty_as_interrupted_exact_zero() {
         let socket_path = PathBuf::from("/tmp/paraegox-query-restart-draining-test.sock");
         let (service, retire_request, _) = head_first_retiring_service(socket_path.clone());
         let RuntimeControlService {
@@ -3610,33 +4792,37 @@ mod tests {
         let mut service = restarted
             .into_control_service(channel)
             .unwrap_or_else(|error| panic!("draining restart control rejected: {error}"));
-        let restarted_prepared = service
+        assert!(service.apply.snapshot().state().prepared.is_none());
+        assert!(matches!(
+            service.apply.snapshot().state().live_materialization,
+            LiveMaterialization::ExactZero { .. }
+        ));
+        let terminal = service
             .apply
             .snapshot()
             .state()
-            .prepared
-            .as_ref()
-            .unwrap_or_else(|| panic!("draining restart lost prepared operation"));
+            .terminal_operations
+            .last()
+            .unwrap_or_else(|| panic!("draining restart lost terminal"));
         assert_eq!(
-            restarted_prepared.phase,
-            PreparedPhase::StartupReconcileRequired
+            terminal.selection.primary,
+            crate::runtime_journal::TerminalOutcome::InterruptedButNowExactZero
         );
-        assert!(restarted_prepared.retiring.is_some());
 
         let query = signed_query_request(QueryRequestFixture {
             query: 0xeb,
             expected_request_digest: Some(retire_request.envelope_request_digest()),
             ..QueryRequestFixture::fresh(0xe4)
         });
-        assert_eq!(
+        assert!(matches!(
             query_operation_lookup(service.apply.snapshot(), &query)
                 .unwrap_or_else(|error| panic!("restart durable lookup failed: {error}")),
             ReferenceQueryOperationLookupV1::Known {
-                request_digest: retire_request.envelope_request_digest(),
-                durable_phase: ReferenceQueryDurablePhaseV1::HeadCommittedRetiringOld,
-                terminal_result: None,
-            }
-        );
+                request_digest,
+                durable_phase: ReferenceQueryDurablePhaseV1::Terminal,
+                terminal_result: Some(_),
+            } if request_digest == retire_request.envelope_request_digest()
+        ));
         let before = service.apply.snapshot().canonical_wire().to_vec();
         let expected_serving = independent_query_serving(service.apply.snapshot());
         let response = service
@@ -3644,14 +4830,73 @@ mod tests {
             .unwrap_or_else(|error| panic!("restart draining query rejected: {error:?}"))
             .unwrap_or_else(|| panic!("restart draining query returned no PXQS"));
         let (_, facts) = decode_verify_query_response(&response, &query, channel, expected_serving);
-        assert_eq!(
+        assert!(matches!(
             facts.operation().lookup(),
-            ReferenceQueryOperationLookupV1::Indeterminate {
-                reason: ReferenceOperationalReasonV1::OwnershipUncertain,
+            ReferenceQueryOperationLookupV1::Known {
+                durable_phase: ReferenceQueryDurablePhaseV1::Terminal,
+                terminal_result: Some(_),
+                ..
             }
-        );
-        assert_eq!(facts.live().state(), ReferenceQueryLiveStateV1::Uncertain);
+        ));
+        assert_eq!(facts.live().state(), ReferenceQueryLiveStateV1::ExactZero);
         assert_eq!(service.apply.snapshot().canonical_wire(), before);
+    }
+
+    #[test]
+    fn higher_tenure_head_first_empty_restart_terminalizes_superseded_exact_zero() {
+        let socket_path = PathBuf::from("/tmp/paraegox-empty-takeover-restart.sock");
+        reset_fixed_owner_callback_actions_for_test();
+        let (service, retire_request, _) = head_first_retiring_service(socket_path.clone());
+        // Ignore the predecessor Loop start; the restart below must not invoke
+        // either lifecycle callback for the already head-committed action.
+        reset_fixed_owner_callback_actions_for_test();
+        let RuntimeControlService {
+            apply,
+            compiled,
+            provisioning,
+            ..
+        } = service;
+        let current = apply.snapshot().clone();
+        let prepared = current
+            .state()
+            .prepared
+            .as_ref()
+            .unwrap_or_else(|| panic!("empty takeover lost prepared action"));
+        let retiring_generation = prepared
+            .retiring
+            .as_ref()
+            .unwrap_or_else(|| panic!("empty takeover lost retiring facts"))
+            .old_resource_generation;
+        let takeover = higher_tenure_successor(&current, 0xdc);
+        drop(apply);
+
+        let restarted = StartedRuntimeBootstrapService::try_start(
+            MockStore {
+                snapshot: takeover,
+                commit_attempts: Rc::new(Cell::new(0)),
+                fail_commit: false,
+                socket_path: socket_path.clone(),
+            },
+            compiled,
+            provisioning,
+        )
+        .unwrap_or_else(|error| panic!("empty takeover restart failed: {error}"));
+        let recovered = restarted.state.snapshot();
+        assert!(!socket_path.exists());
+        assert!(recovered.state().prepared.is_none());
+        assert!(matches!(
+            recovered.state().live_materialization,
+            LiveMaterialization::ExactZero { .. }
+        ));
+        let terminal = terminal_for_request(recovered, &retire_request);
+        assert_eq!(
+            terminal.selection.primary,
+            TerminalOutcome::SupersededAfterIntentExactZero
+        );
+        assert!(terminal.selection.raw.higher_tenure_takeover);
+        assert_owned_crash_generation_is_tombstoned(recovered, retiring_generation);
+        assert!(fixed_owner_start_callback_actions_for_test().is_empty());
+        assert!(fixed_owner_stop_callback_actions_for_test().is_empty());
     }
 
     #[test]

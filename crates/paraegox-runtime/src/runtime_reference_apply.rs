@@ -6,15 +6,19 @@
 //! ingress authentication, policy evidence, resource ownership or tombstones.
 
 use ed25519_dalek::{Signer, SigningKey};
-use paraegox_kernel::{digest::Digest32, identity::PrincipalRef, time::ClockGeneration};
+use paraegox_kernel::{
+    digest::{Digest32, Digest32Builder},
+    identity::PrincipalRef,
+    time::ClockGeneration,
+};
 use paraegox_runtime_contracts::{
-    provenance::TargetSliceDigest,
+    provenance::{PlanProvenance, TargetSliceDigest},
     reference_control::{
         ReferenceApplyRequestV1, ReferenceApplyTerminalFactsV1, ReferenceApplyTerminalHeadV1,
         ReferenceApplyTerminalLifecycleEffectV1, ReferenceApplyTerminalOutcomeV1,
         ReferenceApplyTerminalReceiptAuthClaimV1, ReferenceApplyTerminalReceiptDraftV1,
         ReferenceApplyTerminalReceiptV1, ReferenceAssemblyModeV1, ReferenceChannelBindingV1,
-        ValidatedReferenceLifecycleBudgetsV1,
+        ReferenceTargetExecutionPlanV4, ValidatedReferenceLifecycleBudgetsV1,
     },
     wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef},
 };
@@ -26,15 +30,26 @@ use super::{
 use crate::{
     runtime_journal::{
         DesiredHeadKind, JournalActionKind, JournalActionRef, LiveMaterialization,
-        OpaqueCanonicalValue, PreparedOperation, PreparedPhase, ResourceKind, ResourcePhase,
-        RuntimeDeadlineObservation, RuntimeJournalSnapshot, RuntimeOneSourceCallbackSuccessInput,
-        RuntimeOneSourceOwnershipInput, RuntimeOneSourceResourceRefs,
-        RuntimeOneSourceTombstonesInput, RuntimeStartActionInput, RuntimeTenureAdmissionInput,
-        RuntimeTerminalInput, RuntimeTerminalPreview, TerminalHeadDisposition, TerminalOutcome,
+        OpaqueCanonicalValue, OwnedResourceRecord, PreparedOperation, PreparedPhase, RecoveryPhase,
+        ResourceKind, ResourcePhase, RuntimeDeadlineObservation, RuntimeJournalSnapshot,
+        RuntimeOneSourceCallbackSuccessInput, RuntimeOneSourceOwnershipInput,
+        RuntimeOneSourceResourceRefs, RuntimeOneSourceTombstonesInput,
+        RuntimeRecoveryCallbackOutcome, RuntimeRecoveryPlanInput, RuntimeStartActionInput,
+        RuntimeTenureAdmissionInput, RuntimeTerminalInput, RuntimeTerminalPreview,
+        StartupRecoveryEligibility, TerminalHeadDisposition, TerminalOutcome,
         decode_and_validate_terminal_receipt,
     },
     runtime_store::RuntimeStore,
 };
+
+const RECOVERY_DEADLINE_EVIDENCE_DOMAIN: &[u8] =
+    b"paraegox.runtime.restart-reassembly.deadline.sha256.v1";
+const RECOVERY_OWNER_FAILURE_DOMAIN: &[u8] =
+    b"paraegox.runtime.restart-reassembly.owner-failure.sha256.v1";
+// This owner-local cap is fingerprinted by the pinned Runtime executable. It
+// bounds restart work independently of a potentially much larger signed Slice
+// lifecycle budget.
+const RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS: u64 = 60_000_000_000;
 
 /// Narrow durable-store port used by apply.  The production implementation is
 /// the crash-consistent `RuntimeStore`; focused tests can inject deterministic
@@ -149,6 +164,53 @@ pub(crate) trait RuntimeReferenceMaterializationOwner {
         &mut self,
         action: JournalActionRef,
     ) -> Result<RuntimeOneSourceTombstonesInput, RuntimeReferenceMaterializationOwnerError>;
+
+    fn prove_restart_exact_zero(
+        &mut self,
+        _execution: &ReferenceTargetExecutionPlanV4,
+        _provenance: PlanProvenance,
+        _target_slice_digest: TargetSliceDigest,
+        _resources: &[OwnedResourceRecord],
+    ) -> Result<RuntimeOneSourceTombstonesInput, RuntimeReferenceMaterializationOwnerError> {
+        Err(RuntimeReferenceMaterializationOwnerError::Unavailable)
+    }
+
+    fn prove_restart_action_exact_zero(
+        &mut self,
+        _execution: &ReferenceTargetExecutionPlanV4,
+        _provenance: PlanProvenance,
+        _target_slice_digest: TargetSliceDigest,
+        _action: JournalActionRef,
+    ) -> Result<(), RuntimeReferenceMaterializationOwnerError> {
+        Err(RuntimeReferenceMaterializationOwnerError::Unavailable)
+    }
+
+    fn prove_interrupted_normal_action_exact_zero(
+        &mut self,
+        _execution: &ReferenceTargetExecutionPlanV4,
+        _provenance: PlanProvenance,
+        _target_slice_digest: TargetSliceDigest,
+        _action: JournalActionRef,
+    ) -> Result<(), RuntimeReferenceMaterializationOwnerError> {
+        Err(RuntimeReferenceMaterializationOwnerError::Unavailable)
+    }
+
+    fn prepare_recovery_one_source(
+        &mut self,
+        _execution: &ReferenceTargetExecutionPlanV4,
+        _provenance: PlanProvenance,
+        _target_slice_digest: TargetSliceDigest,
+        _durable_action: Option<JournalActionRef>,
+    ) -> Result<RuntimeOneSourceOwnerPlan, RuntimeReferenceMaterializationOwnerError> {
+        Err(RuntimeReferenceMaterializationOwnerError::Unavailable)
+    }
+
+    fn cleanup_recovery_one_source_once(
+        &mut self,
+        _action: JournalActionRef,
+    ) -> Result<RuntimeOneSourceTombstonesInput, RuntimeReferenceMaterializationOwnerError> {
+        Err(RuntimeReferenceMaterializationOwnerError::Unavailable)
+    }
 }
 
 /// Default owner used by the no-effect core constructor.  Materialized paths
@@ -201,6 +263,618 @@ impl RuntimeReferenceMaterializationOwner for RuntimeNoMaterializationOwner {
     ) -> Result<RuntimeOneSourceTombstonesInput, RuntimeReferenceMaterializationOwnerError> {
         Err(RuntimeReferenceMaterializationOwnerError::Unavailable)
     }
+
+    fn prove_restart_exact_zero(
+        &mut self,
+        _execution: &ReferenceTargetExecutionPlanV4,
+        _provenance: PlanProvenance,
+        _target_slice_digest: TargetSliceDigest,
+        _resources: &[OwnedResourceRecord],
+    ) -> Result<RuntimeOneSourceTombstonesInput, RuntimeReferenceMaterializationOwnerError> {
+        Err(RuntimeReferenceMaterializationOwnerError::Unavailable)
+    }
+
+    fn prepare_recovery_one_source(
+        &mut self,
+        _execution: &ReferenceTargetExecutionPlanV4,
+        _provenance: PlanProvenance,
+        _target_slice_digest: TargetSliceDigest,
+        _durable_action: Option<JournalActionRef>,
+    ) -> Result<RuntimeOneSourceOwnerPlan, RuntimeReferenceMaterializationOwnerError> {
+        Err(RuntimeReferenceMaterializationOwnerError::Unavailable)
+    }
+
+    fn cleanup_recovery_one_source_once(
+        &mut self,
+        _action: JournalActionRef,
+    ) -> Result<RuntimeOneSourceTombstonesInput, RuntimeReferenceMaterializationOwnerError> {
+        Err(RuntimeReferenceMaterializationOwnerError::Unavailable)
+    }
+}
+
+pub(crate) struct RuntimeRestartReassemblyParts<S, O> {
+    pub(crate) store: S,
+    pub(crate) state: RuntimeControlState,
+    pub(crate) owner: O,
+}
+
+/// Runs the fixed-profile restart state machine before a listener capability
+/// can exist. Every state update is committed through the same Runtime store;
+/// any post-intent reopen is terminalized or quarantined and never calls
+/// `on_start` again.
+pub(crate) fn run_runtime_restart_reassembly<S, C, O>(
+    store: S,
+    state: RuntimeControlState,
+    clock: C,
+    owner: O,
+    signer: &RuntimeReferenceApplySigner,
+    execution: Option<&ReferenceTargetExecutionPlanV4>,
+) -> Result<RuntimeRestartReassemblyParts<S, O>, RuntimeRestartReassemblyError>
+where
+    S: RuntimeReferenceApplyStore,
+    C: RuntimeReferenceApplyClock,
+    O: RuntimeReferenceMaterializationOwner,
+{
+    let mut core = RuntimeRestartReassemblyCore {
+        store,
+        state,
+        clock,
+        owner,
+    };
+    core.run(signer, execution)?;
+    Ok(RuntimeRestartReassemblyParts {
+        store: core.store,
+        state: core.state,
+        owner: core.owner,
+    })
+}
+
+struct RuntimeRestartReassemblyCore<S, C, O> {
+    store: S,
+    state: RuntimeControlState,
+    clock: C,
+    owner: O,
+}
+
+impl<S, C, O> RuntimeRestartReassemblyCore<S, C, O>
+where
+    S: RuntimeReferenceApplyStore,
+    C: RuntimeReferenceApplyClock,
+    O: RuntimeReferenceMaterializationOwner,
+{
+    fn run(
+        &mut self,
+        signer: &RuntimeReferenceApplySigner,
+        execution: Option<&ReferenceTargetExecutionPlanV4>,
+    ) -> Result<(), RuntimeRestartReassemblyError> {
+        let snapshot = self.state.snapshot().state();
+        let prepared_reconcile = snapshot.prepared.as_ref().filter(|prepared| {
+            matches!(
+                prepared.phase,
+                PreparedPhase::StartupExpiredNoEffects
+                    | PreparedPhase::StartupReconcileRequired
+                    | PreparedPhase::SupersededBeforeEffects
+                    | PreparedPhase::SupersededReconcileRequired
+            )
+        });
+        let has_prepared_reconcile = prepared_reconcile.is_some();
+        let active = snapshot.active_desired.as_ref();
+        let has_nonterminal_resources = snapshot
+            .owned_resources
+            .iter()
+            .any(|resource| !resource.phase.is_terminal());
+        if active.is_none()
+            && !has_prepared_reconcile
+            && snapshot.recovery_action.is_none()
+            && !has_nonterminal_resources
+        {
+            return Ok(());
+        }
+        if active.is_some_and(|active| active.kind == DesiredHeadKind::EmptyDeactivate)
+            && !has_prepared_reconcile
+            && snapshot.recovery_action.is_none()
+            && !has_nonterminal_resources
+        {
+            return Ok(());
+        }
+        if prepared_reconcile
+            .is_some_and(|prepared| prepared.phase == PreparedPhase::StartupExpiredNoEffects)
+        {
+            self.terminalize_aborted_no_effects(signer)?;
+            return self.run(signer, execution);
+        }
+
+        let Some(execution) = execution else {
+            return self.quarantine(b"restart-owner-binding-unavailable");
+        };
+        let Some(cleanup_provenance) = prepared_reconcile
+            .and_then(|prepared| {
+                prepared
+                    .retiring
+                    .as_ref()
+                    .map(|retiring| retiring.old_slice_provenance)
+                    .or((prepared.incoming_kind == DesiredHeadKind::OneSourceLoop)
+                        .then_some(prepared.slice_provenance))
+            })
+            .or_else(|| {
+                active
+                    .filter(|active| active.kind == DesiredHeadKind::OneSourceLoop)
+                    .map(|active| active.slice_provenance)
+            })
+        else {
+            return self.quarantine(b"restart-cleanup-provenance-unavailable");
+        };
+        let cleanup_plan_provenance = cleanup_provenance.plan_provenance();
+        let cleanup_slice_digest = cleanup_provenance.target_slice_digest;
+        if execution.mode() != ReferenceAssemblyModeV1::OneSourceLoop
+            || execution.target().as_bytes() != &cleanup_provenance.target
+        {
+            return self.quarantine(b"active-execution-mismatch");
+        }
+
+        let mut startup_tombstones = None;
+        if has_nonterminal_resources {
+            let tombstones = match self.owner.prove_restart_exact_zero(
+                execution,
+                cleanup_plan_provenance,
+                cleanup_slice_digest,
+                &self.state.snapshot().state().owned_resources,
+            ) {
+                Ok(value) => value,
+                Err(_) => return self.quarantine(b"old-generation-not-proven-zero"),
+            };
+            let next = self.state.try_begin_startup_resource_cleanup()?;
+            self.commit(next)?;
+            if has_prepared_reconcile {
+                startup_tombstones = Some(tombstones);
+            } else {
+                let next = self
+                    .state
+                    .try_complete_startup_resource_cleanup(tombstones)?;
+                self.commit(next)?;
+            }
+        }
+
+        if has_prepared_reconcile {
+            if startup_tombstones.is_none() {
+                let action = self
+                    .state
+                    .snapshot()
+                    .state()
+                    .prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared.action)
+                    .ok_or(RuntimeRestartReassemblyError::InvalidState)?;
+                if self
+                    .owner
+                    .prove_interrupted_normal_action_exact_zero(
+                        execution,
+                        cleanup_plan_provenance,
+                        cleanup_slice_digest,
+                        action,
+                    )
+                    .is_err()
+                {
+                    return self.quarantine(b"normal-action-not-proven-zero");
+                }
+            }
+            return self.terminalize_interrupted_normal(signer, startup_tombstones);
+        }
+
+        let active = self
+            .state
+            .snapshot()
+            .state()
+            .active_desired
+            .as_ref()
+            .filter(|active| active.kind == DesiredHeadKind::OneSourceLoop)
+            .ok_or(RuntimeRestartReassemblyError::InvalidState)?;
+        let provenance = active.slice_provenance.plan_provenance();
+        let active_slice_digest = active.slice_provenance.target_slice_digest;
+        if execution.manifest_digest() != active.manifest_digest {
+            return self.quarantine(b"active-manifest-mismatch");
+        }
+
+        if let Some(recovery) = self.state.snapshot().state().recovery_action {
+            match recovery.phase {
+                RecoveryPhase::StartupInvalidatedNoEffects => {
+                    let observation = self.observe()?;
+                    let next = self
+                        .state
+                        .try_abort_startup_invalidated_recovery(observation)?;
+                    self.commit(next)?;
+                }
+                RecoveryPhase::StartupReconcileRequired => {
+                    if self
+                        .owner
+                        .prove_restart_action_exact_zero(
+                            execution,
+                            provenance,
+                            active_slice_digest,
+                            recovery.action,
+                        )
+                        .is_err()
+                    {
+                        return self.quarantine(b"post-intent-action-not-proven-zero");
+                    }
+                    let observation = self.observe()?;
+                    let next = self
+                        .state
+                        .try_recovery_failed_not_ready(None, observation)?;
+                    self.commit(next)?;
+                    return Ok(());
+                }
+                RecoveryPhase::RecoveryPlannedNoEffects | RecoveryPhase::StartCallIntent => {
+                    return self.quarantine(b"startup-recovery-phase-not-invalidated");
+                }
+            }
+        }
+
+        let (eligibility, failure_evidence_digest) =
+            match self.state.snapshot().state().live_materialization {
+                LiveMaterialization::StartupInvalidated {
+                    recovery_eligibility,
+                    failure_evidence_digest,
+                    ..
+                } => (recovery_eligibility, failure_evidence_digest),
+                LiveMaterialization::RecoveryFailedNotReady { .. }
+                | LiveMaterialization::ExactZero { .. } => return Ok(()),
+                _ => return self.quarantine(b"startup-live-state-not-recoverable"),
+            };
+        match eligibility {
+            StartupRecoveryEligibility::NoActiveHead
+            | StartupRecoveryEligibility::CanonicalEmptyExactZero
+            | StartupRecoveryEligibility::RecoveryFailureLatched => return Ok(()),
+            StartupRecoveryEligibility::ReconcileRequired => {
+                let prior_failure =
+                    failure_evidence_digest.ok_or(RuntimeRestartReassemblyError::InvalidState)?;
+                return self
+                    .quarantine_preserving_failure(b"startup-reconcile-required", prior_failure);
+            }
+            StartupRecoveryEligibility::EligibleOneSourceLoop => {}
+        }
+
+        let plan = match self.owner.prepare_recovery_one_source(
+            execution,
+            provenance,
+            active_slice_digest,
+            None,
+        ) {
+            Ok(value) => value,
+            Err(_) => return self.quarantine(b"recovery-plan-owner-rejected"),
+        };
+        let planned_at = self.observe()?;
+        let effective_start_budget_nanos =
+            effective_recovery_start_budget(plan.signed_budgets.start().value());
+        if effective_start_budget_nanos == 0 {
+            return self.quarantine(b"recovery-budget-invalid");
+        }
+        let deadline_nanos = planned_at
+            .observed_at_nanos
+            .checked_add(effective_start_budget_nanos)
+            .ok_or(RuntimeRestartReassemblyError::InvalidDeadline)?;
+        let deadline_evidence_digest =
+            recovery_deadline_evidence(self.state.snapshot(), plan, planned_at, deadline_nanos)?;
+        let next = self.state.try_recovery_plan(RuntimeRecoveryPlanInput {
+            action_id: plan.action_id,
+            domain_generation: plan.domain_generation,
+            instance_generation: plan.instance_generation,
+            resource_generation: plan.resource_generation,
+            signed_start_budget_nanos: plan.signed_budgets.start().value(),
+            deadline_nanos,
+            deadline_evidence_digest,
+        })?;
+        self.commit(next)?;
+
+        let pre_intent = self.observe()?;
+        if pre_intent.observed_at_nanos >= deadline_nanos {
+            let next = self.state.try_recovery_failed_not_ready(None, pre_intent)?;
+            self.commit(next)?;
+            return Ok(());
+        }
+        let next = self.state.try_recovery_intent(pre_intent)?;
+        self.commit(next)?;
+
+        let post_intent = self.observe()?;
+        if post_intent.observed_at_nanos >= deadline_nanos {
+            let next = self
+                .state
+                .try_recovery_failed_not_ready(None, post_intent)?;
+            self.commit(next)?;
+            return Ok(());
+        }
+        let action = self
+            .state
+            .snapshot()
+            .state()
+            .recovery_action
+            .ok_or(RuntimeRestartReassemblyError::InvalidState)?
+            .action;
+        let durable_plan = match self.owner.prepare_recovery_one_source(
+            execution,
+            provenance,
+            active_slice_digest,
+            Some(action),
+        ) {
+            Ok(value) if value == plan => value,
+            _ => return self.quarantine(b"durable-recovery-plan-diverged"),
+        };
+        let next = self
+            .state
+            .try_reserve_recovery_resources(durable_plan.resources)?;
+        self.commit(next)?;
+        let ownership = match self
+            .owner
+            .materialize_one_source(action, durable_plan.resources)
+        {
+            Ok(value) => value,
+            Err(_) => return self.quarantine(b"recovery-materialization-uncertain"),
+        };
+        let next = self.state.try_own_recovery_resources(ownership)?;
+        self.commit(next)?;
+
+        let callback = self.owner.start_one_source_once(action);
+        let callback_observation = self.observe()?;
+        let callback_outcome = match callback {
+            Ok(()) => RuntimeRecoveryCallbackOutcome::Success,
+            Err(error) => RuntimeRecoveryCallbackOutcome::Error {
+                reason_digest: recovery_owner_failure_digest(error)?,
+            },
+        };
+        let callback_succeeded = callback_outcome == RuntimeRecoveryCallbackOutcome::Success;
+        let next = self
+            .state
+            .try_latch_recovery_callback(callback_outcome, callback_observation)?;
+        self.commit(next)?;
+
+        if callback_succeeded && callback_observation.observed_at_nanos < deadline_nanos {
+            let selection = self.observe()?;
+            if selection.observed_at_nanos < deadline_nanos {
+                let next = self.state.try_recovery_live_ready(selection)?;
+                self.commit(next)?;
+                return Ok(());
+            }
+            let next = self.state.try_latch_recovery_deadline(selection)?;
+            self.commit(next)?;
+        }
+
+        let next = self.state.try_begin_recovery_cleanup()?;
+        self.commit(next)?;
+        let tombstones = match self.owner.cleanup_recovery_one_source_once(action) {
+            Ok(value) => value,
+            Err(_) => return self.quarantine(b"recovery-cleanup-not-proven-zero"),
+        };
+        let selection = self.observe()?;
+        let next = self
+            .state
+            .try_recovery_failed_not_ready(Some(tombstones), selection)?;
+        self.commit(next)?;
+        Ok(())
+    }
+
+    fn observe(&mut self) -> Result<RuntimeDeadlineObservation, RuntimeRestartReassemblyError> {
+        let generation = self
+            .state
+            .snapshot()
+            .state()
+            .host
+            .clock_generation_high_water;
+        self.clock
+            .observe(generation)
+            .map_err(RuntimeRestartReassemblyError::Clock)
+    }
+
+    fn terminalize_interrupted_normal(
+        &mut self,
+        signer: &RuntimeReferenceApplySigner,
+        tombstones: Option<RuntimeOneSourceTombstonesInput>,
+    ) -> Result<(), RuntimeRestartReassemblyError> {
+        let prepared = self
+            .state
+            .snapshot()
+            .state()
+            .prepared
+            .as_ref()
+            .ok_or(RuntimeRestartReassemblyError::InvalidState)?;
+        let request = ReferenceApplyRequestV1::decode(&prepared.request.canonical_bytes)
+            .map_err(|_| RuntimeRestartReassemblyError::InvalidState)?;
+        let historical_channel = prepared
+            .response_channel
+            .to_contract()
+            .map_err(|_| RuntimeRestartReassemblyError::InvalidState)?;
+        let incoming_kind = prepared.incoming_kind;
+        let observation = self.observe()?;
+        let preview = match incoming_kind {
+            DesiredHeadKind::OneSourceLoop => self
+                .state
+                .snapshot()
+                .try_preview_startup_interrupted_start_terminal(tombstones.as_ref(), observation)
+                .map_err(RuntimeControlStateError::from)?,
+            DesiredHeadKind::EmptyDeactivate => self
+                .state
+                .snapshot()
+                .try_preview_empty_exact_zero_terminal(tombstones.as_ref(), observation)
+                .map_err(RuntimeControlStateError::from)?,
+        };
+        let receipt = signer
+            .sign_terminal(&request, preview, historical_channel)
+            .map_err(RuntimeRestartReassemblyError::Apply)?;
+        let terminal = RuntimeTerminalInput {
+            canonical_response: OpaqueCanonicalValue::try_terminal_response(
+                receipt.canonical_wire(),
+                receipt.receipt_digest(),
+            )
+            .map_err(RuntimeControlStateError::from)?,
+            selection: observation,
+        };
+        let next = match incoming_kind {
+            DesiredHeadKind::OneSourceLoop => self
+                .state
+                .try_startup_interrupted_start_terminal(tombstones, terminal)?,
+            DesiredHeadKind::EmptyDeactivate => self
+                .state
+                .try_startup_interrupted_empty_terminal(tombstones, terminal)?,
+        };
+        self.commit(next)
+    }
+
+    fn terminalize_aborted_no_effects(
+        &mut self,
+        signer: &RuntimeReferenceApplySigner,
+    ) -> Result<(), RuntimeRestartReassemblyError> {
+        let prepared = self
+            .state
+            .snapshot()
+            .state()
+            .prepared
+            .as_ref()
+            .ok_or(RuntimeRestartReassemblyError::InvalidState)?;
+        let request = ReferenceApplyRequestV1::decode(&prepared.request.canonical_bytes)
+            .map_err(|_| RuntimeRestartReassemblyError::InvalidState)?;
+        let historical_channel = prepared
+            .response_channel
+            .to_contract()
+            .map_err(|_| RuntimeRestartReassemblyError::InvalidState)?;
+        let observation = self.observe()?;
+        let preview = self
+            .state
+            .snapshot()
+            .try_preview_startup_aborted_no_effects_terminal(observation)
+            .map_err(RuntimeControlStateError::from)?;
+        let receipt = signer
+            .sign_terminal(&request, preview, historical_channel)
+            .map_err(RuntimeRestartReassemblyError::Apply)?;
+        let terminal = RuntimeTerminalInput {
+            canonical_response: OpaqueCanonicalValue::try_terminal_response(
+                receipt.canonical_wire(),
+                receipt.receipt_digest(),
+            )
+            .map_err(RuntimeControlStateError::from)?,
+            selection: observation,
+        };
+        let next = self
+            .state
+            .try_startup_aborted_no_effects_terminal(terminal)?;
+        self.commit(next)
+    }
+
+    fn commit(&mut self, next: RuntimeControlState) -> Result<(), RuntimeRestartReassemblyError> {
+        self.store
+            .commit_snapshot(next.snapshot().clone())
+            .map_err(RuntimeRestartReassemblyError::Store)?;
+        self.state = next;
+        Ok(())
+    }
+
+    fn quarantine(&mut self, reason: &[u8]) -> Result<(), RuntimeRestartReassemblyError> {
+        let reason_digest = recovery_quarantine_digest(self.state.snapshot(), reason)?;
+        let next = self.state.try_operational_quarantine(reason_digest)?;
+        self.commit(next)
+    }
+
+    fn quarantine_preserving_failure(
+        &mut self,
+        reason: &[u8],
+        prior_failure: Digest32,
+    ) -> Result<(), RuntimeRestartReassemblyError> {
+        let reason_digest =
+            recovery_quarantine_digest_with_failure(self.state.snapshot(), reason, prior_failure)?;
+        let next = self.state.try_operational_quarantine(reason_digest)?;
+        self.commit(next)
+    }
+}
+
+const fn effective_recovery_start_budget(signed_start_budget_nanos: u64) -> u64 {
+    if signed_start_budget_nanos < RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS {
+        signed_start_budget_nanos
+    } else {
+        RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS
+    }
+}
+
+fn recovery_deadline_evidence(
+    snapshot: &RuntimeJournalSnapshot,
+    plan: RuntimeOneSourceOwnerPlan,
+    observation: RuntimeDeadlineObservation,
+    deadline_nanos: u64,
+) -> Result<Digest32, RuntimeRestartReassemblyError> {
+    let mut digest = Digest32Builder::try_new(RECOVERY_DEADLINE_EVIDENCE_DOMAIN)
+        .map_err(|_| RuntimeRestartReassemblyError::Digest)?;
+    digest
+        .field_u64(snapshot.sequence())
+        .and_then(|builder| builder.field_bytes(&plan.action_id))
+        .and_then(|builder| builder.field_u64(plan.resource_generation))
+        .and_then(|builder| builder.field_u64(observation.clock_generation))
+        .and_then(|builder| builder.field_u64(observation.observed_at_nanos))
+        .and_then(|builder| builder.field_u64(plan.signed_budgets.start().value()))
+        .and_then(|builder| builder.field_u64(RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS))
+        .and_then(|builder| builder.field_u64(deadline_nanos))
+        .map_err(|_| RuntimeRestartReassemblyError::Digest)?;
+    Ok(digest.finish())
+}
+
+fn recovery_owner_failure_digest(
+    error: RuntimeReferenceMaterializationOwnerError,
+) -> Result<Digest32, RuntimeRestartReassemblyError> {
+    let mut digest = Digest32Builder::try_new(RECOVERY_OWNER_FAILURE_DOMAIN)
+        .map_err(|_| RuntimeRestartReassemblyError::Digest)?;
+    digest
+        .field_u16(error as u16)
+        .map_err(|_| RuntimeRestartReassemblyError::Digest)?;
+    Ok(digest.finish())
+}
+
+fn recovery_quarantine_digest(
+    snapshot: &RuntimeJournalSnapshot,
+    reason: &[u8],
+) -> Result<Digest32, RuntimeRestartReassemblyError> {
+    let mut digest = Digest32Builder::try_new(RECOVERY_OWNER_FAILURE_DOMAIN)
+        .map_err(|_| RuntimeRestartReassemblyError::Digest)?;
+    digest
+        .field_u64(snapshot.sequence())
+        .and_then(|builder| builder.field_bytes(reason))
+        .map_err(|_| RuntimeRestartReassemblyError::Digest)?;
+    Ok(digest.finish())
+}
+
+fn recovery_quarantine_digest_with_failure(
+    snapshot: &RuntimeJournalSnapshot,
+    reason: &[u8],
+    prior_failure: Digest32,
+) -> Result<Digest32, RuntimeRestartReassemblyError> {
+    recovery_quarantine_digest_with_failure_fields(snapshot.sequence(), reason, prior_failure)
+}
+
+fn recovery_quarantine_digest_with_failure_fields(
+    snapshot_sequence: u64,
+    reason: &[u8],
+    prior_failure: Digest32,
+) -> Result<Digest32, RuntimeRestartReassemblyError> {
+    let mut digest = Digest32Builder::try_new(RECOVERY_OWNER_FAILURE_DOMAIN)
+        .map_err(|_| RuntimeRestartReassemblyError::Digest)?;
+    digest
+        .field_u64(snapshot_sequence)
+        .and_then(|builder| builder.field_bytes(reason))
+        .and_then(|builder| builder.field_digest(&prior_failure))
+        .map_err(|_| RuntimeRestartReassemblyError::Digest)?;
+    Ok(digest.finish())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeRestartReassemblyError {
+    Store(RuntimeReferenceApplyStoreError),
+    Clock(RuntimeReferenceApplyClockError),
+    State(RuntimeControlStateError),
+    Apply(RuntimeReferenceApplyError),
+    InvalidState,
+    InvalidDeadline,
+    Digest,
+}
+
+impl From<RuntimeControlStateError> for RuntimeRestartReassemblyError {
+    fn from(error: RuntimeControlStateError) -> Self {
+        Self::State(error)
+    }
 }
 
 /// Provisioned Runtime response signer.  Apply receives this capability from
@@ -234,7 +908,7 @@ impl RuntimeReferenceApplySigner {
         })
     }
 
-    fn sign_terminal(
+    pub(crate) fn sign_terminal(
         &self,
         request: &ReferenceApplyRequestV1,
         preview: RuntimeTerminalPreview,
@@ -444,6 +1118,9 @@ where
         request: &ReferenceApplyRequestV1,
         preflight: RuntimeReferenceApplyPreflight,
     ) -> Result<RuntimeReferenceApplyOutcome, RuntimeReferenceApplyError> {
+        if preflight.response_channel != self.channel {
+            return Err(RuntimeControlStateError::PreflightRejected.into());
+        }
         if let Some(replay) = self.try_exact_terminal_replay(request)? {
             return Ok(RuntimeReferenceApplyOutcome::Terminal(Box::new(replay)));
         }
@@ -662,7 +1339,7 @@ where
         let preview = self
             .state
             .snapshot()
-            .try_preview_empty_exact_zero_terminal(&tombstones, selection)
+            .try_preview_empty_exact_zero_terminal(Some(&tombstones), selection)
             .map_err(RuntimeControlStateError::from)?;
         let receipt = self.signer.sign_terminal(request, preview, self.channel)?;
         let terminal = RuntimeTerminalInput {
@@ -1056,5 +1733,61 @@ const fn reference_head(value: TerminalHeadDisposition) -> ReferenceApplyTermina
         TerminalHeadDisposition::CommittedIncoming => {
             ReferenceApplyTerminalHeadV1::CommittedIncoming
         }
+    }
+}
+
+#[cfg(test)]
+mod restart_reassembly_regression_tests {
+    use super::{
+        RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS, effective_recovery_start_budget,
+        recovery_quarantine_digest_with_failure_fields,
+    };
+    use paraegox_kernel::digest::Digest32;
+
+    #[test]
+    fn effective_recovery_budget_uses_the_smaller_signed_value_or_local_cap() {
+        assert_eq!(effective_recovery_start_budget(1), 1);
+        assert_eq!(
+            effective_recovery_start_budget(RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS - 1),
+            RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS - 1,
+        );
+        assert_eq!(
+            effective_recovery_start_budget(RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS),
+            RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS,
+        );
+        assert_eq!(
+            effective_recovery_start_budget(RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS + 1),
+            RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS,
+        );
+        assert_eq!(
+            effective_recovery_start_budget(u64::MAX),
+            RUNTIME_RECOVERY_MAX_START_BUDGET_NANOS,
+        );
+    }
+
+    #[test]
+    fn repeated_quarantine_reason_is_chained_to_the_prior_failure_evidence() {
+        let first = recovery_quarantine_digest_with_failure_fields(
+            17,
+            b"startup-reconcile-required",
+            Digest32::from_bytes([0x41; 32]),
+        )
+        .expect("first chained quarantine digest must build");
+        let replay = recovery_quarantine_digest_with_failure_fields(
+            17,
+            b"startup-reconcile-required",
+            Digest32::from_bytes([0x41; 32]),
+        )
+        .expect("same chained quarantine digest must build deterministically");
+        let different_prior = recovery_quarantine_digest_with_failure_fields(
+            17,
+            b"startup-reconcile-required",
+            Digest32::from_bytes([0x42; 32]),
+        )
+        .expect("second chained quarantine digest must build");
+
+        assert_eq!(first, replay);
+        assert_ne!(first, different_prior);
+        assert_ne!(first, Digest32::from_bytes([0; 32]));
     }
 }

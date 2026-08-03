@@ -9,8 +9,8 @@ use paraegox_runtime_contracts::{
     apply::ExpectedActive,
     installation::verify_immutable_manifest_ingress,
     reference_control::{
-        ReferenceApplyRequestV1, ReferenceAssemblyModeV1, ValidatedReferenceLifecycleBudgetsV1,
-        reference_apply_ingress_identities_v1,
+        ReferenceApplyRequestV1, ReferenceAssemblyModeV1, ReferenceChannelBindingV1,
+        ValidatedReferenceLifecycleBudgetsV1, reference_apply_ingress_identities_v1,
     },
 };
 
@@ -20,9 +20,9 @@ use crate::runtime_journal::{
     RuntimeEmptyRetireInput, RuntimeJournalError, RuntimeJournalSnapshot, RuntimeJournalState,
     RuntimeJournalTransaction, RuntimeOneSourceCallbackSuccessInput,
     RuntimeOneSourceOwnershipInput, RuntimeOneSourceResourceRefs, RuntimeOneSourceTombstonesInput,
-    RuntimeRetiringLifecycleBudgets, RuntimeStartActionInput, RuntimeTemporalAdmissionInput,
-    RuntimeTenureAdmissionInput, RuntimeTerminalInput, StartupRecoveryEligibility,
-    StorePinnedBuildIdentity,
+    RuntimeRecoveryCallbackOutcome, RuntimeRecoveryPlanInput, RuntimeRetiringLifecycleBudgets,
+    RuntimeStartActionInput, RuntimeTemporalAdmissionInput, RuntimeTenureAdmissionInput,
+    RuntimeTerminalInput, StartupRecoveryEligibility, StorePinnedBuildIdentity,
 };
 
 // Kept as children of the control-state owner after the authenticated endpoint
@@ -59,6 +59,7 @@ pub(crate) struct RuntimeReferenceApplyPreflight {
     pub(crate) request_nonce_identity: Digest32,
     pub(crate) temporal_lineage_digest: Digest32,
     pub(crate) admitted_at_nanos: u64,
+    pub(crate) response_channel: ReferenceChannelBindingV1,
 }
 
 /// Whether a facade call produced a new journal snapshot or recognized the
@@ -156,6 +157,176 @@ impl RuntimeControlState {
         };
         state.bootstrap_facts()?;
         Ok(state)
+    }
+
+    pub(crate) fn try_begin_startup_resource_cleanup(
+        &self,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_begin_startup_resource_cleanup_successor()?,
+        })
+    }
+
+    pub(crate) fn try_complete_startup_resource_cleanup(
+        &self,
+        tombstones: RuntimeOneSourceTombstonesInput,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_complete_startup_resource_cleanup_successor(tombstones)?,
+        })
+    }
+
+    pub(crate) fn try_operational_quarantine(
+        &self,
+        reason_digest: Digest32,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_operational_quarantine_successor(reason_digest)?,
+        })
+    }
+
+    pub(crate) fn try_abort_startup_invalidated_recovery(
+        &self,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_abort_startup_invalidated_recovery_successor(observation)?,
+        })
+    }
+
+    pub(crate) fn try_recovery_plan(
+        &self,
+        input: RuntimeRecoveryPlanInput,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self.snapshot.try_recovery_plan_successor(input)?,
+        })
+    }
+
+    pub(crate) fn try_recovery_intent(
+        &self,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self.snapshot.try_recovery_intent_successor(observation)?,
+        })
+    }
+
+    pub(crate) fn try_reserve_recovery_resources(
+        &self,
+        resources: RuntimeOneSourceResourceRefs,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_reserve_recovery_resources_successor(resources)?,
+        })
+    }
+
+    pub(crate) fn try_own_recovery_resources(
+        &self,
+        ownership: RuntimeOneSourceOwnershipInput,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_own_recovery_resources_successor(ownership)?,
+        })
+    }
+
+    pub(crate) fn try_latch_recovery_callback(
+        &self,
+        outcome: RuntimeRecoveryCallbackOutcome,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_latch_recovery_callback_successor(outcome, observation)?,
+        })
+    }
+
+    pub(crate) fn try_latch_recovery_deadline(
+        &self,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_latch_recovery_deadline_successor(observation)?,
+        })
+    }
+
+    pub(crate) fn try_begin_recovery_cleanup(&self) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self.snapshot.try_begin_recovery_cleanup_successor()?,
+        })
+    }
+
+    pub(crate) fn try_recovery_live_ready(
+        &self,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_recovery_live_ready_successor(observation)?,
+        })
+    }
+
+    pub(crate) fn try_recovery_failed_not_ready(
+        &self,
+        tombstones: Option<RuntimeOneSourceTombstonesInput>,
+        observation: RuntimeDeadlineObservation,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_recovery_failed_not_ready_successor(tombstones, observation)?,
+        })
+    }
+
+    pub(crate) fn try_startup_interrupted_start_terminal(
+        &self,
+        tombstones: Option<RuntimeOneSourceTombstonesInput>,
+        terminal: RuntimeTerminalInput,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_startup_interrupted_start_terminal_successor(tombstones, terminal)?,
+        })
+    }
+
+    pub(crate) fn try_startup_interrupted_empty_terminal(
+        &self,
+        tombstones: Option<RuntimeOneSourceTombstonesInput>,
+        terminal: RuntimeTerminalInput,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_empty_exact_zero_terminal_successor(tombstones, terminal)?,
+        })
+    }
+
+    pub(crate) fn try_startup_aborted_no_effects_terminal(
+        &self,
+        terminal: RuntimeTerminalInput,
+    ) -> Result<Self, RuntimeControlStateError> {
+        Ok(Self {
+            snapshot: self
+                .snapshot
+                .try_startup_aborted_no_effects_terminal_successor(terminal)?,
+        })
     }
 
     /// Returns the exact validated snapshot to the Runtime store publisher.
@@ -416,7 +587,7 @@ impl RuntimeControlState {
         Ok(Self {
             snapshot: self
                 .snapshot
-                .try_empty_exact_zero_terminal_successor(tombstones, terminal)?,
+                .try_empty_exact_zero_terminal_successor(Some(tombstones), terminal)?,
         })
     }
 
@@ -560,6 +731,7 @@ impl RuntimeControlState {
                 installed_deadline_nanos,
                 lineage_digest: ingress_identities.temporal_lineage_digest(),
             },
+            response_channel: preflight.response_channel,
         })
     }
 
@@ -1254,6 +1426,7 @@ mod tests {
             request_nonce_identity: digest(request_nonce),
             temporal_lineage_digest: digest(temporal_lineage),
             admitted_at_nanos,
+            response_channel: reference_apply_channel(),
         }
     }
 
@@ -1535,7 +1708,29 @@ mod tests {
         assert_eq!(migration.source_sequence(), snapshot.sequence());
         assert_ne!(migration.source_checksum(), Digest32::from_bytes([0; 32]));
         let migrated = migration.into_snapshot();
-        assert_eq!(migrated.state(), snapshot.state());
+        let legacy_channel = migrated
+            .state()
+            .prepared
+            .as_ref()
+            .expect("migrated prepared operation")
+            .response_channel;
+        assert_eq!(legacy_channel.target, [0; 16]);
+        assert_eq!(legacy_channel.runtime_peer, [0; 16]);
+        assert_eq!(
+            legacy_channel.local_endpoint_identity_digest,
+            Digest32::from_bytes([0; 32]),
+        );
+        assert_eq!(
+            legacy_channel.peer_credentials_digest,
+            Digest32::from_bytes([0; 32]),
+        );
+        let mut expected_legacy_state = snapshot.state().clone();
+        expected_legacy_state
+            .prepared
+            .as_mut()
+            .expect("current prepared operation")
+            .response_channel = legacy_channel;
+        assert_eq!(migrated.state(), &expected_legacy_state);
         assert_eq!(&migrated.canonical_wire()[8..10], &4_u16.to_be_bytes());
 
         let mut tampered = snapshot.state().clone();
@@ -1559,8 +1754,14 @@ mod tests {
             .expect("test-only checksum-valid frame");
         assert_eq!(
             RuntimeJournalSnapshot::decode(&checksum_valid_tamper),
+            Err(RuntimeJournalError::UnsupportedPayloadVersion)
+        );
+        let v4_tamper_before = checksum_valid_tamper.clone();
+        assert_eq!(
+            RuntimeJournalSnapshot::migrate_payload_v4(&checksum_valid_tamper),
             Err(RuntimeJournalError::InvalidStateInvariant)
         );
+        assert_eq!(checksum_valid_tamper, v4_tamper_before);
         assert_eq!(snapshot.canonical_wire(), original_wire);
         assert_eq!(
             RuntimeJournalSnapshot::decode(&original_wire),
