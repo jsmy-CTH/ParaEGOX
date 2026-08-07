@@ -37,6 +37,7 @@ const INITIALIZATION_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"paraegox.deployment.controller.initialization-receipt.sha256.v1";
 
 /// Complete immutable inputs pinned by the Controller sequence-one snapshot.
+#[derive(Clone)]
 pub(crate) struct ControllerInitializationInput {
     scope: DeploymentScopeId,
     plan_lineage: DeploymentId,
@@ -107,6 +108,20 @@ pub(crate) fn initialize_controller_store(
     )
 }
 
+pub(crate) fn initialize_controller_store_developer_local(
+    directory: &Path,
+    input: ControllerInitializationInput,
+) -> Result<ControllerInitializationReceipt, ControllerInitializationError> {
+    let mut entropy = SystemControllerInitializationEntropy;
+    initialize_controller_store_with(
+        directory,
+        input,
+        &mut entropy,
+        ControllerFilesystemPolicy::DeveloperLocal,
+        ControllerCommitFailpoint::None,
+    )
+}
+
 pub(crate) fn reconstruct_sequence_one_controller_receipt(
     directory: &Path,
     expected_input: ControllerInitializationInput,
@@ -114,6 +129,19 @@ pub(crate) fn reconstruct_sequence_one_controller_receipt(
     let expected_owner_identity = expected_input.owner_identity_fingerprint;
     let expected_state = expected_input.into_state()?;
     let store = ControllerStore::open_for_sequence_one_receipt(directory, expected_owner_identity)?;
+    receipt_from_sequence_one_store(store, &expected_state)
+}
+
+pub(crate) fn reconstruct_sequence_one_controller_receipt_developer_local(
+    directory: &Path,
+    expected_input: ControllerInitializationInput,
+) -> Result<ControllerInitializationReceipt, ControllerReceiptRecoveryError> {
+    let expected_owner_identity = expected_input.owner_identity_fingerprint;
+    let expected_state = expected_input.into_state()?;
+    let store = ControllerStore::open_for_sequence_one_receipt_developer_local(
+        directory,
+        expected_owner_identity,
+    )?;
     receipt_from_sequence_one_store(store, &expected_state)
 }
 

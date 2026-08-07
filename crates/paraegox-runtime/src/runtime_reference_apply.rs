@@ -1072,6 +1072,34 @@ where
         self.state.snapshot()
     }
 
+    /// Consumes the legacy apply owner only at the DeveloperLocal managed
+    /// cutover boundary.  Read-only PXBR/PXQR traffic cannot alter these
+    /// conditions; any legacy apply, recovery, live resource, or resident
+    /// tenure makes the one-way transfer fail closed.
+    pub(crate) fn into_developer_managed_cutover_store(
+        self,
+    ) -> Result<S, RuntimeReferenceApplyError> {
+        let state = self.state.snapshot().state();
+        if state.prepared.is_some()
+            || state.active_desired.is_some()
+            || state.recovery_action.is_some()
+            || !state.owned_resources.is_empty()
+            || self.resident_full_admitted_tenure.is_some()
+            || !matches!(
+                state.live_materialization,
+                LiveMaterialization::StartupInvalidated {
+                    active_slice_digest: None,
+                    recovery_eligibility: StartupRecoveryEligibility::NoActiveHead,
+                    failure_evidence_digest: None,
+                    ..
+                }
+            )
+        {
+            return Err(RuntimeReferenceApplyError::StoreStateDiverged);
+        }
+        Ok(self.store)
+    }
+
     #[cfg(test)]
     pub(crate) fn into_test_recovery_parts(
         self,

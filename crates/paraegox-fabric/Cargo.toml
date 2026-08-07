@@ -1,0 +1,22 @@
+[package]
+name = "paraegox-fabric"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+getrandom.workspace = true
+paraegox-kernel.workspace = true
+paraegox-runtime-contracts.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+zenoh = { workspace = true, features = ["unstable"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -14,6 +14,11 @@ PURE_COMPILE_SOURCES = (
     DEPLOYMENT_SRC / "deck.rs",
     DEPLOYMENT_SRC / "planner.rs",
 )
+RESTRICTED_APPLY_OWNER_SOURCE = DEPLOYMENT_SRC / "distributed_agent_stack_apply.rs"
+RESTRICTED_APPLY_FABRIC_SOURCE = (
+    CRATES_ROOT / "paraegox-fabric" / "src" / "runtime_apply.rs"
+)
+RESTRICTED_APPLY_FABRIC_LIBRARY = CRATES_ROOT / "paraegox-fabric" / "src" / "lib.rs"
 
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
 FORBIDDEN_RUNTIME_DEPENDENCIES = {"paraegox-deployment", "paraegox-decks"}
@@ -24,6 +29,70 @@ FORBIDDEN_GRAPH_NAMES = {
     "paraegox-graph",
     "paraegox-graph-foundation",
 }
+PUBLIC_DEPLOYMENT_PROCESS_SYMBOLS = {
+    "DeploymentdProcessError",
+    "TenureAuthorityProcessError",
+    "run_deploymentd_process",
+    "run_tenure_authority_process",
+}
+PUBLIC_DEVELOPER_LOCAL_SYMBOLS = {
+    "DeveloperLocalPeerIdentityV1",
+    "DeveloperLocalTenureAuthorityIdentityBytesV1",
+    "DeveloperLocalTenureAuthorityConfigV1",
+    "DeveloperLocalTenureAuthorityFactsV1",
+    "DeveloperLocalTenureAuthorityV1",
+    "DeveloperLocalTenureAuthorityError",
+    "DeveloperFixtureIdentitySeedV1",
+    "DeveloperFixtureDerivedIdentityV1",
+    "DeveloperFixturePathsV1",
+    "DeveloperFixtureRuntimePinsV1",
+    "DeveloperFixtureControllerCredentialsV1",
+    "DeveloperFixtureFabricEndpointV1",
+    "DeveloperFixtureAgentStackInputV1",
+    "DeveloperFixtureAgentStackOutcomeV1",
+    "DeveloperProvisionedAgentStackInputV1",
+    "DeveloperProvisionedAgentStackOutcomeV1",
+    "DeveloperFixtureAgentStackDeactivationOutcomeV1",
+    "DeveloperFixtureAgentStackError",
+    "run_developer_fixture_agent_stack_v1",
+    "run_developer_provisioned_agent_stack_v1",
+    "deactivate_developer_fixture_agent_stack_v1",
+    "DeveloperFixtureModelAgentStackInputV1",
+    "DeveloperFixtureModelAgentStackOutcomeV1",
+    "DeveloperProvisionedModelAgentStackInputV1",
+    "DeveloperProvisionedModelAgentStackOutcomeV1",
+    "DeveloperFixtureModelAgentStackDeactivationOutcomeV1",
+    "DeveloperFixtureModelAgentStackError",
+    "run_developer_fixture_model_agent_stack_v1",
+    "run_developer_provisioned_model_agent_stack_v1",
+    "deactivate_developer_fixture_model_agent_stack_v1",
+    "deactivate_developer_provisioned_model_agent_stack_v1",
+}
+DEVELOPER_LOCAL_ENTRYPOINT = (
+    "paraegox_deployment::{DeveloperLocalPeerIdentityV1, "
+    "DeveloperLocalTenureAuthorityIdentityBytesV1, "
+    "DeveloperLocalTenureAuthorityConfigV1, DeveloperLocalTenureAuthorityFactsV1, "
+    "DeveloperLocalTenureAuthorityV1, DeveloperLocalTenureAuthorityError, "
+    "DeveloperFixtureIdentitySeedV1, DeveloperFixtureDerivedIdentityV1, "
+    "DeveloperFixturePathsV1, DeveloperFixtureRuntimePinsV1, "
+    "DeveloperFixtureControllerCredentialsV1, DeveloperFixtureFabricEndpointV1, "
+    "DeveloperFixtureAgentStackInputV1, DeveloperFixtureAgentStackOutcomeV1, "
+    "DeveloperProvisionedAgentStackInputV1, DeveloperProvisionedAgentStackOutcomeV1, "
+    "DeveloperFixtureAgentStackDeactivationOutcomeV1, "
+    "DeveloperFixtureAgentStackError, run_developer_fixture_agent_stack_v1, "
+    "run_developer_provisioned_agent_stack_v1, "
+    "deactivate_developer_fixture_agent_stack_v1, "
+    "DeveloperFixtureModelAgentStackInputV1, "
+    "DeveloperFixtureModelAgentStackOutcomeV1, "
+    "DeveloperProvisionedModelAgentStackInputV1, "
+    "DeveloperProvisionedModelAgentStackOutcomeV1, "
+    "DeveloperFixtureModelAgentStackDeactivationOutcomeV1, "
+    "DeveloperFixtureModelAgentStackError, "
+    "run_developer_fixture_model_agent_stack_v1, "
+    "run_developer_provisioned_model_agent_stack_v1, "
+    "deactivate_developer_fixture_model_agent_stack_v1, "
+    "deactivate_developer_provisioned_model_agent_stack_v1}"
+)
 
 
 def _read_required(path: Path) -> str:
@@ -109,6 +178,42 @@ def test_runtime_layers_do_not_depend_on_deployment_compile_layers() -> None:
         )
 
 
+def test_restricted_runtime_apply_send_stays_in_controller_owner_allowlist() -> None:
+    allowed_preflight_sources = {
+        RESTRICTED_APPLY_OWNER_SOURCE,
+        RESTRICTED_APPLY_FABRIC_SOURCE,
+        RESTRICTED_APPLY_FABRIC_LIBRARY,
+    }
+    send_call_counts: dict[Path, int] = {}
+    raw_string = re.compile(r'(?s)(?:br|r)(?P<hashes>#+)".*?"(?P=hashes)')
+    quoted_string = re.compile(r'(?s)b?"(?:\\.|[^"\\])*"')
+    send_call = re.compile(
+        r"(?:\.\s*send_once\s*\(|"
+        r"\bRestrictedRuntimeApplyPreflightV1\s*::\s*send_once\s*\()"
+    )
+    for path in CRATES_ROOT.rglob("*.rs"):
+        source = path.read_text(encoding="utf-8")
+        if "RestrictedRuntimeApplyPreflightV1" in source:
+            assert path in allowed_preflight_sources, (
+                "restricted Runtime apply preflight escaped its Fabric mechanism and "
+                f"Deployment owner: {path.relative_to(REPO_ROOT)}"
+            )
+        source_without_strings = quoted_string.sub(
+            '""', raw_string.sub('""', source)
+        )
+        count = len(send_call.findall(source_without_strings))
+        if count:
+            send_call_counts[path] = count
+
+    assert send_call_counts == {
+        RESTRICTED_APPLY_OWNER_SOURCE: 2,
+        RESTRICTED_APPLY_FABRIC_SOURCE: 2,
+    }, (
+        "restricted physical send calls must remain limited to the two Controller-owner "
+        "dispatches plus Fabric's move-only compile-fail example"
+    )
+
+
 def test_pure_compile_sources_do_not_reimplement_manifest_or_side_effects() -> None:
     forbidden_literals = (
         "PXCM",
@@ -185,26 +290,30 @@ def test_s7_c_pure_compile_types_remain_private_behind_exact_process_facades() -
             "paraegox-deploymentd initialize-reference-v1/commit-reference-loop-v1/"
             "commit-reference-empty-v1/acquire-tenure-v1/bootstrap-runtime-v1/"
             "apply-reference-v1/reconcile-reference-once-v1/"
-            "migrate-controller-journal-v7-to-v8-v1 CLI"
+            "migrate-controller-journal-v7-to-v8-v1/"
+            "initialize-distributed-agent-stack-v1/"
+            "observe-distributed-agent-stack-nodes-once-v1 CLI"
         ),
+        DEVELOPER_LOCAL_ENTRYPOINT,
     ]
     assert deployment_row["consumers"] == [
         "paraegox-tenure-authority",
         "paraegox-deploymentd",
+        "paraegox-local",
     ]
 
+    deployment_api_symbol_groups = []
     for api in registry["public_apis"]:
         module = str(api["module"]).replace("-", "_")
         symbols = {str(symbol) for symbol in api["symbols"]}
         if module == "paraegox_deployment":
-            assert symbols == {
-                "DeploymentdProcessError",
-                "TenureAuthorityProcessError",
-                "run_deploymentd_process",
-                "run_tenure_authority_process",
-            }
+            deployment_api_symbol_groups.append(frozenset(symbols))
             continue
         assert not module.startswith(("paraegox_deployment", "paraegox_decks"))
+    assert set(deployment_api_symbol_groups) == {
+        frozenset(PUBLIC_DEPLOYMENT_PROCESS_SYMBOLS),
+        frozenset(PUBLIC_DEVELOPER_LOCAL_SYMBOLS),
+    }
 
     deployment_manifest = _load_toml(DEPLOYMENT_ROOT / "Cargo.toml")
     assert "bin" not in deployment_manifest

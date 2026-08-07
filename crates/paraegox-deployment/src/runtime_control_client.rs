@@ -26,6 +26,24 @@ use nix::sys::stat::Mode;
 use paraegox_kernel::digest::Digest32;
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::{ClockDomainRef, ClockGeneration};
+use paraegox_runtime_contracts::managed_agent_stack_plan::{
+    MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES, MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
+    ManagedAgentStackApplyRequestV1, ManagedAgentStackPlanError,
+    ManagedAgentStackTerminalReceiptV1,
+};
+use paraegox_runtime_contracts::managed_fabric_plan::{
+    MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES, MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES,
+    ManagedFabricApplyRequestV1, ManagedFabricApplyTerminalReceiptV1, ManagedFabricPlanError,
+};
+use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+    MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
+    MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedModelAgentStackApplyRequestV1,
+    ManagedModelAgentStackPlanError, ManagedModelAgentStackTerminalReceiptV1,
+};
+use paraegox_runtime_contracts::managed_serving_bootstrap::{
+    MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES, MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES,
+    ManagedServingBootstrapError, ManagedServingBootstrapResponseV1,
+};
 use paraegox_runtime_contracts::reference_control::{
     MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES, MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES,
     MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES, MAX_REFERENCE_QUERY_REQUEST_BYTES,
@@ -44,6 +62,9 @@ use tokio::net::UnixStream;
 use tokio::time::{Instant, timeout_at};
 
 use crate::controller_apply::PreparedControllerApplyAttemptV1;
+use crate::managed_agent_stack_apply::ManagedAgentStackSendActionV1;
+use crate::managed_fabric_apply::{ManagedFabricSendActionV1, ManagedServingBootstrapSendActionV1};
+use crate::managed_model_agent_stack_apply::ManagedModelAgentStackSendActionV1;
 
 const RUNTIME_CONTROL_SOCKET_MODE: u32 = 0o660;
 const RUNTIME_CONTROL_SOCKET_DIRECTORY_MODE: u32 = 0o2750;
@@ -54,6 +75,12 @@ const ED25519_ALGORITHM_VERSION: u16 = 1;
 pub(crate) const MAX_RUNTIME_BOOTSTRAP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_RUNTIME_QUERY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_RUNTIME_APPLY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const MAX_RUNTIME_MANAGED_SERVING_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const MAX_RUNTIME_MANAGED_FABRIC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const MAX_RUNTIME_MANAGED_AGENT_STACK_EXCHANGE_TIMEOUT: Duration =
+    Duration::from_secs(30);
+pub(crate) const MAX_RUNTIME_MANAGED_MODEL_AGENT_STACK_EXCHANGE_TIMEOUT: Duration =
+    Duration::from_secs(30);
 
 /// Immutable signed request plus its byte-identical length-prefixed transport.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1120,6 +1147,960 @@ impl ValidatedRuntimeApplyTerminalReceipt {
     }
 }
 
+/// Pinned Runtime selector for successor PXFR response authentication.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeManagedServingResponseVerifier {
+    runtime_principal: PrincipalRef,
+    key: ApplyAuthKeyRef,
+    verifying_key: VerifyingKey,
+}
+
+impl RuntimeManagedServingResponseVerifier {
+    pub(crate) fn try_new(
+        runtime_principal: PrincipalRef,
+        key: ApplyAuthKeyRef,
+        algorithm: ApplyAuthAlgorithm,
+        algorithm_version: u16,
+        expected_public_key_fingerprint: Digest32,
+        verifying_key: VerifyingKey,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        if bytes_are_zero(runtime_principal.as_bytes()) || bytes_are_zero(key.as_bytes()) {
+            return Err(RuntimeControlClientConfigurationError::InvalidResponseAuthPin);
+        }
+        if algorithm.value() != ED25519_ALGORITHM || algorithm_version != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RuntimeControlClientConfigurationError::UnsupportedResponseAuthProfile);
+        }
+        if verifying_key.is_weak() {
+            return Err(RuntimeControlClientConfigurationError::WeakRuntimeResponseKey);
+        }
+        let fingerprint = ed25519_control_key_fingerprint(&verifying_key.to_bytes())
+            .map_err(RuntimeControlClientConfigurationError::ControlContract)?;
+        if bytes_are_zero(expected_public_key_fingerprint.as_bytes())
+            || fingerprint != expected_public_key_fingerprint
+        {
+            return Err(RuntimeControlClientConfigurationError::ResponseKeyFingerprintMismatch);
+        }
+        Ok(Self {
+            runtime_principal,
+            key,
+            verifying_key,
+        })
+    }
+
+    fn verify(
+        &self,
+        response: &ManagedServingBootstrapResponseV1,
+    ) -> Result<(), RuntimeManagedServingClientFailure> {
+        if response.authentication_runtime_peer() != self.runtime_principal {
+            return Err(RuntimeManagedServingClientFailure::ResponsePrincipalMismatch);
+        }
+        if response.authentication_key() != self.key {
+            return Err(RuntimeManagedServingClientFailure::ResponseKeyMismatch);
+        }
+        if response.authentication_algorithm().value() != ED25519_ALGORITHM
+            || response.authentication_algorithm_version() != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RuntimeManagedServingClientFailure::UnsupportedResponseAuthProfile);
+        }
+        let signature: [u8; ED25519_SIGNATURE_BYTES] = response
+            .authentication_signature()
+            .try_into()
+            .map_err(|_| RuntimeManagedServingClientFailure::InvalidResponseSignature)?;
+        let transcript = response
+            .signing_transcript()
+            .map_err(RuntimeManagedServingClientFailure::ResponseContract)?;
+        self.verifying_key
+            .verify_strict(transcript.as_bytes(), &Signature::from_bytes(&signature))
+            .map_err(|_| RuntimeManagedServingClientFailure::InvalidResponseSignature)
+    }
+}
+
+/// Result of exactly one move-only PXFB transport attempt. The action is
+/// returned on every path so the Controller can durably commit either the
+/// verified PXFR or `AttemptClosedNoResponse`.
+#[derive(Debug)]
+pub(crate) struct RuntimeManagedServingExchangeOutcomeV1 {
+    action: ManagedServingBootstrapSendActionV1,
+    response: Result<Box<[u8]>, RuntimeManagedServingExchangeError>,
+}
+
+impl RuntimeManagedServingExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedServingBootstrapSendActionV1,
+        Result<Box<[u8]>, RuntimeManagedServingExchangeError>,
+    ) {
+        (self.action, self.response)
+    }
+}
+
+/// Direct one-shot PXFB/PXFR client. It owns no retry or journal policy.
+#[derive(Clone, Debug)]
+pub(crate) struct UnixRuntimeManagedServingClient {
+    endpoint: UnixRuntimeControlEndpoint,
+    response_verifier: RuntimeManagedServingResponseVerifier,
+    exchange_timeout: Duration,
+}
+
+impl UnixRuntimeManagedServingClient {
+    pub(crate) fn try_new(
+        endpoint: UnixRuntimeControlEndpoint,
+        response_verifier: RuntimeManagedServingResponseVerifier,
+        exchange_timeout: Duration,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        if exchange_timeout.is_zero()
+            || exchange_timeout > MAX_RUNTIME_MANAGED_SERVING_EXCHANGE_TIMEOUT
+        {
+            return Err(RuntimeControlClientConfigurationError::InvalidExchangeTimeout);
+        }
+        if endpoint.runtime_principal != response_verifier.runtime_principal {
+            return Err(RuntimeControlClientConfigurationError::ResponsePrincipalMismatch);
+        }
+        Ok(Self {
+            endpoint,
+            response_verifier,
+            exchange_timeout,
+        })
+    }
+
+    /// Consumes exactly one durable in-flight action. No request bytes are
+    /// reconstructed, no identity is allocated, and no retry occurs.
+    pub(crate) async fn exchange(
+        &self,
+        action: ManagedServingBootstrapSendActionV1,
+    ) -> RuntimeManagedServingExchangeOutcomeV1 {
+        let response = self.exchange_request(action.request()).await;
+        RuntimeManagedServingExchangeOutcomeV1 { action, response }
+    }
+
+    async fn exchange_request(
+        &self,
+        request: &paraegox_runtime_contracts::managed_serving_bootstrap::ManagedServingBootstrapRequestV1,
+    ) -> Result<Box<[u8]>, RuntimeManagedServingExchangeError> {
+        if request.canonical_wire().is_empty()
+            || request.canonical_wire().len() > MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES
+            || request.target() != self.endpoint.target
+            || request.channel().target() != request.target()
+            || request.channel().runtime_peer() != self.response_verifier.runtime_principal
+        {
+            return Err(RuntimeManagedServingExchangeError::NotSent(
+                RuntimeManagedServingClientFailure::RequestMismatch,
+            ));
+        }
+        let transport_frame = length_prefix_managed_serving(request.canonical_wire());
+        let deadline = Instant::now() + self.exchange_timeout;
+        let validated_endpoint = validate_endpoint_metadata(&self.endpoint)
+            .map_err(RuntimeManagedServingClientFailure::Endpoint)
+            .map_err(RuntimeManagedServingExchangeError::NotSent)?;
+        let mut stream = bounded_managed_serving_io(
+            deadline,
+            RuntimeManagedServingIoPhase::Connect,
+            ManagedServingDeliveryState::NotSent,
+            UnixStream::connect(self.endpoint.socket_path()),
+        )
+        .await?;
+        validated_endpoint
+            .revalidate(&self.endpoint)
+            .map_err(RuntimeManagedServingClientFailure::Endpoint)
+            .map_err(RuntimeManagedServingExchangeError::NotSent)?;
+        let runtime_credentials =
+            validate_peer_credentials(&stream, self.endpoint.server_credentials)
+                .map_err(RuntimeManagedServingClientFailure::Endpoint)
+                .map_err(RuntimeManagedServingExchangeError::NotSent)?;
+        let current_channel = validated_endpoint
+            .channel(&self.endpoint, runtime_credentials)
+            .map_err(RuntimeManagedServingClientFailure::Endpoint)
+            .map_err(RuntimeManagedServingExchangeError::NotSent)?;
+        if current_channel != request.channel() {
+            return Err(RuntimeManagedServingExchangeError::NotSent(
+                RuntimeManagedServingClientFailure::CurrentChannelMismatch,
+            ));
+        }
+        bounded_managed_serving_io(
+            deadline,
+            RuntimeManagedServingIoPhase::WriteRequest,
+            ManagedServingDeliveryState::MayHaveSent,
+            stream.write_all(&transport_frame),
+        )
+        .await?;
+        let mut length_bytes = [0_u8; LENGTH_PREFIX_BYTES];
+        bounded_managed_serving_read_exact(
+            deadline,
+            RuntimeManagedServingIoPhase::ReadResponseLength,
+            &mut stream,
+            &mut length_bytes,
+        )
+        .await?;
+        let response_length = u32::from_be_bytes(length_bytes) as usize;
+        if response_length == 0 {
+            return Err(RuntimeManagedServingExchangeError::ClosedNoResponse(
+                RuntimeManagedServingClientFailure::InvalidResponseLength,
+            ));
+        }
+        if response_length > MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES {
+            return Err(RuntimeManagedServingExchangeError::ClosedNoResponse(
+                RuntimeManagedServingClientFailure::ResponseBoundExceeded,
+            ));
+        }
+        let mut response_bytes = vec![0_u8; response_length];
+        bounded_managed_serving_read_exact(
+            deadline,
+            RuntimeManagedServingIoPhase::ReadResponse,
+            &mut stream,
+            &mut response_bytes,
+        )
+        .await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_bytes = bounded_managed_serving_io(
+            deadline,
+            RuntimeManagedServingIoPhase::ReadTrailing,
+            ManagedServingDeliveryState::MayHaveSent,
+            stream.read(&mut trailing),
+        )
+        .await?;
+        if trailing_bytes != 0 {
+            return Err(RuntimeManagedServingExchangeError::ClosedNoResponse(
+                RuntimeManagedServingClientFailure::TrailingBytes,
+            ));
+        }
+        let response =
+            ManagedServingBootstrapResponseV1::decode(&response_bytes).map_err(|error| {
+                RuntimeManagedServingExchangeError::ClosedNoResponse(
+                    RuntimeManagedServingClientFailure::ResponseContract(error),
+                )
+            })?;
+        self.response_verifier
+            .verify(&response)
+            .map_err(RuntimeManagedServingExchangeError::ClosedNoResponse)?;
+        response
+            .validate_against_request(request, current_channel)
+            .map_err(|error| {
+                RuntimeManagedServingExchangeError::ClosedNoResponse(
+                    RuntimeManagedServingClientFailure::ResponseContract(error),
+                )
+            })?;
+        Ok(response.canonical_wire().into())
+    }
+}
+
+fn length_prefix_managed_serving(payload: &[u8]) -> Box<[u8]> {
+    debug_assert!(payload.len() <= MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES);
+    let payload_length = u32::try_from(payload.len())
+        .expect("canonical managed-serving request bound is smaller than u32::MAX");
+    let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    frame.extend_from_slice(&payload_length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame.into_boxed_slice()
+}
+
+/// Pinned Runtime signer for exact PXFT v1 receipts.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeManagedFabricResponseVerifier {
+    runtime_principal: PrincipalRef,
+    key: ApplyAuthKeyRef,
+    verifying_key: VerifyingKey,
+}
+
+impl RuntimeManagedFabricResponseVerifier {
+    pub(crate) fn try_new(
+        runtime_principal: PrincipalRef,
+        key: ApplyAuthKeyRef,
+        algorithm: ApplyAuthAlgorithm,
+        algorithm_version: u16,
+        expected_public_key_fingerprint: Digest32,
+        verifying_key: VerifyingKey,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        let verified = RuntimeManagedServingResponseVerifier::try_new(
+            runtime_principal,
+            key,
+            algorithm,
+            algorithm_version,
+            expected_public_key_fingerprint,
+            verifying_key,
+        )?;
+        Ok(Self {
+            runtime_principal: verified.runtime_principal,
+            key: verified.key,
+            verifying_key: verified.verifying_key,
+        })
+    }
+
+    fn verify(
+        &self,
+        receipt: &ManagedFabricApplyTerminalReceiptV1,
+    ) -> Result<(), RuntimeManagedFabricClientFailure> {
+        if receipt.authentication_runtime_peer() != self.runtime_principal {
+            return Err(RuntimeManagedFabricClientFailure::ResponsePrincipalMismatch);
+        }
+        if receipt.authentication_key() != self.key {
+            return Err(RuntimeManagedFabricClientFailure::ResponseKeyMismatch);
+        }
+        if receipt.authentication_algorithm().value() != ED25519_ALGORITHM
+            || receipt.authentication_algorithm_version() != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RuntimeManagedFabricClientFailure::UnsupportedResponseAuthProfile);
+        }
+        let signature: [u8; ED25519_SIGNATURE_BYTES] = receipt
+            .authentication_signature()
+            .try_into()
+            .map_err(|_| RuntimeManagedFabricClientFailure::InvalidResponseSignature)?;
+        let transcript = receipt
+            .signing_transcript()
+            .map_err(RuntimeManagedFabricClientFailure::ResponseContract)?;
+        self.verifying_key
+            .verify_strict(transcript.as_bytes(), &Signature::from_bytes(&signature))
+            .map_err(|_| RuntimeManagedFabricClientFailure::InvalidResponseSignature)
+    }
+}
+
+/// Exactly one move-only PXAR v6 exchange. The action is returned even when
+/// the journal must remain uncertain after a transport failure.
+#[derive(Debug)]
+pub(crate) struct RuntimeManagedFabricExchangeOutcomeV1 {
+    action: ManagedFabricSendActionV1,
+    response: Result<Box<[u8]>, RuntimeManagedFabricExchangeError>,
+}
+
+impl RuntimeManagedFabricExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedFabricSendActionV1,
+        Result<Box<[u8]>, RuntimeManagedFabricExchangeError>,
+    ) {
+        (self.action, self.response)
+    }
+}
+
+/// One-shot exact PXAR v6/PXFT v1 Unix client. It owns no journal or retry.
+#[derive(Clone, Debug)]
+pub(crate) struct UnixRuntimeManagedFabricClient {
+    endpoint: UnixRuntimeControlEndpoint,
+    response_verifier: RuntimeManagedFabricResponseVerifier,
+    exchange_timeout: Duration,
+}
+
+impl UnixRuntimeManagedFabricClient {
+    pub(crate) fn try_new(
+        endpoint: UnixRuntimeControlEndpoint,
+        response_verifier: RuntimeManagedFabricResponseVerifier,
+        exchange_timeout: Duration,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        if exchange_timeout.is_zero()
+            || exchange_timeout > MAX_RUNTIME_MANAGED_FABRIC_EXCHANGE_TIMEOUT
+        {
+            return Err(RuntimeControlClientConfigurationError::InvalidExchangeTimeout);
+        }
+        if endpoint.runtime_principal != response_verifier.runtime_principal {
+            return Err(RuntimeControlClientConfigurationError::ResponsePrincipalMismatch);
+        }
+        Ok(Self {
+            endpoint,
+            response_verifier,
+            exchange_timeout,
+        })
+    }
+
+    pub(crate) async fn exchange(
+        &self,
+        action: ManagedFabricSendActionV1,
+    ) -> RuntimeManagedFabricExchangeOutcomeV1 {
+        let response = self
+            .exchange_request(action.request(), action.channel())
+            .await;
+        RuntimeManagedFabricExchangeOutcomeV1 { action, response }
+    }
+
+    async fn exchange_request(
+        &self,
+        request: &ManagedFabricApplyRequestV1,
+        request_time_channel: ReferenceChannelBindingV1,
+    ) -> Result<Box<[u8]>, RuntimeManagedFabricExchangeError> {
+        let decoded = ManagedFabricApplyRequestV1::decode(request.canonical_wire())
+            .map_err(RuntimeManagedFabricClientFailure::RequestContract)
+            .map_err(RuntimeManagedFabricExchangeError::NotSent)?;
+        if decoded != *request
+            || request.canonical_wire().is_empty()
+            || request.canonical_wire().len() > MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES
+            || request.target() != self.endpoint.target
+            || request_time_channel.target() != request.target()
+            || request_time_channel.runtime_peer() != self.response_verifier.runtime_principal
+        {
+            return Err(RuntimeManagedFabricExchangeError::NotSent(
+                RuntimeManagedFabricClientFailure::RequestMismatch,
+            ));
+        }
+        let transport_frame = length_prefix_managed_fabric(request.canonical_wire());
+        let deadline = Instant::now() + self.exchange_timeout;
+        let validated_endpoint = validate_endpoint_metadata(&self.endpoint)
+            .map_err(RuntimeManagedFabricClientFailure::Endpoint)
+            .map_err(RuntimeManagedFabricExchangeError::NotSent)?;
+        let mut stream = bounded_managed_fabric_io(
+            deadline,
+            RuntimeManagedFabricIoPhase::Connect,
+            ManagedFabricDeliveryState::NotSent,
+            UnixStream::connect(self.endpoint.socket_path()),
+        )
+        .await?;
+        validated_endpoint
+            .revalidate(&self.endpoint)
+            .map_err(RuntimeManagedFabricClientFailure::Endpoint)
+            .map_err(RuntimeManagedFabricExchangeError::NotSent)?;
+        let runtime_credentials =
+            validate_peer_credentials(&stream, self.endpoint.server_credentials)
+                .map_err(RuntimeManagedFabricClientFailure::Endpoint)
+                .map_err(RuntimeManagedFabricExchangeError::NotSent)?;
+        let current_channel = validated_endpoint
+            .channel(&self.endpoint, runtime_credentials)
+            .map_err(RuntimeManagedFabricClientFailure::Endpoint)
+            .map_err(RuntimeManagedFabricExchangeError::NotSent)?;
+        if current_channel != request_time_channel {
+            return Err(RuntimeManagedFabricExchangeError::NotSent(
+                RuntimeManagedFabricClientFailure::CurrentChannelMismatch,
+            ));
+        }
+        bounded_managed_fabric_io(
+            deadline,
+            RuntimeManagedFabricIoPhase::WriteRequest,
+            ManagedFabricDeliveryState::Uncertain,
+            stream.write_all(&transport_frame),
+        )
+        .await?;
+        let mut length_bytes = [0_u8; LENGTH_PREFIX_BYTES];
+        bounded_managed_fabric_read_exact(
+            deadline,
+            RuntimeManagedFabricIoPhase::ReadResponseLength,
+            &mut stream,
+            &mut length_bytes,
+        )
+        .await?;
+        let response_length = u32::from_be_bytes(length_bytes) as usize;
+        if response_length == 0 {
+            return Err(RuntimeManagedFabricExchangeError::Uncertain(
+                RuntimeManagedFabricClientFailure::InvalidResponseLength,
+            ));
+        }
+        if response_length > MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES {
+            return Err(RuntimeManagedFabricExchangeError::Uncertain(
+                RuntimeManagedFabricClientFailure::ResponseBoundExceeded,
+            ));
+        }
+        let mut response_bytes = vec![0_u8; response_length];
+        bounded_managed_fabric_read_exact(
+            deadline,
+            RuntimeManagedFabricIoPhase::ReadResponse,
+            &mut stream,
+            &mut response_bytes,
+        )
+        .await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_bytes = bounded_managed_fabric_io(
+            deadline,
+            RuntimeManagedFabricIoPhase::ReadTrailing,
+            ManagedFabricDeliveryState::Uncertain,
+            stream.read(&mut trailing),
+        )
+        .await?;
+        if trailing_bytes != 0 {
+            return Err(RuntimeManagedFabricExchangeError::Uncertain(
+                RuntimeManagedFabricClientFailure::TrailingBytes,
+            ));
+        }
+        let receipt = ManagedFabricApplyTerminalReceiptV1::decode(&response_bytes)
+            .map_err(RuntimeManagedFabricClientFailure::ResponseContract)
+            .map_err(RuntimeManagedFabricExchangeError::Uncertain)?;
+        self.response_verifier
+            .verify(&receipt)
+            .map_err(RuntimeManagedFabricExchangeError::Uncertain)?;
+        receipt
+            .validate_against_request(request, request_time_channel)
+            .map_err(RuntimeManagedFabricClientFailure::ResponseContract)
+            .map_err(RuntimeManagedFabricExchangeError::Uncertain)?;
+        Ok(receipt.canonical_wire().into())
+    }
+}
+
+fn length_prefix_managed_fabric(payload: &[u8]) -> Box<[u8]> {
+    debug_assert!(payload.len() <= MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES);
+    let payload_length = u32::try_from(payload.len())
+        .expect("canonical managed Fabric request bound is smaller than u32::MAX");
+    let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    frame.extend_from_slice(&payload_length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame.into_boxed_slice()
+}
+
+/// Pinned Runtime signer for exact PXST v1 receipts.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeManagedAgentStackResponseVerifier {
+    runtime_principal: PrincipalRef,
+    key: ApplyAuthKeyRef,
+    verifying_key: VerifyingKey,
+}
+
+impl RuntimeManagedAgentStackResponseVerifier {
+    pub(crate) fn try_new(
+        runtime_principal: PrincipalRef,
+        key: ApplyAuthKeyRef,
+        algorithm: ApplyAuthAlgorithm,
+        algorithm_version: u16,
+        expected_public_key_fingerprint: Digest32,
+        verifying_key: VerifyingKey,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        let verified = RuntimeManagedServingResponseVerifier::try_new(
+            runtime_principal,
+            key,
+            algorithm,
+            algorithm_version,
+            expected_public_key_fingerprint,
+            verifying_key,
+        )?;
+        Ok(Self {
+            runtime_principal: verified.runtime_principal,
+            key: verified.key,
+            verifying_key: verified.verifying_key,
+        })
+    }
+
+    fn verify(
+        &self,
+        response: &ManagedAgentStackTerminalReceiptV1,
+    ) -> Result<(), RuntimeManagedAgentStackClientFailure> {
+        if response.authentication_key() != self.key {
+            return Err(RuntimeManagedAgentStackClientFailure::ResponseKeyMismatch);
+        }
+        if response.authentication_algorithm().value() != ED25519_ALGORITHM
+            || response.authentication_algorithm_version() != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RuntimeManagedAgentStackClientFailure::UnsupportedResponseAuthProfile);
+        }
+        let signature: [u8; ED25519_SIGNATURE_BYTES] = response
+            .authentication_signature()
+            .try_into()
+            .map_err(|_| RuntimeManagedAgentStackClientFailure::InvalidResponseSignature)?;
+        let transcript = response
+            .signing_transcript()
+            .map_err(RuntimeManagedAgentStackClientFailure::ResponseContract)?;
+        self.verifying_key
+            .verify_strict(transcript.as_bytes(), &Signature::from_bytes(&signature))
+            .map_err(|_| RuntimeManagedAgentStackClientFailure::InvalidResponseSignature)
+    }
+}
+
+/// Exactly one move-only PXAR v7 exchange. The action is returned even on
+/// failure; the durable journal remains `Uncertain` and cannot authorize retry.
+#[derive(Debug)]
+pub(crate) struct RuntimeManagedAgentStackExchangeOutcomeV1 {
+    action: ManagedAgentStackSendActionV1,
+    response: Result<Box<[u8]>, RuntimeManagedAgentStackExchangeError>,
+}
+
+impl RuntimeManagedAgentStackExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedAgentStackSendActionV1,
+        Result<Box<[u8]>, RuntimeManagedAgentStackExchangeError>,
+    ) {
+        (self.action, self.response)
+    }
+}
+
+/// One-shot exact PXAR v7/PXST v1 Unix client. It owns no journal or retry.
+#[derive(Clone, Debug)]
+pub(crate) struct UnixRuntimeManagedAgentStackClient {
+    endpoint: UnixRuntimeControlEndpoint,
+    response_verifier: RuntimeManagedAgentStackResponseVerifier,
+    exchange_timeout: Duration,
+}
+
+impl UnixRuntimeManagedAgentStackClient {
+    pub(crate) fn try_new(
+        endpoint: UnixRuntimeControlEndpoint,
+        response_verifier: RuntimeManagedAgentStackResponseVerifier,
+        exchange_timeout: Duration,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        if exchange_timeout.is_zero()
+            || exchange_timeout > MAX_RUNTIME_MANAGED_AGENT_STACK_EXCHANGE_TIMEOUT
+        {
+            return Err(RuntimeControlClientConfigurationError::InvalidExchangeTimeout);
+        }
+        if endpoint.runtime_principal != response_verifier.runtime_principal {
+            return Err(RuntimeControlClientConfigurationError::ResponsePrincipalMismatch);
+        }
+        Ok(Self {
+            endpoint,
+            response_verifier,
+            exchange_timeout,
+        })
+    }
+
+    pub(crate) async fn exchange(
+        &self,
+        action: ManagedAgentStackSendActionV1,
+    ) -> RuntimeManagedAgentStackExchangeOutcomeV1 {
+        let response = self
+            .exchange_request(action.request(), action.channel())
+            .await;
+        RuntimeManagedAgentStackExchangeOutcomeV1 { action, response }
+    }
+
+    async fn exchange_request(
+        &self,
+        request: &ManagedAgentStackApplyRequestV1,
+        request_time_channel: ReferenceChannelBindingV1,
+    ) -> Result<Box<[u8]>, RuntimeManagedAgentStackExchangeError> {
+        let decoded = ManagedAgentStackApplyRequestV1::decode(request.canonical_wire())
+            .map_err(RuntimeManagedAgentStackClientFailure::RequestContract)
+            .map_err(RuntimeManagedAgentStackExchangeError::NotSent)?;
+        if decoded != *request
+            || request.canonical_wire().is_empty()
+            || request.canonical_wire().len() > MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES
+            || request.target() != self.endpoint.target
+            || request_time_channel.target() != request.target()
+            || request_time_channel.runtime_peer() != self.response_verifier.runtime_principal
+        {
+            return Err(RuntimeManagedAgentStackExchangeError::NotSent(
+                RuntimeManagedAgentStackClientFailure::RequestMismatch,
+            ));
+        }
+        let transport_frame = length_prefix_managed_agent_stack(request.canonical_wire());
+        let deadline = Instant::now() + self.exchange_timeout;
+        let validated_endpoint = validate_endpoint_metadata(&self.endpoint)
+            .map_err(RuntimeManagedAgentStackClientFailure::Endpoint)
+            .map_err(RuntimeManagedAgentStackExchangeError::NotSent)?;
+        let mut stream = bounded_managed_agent_stack_io(
+            deadline,
+            RuntimeManagedAgentStackIoPhase::Connect,
+            ManagedAgentStackDeliveryState::NotSent,
+            UnixStream::connect(self.endpoint.socket_path()),
+        )
+        .await?;
+        validated_endpoint
+            .revalidate(&self.endpoint)
+            .map_err(RuntimeManagedAgentStackClientFailure::Endpoint)
+            .map_err(RuntimeManagedAgentStackExchangeError::NotSent)?;
+        let runtime_credentials =
+            validate_peer_credentials(&stream, self.endpoint.server_credentials)
+                .map_err(RuntimeManagedAgentStackClientFailure::Endpoint)
+                .map_err(RuntimeManagedAgentStackExchangeError::NotSent)?;
+        let current_channel = validated_endpoint
+            .channel(&self.endpoint, runtime_credentials)
+            .map_err(RuntimeManagedAgentStackClientFailure::Endpoint)
+            .map_err(RuntimeManagedAgentStackExchangeError::NotSent)?;
+        if current_channel != request_time_channel {
+            return Err(RuntimeManagedAgentStackExchangeError::NotSent(
+                RuntimeManagedAgentStackClientFailure::CurrentChannelMismatch,
+            ));
+        }
+        bounded_managed_agent_stack_io(
+            deadline,
+            RuntimeManagedAgentStackIoPhase::WriteRequest,
+            ManagedAgentStackDeliveryState::Uncertain,
+            stream.write_all(&transport_frame),
+        )
+        .await?;
+        let mut length_bytes = [0_u8; LENGTH_PREFIX_BYTES];
+        bounded_managed_agent_stack_read_exact(
+            deadline,
+            RuntimeManagedAgentStackIoPhase::ReadResponseLength,
+            &mut stream,
+            &mut length_bytes,
+        )
+        .await?;
+        let response_length = u32::from_be_bytes(length_bytes) as usize;
+        if response_length == 0 {
+            return Err(RuntimeManagedAgentStackExchangeError::Uncertain(
+                RuntimeManagedAgentStackClientFailure::InvalidResponseLength,
+            ));
+        }
+        if response_length > MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES {
+            return Err(RuntimeManagedAgentStackExchangeError::Uncertain(
+                RuntimeManagedAgentStackClientFailure::ResponseBoundExceeded,
+            ));
+        }
+        let mut response_bytes = vec![0_u8; response_length];
+        bounded_managed_agent_stack_read_exact(
+            deadline,
+            RuntimeManagedAgentStackIoPhase::ReadResponse,
+            &mut stream,
+            &mut response_bytes,
+        )
+        .await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_bytes = bounded_managed_agent_stack_io(
+            deadline,
+            RuntimeManagedAgentStackIoPhase::ReadTrailing,
+            ManagedAgentStackDeliveryState::Uncertain,
+            stream.read(&mut trailing),
+        )
+        .await?;
+        if trailing_bytes != 0 {
+            return Err(RuntimeManagedAgentStackExchangeError::Uncertain(
+                RuntimeManagedAgentStackClientFailure::TrailingBytes,
+            ));
+        }
+        let receipt = ManagedAgentStackTerminalReceiptV1::decode(&response_bytes)
+            .map_err(RuntimeManagedAgentStackClientFailure::ResponseContract)
+            .map_err(RuntimeManagedAgentStackExchangeError::Uncertain)?;
+        self.response_verifier
+            .verify(&receipt)
+            .map_err(RuntimeManagedAgentStackExchangeError::Uncertain)?;
+        receipt
+            .validate_against_request(request, request_time_channel)
+            .map_err(RuntimeManagedAgentStackClientFailure::ResponseContract)
+            .map_err(RuntimeManagedAgentStackExchangeError::Uncertain)?;
+        Ok(receipt.canonical_wire().into())
+    }
+}
+
+fn length_prefix_managed_agent_stack(payload: &[u8]) -> Box<[u8]> {
+    debug_assert!(payload.len() <= MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES);
+    let payload_length = u32::try_from(payload.len())
+        .expect("canonical managed Agent stack request bound is smaller than u32::MAX");
+    let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    frame.extend_from_slice(&payload_length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame.into_boxed_slice()
+}
+
+/// Pinned Runtime signer for exact independent PXMT v1 receipts.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeManagedModelAgentStackResponseVerifier {
+    runtime_principal: PrincipalRef,
+    key: ApplyAuthKeyRef,
+    verifying_key: VerifyingKey,
+}
+
+impl RuntimeManagedModelAgentStackResponseVerifier {
+    pub(crate) fn try_new(
+        runtime_principal: PrincipalRef,
+        key: ApplyAuthKeyRef,
+        algorithm: ApplyAuthAlgorithm,
+        algorithm_version: u16,
+        expected_public_key_fingerprint: Digest32,
+        verifying_key: VerifyingKey,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        let verified = RuntimeManagedServingResponseVerifier::try_new(
+            runtime_principal,
+            key,
+            algorithm,
+            algorithm_version,
+            expected_public_key_fingerprint,
+            verifying_key,
+        )?;
+        Ok(Self {
+            runtime_principal: verified.runtime_principal,
+            key: verified.key,
+            verifying_key: verified.verifying_key,
+        })
+    }
+
+    fn verify(
+        &self,
+        response: &ManagedModelAgentStackTerminalReceiptV1,
+    ) -> Result<(), RuntimeManagedModelAgentStackClientFailure> {
+        if response.authentication_key() != self.key {
+            return Err(RuntimeManagedModelAgentStackClientFailure::ResponseKeyMismatch);
+        }
+        if response.authentication_algorithm().value() != ED25519_ALGORITHM
+            || response.authentication_algorithm_version() != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RuntimeManagedModelAgentStackClientFailure::UnsupportedResponseAuthProfile);
+        }
+        let signature: [u8; ED25519_SIGNATURE_BYTES] = response
+            .authentication_signature()
+            .try_into()
+            .map_err(|_| RuntimeManagedModelAgentStackClientFailure::InvalidResponseSignature)?;
+        let transcript = response
+            .signing_transcript()
+            .map_err(RuntimeManagedModelAgentStackClientFailure::ResponseContract)?;
+        self.verifying_key
+            .verify_strict(transcript.as_bytes(), &Signature::from_bytes(&signature))
+            .map_err(|_| RuntimeManagedModelAgentStackClientFailure::InvalidResponseSignature)
+    }
+}
+
+/// Exactly one move-only PXAR v9 exchange. The action is returned even on
+/// failure; the durable journal remains `Uncertain` and cannot authorize retry.
+#[derive(Debug)]
+pub(crate) struct RuntimeManagedModelAgentStackExchangeOutcomeV1 {
+    action: ManagedModelAgentStackSendActionV1,
+    response: Result<Box<[u8]>, RuntimeManagedModelAgentStackExchangeError>,
+}
+
+impl RuntimeManagedModelAgentStackExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedModelAgentStackSendActionV1,
+        Result<Box<[u8]>, RuntimeManagedModelAgentStackExchangeError>,
+    ) {
+        (self.action, self.response)
+    }
+}
+
+/// One-shot exact PXAR v9/PXMT v1 Unix client. It owns no journal or retry and
+/// returns every authenticated, request-correlated legal terminal outcome.
+#[derive(Clone, Debug)]
+pub(crate) struct UnixRuntimeManagedModelAgentStackClient {
+    endpoint: UnixRuntimeControlEndpoint,
+    response_verifier: RuntimeManagedModelAgentStackResponseVerifier,
+    exchange_timeout: Duration,
+}
+
+impl UnixRuntimeManagedModelAgentStackClient {
+    pub(crate) fn try_new(
+        endpoint: UnixRuntimeControlEndpoint,
+        response_verifier: RuntimeManagedModelAgentStackResponseVerifier,
+        exchange_timeout: Duration,
+    ) -> Result<Self, RuntimeControlClientConfigurationError> {
+        if exchange_timeout.is_zero()
+            || exchange_timeout > MAX_RUNTIME_MANAGED_MODEL_AGENT_STACK_EXCHANGE_TIMEOUT
+        {
+            return Err(RuntimeControlClientConfigurationError::InvalidExchangeTimeout);
+        }
+        if endpoint.runtime_principal != response_verifier.runtime_principal {
+            return Err(RuntimeControlClientConfigurationError::ResponsePrincipalMismatch);
+        }
+        Ok(Self {
+            endpoint,
+            response_verifier,
+            exchange_timeout,
+        })
+    }
+
+    pub(crate) async fn exchange(
+        &self,
+        action: ManagedModelAgentStackSendActionV1,
+    ) -> RuntimeManagedModelAgentStackExchangeOutcomeV1 {
+        let response = self
+            .exchange_request(action.request(), action.channel())
+            .await;
+        RuntimeManagedModelAgentStackExchangeOutcomeV1 { action, response }
+    }
+
+    async fn exchange_request(
+        &self,
+        request: &ManagedModelAgentStackApplyRequestV1,
+        request_time_channel: ReferenceChannelBindingV1,
+    ) -> Result<Box<[u8]>, RuntimeManagedModelAgentStackExchangeError> {
+        let decoded = ManagedModelAgentStackApplyRequestV1::decode(request.canonical_wire())
+            .map_err(RuntimeManagedModelAgentStackClientFailure::RequestContract)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        if decoded != *request
+            || request.canonical_wire().is_empty()
+            || request.canonical_wire().len() > MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES
+            || request.target() != self.endpoint.target
+            || request_time_channel.target() != request.target()
+            || request_time_channel.runtime_peer() != self.response_verifier.runtime_principal
+        {
+            return Err(RuntimeManagedModelAgentStackExchangeError::NotSent(
+                RuntimeManagedModelAgentStackClientFailure::RequestMismatch,
+            ));
+        }
+        let transport_frame = length_prefix_managed_model_agent_stack(request.canonical_wire());
+        let deadline = Instant::now() + self.exchange_timeout;
+        let validated_endpoint = validate_endpoint_metadata(&self.endpoint)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::Endpoint)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        let mut stream = bounded_managed_model_agent_stack_io(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::Connect,
+            ManagedModelAgentStackDeliveryState::NotSent,
+            UnixStream::connect(self.endpoint.socket_path()),
+        )
+        .await?;
+        validated_endpoint
+            .revalidate(&self.endpoint)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::Endpoint)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        let runtime_credentials =
+            validate_peer_credentials(&stream, self.endpoint.server_credentials)
+                .map_err(RuntimeManagedModelAgentStackClientFailure::Endpoint)
+                .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        let current_channel = validated_endpoint
+            .channel(&self.endpoint, runtime_credentials)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::Endpoint)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        if current_channel != request_time_channel {
+            return Err(RuntimeManagedModelAgentStackExchangeError::NotSent(
+                RuntimeManagedModelAgentStackClientFailure::CurrentChannelMismatch,
+            ));
+        }
+        bounded_managed_model_agent_stack_io(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::WriteRequest,
+            ManagedModelAgentStackDeliveryState::Uncertain,
+            stream.write_all(&transport_frame),
+        )
+        .await?;
+        let mut length_bytes = [0_u8; LENGTH_PREFIX_BYTES];
+        bounded_managed_model_agent_stack_read_exact(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::ReadResponseLength,
+            &mut stream,
+            &mut length_bytes,
+        )
+        .await?;
+        let response_length = u32::from_be_bytes(length_bytes) as usize;
+        if response_length == 0 {
+            return Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                RuntimeManagedModelAgentStackClientFailure::InvalidResponseLength,
+            ));
+        }
+        if response_length > MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES {
+            return Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                RuntimeManagedModelAgentStackClientFailure::ResponseBoundExceeded,
+            ));
+        }
+        let mut response_bytes = vec![0_u8; response_length];
+        bounded_managed_model_agent_stack_read_exact(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::ReadResponse,
+            &mut stream,
+            &mut response_bytes,
+        )
+        .await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_bytes = bounded_managed_model_agent_stack_io(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::ReadTrailing,
+            ManagedModelAgentStackDeliveryState::Uncertain,
+            stream.read(&mut trailing),
+        )
+        .await?;
+        if trailing_bytes != 0 {
+            return Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                RuntimeManagedModelAgentStackClientFailure::TrailingBytes,
+            ));
+        }
+        let receipt = ManagedModelAgentStackTerminalReceiptV1::decode(&response_bytes)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::ResponseContract)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::Uncertain)?;
+        self.response_verifier
+            .verify(&receipt)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::Uncertain)?;
+        receipt
+            .validate_against_request(request, request_time_channel)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::ResponseContract)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::Uncertain)?;
+        Ok(receipt.canonical_wire().into())
+    }
+}
+
+fn length_prefix_managed_model_agent_stack(payload: &[u8]) -> Box<[u8]> {
+    debug_assert!(payload.len() <= MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES);
+    let payload_length = u32::try_from(payload.len())
+        .expect("canonical managed Model+Agent stack request bound is smaller than u32::MAX");
+    let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    frame.extend_from_slice(&payload_length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame.into_boxed_slice()
+}
+
 /// Direct PXAR-to-PXRT Runtime client. It never retries and never writes the
 /// Controller journal; the caller owns durable receipt commit after success.
 #[derive(Clone, Debug)]
@@ -1486,6 +2467,218 @@ impl fmt::Display for RuntimeQueryClientFailure {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeManagedServingExchangeError {
+    NotSent(RuntimeManagedServingClientFailure),
+    ClosedNoResponse(RuntimeManagedServingClientFailure),
+}
+
+impl RuntimeManagedServingExchangeError {
+    #[must_use]
+    pub(crate) const fn failure(self) -> RuntimeManagedServingClientFailure {
+        match self {
+            Self::NotSent(failure) | Self::ClosedNoResponse(failure) => failure,
+        }
+    }
+}
+
+impl fmt::Display for RuntimeManagedServingExchangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Runtime managed-serving exchange failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for RuntimeManagedServingExchangeError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeManagedServingIoPhase {
+    Connect,
+    WriteRequest,
+    ReadResponseLength,
+    ReadResponse,
+    ReadTrailing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeManagedServingClientFailure {
+    RequestMismatch,
+    CurrentChannelMismatch,
+    Endpoint(RuntimeBootstrapClientFailure),
+    DeadlineExceeded(RuntimeManagedServingIoPhase),
+    Io(RuntimeManagedServingIoPhase),
+    TruncatedResponse,
+    InvalidResponseLength,
+    ResponseBoundExceeded,
+    TrailingBytes,
+    ResponseContract(ManagedServingBootstrapError),
+    ResponsePrincipalMismatch,
+    ResponseKeyMismatch,
+    UnsupportedResponseAuthProfile,
+    InvalidResponseSignature,
+}
+
+impl fmt::Display for RuntimeManagedServingClientFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeManagedFabricExchangeError {
+    NotSent(RuntimeManagedFabricClientFailure),
+    Uncertain(RuntimeManagedFabricClientFailure),
+}
+
+impl fmt::Display for RuntimeManagedFabricExchangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Runtime managed Fabric exchange failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for RuntimeManagedFabricExchangeError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeManagedFabricIoPhase {
+    Connect,
+    WriteRequest,
+    ReadResponseLength,
+    ReadResponse,
+    ReadTrailing,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeManagedFabricClientFailure {
+    RequestMismatch,
+    RequestContract(ManagedFabricPlanError),
+    CurrentChannelMismatch,
+    Endpoint(RuntimeBootstrapClientFailure),
+    DeadlineExceeded(RuntimeManagedFabricIoPhase),
+    Io(RuntimeManagedFabricIoPhase),
+    TruncatedResponse,
+    InvalidResponseLength,
+    ResponseBoundExceeded,
+    TrailingBytes,
+    ResponseContract(ManagedFabricPlanError),
+    ResponsePrincipalMismatch,
+    ResponseKeyMismatch,
+    UnsupportedResponseAuthProfile,
+    InvalidResponseSignature,
+}
+
+impl fmt::Display for RuntimeManagedFabricClientFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeManagedAgentStackExchangeError {
+    NotSent(RuntimeManagedAgentStackClientFailure),
+    Uncertain(RuntimeManagedAgentStackClientFailure),
+}
+
+impl fmt::Display for RuntimeManagedAgentStackExchangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Runtime managed Agent stack exchange failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for RuntimeManagedAgentStackExchangeError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeManagedAgentStackIoPhase {
+    Connect,
+    WriteRequest,
+    ReadResponseLength,
+    ReadResponse,
+    ReadTrailing,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeManagedAgentStackClientFailure {
+    RequestMismatch,
+    RequestContract(ManagedAgentStackPlanError),
+    CurrentChannelMismatch,
+    Endpoint(RuntimeBootstrapClientFailure),
+    DeadlineExceeded(RuntimeManagedAgentStackIoPhase),
+    Io(RuntimeManagedAgentStackIoPhase),
+    TruncatedResponse,
+    InvalidResponseLength,
+    ResponseBoundExceeded,
+    TrailingBytes,
+    ResponseContract(ManagedAgentStackPlanError),
+    ResponsePrincipalMismatch,
+    ResponseKeyMismatch,
+    UnsupportedResponseAuthProfile,
+    InvalidResponseSignature,
+}
+
+impl fmt::Display for RuntimeManagedAgentStackClientFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeManagedModelAgentStackExchangeError {
+    NotSent(RuntimeManagedModelAgentStackClientFailure),
+    Uncertain(RuntimeManagedModelAgentStackClientFailure),
+}
+
+impl fmt::Display for RuntimeManagedModelAgentStackExchangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Runtime managed Model+Agent stack exchange failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for RuntimeManagedModelAgentStackExchangeError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeManagedModelAgentStackIoPhase {
+    Connect,
+    WriteRequest,
+    ReadResponseLength,
+    ReadResponse,
+    ReadTrailing,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeManagedModelAgentStackClientFailure {
+    RequestMismatch,
+    RequestContract(ManagedModelAgentStackPlanError),
+    CurrentChannelMismatch,
+    Endpoint(RuntimeBootstrapClientFailure),
+    DeadlineExceeded(RuntimeManagedModelAgentStackIoPhase),
+    Io(RuntimeManagedModelAgentStackIoPhase),
+    TruncatedResponse,
+    InvalidResponseLength,
+    ResponseBoundExceeded,
+    TrailingBytes,
+    ResponseContract(ManagedModelAgentStackPlanError),
+    ResponsePrincipalMismatch,
+    ResponseKeyMismatch,
+    UnsupportedResponseAuthProfile,
+    InvalidResponseSignature,
+}
+
+impl fmt::Display for RuntimeManagedModelAgentStackClientFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
 /// Apply delivery classification. There is intentionally no post-send
 /// `Rejected` state: even an invalid response cannot prove the PXAR was not
 /// executed.
@@ -1557,6 +2750,78 @@ enum ApplyDeliveryState {
 enum QueryDeliveryState {
     NotSent,
     Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedServingDeliveryState {
+    NotSent,
+    MayHaveSent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedFabricDeliveryState {
+    NotSent,
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedAgentStackDeliveryState {
+    NotSent,
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedModelAgentStackDeliveryState {
+    NotSent,
+    Uncertain,
+}
+
+impl ManagedFabricDeliveryState {
+    const fn error(
+        self,
+        failure: RuntimeManagedFabricClientFailure,
+    ) -> RuntimeManagedFabricExchangeError {
+        match self {
+            Self::NotSent => RuntimeManagedFabricExchangeError::NotSent(failure),
+            Self::Uncertain => RuntimeManagedFabricExchangeError::Uncertain(failure),
+        }
+    }
+}
+
+impl ManagedAgentStackDeliveryState {
+    const fn error(
+        self,
+        failure: RuntimeManagedAgentStackClientFailure,
+    ) -> RuntimeManagedAgentStackExchangeError {
+        match self {
+            Self::NotSent => RuntimeManagedAgentStackExchangeError::NotSent(failure),
+            Self::Uncertain => RuntimeManagedAgentStackExchangeError::Uncertain(failure),
+        }
+    }
+}
+
+impl ManagedModelAgentStackDeliveryState {
+    const fn error(
+        self,
+        failure: RuntimeManagedModelAgentStackClientFailure,
+    ) -> RuntimeManagedModelAgentStackExchangeError {
+        match self {
+            Self::NotSent => RuntimeManagedModelAgentStackExchangeError::NotSent(failure),
+            Self::Uncertain => RuntimeManagedModelAgentStackExchangeError::Uncertain(failure),
+        }
+    }
+}
+
+impl ManagedServingDeliveryState {
+    const fn error(
+        self,
+        failure: RuntimeManagedServingClientFailure,
+    ) -> RuntimeManagedServingExchangeError {
+        match self {
+            Self::NotSent => RuntimeManagedServingExchangeError::NotSent(failure),
+            Self::MayHaveSent => RuntimeManagedServingExchangeError::ClosedNoResponse(failure),
+        }
+    }
 }
 
 impl QueryDeliveryState {
@@ -1939,6 +3204,160 @@ async fn bounded_query_read_exact(
     }
 }
 
+async fn bounded_managed_serving_io<Output, Operation>(
+    deadline: Instant,
+    phase: RuntimeManagedServingIoPhase,
+    delivery: ManagedServingDeliveryState,
+    operation: Operation,
+) -> Result<Output, RuntimeManagedServingExchangeError>
+where
+    Operation: Future<Output = io::Result<Output>>,
+{
+    timeout_at(deadline, operation)
+        .await
+        .map_err(|_| delivery.error(RuntimeManagedServingClientFailure::DeadlineExceeded(phase)))?
+        .map_err(|_| delivery.error(RuntimeManagedServingClientFailure::Io(phase)))
+}
+
+async fn bounded_managed_serving_read_exact(
+    deadline: Instant,
+    phase: RuntimeManagedServingIoPhase,
+    stream: &mut UnixStream,
+    output: &mut [u8],
+) -> Result<(), RuntimeManagedServingExchangeError> {
+    match timeout_at(deadline, stream.read_exact(output)).await {
+        Err(_) => Err(RuntimeManagedServingExchangeError::ClosedNoResponse(
+            RuntimeManagedServingClientFailure::DeadlineExceeded(phase),
+        )),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(RuntimeManagedServingExchangeError::ClosedNoResponse(
+                RuntimeManagedServingClientFailure::TruncatedResponse,
+            ))
+        }
+        Ok(Err(_)) => Err(RuntimeManagedServingExchangeError::ClosedNoResponse(
+            RuntimeManagedServingClientFailure::Io(phase),
+        )),
+        Ok(Ok(_)) => Ok(()),
+    }
+}
+
+async fn bounded_managed_fabric_io<Output, Operation>(
+    deadline: Instant,
+    phase: RuntimeManagedFabricIoPhase,
+    delivery: ManagedFabricDeliveryState,
+    operation: Operation,
+) -> Result<Output, RuntimeManagedFabricExchangeError>
+where
+    Operation: Future<Output = io::Result<Output>>,
+{
+    timeout_at(deadline, operation)
+        .await
+        .map_err(|_| delivery.error(RuntimeManagedFabricClientFailure::DeadlineExceeded(phase)))?
+        .map_err(|_| delivery.error(RuntimeManagedFabricClientFailure::Io(phase)))
+}
+
+async fn bounded_managed_fabric_read_exact(
+    deadline: Instant,
+    phase: RuntimeManagedFabricIoPhase,
+    stream: &mut UnixStream,
+    output: &mut [u8],
+) -> Result<(), RuntimeManagedFabricExchangeError> {
+    match timeout_at(deadline, stream.read_exact(output)).await {
+        Err(_) => Err(RuntimeManagedFabricExchangeError::Uncertain(
+            RuntimeManagedFabricClientFailure::DeadlineExceeded(phase),
+        )),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(RuntimeManagedFabricExchangeError::Uncertain(
+                RuntimeManagedFabricClientFailure::TruncatedResponse,
+            ))
+        }
+        Ok(Err(_)) => Err(RuntimeManagedFabricExchangeError::Uncertain(
+            RuntimeManagedFabricClientFailure::Io(phase),
+        )),
+        Ok(Ok(_)) => Ok(()),
+    }
+}
+
+async fn bounded_managed_agent_stack_io<Output, Operation>(
+    deadline: Instant,
+    phase: RuntimeManagedAgentStackIoPhase,
+    delivery: ManagedAgentStackDeliveryState,
+    operation: Operation,
+) -> Result<Output, RuntimeManagedAgentStackExchangeError>
+where
+    Operation: Future<Output = io::Result<Output>>,
+{
+    timeout_at(deadline, operation)
+        .await
+        .map_err(|_| {
+            delivery.error(RuntimeManagedAgentStackClientFailure::DeadlineExceeded(
+                phase,
+            ))
+        })?
+        .map_err(|_| delivery.error(RuntimeManagedAgentStackClientFailure::Io(phase)))
+}
+
+async fn bounded_managed_agent_stack_read_exact(
+    deadline: Instant,
+    phase: RuntimeManagedAgentStackIoPhase,
+    stream: &mut UnixStream,
+    output: &mut [u8],
+) -> Result<(), RuntimeManagedAgentStackExchangeError> {
+    match timeout_at(deadline, stream.read_exact(output)).await {
+        Err(_) => Err(RuntimeManagedAgentStackExchangeError::Uncertain(
+            RuntimeManagedAgentStackClientFailure::DeadlineExceeded(phase),
+        )),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(RuntimeManagedAgentStackExchangeError::Uncertain(
+                RuntimeManagedAgentStackClientFailure::TruncatedResponse,
+            ))
+        }
+        Ok(Err(_)) => Err(RuntimeManagedAgentStackExchangeError::Uncertain(
+            RuntimeManagedAgentStackClientFailure::Io(phase),
+        )),
+        Ok(Ok(_)) => Ok(()),
+    }
+}
+
+async fn bounded_managed_model_agent_stack_io<Output, Operation>(
+    deadline: Instant,
+    phase: RuntimeManagedModelAgentStackIoPhase,
+    delivery: ManagedModelAgentStackDeliveryState,
+    operation: Operation,
+) -> Result<Output, RuntimeManagedModelAgentStackExchangeError>
+where
+    Operation: Future<Output = io::Result<Output>>,
+{
+    timeout_at(deadline, operation)
+        .await
+        .map_err(|_| {
+            delivery.error(RuntimeManagedModelAgentStackClientFailure::DeadlineExceeded(phase))
+        })?
+        .map_err(|_| delivery.error(RuntimeManagedModelAgentStackClientFailure::Io(phase)))
+}
+
+async fn bounded_managed_model_agent_stack_read_exact(
+    deadline: Instant,
+    phase: RuntimeManagedModelAgentStackIoPhase,
+    stream: &mut UnixStream,
+    output: &mut [u8],
+) -> Result<(), RuntimeManagedModelAgentStackExchangeError> {
+    match timeout_at(deadline, stream.read_exact(output)).await {
+        Err(_) => Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+            RuntimeManagedModelAgentStackClientFailure::DeadlineExceeded(phase),
+        )),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                RuntimeManagedModelAgentStackClientFailure::TruncatedResponse,
+            ))
+        }
+        Ok(Err(_)) => Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+            RuntimeManagedModelAgentStackClientFailure::Io(phase),
+        )),
+        Ok(Ok(_)) => Ok(()),
+    }
+}
+
 async fn bounded_apply_io<Output, Operation>(
     deadline: Instant,
     phase: RuntimeApplyIoPhase,
@@ -1990,7 +3409,9 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use paraegox_kernel::digest::Digest32;
     use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
-    use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
+    use paraegox_kernel::time::{
+        BoundedDuration, ClockDomainRef, ClockGeneration, ClockReading, MonotonicInstant,
+    };
     use paraegox_runtime_contracts::apply::{
         ApplyOperationId, ExpectedActive, PlanWriterContext, PlanWriterEpoch, PlanWriterRef,
         RuntimeApplyControl, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm,
@@ -2000,6 +3421,35 @@ mod tests {
     use paraegox_runtime_contracts::installation::{
         InstalledRuntimeArtifactObservationV1, RuntimeCompiledInstallationFactsV1,
         generate_build_descriptor, generate_manifest,
+    };
+    use paraegox_runtime_contracts::managed_agent_stack_plan::{
+        ManagedAgentStackApplyRequestV1, ManagedAgentStackTerminalAuthClaimV1,
+        ManagedAgentStackTerminalEvidenceFieldsV1, ManagedAgentStackTerminalEvidenceV1,
+        ManagedAgentStackTerminalFactsV1, ManagedAgentStackTerminalHeadV1,
+        ManagedAgentStackTerminalLifecycleEffectV1, ManagedAgentStackTerminalOutcomeV1,
+        ManagedAgentStackTerminalReceiptDraftV1, ManagedAgentStackTerminalStateV1,
+    };
+    use paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricManifestProjectionV1;
+    use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+        MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedModelAdapterBindingV1,
+        ManagedModelAdapterVersionV1, ManagedModelAgentStackApplyRequestDraftV1,
+        ManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackProjectionV1,
+        ManagedModelAgentStackTargetExecutionV1, ManagedModelAgentStackTerminalAuthClaimV1,
+        ManagedModelAgentStackTerminalEvidenceFieldsV1, ManagedModelAgentStackTerminalEvidenceV1,
+        ManagedModelAgentStackTerminalFactsV1, ManagedModelAgentStackTerminalHeadV1,
+        ManagedModelAgentStackTerminalLifecycleEffectV1, ManagedModelAgentStackTerminalOutcomeV1,
+        ManagedModelAgentStackTerminalReceiptDraftV1, ManagedModelAgentStackTerminalReceiptV1,
+        ManagedModelAgentStackTerminalStateV1, ManagedModelCapabilityIdV1,
+        ManagedModelServicePlanV1,
+    };
+    use paraegox_runtime_contracts::managed_service::{
+        ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleBudgetsV1,
+        ManagedServiceSpecV1,
+    };
+    use paraegox_runtime_contracts::managed_serving_bootstrap::{
+        ManagedServingBootstrapFactsV1, ManagedServingBootstrapRequestDraftV1,
+        ManagedServingBootstrapRequestIdV1, ManagedServingBootstrapResponseAuthClaimV1,
+        ManagedServingBootstrapResponseDraftV1,
     };
     use paraegox_runtime_contracts::provenance::{
         PlanProvenance, SourcePlanDigest, SourcePlanRef, SourcePlanRevision, SourceScopeRef,
@@ -2042,12 +3492,19 @@ mod tests {
         RuntimeBootstrapClientFailure, RuntimeBootstrapExchangeError,
         RuntimeBootstrapRequestAuthPin, RuntimeBootstrapResponseVerifier,
         RuntimeBootstrapServingExpectation, RuntimeControlClientConfigurationError,
-        RuntimeControlSocketAcl, RuntimeQueryClientFailure, RuntimeQueryExchangeError,
-        RuntimeQueryIoPhase, RuntimeQueryResponseVerifier, RuntimeUnixCredentials,
-        UnixRuntimeApplyClient, UnixRuntimeBootstrapClient, UnixRuntimeControlEndpoint,
+        RuntimeControlSocketAcl, RuntimeManagedAgentStackClientFailure,
+        RuntimeManagedAgentStackExchangeError, RuntimeManagedAgentStackResponseVerifier,
+        RuntimeManagedModelAgentStackClientFailure, RuntimeManagedModelAgentStackExchangeError,
+        RuntimeManagedModelAgentStackResponseVerifier, RuntimeManagedServingResponseVerifier,
+        RuntimeQueryClientFailure, RuntimeQueryExchangeError, RuntimeQueryIoPhase,
+        RuntimeQueryResponseVerifier, RuntimeUnixCredentials, UnixRuntimeApplyClient,
+        UnixRuntimeBootstrapClient, UnixRuntimeControlEndpoint, UnixRuntimeManagedAgentStackClient,
+        UnixRuntimeManagedModelAgentStackClient, UnixRuntimeManagedServingClient,
         UnixRuntimeQueryClient, ValidatedRuntimeApplyTerminalReceipt,
         ValidatedRuntimeQueryResponse,
     };
+    use crate::managed_agent_stack_apply::ManagedAgentStackSendActionV1;
+    use crate::managed_fabric_apply::ManagedServingBootstrapSendActionV1;
 
     const TARGET: RuntimeHostId = RuntimeHostId::from_bytes([0x11; 16]);
     const SCOPE: SourceScopeRef = SourceScopeRef::from_bytes([0x22; 16]);
@@ -2059,6 +3516,8 @@ mod tests {
     const CLOCK_DOMAIN: ClockDomainRef = ClockDomainRef::from_bytes([0x52; 16]);
     const CONTROLLER_SEED: [u8; 32] = [0x61; 32];
     const RUNTIME_SEED: [u8; 32] = [0x62; 32];
+    const STACK_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/wire/s7_managed_agent_stack_successor_v1.json");
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -2117,14 +3576,23 @@ mod tests {
         }
 
         fn endpoint(&self, expected_server: RuntimeUnixCredentials) -> UnixRuntimeControlEndpoint {
+            self.endpoint_for(expected_server, TARGET, RUNTIME_PRINCIPAL)
+        }
+
+        fn endpoint_for(
+            &self,
+            expected_server: RuntimeUnixCredentials,
+            target: RuntimeHostId,
+            runtime_principal: PrincipalRef,
+        ) -> UnixRuntimeControlEndpoint {
             let metadata = fs::symlink_metadata(&self.directory)
                 .unwrap_or_else(|error| panic!("fake directory metadata failed: {error}"));
             UnixRuntimeControlEndpoint::try_new(
                 self.path.clone(),
                 RuntimeControlSocketAcl::new(metadata.uid(), metadata.gid()),
                 expected_server,
-                TARGET,
-                RUNTIME_PRINCIPAL,
+                target,
+                runtime_principal,
             )
             .unwrap_or_else(|error| panic!("fake endpoint failed: {error}"))
         }
@@ -2153,6 +3621,14 @@ mod tests {
     }
 
     fn live_channel(socket: &FakeRuntimeSocket) -> ReferenceChannelBindingV1 {
+        live_channel_for(socket, TARGET, RUNTIME_PRINCIPAL)
+    }
+
+    fn live_channel_for(
+        socket: &FakeRuntimeSocket,
+        target: RuntimeHostId,
+        runtime_principal: PrincipalRef,
+    ) -> ReferenceChannelBindingV1 {
         let metadata = fs::symlink_metadata(&socket.path)
             .unwrap_or_else(|error| panic!("socket metadata failed: {error}"));
         let endpoint_digest = reference_local_control_endpoint_identity_digest_v1(
@@ -2171,18 +3647,311 @@ mod tests {
             u64::from(std::process::id()),
         )
         .unwrap_or_else(|error| panic!("peer digest failed: {error}"));
-        ReferenceChannelBindingV1::try_new(TARGET, RUNTIME_PRINCIPAL, endpoint_digest, peer_digest)
+        ReferenceChannelBindingV1::try_new(target, runtime_principal, endpoint_digest, peer_digest)
             .unwrap_or_else(|error| panic!("channel binding failed: {error}"))
     }
 
-    fn unrelated_channel() -> ReferenceChannelBindingV1 {
+    fn unrelated_channel(target: RuntimeHostId) -> ReferenceChannelBindingV1 {
         ReferenceChannelBindingV1::try_new(
-            TARGET,
+            target,
             RUNTIME_PRINCIPAL,
             Digest32::from_bytes([0x73; 32]),
             Digest32::from_bytes([0x74; 32]),
         )
         .unwrap_or_else(|error| panic!("unrelated channel failed: {error}"))
+    }
+
+    fn hex_nibble(value: u8) -> u8 {
+        match value {
+            b'0'..=b'9' => value - b'0',
+            b'a'..=b'f' => value - b'a' + 10,
+            _ => panic!("fixture hex must be lowercase"),
+        }
+    }
+
+    fn stack_fixture_hex_after(anchor: &str, key: &str) -> Vec<u8> {
+        let anchor_start = STACK_FIXTURE
+            .find(anchor)
+            .unwrap_or_else(|| panic!("fixture anchor missing: {anchor}"));
+        let tail = &STACK_FIXTURE[anchor_start..];
+        let key_start = tail
+            .find(key)
+            .unwrap_or_else(|| panic!("fixture key missing: {key}"));
+        let value = &tail[key_start + key.len()..];
+        let quote_start = value
+            .find('"')
+            .map(|offset| offset + 1)
+            .unwrap_or_else(|| panic!("fixture value missing: {key}"));
+        let quote_end = value[quote_start..]
+            .find('"')
+            .map(|offset| quote_start + offset)
+            .unwrap_or_else(|| panic!("fixture value unterminated: {key}"));
+        value.as_bytes()[quote_start..quote_end]
+            .chunks_exact(2)
+            .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
+            .collect()
+    }
+
+    fn managed_agent_stack_request() -> ManagedAgentStackApplyRequestV1 {
+        ManagedAgentStackApplyRequestV1::decode(&stack_fixture_hex_after(
+            "\"fabric_and_agent\"",
+            "\"outer_v7_hex\"",
+        ))
+        .unwrap_or_else(|error| panic!("PXAR7 fixture failed: {error}"))
+    }
+
+    fn managed_agent_stack_receipt(
+        request: &ManagedAgentStackApplyRequestV1,
+        channel: ReferenceChannelBindingV1,
+    ) -> paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentStackTerminalReceiptV1
+    {
+        let state = ManagedAgentStackTerminalStateV1::try_new(
+            ManagedAgentStackTerminalOutcomeV1::ActiveReady,
+            ManagedAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+            ManagedAgentStackTerminalHeadV1::CommittedIncoming,
+            Some(ManagedServiceGeneration::try_new(7).expect("Fabric generation")),
+            Some(ManagedServiceGeneration::try_new(8).expect("Agent generation")),
+        )
+        .expect("stack terminal state");
+        let evidence = ManagedAgentStackTerminalEvidenceV1::try_new(
+            ManagedAgentStackTerminalEvidenceFieldsV1 {
+                physical_binding_census: 2,
+                census_complete: true,
+                fabric_ready: true,
+                agent_ready: true,
+                dependency_satisfied: true,
+                exact_zero: false,
+                quarantined: false,
+                resource_census_digest: Digest32::from_bytes([0xc1; 32]),
+                raw_outcome_digest: Digest32::from_bytes([0xc2; 32]),
+                completion_runtime_host_epoch: 9,
+                completion_snapshot_sequence: 10,
+                selection_clock_generation: request.temporal().target_clock_generation(),
+                selection_observed_at_nanos: 11,
+            },
+        )
+        .expect("stack terminal evidence");
+        let facts = ManagedAgentStackTerminalFactsV1::try_new(request, state, evidence)
+            .expect("stack terminal facts");
+        let auth = ManagedAgentStackTerminalAuthClaimV1::try_new(
+            channel,
+            RESPONSE_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+        )
+        .expect("stack terminal auth");
+        let draft = ManagedAgentStackTerminalReceiptDraftV1::try_new(request, facts, channel, auth)
+            .expect("stack terminal draft");
+        let signature = SigningKey::from_bytes(&RUNTIME_SEED).sign(
+            draft
+                .signing_transcript()
+                .expect("stack terminal transcript")
+                .as_bytes(),
+        );
+        draft
+            .finalize(&signature.to_bytes())
+            .expect("stack terminal receipt")
+    }
+
+    fn managed_agent_stack_response_verifier() -> RuntimeManagedAgentStackResponseVerifier {
+        let verifying_key = SigningKey::from_bytes(&RUNTIME_SEED).verifying_key();
+        let fingerprint = ed25519_control_key_fingerprint(verifying_key.as_bytes())
+            .unwrap_or_else(|error| panic!("stack key fingerprint failed: {error}"));
+        RuntimeManagedAgentStackResponseVerifier::try_new(
+            RUNTIME_PRINCIPAL,
+            RESPONSE_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+            fingerprint,
+            verifying_key,
+        )
+        .unwrap_or_else(|error| panic!("stack response verifier failed: {error}"))
+    }
+
+    fn managed_model_agent_stack_request(seed: u8) -> ManagedModelAgentStackApplyRequestV1 {
+        let predecessor = managed_agent_stack_request();
+        let embedded = predecessor.target_execution().clone();
+        let projection =
+            ManagedModelAgentStackProjectionV1::try_from_managed_agent_stack_projection(
+                embedded.projection().clone(),
+            )
+            .unwrap_or_else(|error| panic!("Model+Agent projection failed: {error}"));
+        let budgets = ManagedServiceLifecycleBudgetsV1::try_new(
+            BoundedDuration::from_nanos(1_000_000_000),
+            BoundedDuration::from_nanos(2_000_000_000),
+            BoundedDuration::from_nanos(3_000_000_000),
+            BoundedDuration::from_nanos(4_000_000_000),
+            BoundedDuration::from_nanos(5_000_000_000),
+        )
+        .expect("Model service budgets");
+        let model = ManagedModelServicePlanV1::try_new(
+            ManagedServiceSpecV1::new(ManagedServiceId::from_bytes([0xd1; 16]), budgets),
+            4,
+            embedded.agent().expect("embedded Agent").provider(),
+            ManagedModelAdapterBindingV1::try_new(
+                [0xd2; 16],
+                ManagedModelAdapterVersionV1::try_new(1).expect("adapter version"),
+                ManagedModelCapabilityIdV1::bounded_text_v1(),
+            )
+            .expect("adapter binding"),
+        )
+        .unwrap_or_else(|error| panic!("Model service plan failed: {error}"));
+        let execution = ManagedModelAgentStackTargetExecutionV1::try_fabric_model_and_agent(
+            projection, embedded, model,
+        )
+        .unwrap_or_else(|error| panic!("Model+Agent execution failed: {error}"));
+        let predecessor_control = predecessor.control_commitment().control();
+        let control = RuntimeApplyControl::new(
+            predecessor_control.writer_context().clone(),
+            predecessor_control.expected_active(),
+            ApplyOperationId::from_bytes([seed; 16]),
+        );
+        let auth_claim = ApplyRequestAuthClaim::try_new(
+            CONTROLLER_PRINCIPAL,
+            CONTROLLER_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1).expect("request algorithm"),
+            1,
+            &[seed.wrapping_add(1); 32],
+        )
+        .expect("Model+Agent request auth");
+        let draft = ManagedModelAgentStackApplyRequestDraftV1::try_new(
+            execution,
+            predecessor.provenance(),
+            control,
+            predecessor.temporal(),
+            predecessor.expected_runtime_store_instance_id(),
+            auth_claim,
+        )
+        .unwrap_or_else(|error| panic!("Model+Agent request draft failed: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED).sign(
+            draft
+                .signing_transcript()
+                .unwrap_or_else(|error| panic!("Model+Agent request transcript failed: {error}"))
+                .as_bytes(),
+        );
+        draft
+            .finalize(&signature.to_bytes())
+            .unwrap_or_else(|error| panic!("Model+Agent request failed: {error}"))
+    }
+
+    fn managed_model_agent_stack_receipt(
+        request: &ManagedModelAgentStackApplyRequestV1,
+        channel: ReferenceChannelBindingV1,
+        outcome: ManagedModelAgentStackTerminalOutcomeV1,
+        response_key: ApplyAuthKeyRef,
+    ) -> ManagedModelAgentStackTerminalReceiptV1 {
+        let fabric_generation = ManagedServiceGeneration::try_new(7).expect("Fabric generation");
+        let model_generation = ManagedServiceGeneration::try_new(8).expect("Model generation");
+        let agent_generation = ManagedServiceGeneration::try_new(9).expect("Agent generation");
+        let (lifecycle, head, fabric, model, agent, evidence_fields) = match outcome {
+            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady => (
+                ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+                Some(fabric_generation),
+                Some(model_generation),
+                Some(agent_generation),
+                (2, true, true, true, true, true, true, false),
+            ),
+            ManagedModelAgentStackTerminalOutcomeV1::NoEffectRejected => (
+                ManagedModelAgentStackTerminalLifecycleEffectV1::ProvenNotStarted,
+                ManagedModelAgentStackTerminalHeadV1::PreservedNone,
+                Some(fabric_generation),
+                None,
+                None,
+                (0, true, true, false, false, false, false, false),
+            ),
+            ManagedModelAgentStackTerminalOutcomeV1::Uncertain => (
+                ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                ManagedModelAgentStackTerminalHeadV1::PreservedNone,
+                Some(fabric_generation),
+                None,
+                None,
+                (0, false, true, false, false, false, false, false),
+            ),
+            ManagedModelAgentStackTerminalOutcomeV1::Quarantined => (
+                ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+                Some(fabric_generation),
+                Some(model_generation),
+                None,
+                (2, true, true, true, false, false, false, true),
+            ),
+            ManagedModelAgentStackTerminalOutcomeV1::EmptyExactZero => {
+                panic!("active request fixture cannot emit EmptyExactZero")
+            }
+        };
+        let state = ManagedModelAgentStackTerminalStateV1::try_new(
+            outcome, lifecycle, head, fabric, model, agent,
+        )
+        .expect("Model+Agent terminal state");
+        let (
+            physical_binding_census,
+            census_complete,
+            fabric_ready,
+            model_ready,
+            agent_ready,
+            fabric_to_agent_dependency_ready,
+            model_to_agent_dependency_ready,
+            quarantined,
+        ) = evidence_fields;
+        let marker = outcome as u8;
+        let evidence = ManagedModelAgentStackTerminalEvidenceV1::try_new(
+            ManagedModelAgentStackTerminalEvidenceFieldsV1 {
+                physical_binding_census,
+                census_complete,
+                fabric_ready,
+                model_ready,
+                agent_ready,
+                fabric_to_agent_dependency_ready,
+                model_to_agent_dependency_ready,
+                exact_zero: false,
+                quarantined,
+                resource_census_digest: Digest32::from_bytes([0xe0 + marker; 32]),
+                raw_outcome_digest: Digest32::from_bytes([0xf0 + marker; 32]),
+                completion_runtime_host_epoch: 9,
+                completion_snapshot_sequence: 10,
+                selection_clock_generation: request.temporal().target_clock_generation(),
+                selection_observed_at_nanos: 11 + u64::from(marker),
+            },
+        )
+        .expect("Model+Agent terminal evidence");
+        let facts = ManagedModelAgentStackTerminalFactsV1::try_new(request, state, evidence)
+            .expect("Model+Agent terminal facts");
+        let auth = ManagedModelAgentStackTerminalAuthClaimV1::try_new(
+            channel,
+            response_key,
+            ApplyAuthAlgorithm::try_new(1).expect("response algorithm"),
+            1,
+        )
+        .expect("Model+Agent terminal auth");
+        let draft =
+            ManagedModelAgentStackTerminalReceiptDraftV1::try_new(request, facts, channel, auth)
+                .expect("Model+Agent terminal draft");
+        let signature = SigningKey::from_bytes(&RUNTIME_SEED).sign(
+            draft
+                .signing_transcript()
+                .expect("Model+Agent terminal transcript")
+                .as_bytes(),
+        );
+        draft
+            .finalize(&signature.to_bytes())
+            .expect("Model+Agent terminal receipt")
+    }
+
+    fn managed_model_agent_stack_response_verifier() -> RuntimeManagedModelAgentStackResponseVerifier
+    {
+        let verifying_key = SigningKey::from_bytes(&RUNTIME_SEED).verifying_key();
+        let fingerprint = ed25519_control_key_fingerprint(verifying_key.as_bytes())
+            .unwrap_or_else(|error| panic!("Model+Agent key fingerprint failed: {error}"));
+        RuntimeManagedModelAgentStackResponseVerifier::try_new(
+            RUNTIME_PRINCIPAL,
+            RESPONSE_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+            fingerprint,
+            verifying_key,
+        )
+        .unwrap_or_else(|error| panic!("Model+Agent response verifier failed: {error}"))
     }
 
     fn compiled_facts() -> RuntimeCompiledInstallationFactsV1 {
@@ -2379,6 +4148,31 @@ mod tests {
             verifying_key,
         )
         .unwrap_or_else(|error| panic!("response verifier failed: {error}"))
+    }
+
+    fn managed_projection() -> ManagedFabricManifestProjectionV1 {
+        let compiled = compiled_facts();
+        let artifact = InstalledRuntimeArtifactObservationV1::try_new(
+            1_048_576,
+            Digest32::from_bytes([0x87; 32]),
+            "aarch64-unknown-linux-gnu",
+        )
+        .unwrap_or_else(|error| panic!("artifact observation failed: {error}"));
+        let descriptor = generate_build_descriptor(&artifact, compiled)
+            .unwrap_or_else(|error| panic!("descriptor generation failed: {error}"));
+        let installation = generate_manifest(
+            descriptor.canonical_wire(),
+            descriptor.descriptor_digest(),
+            TARGET,
+            &artifact,
+            compiled,
+        )
+        .unwrap_or_else(|error| panic!("manifest generation failed: {error}"));
+        let ingress = installation
+            .immutable_manifest_ingress()
+            .unwrap_or_else(|error| panic!("manifest ingress failed: {error}"));
+        ManagedFabricManifestProjectionV1::try_from_verified_legacy_manifest(&ingress)
+            .unwrap_or_else(|error| panic!("managed projection failed: {error}"))
     }
 
     fn client(
@@ -2820,6 +4614,53 @@ mod tests {
         request
     }
 
+    fn managed_model_response_frame(payload: &[u8], trailing: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(4 + payload.len() + trailing.len());
+        frame.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("PXMT response length")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(trailing);
+        frame
+    }
+
+    async fn perform_managed_model_exchange<BuildFrame>(
+        request: &ManagedModelAgentStackApplyRequestV1,
+        build_frame: BuildFrame,
+    ) -> (
+        Vec<u8>,
+        Vec<u8>,
+        bool,
+        Result<Box<[u8]>, RuntimeManagedModelAgentStackExchangeError>,
+    )
+    where
+        BuildFrame: FnOnce(ReferenceChannelBindingV1) -> Vec<u8>,
+    {
+        let socket = FakeRuntimeSocket::new();
+        let listener = socket.bind();
+        let channel = live_channel_for(&socket, request.target(), RUNTIME_PRINCIPAL);
+        let frame = build_frame(channel);
+        let client = UnixRuntimeManagedModelAgentStackClient::try_new(
+            socket.endpoint_for(current_credentials(), request.target(), RUNTIME_PRINCIPAL),
+            managed_model_agent_stack_response_verifier(),
+            std::time::Duration::from_millis(500),
+        )
+        .expect("managed Model+Agent client");
+        let server = tokio::spawn(async move {
+            let observed = serve_frame(&listener, &frame).await;
+            let retried =
+                tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_ok();
+            (observed, frame, retried)
+        });
+        let result = client.exchange_request(request, channel).await;
+        let (observed, frame, retried) = server.await.expect("managed Model+Agent server");
+        (observed, frame, retried, result)
+    }
+
     async fn perform_apply_exchange(
         socket: &FakeRuntimeSocket,
         listener: UnixListener,
@@ -2889,6 +4730,128 @@ mod tests {
             .expect_err("wrong apply fingerprint must fail"),
             RuntimeControlClientConfigurationError::ResponseKeyFingerprintMismatch
         );
+    }
+
+    #[test]
+    fn managed_serving_exchange_sends_exact_px_f_b_once_and_accepts_verified_px_f_r() {
+        run_async(async {
+            let socket = FakeRuntimeSocket::new();
+            let listener = socket.bind();
+            let channel = live_channel(&socket);
+            let request_claim = ApplyRequestAuthClaim::try_new(
+                CONTROLLER_PRINCIPAL,
+                CONTROLLER_KEY_REF,
+                ApplyAuthAlgorithm::try_new(1)
+                    .unwrap_or_else(|error| panic!("request algorithm failed: {error}")),
+                1,
+                &[0xa1; 32],
+            )
+            .unwrap_or_else(|error| panic!("managed serving request claim failed: {error}"));
+            let request_draft = ManagedServingBootstrapRequestDraftV1::try_new(
+                ManagedServingBootstrapRequestIdV1::try_from_bytes([0xa2; 16])
+                    .unwrap_or_else(|error| panic!("request id failed: {error}")),
+                TARGET,
+                SCOPE,
+                STORE,
+                managed_projection(),
+                channel,
+                request_claim,
+            )
+            .unwrap_or_else(|error| panic!("managed serving request draft failed: {error}"));
+            let controller_signature = SigningKey::from_bytes(&CONTROLLER_SEED).sign(
+                request_draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("request transcript failed: {error}"))
+                    .as_bytes(),
+            );
+            let request = request_draft
+                .finalize(&controller_signature.to_bytes())
+                .unwrap_or_else(|error| panic!("managed serving request failed: {error}"));
+            let facts = ManagedServingBootstrapFactsV1::try_recovered_ready(
+                TARGET,
+                STORE,
+                request.projection().clone(),
+                11,
+                12,
+                ClockReading::new(
+                    CLOCK_DOMAIN,
+                    ClockGeneration::try_new(13)
+                        .unwrap_or_else(|error| panic!("clock generation failed: {error}")),
+                    MonotonicInstant::from_ticks(101),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("managed serving facts failed: {error}"));
+            let response_claim = ManagedServingBootstrapResponseAuthClaimV1::try_new(
+                channel,
+                RESPONSE_KEY_REF,
+                ApplyAuthAlgorithm::try_new(1)
+                    .unwrap_or_else(|error| panic!("response algorithm failed: {error}")),
+                1,
+            )
+            .unwrap_or_else(|error| panic!("managed serving response claim failed: {error}"));
+            let response_draft = ManagedServingBootstrapResponseDraftV1::try_new(
+                &request,
+                facts,
+                channel,
+                response_claim,
+            )
+            .unwrap_or_else(|error| panic!("managed serving response draft failed: {error}"));
+            let runtime_signature = SigningKey::from_bytes(&RUNTIME_SEED).sign(
+                response_draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("response transcript failed: {error}"))
+                    .as_bytes(),
+            );
+            let response = response_draft
+                .finalize(&runtime_signature.to_bytes())
+                .unwrap_or_else(|error| panic!("managed serving response failed: {error}"));
+            let mut frame = Vec::with_capacity(4 + response.canonical_wire().len());
+            frame.extend_from_slice(
+                &u32::try_from(response.canonical_wire().len())
+                    .unwrap_or_else(|error| panic!("response length failed: {error}"))
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(response.canonical_wire());
+            let verifying_key = SigningKey::from_bytes(&RUNTIME_SEED).verifying_key();
+            let fingerprint = ed25519_control_key_fingerprint(verifying_key.as_bytes())
+                .unwrap_or_else(|error| panic!("response key fingerprint failed: {error}"));
+            let verifier = RuntimeManagedServingResponseVerifier::try_new(
+                RUNTIME_PRINCIPAL,
+                RESPONSE_KEY_REF,
+                ApplyAuthAlgorithm::try_new(1)
+                    .unwrap_or_else(|error| panic!("verifier algorithm failed: {error}")),
+                1,
+                fingerprint,
+                verifying_key,
+            )
+            .unwrap_or_else(|error| panic!("managed serving verifier failed: {error}"));
+            let client = UnixRuntimeManagedServingClient::try_new(
+                socket.endpoint(current_credentials()),
+                verifier,
+                std::time::Duration::from_millis(500),
+            )
+            .unwrap_or_else(|error| panic!("managed serving client failed: {error}"));
+            let expected_request = request.canonical_wire().to_vec();
+            let mut expected_transport = Vec::with_capacity(4 + expected_request.len());
+            expected_transport.extend_from_slice(
+                &u32::try_from(expected_request.len())
+                    .unwrap_or_else(|error| panic!("request length failed: {error}"))
+                    .to_be_bytes(),
+            );
+            expected_transport.extend_from_slice(&expected_request);
+            let action = ManagedServingBootstrapSendActionV1::from_contract_fixture(request);
+            let server = tokio::spawn(async move { serve_frame(&listener, &frame).await });
+            let outcome = client.exchange(action).await;
+            let (action, received) = outcome.into_parts();
+            let observed = server
+                .await
+                .unwrap_or_else(|error| panic!("managed serving server task failed: {error}"));
+            assert_eq!(observed, expected_transport);
+            assert_eq!(action.canonical_request_bytes(), expected_request);
+            let received =
+                received.unwrap_or_else(|error| panic!("managed serving exchange failed: {error}"));
+            assert_eq!(received.as_ref(), response.canonical_wire());
+        });
     }
 
     #[test]
@@ -3132,7 +5095,7 @@ mod tests {
             let wrong_channel_response = response(
                 &prepared,
                 &channel_compatibility,
-                unrelated_channel(),
+                unrelated_channel(TARGET),
                 9,
                 None,
             );
@@ -3294,7 +5257,16 @@ mod tests {
             let channel_request = query_request(0xa5, 0xa6, STORE);
             assert_contract_rejected(
                 channel_request.clone(),
-                |_| query_response(&channel_request, unrelated_channel(), STORE, 11, 11, None),
+                |_| {
+                    query_response(
+                        &channel_request,
+                        unrelated_channel(TARGET),
+                        STORE,
+                        11,
+                        11,
+                        None,
+                    )
+                },
                 query_baseline(STORE, 10, 11),
             )
             .await;
@@ -3447,7 +5419,7 @@ mod tests {
             let mismatch_result = mismatch_client
                 .exchange(prepared_query(
                     mismatch_request,
-                    unrelated_channel(),
+                    unrelated_channel(TARGET),
                     query_baseline(STORE, 10, 11),
                 ))
                 .await;
@@ -3888,6 +5860,316 @@ mod tests {
                     )
                 ))
             );
+        });
+    }
+
+    #[test]
+    fn managed_agent_stack_exchange_sends_exact_pxar7_once_and_accepts_exact_pxst1() {
+        run_async(async {
+            let socket = FakeRuntimeSocket::new();
+            let listener = socket.bind();
+            let request = managed_agent_stack_request();
+            let channel = live_channel_for(&socket, request.target(), RUNTIME_PRINCIPAL);
+            let receipt = managed_agent_stack_receipt(&request, channel);
+            let mut frame = Vec::with_capacity(4 + receipt.canonical_wire().len());
+            frame.extend_from_slice(
+                &u32::try_from(receipt.canonical_wire().len())
+                    .expect("PXST length")
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(receipt.canonical_wire());
+            let client = UnixRuntimeManagedAgentStackClient::try_new(
+                socket.endpoint_for(current_credentials(), request.target(), RUNTIME_PRINCIPAL),
+                managed_agent_stack_response_verifier(),
+                std::time::Duration::from_millis(500),
+            )
+            .expect("managed Agent stack client");
+            let action =
+                ManagedAgentStackSendActionV1::from_contract_fixture(request.clone(), channel);
+            let server = tokio::spawn(async move { serve_frame(&listener, &frame).await });
+            let outcome = client.exchange(action).await;
+            let observed = server.await.expect("managed Agent stack server");
+            let (action, response) = outcome.into_parts();
+            assert_eq!(&observed[4..], request.canonical_wire());
+            assert_eq!(&observed[4..10], b"PXAR\0\x07");
+            assert_eq!(action.request(), &request);
+            assert_eq!(
+                response.expect("verified PXST").as_ref(),
+                receipt.canonical_wire()
+            );
+        });
+    }
+
+    #[test]
+    fn managed_agent_stack_exchange_rejects_wrong_pxst_version_and_oversized_frame() {
+        run_async(async {
+            let socket = FakeRuntimeSocket::new();
+            let listener = socket.bind();
+            let request = managed_agent_stack_request();
+            let channel = live_channel_for(&socket, request.target(), RUNTIME_PRINCIPAL);
+            let receipt = managed_agent_stack_receipt(&request, channel);
+            let mut wrong = receipt.canonical_wire().to_vec();
+            wrong[4..6].copy_from_slice(&2_u16.to_be_bytes());
+            let mut frame = Vec::with_capacity(4 + wrong.len());
+            frame.extend_from_slice(&u32::try_from(wrong.len()).expect("length").to_be_bytes());
+            frame.extend_from_slice(&wrong);
+            let client = UnixRuntimeManagedAgentStackClient::try_new(
+                socket.endpoint_for(current_credentials(), request.target(), RUNTIME_PRINCIPAL),
+                managed_agent_stack_response_verifier(),
+                std::time::Duration::from_millis(500),
+            )
+            .expect("managed Agent stack client");
+            let action =
+                ManagedAgentStackSendActionV1::from_contract_fixture(request.clone(), channel);
+            let server = tokio::spawn(async move { serve_frame(&listener, &frame).await });
+            let (_, response) = client.exchange(action).await.into_parts();
+            server.await.expect("wrong-version server");
+            assert!(matches!(
+                response,
+                Err(RuntimeManagedAgentStackExchangeError::Uncertain(
+                    RuntimeManagedAgentStackClientFailure::ResponseContract(_)
+                ))
+            ));
+
+            let socket = FakeRuntimeSocket::new();
+            let listener = socket.bind();
+            let channel = live_channel_for(&socket, request.target(), RUNTIME_PRINCIPAL);
+            let oversized = u32::try_from(
+                paraegox_runtime_contracts::managed_agent_stack_plan::MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES
+                    + 1,
+            )
+            .expect("oversized PXST length")
+            .to_be_bytes();
+            let client = UnixRuntimeManagedAgentStackClient::try_new(
+                socket.endpoint_for(current_credentials(), request.target(), RUNTIME_PRINCIPAL),
+                managed_agent_stack_response_verifier(),
+                std::time::Duration::from_millis(500),
+            )
+            .expect("managed Agent stack client");
+            let action = ManagedAgentStackSendActionV1::from_contract_fixture(request, channel);
+            let server = tokio::spawn(async move { serve_frame(&listener, &oversized).await });
+            let (_, response) = client.exchange(action).await.into_parts();
+            server.await.expect("oversized server");
+            assert!(matches!(
+                response,
+                Err(RuntimeManagedAgentStackExchangeError::Uncertain(
+                    RuntimeManagedAgentStackClientFailure::ResponseBoundExceeded
+                ))
+            ));
+        });
+    }
+
+    #[test]
+    fn managed_model_agent_stack_exchange_sends_exact_pxar9_once_and_retains_legal_pxmt() {
+        run_async(async {
+            let request = managed_model_agent_stack_request(0x91);
+            let (observed, frame, retried, response) =
+                perform_managed_model_exchange(&request, |channel| {
+                    let receipt = managed_model_agent_stack_receipt(
+                        &request,
+                        channel,
+                        ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                        RESPONSE_KEY_REF,
+                    );
+                    managed_model_response_frame(receipt.canonical_wire(), &[])
+                })
+                .await;
+            assert!(!retried, "PXAR9 transport must never retry");
+            assert_eq!(
+                u32::from_be_bytes(observed[..4].try_into().expect("request length")) as usize,
+                request.canonical_wire().len()
+            );
+            assert_eq!(&observed[4..], request.canonical_wire());
+            assert_eq!(&observed[4..10], b"PXAR\0\x09");
+            assert_eq!(response.expect("verified PXMT").as_ref(), &frame[4..]);
+
+            for outcome in [
+                ManagedModelAgentStackTerminalOutcomeV1::NoEffectRejected,
+                ManagedModelAgentStackTerminalOutcomeV1::Uncertain,
+                ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
+            ] {
+                let (_, _, retried, response) =
+                    perform_managed_model_exchange(&request, |channel| {
+                        let receipt = managed_model_agent_stack_receipt(
+                            &request,
+                            channel,
+                            outcome,
+                            RESPONSE_KEY_REF,
+                        );
+                        managed_model_response_frame(receipt.canonical_wire(), &[])
+                    })
+                    .await;
+                assert!(!retried, "terminal classification cannot authorize retry");
+                let receipt = ManagedModelAgentStackTerminalReceiptV1::decode(
+                    &response.expect("legal PXMT must be returned"),
+                )
+                .expect("returned PXMT");
+                assert_eq!(receipt.facts().state().outcome(), outcome);
+            }
+        });
+    }
+
+    #[test]
+    fn managed_model_agent_stack_exchange_cross_rejects_other_wires_and_wrong_version() {
+        run_async(async {
+            let request = managed_model_agent_stack_request(0x92);
+            let agent_request = managed_agent_stack_request();
+            let (_, _, _, pxst) = perform_managed_model_exchange(&request, |channel| {
+                let receipt = managed_agent_stack_receipt(&agent_request, channel);
+                managed_model_response_frame(receipt.canonical_wire(), &[])
+            })
+            .await;
+            assert!(matches!(
+                pxst,
+                Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                    RuntimeManagedModelAgentStackClientFailure::ResponseContract(_)
+                ))
+            ));
+
+            let (_, _, _, pxds) = perform_managed_model_exchange(&request, |_| {
+                managed_model_response_frame(b"PXDS\0\x01", &[])
+            })
+            .await;
+            assert!(matches!(
+                pxds,
+                Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                    RuntimeManagedModelAgentStackClientFailure::ResponseContract(_)
+                ))
+            ));
+
+            let (_, _, _, wrong_version) = perform_managed_model_exchange(&request, |channel| {
+                let receipt = managed_model_agent_stack_receipt(
+                    &request,
+                    channel,
+                    ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                    RESPONSE_KEY_REF,
+                );
+                let mut wire = receipt.canonical_wire().to_vec();
+                wire[4..6].copy_from_slice(&2_u16.to_be_bytes());
+                managed_model_response_frame(&wire, &[])
+            })
+            .await;
+            assert!(matches!(
+                wrong_version,
+                Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                    RuntimeManagedModelAgentStackClientFailure::ResponseContract(_)
+                ))
+            ));
+        });
+    }
+
+    #[test]
+    fn managed_model_agent_stack_exchange_rejects_auth_channel_and_request_mismatch() {
+        run_async(async {
+            let request = managed_model_agent_stack_request(0x93);
+            let (_, _, _, signature) = perform_managed_model_exchange(&request, |channel| {
+                let receipt = managed_model_agent_stack_receipt(
+                    &request,
+                    channel,
+                    ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                    RESPONSE_KEY_REF,
+                );
+                let mut wire = receipt.canonical_wire().to_vec();
+                *wire.last_mut().expect("PXMT signature byte") ^= 1;
+                managed_model_response_frame(&wire, &[])
+            })
+            .await;
+            assert!(matches!(
+                signature,
+                Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                    RuntimeManagedModelAgentStackClientFailure::InvalidResponseSignature
+                ))
+            ));
+
+            let wrong_key = ApplyAuthKeyRef::from_bytes([0xa7; 16]);
+            let (_, _, _, key) = perform_managed_model_exchange(&request, |channel| {
+                let receipt = managed_model_agent_stack_receipt(
+                    &request,
+                    channel,
+                    ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                    wrong_key,
+                );
+                managed_model_response_frame(receipt.canonical_wire(), &[])
+            })
+            .await;
+            assert!(matches!(
+                key,
+                Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                    RuntimeManagedModelAgentStackClientFailure::ResponseKeyMismatch
+                ))
+            ));
+
+            let (_, _, _, channel) = perform_managed_model_exchange(&request, |_| {
+                let receipt = managed_model_agent_stack_receipt(
+                    &request,
+                    unrelated_channel(request.target()),
+                    ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                    RESPONSE_KEY_REF,
+                );
+                managed_model_response_frame(receipt.canonical_wire(), &[])
+            })
+            .await;
+            assert!(matches!(
+                channel,
+                Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                    RuntimeManagedModelAgentStackClientFailure::ResponseContract(_)
+                ))
+            ));
+
+            let other_request = managed_model_agent_stack_request(0x94);
+            let (_, _, _, correlation) = perform_managed_model_exchange(&request, |channel| {
+                let receipt = managed_model_agent_stack_receipt(
+                    &other_request,
+                    channel,
+                    ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                    RESPONSE_KEY_REF,
+                );
+                managed_model_response_frame(receipt.canonical_wire(), &[])
+            })
+            .await;
+            assert!(matches!(
+                correlation,
+                Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                    RuntimeManagedModelAgentStackClientFailure::ResponseContract(_)
+                ))
+            ));
+        });
+    }
+
+    #[test]
+    fn managed_model_agent_stack_exchange_rejects_oversize_and_trailing_bytes() {
+        run_async(async {
+            let request = managed_model_agent_stack_request(0x95);
+            let (_, _, _, oversized) = perform_managed_model_exchange(&request, |_| {
+                u32::try_from(MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES + 1)
+                    .expect("oversized PXMT length")
+                    .to_be_bytes()
+                    .to_vec()
+            })
+            .await;
+            assert!(matches!(
+                oversized,
+                Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                    RuntimeManagedModelAgentStackClientFailure::ResponseBoundExceeded
+                ))
+            ));
+
+            let (_, _, _, trailing) = perform_managed_model_exchange(&request, |channel| {
+                let receipt = managed_model_agent_stack_receipt(
+                    &request,
+                    channel,
+                    ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                    RESPONSE_KEY_REF,
+                );
+                managed_model_response_frame(receipt.canonical_wire(), &[0xff])
+            })
+            .await;
+            assert!(matches!(
+                trailing,
+                Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                    RuntimeManagedModelAgentStackClientFailure::TrailingBytes
+                ))
+            ));
         });
     }
 }

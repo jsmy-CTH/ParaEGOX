@@ -5,24 +5,24 @@
 //! the executable's fixed startup call, never through process environment,
 //! operator configuration, a descriptor, or journal state.
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(unix)]
 use paraegox_kernel::digest::Digest32;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(unix)]
 use paraegox_runtime_contracts::execution::{CardDefinitionRef, CardImplementationRef};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(unix)]
 use paraegox_runtime_contracts::installation::{
     RuntimeCompiledInstallationFactsV1, RuntimeInstallationError,
 };
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(unix)]
 const REFERENCE_DEFINITION: [u8; 16] = [0xa1; 16];
-#[cfg(any(target_os = "linux", test))]
+#[cfg(unix)]
 const REFERENCE_IMPLEMENTATION: [u8; 16] = [0xa2; 16];
-#[cfg(any(target_os = "linux", test))]
+#[cfg(unix)]
 const REFERENCE_EXPORT: [u8; 16] = [0xa3; 16];
-#[cfg(any(target_os = "linux", test))]
+#[cfg(unix)]
 const REFERENCE_DEFINITION_DIGEST: [u8; 32] = [0xa4; 32];
-#[cfg(any(target_os = "linux", test))]
+#[cfg(unix)]
 const REFERENCE_FIXTURE_ARTIFACT_DIGEST: [u8; 32] = [0xa5; 32];
 
 /// Immutable facts supplied by the final executable's generated source.
@@ -43,14 +43,14 @@ impl RuntimeHostEmbeddedBuildMetadataV1 {
         }
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(unix)]
     pub(crate) const fn target_triple(self) -> &'static str {
         self.target_triple
     }
 }
 
 /// Returns the fixed fixture table plus final-executable build identity.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(unix)]
 pub(crate) fn runtime_compiled_installation_facts(
     metadata: RuntimeHostEmbeddedBuildMetadataV1,
 ) -> Result<RuntimeCompiledInstallationFactsV1, RuntimeInstallationError> {

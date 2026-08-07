@@ -10,12 +10,14 @@ publish = false
 [dependencies]
 ed25519-dalek.workspace = true
 paraegox-kernel.workspace = true
+paraegox-node.workspace = true
 paraegox-runtime-contracts.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
-tokio.workspace = true
+paraegox-fabric.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 
 [lints]
 workspace = true

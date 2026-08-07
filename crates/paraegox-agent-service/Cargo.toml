@@ -1,0 +1,20 @@
+[package]
+name = "paraegox-agent-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+paraegox-agent-contracts.workspace = true
+paraegox-kernel.workspace = true
+paraegox-model.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

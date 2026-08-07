@@ -151,6 +151,29 @@ pub(crate) fn initialize_tenure_authority_store(
         .map_err(map_initialization_error)
 }
 
+pub(crate) fn initialize_tenure_authority_store_developer_local(
+    directory: &Path,
+    provisioning: TenureAuthorityProvisioning,
+) -> Result<TenureAuthorityInitializationReceipt, TenureAuthorityInitializationError> {
+    initializer::initialize_developer_local(directory, provisioning.0)
+        .map(TenureAuthorityInitializationReceipt)
+        .map_err(map_initialization_error)
+}
+
+pub(crate) fn observe_tenure_authority_store_id_developer_local(
+    directory: &Path,
+    provisioning: TenureAuthorityProvisioning,
+) -> Result<[u8; 32], TenureAuthorityReceiptRecoveryError> {
+    let store = AuthorityStore::open_for_sequence_one_receipt_with_policy(
+        directory,
+        provisioning.0,
+        FilesystemPolicy::DeveloperLocal,
+    )
+    .map_err(map_receipt_store_error)?;
+    let snapshot = store.snapshot().map_err(map_receipt_store_state_error)?;
+    Ok(*snapshot.store_instance_id.as_bytes())
+}
+
 pub(crate) fn reconstruct_sequence_one_initialization_receipt(
     directory: &Path,
     provisioning: TenureAuthorityProvisioning,
@@ -250,6 +273,21 @@ impl DeploymentTenureAuthority {
             provisioning,
             private_seed,
             FilesystemPolicy::ProductionReference,
+        )
+    }
+
+    pub(crate) fn open_developer_local(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        provisioning: TenureAuthorityProvisioning,
+        private_seed: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, TenureAuthorityOpenError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            provisioning,
+            private_seed,
+            FilesystemPolicy::DeveloperLocal,
         )
     }
 

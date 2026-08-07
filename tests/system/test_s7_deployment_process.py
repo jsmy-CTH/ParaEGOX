@@ -730,7 +730,7 @@ def _runtime_socket_accepts_probe(profile: InstalledControllerProfile) -> bool:
     probe = _run_text(
         [
             *profile.service.command_prefix,
-            os.fspath(Path(sys.executable).resolve()),
+            "/usr/bin/python3",
             "-c",
             (
                 "import socket,sys; "
@@ -1057,7 +1057,7 @@ finally:
     process = subprocess.Popen(
         [
             *runtime.command_prefix,
-            os.fspath(Path(sys.executable).resolve()),
+            "/usr/bin/python3",
             "-c",
             sink_source,
             os.fspath(socket_path),

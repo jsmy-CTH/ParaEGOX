@@ -1,0 +1,9 @@
+# DeveloperLocal example only. Never place an API key in this file.
+schema_version = 1
+state_root = "/private/tmp/paraegox-deepseek"
+fabric_listen = "tcp/127.0.0.1:7447"
+
+[model]
+provider = "deepseek-chat-completions-v1"
+model = "deepseek-v4-flash"
+secret_ref = "env:DEEPSEEK_API_KEY"

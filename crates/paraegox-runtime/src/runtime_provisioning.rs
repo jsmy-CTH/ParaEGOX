@@ -31,8 +31,10 @@ use paraegox_runtime_contracts::reference_control::{
     ReferenceAdmissionPolicyInputV1, ReferenceBootstrapChannelPolicyInputV1, ReferenceControlError,
     ed25519_control_key_fingerprint, reference_admission_policy_fingerprint_v1,
     reference_bootstrap_channel_policy_fingerprint_v1,
+    reference_developer_local_bootstrap_channel_policy_fingerprint_v1,
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
+use zeroize::Zeroize;
 
 use crate::admission::{
     AdmissionConfigurationError, AdmissionStateLimits, ApplyAdmissionPolicy, ED25519_ALGORITHM,
@@ -42,6 +44,8 @@ use crate::admission::{
 
 pub(crate) const CONTROL_SOCKET_DIRECTORY_MODE: u32 = 0o2750;
 pub(crate) const CONTROL_SOCKET_MODE: u32 = 0o660;
+pub(crate) const DEVELOPER_LOCAL_SOCKET_DIRECTORY_MODE: u32 = CONTROL_SOCKET_DIRECTORY_MODE;
+pub(crate) const DEVELOPER_LOCAL_SOCKET_MODE: u32 = CONTROL_SOCKET_MODE;
 const KEY_FILE_MODE: u32 = 0o400;
 const MODE_MASK: u32 = 0o7777;
 const KEY_BYTES: usize = 32;
@@ -76,6 +80,50 @@ pub(crate) struct RuntimeProvisioningInputV1 {
     pub(crate) tenure_public_key_path: PathBuf,
 }
 
+/// In-memory identity material admitted only by the explicit DeveloperLocal
+/// composition root.  It deliberately has no production constructor and
+/// never changes the production protected-key-file path.
+pub(crate) struct RuntimeDeveloperLocalProvisioningInputV1 {
+    pub(crate) socket_path: PathBuf,
+    pub(crate) target: RuntimeHostId,
+    pub(crate) source_scope: SourceScopeRef,
+    pub(crate) writer: PlanWriterRef,
+    pub(crate) runtime_principal: PrincipalRef,
+    pub(crate) controller_principal: PrincipalRef,
+    pub(crate) controller_request_key_ref: ApplyAuthKeyRef,
+    pub(crate) controller_signing_seed: [u8; KEY_BYTES],
+    pub(crate) runtime_response_key_ref: ApplyAuthKeyRef,
+    pub(crate) runtime_response_signing_seed: [u8; KEY_BYTES],
+    pub(crate) authority_principal: PrincipalRef,
+    pub(crate) tenure_authority_ref: TenureAuthorityRef,
+    pub(crate) tenure_key_ref: TenureKeyRef,
+    pub(crate) tenure_signing_seed: [u8; KEY_BYTES],
+}
+
+impl Drop for RuntimeDeveloperLocalProvisioningInputV1 {
+    fn drop(&mut self) {
+        self.controller_signing_seed.zeroize();
+        self.runtime_response_signing_seed.zeroize();
+        self.tenure_signing_seed.zeroize();
+    }
+}
+
+struct RuntimeProvisioningMaterialV1 {
+    controller_public_key: [u8; KEY_BYTES],
+    response_public_key: [u8; KEY_BYTES],
+    response_seed: [u8; KEY_BYTES],
+    tenure_public_key: [u8; KEY_BYTES],
+    socket_directory_mode: u32,
+    socket_mode: u32,
+    developer_local: bool,
+}
+
+impl Drop for RuntimeProvisioningMaterialV1 {
+    fn drop(&mut self) {
+        self.response_seed.zeroize();
+    }
+}
+
 /// Validated in-memory Runtime provisioning capability.
 ///
 /// Debug output never exposes public key bytes or the Runtime signing seed.
@@ -93,6 +141,8 @@ pub(crate) struct RuntimeProvisioningV1 {
     runtime_gid: u32,
     controller_uid: u32,
     controller_gid: u32,
+    socket_directory_mode: u32,
+    socket_mode: u32,
     admission_policy: ApplyAdmissionPolicy,
     owner_target_fingerprint: Digest32,
     admission_policy_fingerprint: Digest32,
@@ -159,10 +209,90 @@ impl RuntimeProvisioningV1 {
             input.runtime_gid,
         )?;
 
-        let controller_key = parse_verifying_key(controller_public_key)?;
-        let response_key = parse_verifying_key(response_public_key)?;
-        let tenure_key = parse_verifying_key(tenure_public_key)?;
-        let response_signer = SigningKey::from_bytes(&response_seed);
+        Self::try_new_from_material(
+            input,
+            RuntimeProvisioningMaterialV1 {
+                controller_public_key,
+                response_public_key,
+                response_seed,
+                tenure_public_key,
+                socket_directory_mode: CONTROL_SOCKET_DIRECTORY_MODE,
+                socket_mode: CONTROL_SOCKET_MODE,
+                developer_local: false,
+            },
+        )
+    }
+
+    /// Builds the same authenticated provisioning capability for the explicit
+    /// same-user DeveloperLocal launcher.  Role identities and signing keys
+    /// remain distinct; only the production multi-UID deployment requirement
+    /// is replaced by the current process credentials.
+    pub(crate) fn try_new_developer_local(
+        input: RuntimeDeveloperLocalProvisioningInputV1,
+    ) -> Result<Self, RuntimeProvisioningError> {
+        validate_canonical_absolute_path(&input.socket_path, true)?;
+        let uid = geteuid().as_raw();
+        let gid = getegid().as_raw();
+        if uid == 0 || gid == 0 {
+            return Err(RuntimeProvisioningError::InvalidProvisioning);
+        }
+        let controller_signer = SigningKey::from_bytes(&input.controller_signing_seed);
+        let response_signer = SigningKey::from_bytes(&input.runtime_response_signing_seed);
+        let tenure_signer = SigningKey::from_bytes(&input.tenure_signing_seed);
+        let material = RuntimeProvisioningInputV1 {
+            socket_path: input.socket_path.clone(),
+            target: input.target,
+            source_scope: input.source_scope,
+            writer: input.writer,
+            runtime_principal: input.runtime_principal,
+            runtime_uid: uid,
+            runtime_gid: gid,
+            controller_principal: input.controller_principal,
+            controller_uid: uid,
+            controller_gid: gid,
+            controller_request_key_ref: input.controller_request_key_ref,
+            controller_public_key_path: PathBuf::new(),
+            runtime_response_key_ref: input.runtime_response_key_ref,
+            runtime_response_public_key_path: PathBuf::new(),
+            runtime_response_private_seed_path: PathBuf::new(),
+            authority_principal: input.authority_principal,
+            authority_uid: uid,
+            authority_gid: gid,
+            tenure_authority_ref: input.tenure_authority_ref,
+            tenure_key_ref: input.tenure_key_ref,
+            tenure_public_key_path: PathBuf::new(),
+        };
+        validate_role_identities(&material, false)?;
+        let response_seed = input.runtime_response_signing_seed;
+        Self::try_new_from_material(
+            material,
+            RuntimeProvisioningMaterialV1 {
+                controller_public_key: controller_signer.verifying_key().to_bytes(),
+                response_public_key: response_signer.verifying_key().to_bytes(),
+                response_seed,
+                tenure_public_key: tenure_signer.verifying_key().to_bytes(),
+                socket_directory_mode: DEVELOPER_LOCAL_SOCKET_DIRECTORY_MODE,
+                socket_mode: DEVELOPER_LOCAL_SOCKET_MODE,
+                developer_local: true,
+            },
+        )
+    }
+
+    fn try_new_from_material(
+        input: RuntimeProvisioningInputV1,
+        mut material: RuntimeProvisioningMaterialV1,
+    ) -> Result<Self, RuntimeProvisioningError> {
+        let controller_key = parse_verifying_key(material.controller_public_key)?;
+        let response_key = parse_verifying_key(material.response_public_key)?;
+        let tenure_key = parse_verifying_key(material.tenure_public_key)?;
+        let response_signer = SigningKey::from_bytes(&material.response_seed);
+        material.response_seed.zeroize();
+        let controller_public_key = material.controller_public_key;
+        let response_public_key = material.response_public_key;
+        let tenure_public_key = material.tenure_public_key;
+        let socket_directory_mode = material.socket_directory_mode;
+        let socket_mode = material.socket_mode;
+        let developer_local = material.developer_local;
         if response_signer.verifying_key() != response_key
             || controller_key == response_key
             || controller_key == tenure_key
@@ -229,23 +359,26 @@ impl RuntimeProvisioningV1 {
         admission_policy.verify_reference_fingerprint(sealed_admission)?;
         let admission_policy_fingerprint = sealed_admission.digest();
         let owner_target_fingerprint = owner_target_fingerprint(&input)?;
-        let channel_policy_fingerprint = reference_bootstrap_channel_policy_fingerprint_v1(
-            ReferenceBootstrapChannelPolicyInputV1 {
-                canonical_socket_path: input.socket_path.as_os_str().as_bytes(),
-                target: input.target,
-                source_scope: input.source_scope,
-                controller_principal: input.controller_principal,
-                controller_key_ref: input.controller_request_key_ref,
-                controller_public_key: &controller_public_key,
-                runtime_uid: input.runtime_uid,
-                runtime_gid: input.runtime_gid,
-                controller_uid: input.controller_uid,
-                controller_gid: input.controller_gid,
-                runtime_principal: input.runtime_principal,
-                response_key_ref: input.runtime_response_key_ref,
-                response_public_key: &response_public_key,
-            },
-        )?;
+        let channel_input = ReferenceBootstrapChannelPolicyInputV1 {
+            canonical_socket_path: input.socket_path.as_os_str().as_bytes(),
+            target: input.target,
+            source_scope: input.source_scope,
+            controller_principal: input.controller_principal,
+            controller_key_ref: input.controller_request_key_ref,
+            controller_public_key: &controller_public_key,
+            runtime_uid: input.runtime_uid,
+            runtime_gid: input.runtime_gid,
+            controller_uid: input.controller_uid,
+            controller_gid: input.controller_gid,
+            runtime_principal: input.runtime_principal,
+            response_key_ref: input.runtime_response_key_ref,
+            response_public_key: &response_public_key,
+        };
+        let channel_policy_fingerprint = if developer_local {
+            reference_developer_local_bootstrap_channel_policy_fingerprint_v1(channel_input)?
+        } else {
+            reference_bootstrap_channel_policy_fingerprint_v1(channel_input)?
+        };
         let controller_key_fingerprint = ed25519_control_key_fingerprint(&controller_public_key)?;
 
         Ok(Self {
@@ -262,6 +395,8 @@ impl RuntimeProvisioningV1 {
             runtime_gid: input.runtime_gid,
             controller_uid: input.controller_uid,
             controller_gid: input.controller_gid,
+            socket_directory_mode,
+            socket_mode,
             admission_policy,
             owner_target_fingerprint,
             admission_policy_fingerprint,
@@ -316,6 +451,11 @@ impl RuntimeProvisioningV1 {
     }
 
     #[must_use]
+    pub(crate) fn runtime_response_public_key(&self) -> [u8; KEY_BYTES] {
+        self.response_signer.verifying_key().to_bytes()
+    }
+
+    #[must_use]
     pub(crate) const fn runtime_uid(&self) -> u32 {
         self.runtime_uid
     }
@@ -333,6 +473,16 @@ impl RuntimeProvisioningV1 {
     #[must_use]
     pub(crate) const fn controller_gid(&self) -> u32 {
         self.controller_gid
+    }
+
+    #[must_use]
+    pub(crate) const fn socket_directory_mode(&self) -> u32 {
+        self.socket_directory_mode
+    }
+
+    #[must_use]
+    pub(crate) const fn socket_mode(&self) -> u32 {
+        self.socket_mode
     }
 
     #[must_use]
@@ -396,6 +546,13 @@ fn validate_input(input: &RuntimeProvisioningInputV1) -> Result<(), RuntimeProvi
         }
     }
 
+    validate_role_identities(input, true)
+}
+
+fn validate_role_identities(
+    input: &RuntimeProvisioningInputV1,
+    require_distinct_os_users: bool,
+) -> Result<(), RuntimeProvisioningError> {
     let required_refs: [&[u8]; 9] = [
         input.target.as_bytes(),
         input.source_scope.as_bytes(),
@@ -447,12 +604,11 @@ fn validate_input(input: &RuntimeProvisioningInputV1) -> Result<(), RuntimeProvi
     }
     let uids = [input.runtime_uid, input.controller_uid, input.authority_uid];
     if uids.contains(&0)
-        || uids[0] == uids[1]
-        || uids[0] == uids[2]
-        || uids[1] == uids[2]
         || input.runtime_gid == 0
         || input.controller_gid == 0
         || input.authority_gid == 0
+        || require_distinct_os_users
+            && (uids[0] == uids[1] || uids[0] == uids[2] || uids[1] == uids[2])
     {
         return Err(RuntimeProvisioningError::InvalidProvisioning);
     }

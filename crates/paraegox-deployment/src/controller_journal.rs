@@ -28,6 +28,16 @@ use paraegox_runtime_contracts::reference_control::{
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
+use crate::distributed_agent_stack_node_reconcile::{
+    DistributedAgentStackNodeDiscoveryStateV1,
+    validate_distributed_agent_stack_node_initial_wire_v1,
+    validate_distributed_agent_stack_node_wire_successor_v1,
+};
+use crate::distributed_agent_stack_store::{
+    validate_distributed_agent_stack_initial_state_wire_v1,
+    validate_distributed_agent_stack_state_wire_successor_v1,
+    validate_distributed_agent_stack_state_wire_v1,
+};
 use crate::manifest_ingress::ControllerInstalledManifestPin;
 use crate::plan::{DeploymentId, DeploymentRevision, DeploymentScopeId};
 use crate::planner::{
@@ -42,6 +52,7 @@ use crate::tenure_protocol::{
 
 const JOURNAL_MAGIC: &[u8; 4] = b"PXJR";
 const JOURNAL_ENVELOPE_VERSION: u16 = 1;
+const JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION: u16 = 2;
 const CONTROLLER_OWNER_KIND: u16 = 1;
 // Payload v7 retained only an opaque query response after transport. It could
 // not prove that the exact canonical PXQR and its request-time channel, Runtime
@@ -55,6 +66,15 @@ const CHECKSUM_VERSION: u16 = 1;
 const CONTROLLER_PAYLOAD_MAGIC: &[u8; 4] = b"PXCP";
 const CONTROLLER_CHECKSUM_DOMAIN: &[u8] =
     b"paraegox.deployment.controller-journal.checksum.sha256.v1";
+const DISTRIBUTED_EXTENSION_MAGIC: &[u8; 4] = b"PXDE";
+const DISTRIBUTED_EXTENSION_VERSION: u16 = 1;
+const DISTRIBUTED_EXTENSION_KIND: u16 = 1;
+const DISTRIBUTED_EXTENSION_BODY_HEADER_BYTES: usize = 8;
+const DISTRIBUTED_EXTENSION_FOOTER_PREFIX_BYTES: usize = 16;
+const DISTRIBUTED_EXTENSION_FOOTER_BYTES: usize = DISTRIBUTED_EXTENSION_FOOTER_PREFIX_BYTES + 32;
+const MAX_DISTRIBUTED_EXTENSION_BODY_BYTES: usize = 6 * 1024 * 1024;
+const DISTRIBUTED_EXTENSION_CHECKSUM_DOMAIN: &[u8] =
+    b"paraegox.deployment.controller-journal.distributed-extension.sha256.v1";
 const CONTROLLER_PLAN_CONTENT_INTEGRITY_DOMAIN: &[u8] =
     b"paraegox.deployment.controller-journal.plan-content-integrity.sha256.v1";
 const DEPLOYMENT_PLAN_DIGEST_DOMAIN: &[u8] = b"paraegox.deployment.committed-plan.sha256.v1";
@@ -4099,11 +4119,143 @@ fn allocation_matches_delta_result(
 
 /// Versioned/checksummed Controller snapshot envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ControllerDistributedAgentStackExtensionV1 {
+    journal_wire: Box<[u8]>,
+    node_discovery_wire: Box<[u8]>,
+}
+
+impl ControllerDistributedAgentStackExtensionV1 {
+    fn try_initial(
+        journal_wire: &[u8],
+        node_discovery_wire: &[u8],
+    ) -> Result<Self, ControllerJournalError> {
+        validate_distributed_agent_stack_initial_state_wire_v1(journal_wire)
+            .map_err(|_| ControllerJournalError::InvalidDistributedAgentStackExtension)?;
+        validate_distributed_agent_stack_node_initial_wire_v1(node_discovery_wire)
+            .map_err(|_| ControllerJournalError::InvalidDistributedAgentStackExtension)?;
+        let extension = Self {
+            journal_wire: journal_wire.into(),
+            node_discovery_wire: node_discovery_wire.into(),
+        };
+        extension.validate_cross_binding()?;
+        Ok(extension)
+    }
+
+    fn try_from_wires(
+        journal_wire: &[u8],
+        node_discovery_wire: &[u8],
+    ) -> Result<Self, ControllerJournalError> {
+        validate_distributed_agent_stack_state_wire_v1(journal_wire)
+            .map_err(|_| ControllerJournalError::InvalidDistributedAgentStackExtension)?;
+        DistributedAgentStackNodeDiscoveryStateV1::decode(node_discovery_wire)
+            .map_err(|_| ControllerJournalError::InvalidDistributedAgentStackExtension)?;
+        let extension = Self {
+            journal_wire: journal_wire.into(),
+            node_discovery_wire: node_discovery_wire.into(),
+        };
+        extension.validate_cross_binding()?;
+        Ok(extension)
+    }
+
+    fn validate_cross_binding(&self) -> Result<(), ControllerJournalError> {
+        let journal = validate_distributed_agent_stack_state_wire_v1(&self.journal_wire)
+            .map_err(|_| ControllerJournalError::InvalidDistributedAgentStackExtension)?;
+        let nodes = DistributedAgentStackNodeDiscoveryStateV1::decode(&self.node_discovery_wire)
+            .map_err(|_| ControllerJournalError::InvalidDistributedAgentStackExtension)?;
+        if journal.owner_anchor() != nodes.owner_anchor()
+            || journal.rollout_id() != nodes.rollout_id()
+            || journal.targets() != nodes.runtime_targets()
+        {
+            return Err(ControllerJournalError::InvalidDistributedAgentStackExtension);
+        }
+        Ok(())
+    }
+
+    fn validate_successor_of(&self, previous: &Self) -> Result<(), ControllerJournalError> {
+        if self == previous {
+            return Ok(());
+        }
+        self.validate_cross_binding()?;
+        let journal_changed = self.journal_wire != previous.journal_wire;
+        let nodes_changed = self.node_discovery_wire != previous.node_discovery_wire;
+        if journal_changed {
+            validate_distributed_agent_stack_state_wire_successor_v1(
+                &previous.journal_wire,
+                &self.journal_wire,
+            )
+            .map_err(|_| ControllerJournalError::InvalidDistributedAgentStackExtension)?;
+        }
+        if nodes_changed {
+            validate_distributed_agent_stack_node_wire_successor_v1(
+                &previous.node_discovery_wire,
+                &self.node_discovery_wire,
+            )
+            .map_err(|_| ControllerJournalError::InvalidDistributedAgentStackExtension)?;
+        }
+        if !journal_changed && !nodes_changed {
+            return Err(ControllerJournalError::InvalidDistributedAgentStackExtension);
+        }
+        Ok(())
+    }
+
+    fn encode_body(&self) -> Result<Box<[u8]>, ControllerJournalError> {
+        self.validate_cross_binding()?;
+        let journal_length = u32::try_from(self.journal_wire.len())
+            .map_err(|_| ControllerJournalError::SnapshotTooLarge)?;
+        let node_length = u32::try_from(self.node_discovery_wire.len())
+            .map_err(|_| ControllerJournalError::SnapshotTooLarge)?;
+        let body_length = DISTRIBUTED_EXTENSION_BODY_HEADER_BYTES
+            .checked_add(self.journal_wire.len())
+            .and_then(|value| value.checked_add(self.node_discovery_wire.len()))
+            .ok_or(ControllerJournalError::SnapshotTooLarge)?;
+        if body_length > MAX_DISTRIBUTED_EXTENSION_BODY_BYTES {
+            return Err(ControllerJournalError::SnapshotTooLarge);
+        }
+        let mut body = Vec::with_capacity(body_length);
+        body.extend_from_slice(&journal_length.to_be_bytes());
+        body.extend_from_slice(&node_length.to_be_bytes());
+        body.extend_from_slice(&self.journal_wire);
+        body.extend_from_slice(&self.node_discovery_wire);
+        Ok(body.into_boxed_slice())
+    }
+
+    fn decode_body(body: &[u8]) -> Result<Self, ControllerJournalError> {
+        if body.len() < DISTRIBUTED_EXTENSION_BODY_HEADER_BYTES
+            || body.len() > MAX_DISTRIBUTED_EXTENSION_BODY_BYTES
+        {
+            return Err(ControllerJournalError::InvalidDistributedAgentStackExtension);
+        }
+        let mut reader = Reader::new(body);
+        let journal_length =
+            usize::try_from(reader.u32()?).map_err(|_| ControllerJournalError::LengthOverflow)?;
+        let node_length =
+            usize::try_from(reader.u32()?).map_err(|_| ControllerJournalError::LengthOverflow)?;
+        if journal_length == 0
+            || node_length == 0
+            || DISTRIBUTED_EXTENSION_BODY_HEADER_BYTES
+                .checked_add(journal_length)
+                .and_then(|value| value.checked_add(node_length))
+                != Some(body.len())
+        {
+            return Err(ControllerJournalError::InvalidDistributedAgentStackExtension);
+        }
+        let journal_wire = reader.take(journal_length)?;
+        let node_discovery_wire = reader.take(node_length)?;
+        if reader.remaining() != 0 {
+            return Err(ControllerJournalError::TrailingBytes);
+        }
+        Self::try_from_wires(journal_wire, node_discovery_wire)
+    }
+}
+
+/// Versioned/checksummed Controller snapshot envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ControllerJournalSnapshot {
     store_instance_id: [u8; 32],
     owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
     snapshot_sequence: u64,
     state: ControllerJournalState,
+    distributed_agent_stack: Option<ControllerDistributedAgentStackExtensionV1>,
 }
 
 /// Strictly parsed v7 source evidence plus its canonical v8 successor.
@@ -4161,7 +4313,13 @@ impl ControllerJournalSnapshot {
         if !state.is_exact_fresh() {
             return Err(ControllerJournalError::NonFreshInitialState);
         }
-        Self::try_from_stored(store_instance_id, owner_identity_fingerprint, 1, state)
+        Self::try_from_stored(
+            store_instance_id,
+            owner_identity_fingerprint,
+            1,
+            state,
+            None,
+        )
     }
 
     fn try_from_stored(
@@ -4169,6 +4327,7 @@ impl ControllerJournalSnapshot {
         owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
         snapshot_sequence: u64,
         state: ControllerJournalState,
+        distributed_agent_stack: Option<ControllerDistributedAgentStackExtensionV1>,
     ) -> Result<Self, ControllerJournalError> {
         if store_instance_id == [0; 32] {
             return Err(ControllerJournalError::ZeroStoreIdentity);
@@ -4183,7 +4342,7 @@ impl ControllerJournalSnapshot {
         if snapshot_sequence == 1 && !state.is_exact_fresh() {
             return Err(ControllerJournalError::NonFreshInitialState);
         }
-        if snapshot_sequence > 1 && state.is_exact_fresh() {
+        if snapshot_sequence > 1 && state.is_exact_fresh() && distributed_agent_stack.is_none() {
             return Err(ControllerJournalError::FreshStateAfterInitialization);
         }
         Ok(Self {
@@ -4191,6 +4350,7 @@ impl ControllerJournalSnapshot {
             owner_identity_fingerprint,
             snapshot_sequence,
             state,
+            distributed_agent_stack,
         })
     }
 
@@ -4208,6 +4368,42 @@ impl ControllerJournalSnapshot {
             self.owner_identity_fingerprint,
             snapshot_sequence,
             state,
+            self.distributed_agent_stack.clone(),
+        )
+    }
+
+    pub(crate) fn try_distributed_agent_stack_successor(
+        &self,
+        journal_wire: &[u8],
+        node_discovery_wire: &[u8],
+    ) -> Result<Self, ControllerJournalError> {
+        let distributed_agent_stack = match &self.distributed_agent_stack {
+            Some(previous) => {
+                let next = ControllerDistributedAgentStackExtensionV1::try_from_wires(
+                    journal_wire,
+                    node_discovery_wire,
+                )?;
+                next.validate_successor_of(previous)?;
+                if &next == previous {
+                    return Err(ControllerJournalError::InvalidDistributedAgentStackExtension);
+                }
+                Some(next)
+            }
+            None => Some(ControllerDistributedAgentStackExtensionV1::try_initial(
+                journal_wire,
+                node_discovery_wire,
+            )?),
+        };
+        let snapshot_sequence = self
+            .snapshot_sequence
+            .checked_add(1)
+            .ok_or(ControllerJournalError::SnapshotSequenceExhausted)?;
+        Self::try_from_stored(
+            self.store_instance_id,
+            self.owner_identity_fingerprint,
+            snapshot_sequence,
+            self.state.clone(),
+            distributed_agent_stack,
         )
     }
 
@@ -4227,7 +4423,22 @@ impl ControllerJournalSnapshot {
         if self.snapshot_sequence != expected {
             return Err(ControllerJournalError::SnapshotSequenceNotNext);
         }
-        self.state.validate_successor_of(&previous.state)
+        self.state.validate_successor_of(&previous.state)?;
+        match (
+            &previous.distributed_agent_stack,
+            &self.distributed_agent_stack,
+        ) {
+            (None, None) => Ok(()),
+            (None, Some(next)) => {
+                ControllerDistributedAgentStackExtensionV1::try_initial(
+                    &next.journal_wire,
+                    &next.node_discovery_wire,
+                )?;
+                Ok(())
+            }
+            (Some(_), None) => Err(ControllerJournalError::DistributedAgentStackExtensionRemoved),
+            (Some(previous), Some(next)) => next.validate_successor_of(previous),
+        }
     }
 
     pub(crate) const fn store_instance_id(&self) -> &[u8; 32] {
@@ -4246,6 +4457,18 @@ impl ControllerJournalSnapshot {
         &self.state
     }
 
+    pub(crate) fn distributed_agent_stack_journal_wire(&self) -> Option<&[u8]> {
+        self.distributed_agent_stack
+            .as_ref()
+            .map(|extension| extension.journal_wire.as_ref())
+    }
+
+    pub(crate) fn distributed_agent_stack_node_discovery_wire(&self) -> Option<&[u8]> {
+        self.distributed_agent_stack
+            .as_ref()
+            .map(|extension| extension.node_discovery_wire.as_ref())
+    }
+
     pub(crate) fn encode(&self) -> Result<Box<[u8]>, ControllerJournalError> {
         self.encode_with_payload_version(CONTROLLER_PAYLOAD_VERSION)
     }
@@ -4254,7 +4477,17 @@ impl ControllerJournalSnapshot {
         &self,
         payload_version: u16,
     ) -> Result<Box<[u8]>, ControllerJournalError> {
-        let payload = encode_payload_version(&self.state, payload_version)?;
+        if self.distributed_agent_stack.is_some() && payload_version != CONTROLLER_PAYLOAD_VERSION {
+            return Err(ControllerJournalError::UnknownPayloadVersion);
+        }
+        let base_payload = encode_payload_version(&self.state, payload_version)?;
+        let (envelope_version, payload) = match &self.distributed_agent_stack {
+            Some(extension) => (
+                JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION,
+                encode_distributed_extension_payload(&base_payload, extension)?,
+            ),
+            None => (JOURNAL_ENVELOPE_VERSION, base_payload.into_boxed_slice()),
+        };
         let payload_length =
             u64::try_from(payload.len()).map_err(|_| ControllerJournalError::SnapshotTooLarge)?;
         let total_length = JOURNAL_HEADER_BYTES
@@ -4266,7 +4499,7 @@ impl ControllerJournalSnapshot {
 
         let mut prefix = Vec::with_capacity(JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES);
         prefix.extend_from_slice(JOURNAL_MAGIC);
-        prefix.extend_from_slice(&JOURNAL_ENVELOPE_VERSION.to_be_bytes());
+        prefix.extend_from_slice(&envelope_version.to_be_bytes());
         prefix.extend_from_slice(&CONTROLLER_OWNER_KIND.to_be_bytes());
         prefix.extend_from_slice(&payload_version.to_be_bytes());
         prefix.extend_from_slice(&CHECKSUM_ALGORITHM_SHA256.to_be_bytes());
@@ -4300,7 +4533,11 @@ impl ControllerJournalSnapshot {
         if reader.take_array::<4>()? != *JOURNAL_MAGIC {
             return Err(ControllerJournalError::InvalidMagic);
         }
-        if reader.u16()? != JOURNAL_ENVELOPE_VERSION {
+        let envelope_version = reader.u16()?;
+        if !matches!(
+            envelope_version,
+            JOURNAL_ENVELOPE_VERSION | JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION
+        ) {
             return Err(ControllerJournalError::UnknownEnvelopeVersion);
         }
         if reader.u16()? != CONTROLLER_OWNER_KIND {
@@ -4331,11 +4568,20 @@ impl ControllerJournalSnapshot {
         if controller_checksum(prefix, payload)? != checksum {
             return Err(ControllerJournalError::ChecksumMismatch);
         }
+        let (base_payload, distributed_agent_stack) = match envelope_version {
+            JOURNAL_ENVELOPE_VERSION => (payload, None),
+            JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION => {
+                let (base_payload, extension) = decode_distributed_extension_payload(payload)?;
+                (base_payload, Some(extension))
+            }
+            _ => return Err(ControllerJournalError::UnknownEnvelopeVersion),
+        };
         Self::try_from_stored(
             store_instance_id,
             owner_identity_fingerprint,
             snapshot_sequence,
-            decode_payload(payload)?,
+            decode_payload(base_payload)?,
+            distributed_agent_stack,
         )
     }
 
@@ -4408,6 +4654,7 @@ impl ControllerJournalSnapshot {
             owner_identity_fingerprint,
             snapshot_sequence,
             state,
+            None,
         )?;
         Ok(ControllerJournalPayloadV7Migration {
             snapshot,
@@ -4418,6 +4665,93 @@ impl ControllerJournalSnapshot {
             source_snapshot_sequence: snapshot_sequence,
         })
     }
+}
+
+fn encode_distributed_extension_payload(
+    base_payload: &[u8],
+    extension: &ControllerDistributedAgentStackExtensionV1,
+) -> Result<Box<[u8]>, ControllerJournalError> {
+    let body = extension.encode_body()?;
+    let body_length =
+        u64::try_from(body.len()).map_err(|_| ControllerJournalError::SnapshotTooLarge)?;
+    let mut footer_prefix = Vec::with_capacity(DISTRIBUTED_EXTENSION_FOOTER_PREFIX_BYTES);
+    footer_prefix.extend_from_slice(DISTRIBUTED_EXTENSION_MAGIC);
+    footer_prefix.extend_from_slice(&DISTRIBUTED_EXTENSION_VERSION.to_be_bytes());
+    footer_prefix.extend_from_slice(&DISTRIBUTED_EXTENSION_KIND.to_be_bytes());
+    footer_prefix.extend_from_slice(&body_length.to_be_bytes());
+    debug_assert_eq!(
+        footer_prefix.len(),
+        DISTRIBUTED_EXTENSION_FOOTER_PREFIX_BYTES
+    );
+    let extension_checksum = distributed_extension_checksum(&footer_prefix, &body)?;
+    let total = base_payload
+        .len()
+        .checked_add(body.len())
+        .and_then(|value| value.checked_add(DISTRIBUTED_EXTENSION_FOOTER_BYTES))
+        .ok_or(ControllerJournalError::SnapshotTooLarge)?;
+    if total > MAX_CONTROLLER_SNAPSHOT_BYTES - JOURNAL_HEADER_BYTES {
+        return Err(ControllerJournalError::SnapshotTooLarge);
+    }
+    let mut payload = Vec::with_capacity(total);
+    payload.extend_from_slice(base_payload);
+    payload.extend_from_slice(&body);
+    payload.extend_from_slice(&footer_prefix);
+    payload.extend_from_slice(extension_checksum.as_bytes());
+    Ok(payload.into_boxed_slice())
+}
+
+fn decode_distributed_extension_payload(
+    payload: &[u8],
+) -> Result<(&[u8], ControllerDistributedAgentStackExtensionV1), ControllerJournalError> {
+    if payload.len() <= DISTRIBUTED_EXTENSION_FOOTER_BYTES {
+        return Err(ControllerJournalError::InvalidDistributedAgentStackExtension);
+    }
+    let footer_offset = payload
+        .len()
+        .checked_sub(DISTRIBUTED_EXTENSION_FOOTER_BYTES)
+        .ok_or(ControllerJournalError::LengthOverflow)?;
+    let footer_prefix =
+        &payload[footer_offset..footer_offset + DISTRIBUTED_EXTENSION_FOOTER_PREFIX_BYTES];
+    let mut footer = Reader::new(footer_prefix);
+    if footer.take_array::<4>()? != *DISTRIBUTED_EXTENSION_MAGIC
+        || footer.u16()? != DISTRIBUTED_EXTENSION_VERSION
+        || footer.u16()? != DISTRIBUTED_EXTENSION_KIND
+    {
+        return Err(ControllerJournalError::UnknownDistributedAgentStackExtension);
+    }
+    let body_length =
+        usize::try_from(footer.u64()?).map_err(|_| ControllerJournalError::LengthOverflow)?;
+    if footer.remaining() != 0
+        || body_length == 0
+        || body_length > MAX_DISTRIBUTED_EXTENSION_BODY_BYTES
+        || body_length > footer_offset
+    {
+        return Err(ControllerJournalError::InvalidDistributedAgentStackExtension);
+    }
+    let body_offset = footer_offset - body_length;
+    if body_offset == 0 {
+        return Err(ControllerJournalError::InvalidDistributedAgentStackExtension);
+    }
+    let body = &payload[body_offset..footer_offset];
+    let stored_checksum = Digest32::from_bytes(
+        payload[footer_offset + DISTRIBUTED_EXTENSION_FOOTER_PREFIX_BYTES..]
+            .try_into()
+            .map_err(|_| ControllerJournalError::Truncated)?,
+    );
+    if distributed_extension_checksum(footer_prefix, body)? != stored_checksum {
+        return Err(ControllerJournalError::DistributedAgentStackExtensionChecksumMismatch);
+    }
+    let extension = ControllerDistributedAgentStackExtensionV1::decode_body(body)?;
+    Ok((&payload[..body_offset], extension))
+}
+
+fn distributed_extension_checksum(
+    footer_prefix: &[u8],
+    body: &[u8],
+) -> Result<Digest32, ControllerJournalError> {
+    let mut builder = Digest32Builder::try_new(DISTRIBUTED_EXTENSION_CHECKSUM_DOMAIN)?;
+    builder.field_bytes(footer_prefix)?.field_bytes(body)?;
+    Ok(builder.finish())
 }
 
 fn deployment_plan_digest(
@@ -5592,6 +5926,10 @@ pub(crate) enum ControllerJournalError {
     SnapshotSequenceNotNext,
     SnapshotSequenceExhausted,
     SnapshotOwnerChanged,
+    InvalidDistributedAgentStackExtension,
+    UnknownDistributedAgentStackExtension,
+    DistributedAgentStackExtensionChecksumMismatch,
+    DistributedAgentStackExtensionRemoved,
     AllocationCapacityExceeded,
     InvalidAllocation,
     NonCanonicalAllocation,
@@ -7241,7 +7579,7 @@ pub(crate) mod tests {
             Err(ControllerJournalError::OwnerKindMismatch)
         );
         let mut bad_envelope_version = encoded.to_vec();
-        bad_envelope_version[5] = 2;
+        bad_envelope_version[5] = 3;
         assert_eq!(
             ControllerJournalSnapshot::decode(&bad_envelope_version),
             Err(ControllerJournalError::UnknownEnvelopeVersion)
@@ -7790,6 +8128,7 @@ pub(crate) mod tests {
             initial.owner_identity_fingerprint,
             2,
             prepared.state.clone(),
+            None,
         )
         .expect("individually valid swapped snapshot must construct");
         assert_eq!(
@@ -7801,6 +8140,7 @@ pub(crate) mod tests {
             initial.owner_identity_fingerprint,
             3,
             prepared.state.clone(),
+            None,
         )
         .expect("individually valid sequence jump must construct");
         assert_eq!(
@@ -8366,6 +8706,7 @@ pub(crate) mod tests {
                 uncertain_signed.owner_identity_fingerprint,
                 9,
                 retired,
+                None,
             )
             .expect("individually valid later snapshot")
             .encode()
@@ -8848,6 +9189,7 @@ pub(crate) mod tests {
             ControllerOwnerIdentityFingerprint::from_stored(digest(0x42)),
             20,
             conflicting,
+            None,
         )
         .expect("raw conflict without a decision remains valid current evidence");
         let encoded = snapshot.encode().expect("raw conflict snapshot encoding");
@@ -9142,6 +9484,7 @@ pub(crate) mod tests {
             ControllerOwnerIdentityFingerprint::from_stored(digest(0x42)),
             600,
             state,
+            None,
         )
         .expect("the previous state remains valid");
         assert!(
@@ -9257,6 +9600,7 @@ pub(crate) mod tests {
             ControllerOwnerIdentityFingerprint::from_stored(digest(0x42)),
             12,
             archived.clone(),
+            None,
         )
         .expect("two-history state must validate");
         let encoded = snapshot.encode().expect("two-history state must encode");

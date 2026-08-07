@@ -419,7 +419,52 @@ pub struct ReferenceBootstrapChannelPolicyInputV1<'a> {
 pub fn reference_bootstrap_channel_policy_fingerprint_v1(
     input: ReferenceBootstrapChannelPolicyInputV1<'_>,
 ) -> Result<Digest32, ReferenceControlError> {
+    bootstrap_channel_policy_fingerprint(
+        BOOTSTRAP_CHANNEL_POLICY_FINGERPRINT_DOMAIN,
+        input,
+        BootstrapPeerIdentityPolicy::DistinctServiceUsers,
+    )
+}
+
+const DEVELOPER_LOCAL_BOOTSTRAP_CHANNEL_POLICY_FINGERPRINT_DOMAIN: &[u8] =
+    b"paraegox.reference-control.developer-local-bootstrap-channel-policy.sha256.v1";
+
+/// Derives the explicit same-process DeveloperLocal channel policy.
+///
+/// All cryptographic principals, key selectors, keys, target, scope, path and
+/// fixed socket modes remain independently bound.  The sole profile change is
+/// that Runtime and Controller peer credentials must be the same non-root
+/// uid/gid, matching their real single-process `SO_PEERCRED` observation.
+pub fn reference_developer_local_bootstrap_channel_policy_fingerprint_v1(
+    input: ReferenceBootstrapChannelPolicyInputV1<'_>,
+) -> Result<Digest32, ReferenceControlError> {
+    bootstrap_channel_policy_fingerprint(
+        DEVELOPER_LOCAL_BOOTSTRAP_CHANNEL_POLICY_FINGERPRINT_DOMAIN,
+        input,
+        BootstrapPeerIdentityPolicy::SameProcessUser,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum BootstrapPeerIdentityPolicy {
+    DistinctServiceUsers,
+    SameProcessUser,
+}
+
+fn bootstrap_channel_policy_fingerprint(
+    domain: &'static [u8],
+    input: ReferenceBootstrapChannelPolicyInputV1<'_>,
+    peer_policy: BootstrapPeerIdentityPolicy,
+) -> Result<Digest32, ReferenceControlError> {
     let path = input.canonical_socket_path;
+    let invalid_peer_identity = match peer_policy {
+        BootstrapPeerIdentityPolicy::DistinctServiceUsers => {
+            input.runtime_uid == input.controller_uid
+        }
+        BootstrapPeerIdentityPolicy::SameProcessUser => {
+            input.runtime_uid != input.controller_uid || input.runtime_gid != input.controller_gid
+        }
+    };
     if path.len() <= 1
         || path.first() != Some(&b'/')
         || path.last() == Some(&b'/')
@@ -432,7 +477,7 @@ pub fn reference_bootstrap_channel_policy_fingerprint_v1(
         || input.runtime_gid == 0
         || input.controller_uid == 0
         || input.controller_gid == 0
-        || input.runtime_uid == input.controller_uid
+        || invalid_peer_identity
         || control_bytes_are_zero(input.target.as_bytes())
         || control_bytes_are_zero(input.source_scope.as_bytes())
         || control_bytes_are_zero(input.controller_principal.as_bytes())
@@ -461,7 +506,7 @@ pub fn reference_bootstrap_channel_policy_fingerprint_v1(
         }
     }
 
-    let mut builder = Digest32Builder::try_new(BOOTSTRAP_CHANNEL_POLICY_FINGERPRINT_DOMAIN)?;
+    let mut builder = Digest32Builder::try_new(domain)?;
     builder.field_bytes(input.target.as_bytes())?;
     builder.field_bytes(path)?;
     builder.field_bytes(input.source_scope.as_bytes())?;

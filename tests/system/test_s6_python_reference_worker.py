@@ -22,6 +22,7 @@ from paraegox_sdk.worker.protocol import (
     Direction,
     DrainedBody,
     Frame,
+    FrameBody,
     HeartbeatBody,
     InvokeBody,
     InvokedBody,
@@ -71,7 +72,7 @@ def _identity() -> SessionIdentity:
 def _host_frame(
     sequence: int,
     state: WorkerState,
-    body: object,
+    body: FrameBody,
     invocation_id: int = 0,
 ) -> Frame:
     return Frame(
@@ -80,7 +81,7 @@ def _host_frame(
         Direction.HOST_TO_WORKER,
         state,
         invocation_id,
-        body,  # type: ignore[arg-type]
+        body,
     )
 
 

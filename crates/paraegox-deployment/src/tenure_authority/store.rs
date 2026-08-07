@@ -43,6 +43,11 @@ const MAX_LINUX_MOUNTINFO_LINE_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FilesystemPolicy {
     ProductionReference,
+    /// Explicit same-user developer profile. This keeps every path, owner,
+    /// mode, link-count, lock, checksum, and durable-publish check below, but
+    /// does not claim that the host filesystem has the Linux/ext4 production
+    /// evidence profile.
+    DeveloperLocal,
     #[cfg(test)]
     ExplicitFixture,
 }
@@ -714,6 +719,9 @@ fn validate_absolute_path_chain(path: &Path) -> Result<(), StoreOpenError> {
 }
 
 fn verify_filesystem(directory: &File, _policy: FilesystemPolicy) -> Result<(), StoreOpenError> {
+    if _policy == FilesystemPolicy::DeveloperLocal {
+        return Ok(());
+    }
     #[cfg(test)]
     if _policy == FilesystemPolicy::ExplicitFixture {
         return Ok(());
