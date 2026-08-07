@@ -53,6 +53,22 @@ impl fmt::Display for DeploymentdProcessError {
             ProcessErrorKind::Commit => ("PXDC-COMMIT-FAILED-CLOSED", "commit_reference_plan"),
             ProcessErrorKind::Tenure => ("PXDC-TENURE-FAILED-CLOSED", "acquire_tenure"),
             ProcessErrorKind::Bootstrap => ("PXDC-BOOTSTRAP-FAILED-CLOSED", "bootstrap_runtime"),
+            ProcessErrorKind::ServingObservation => (
+                "PXDC-SERVING-OBSERVATION-FAILED-CLOSED",
+                "observe_managed_serving",
+            ),
+            ProcessErrorKind::AgentStack => (
+                "PXDC-AGENT-STACK-FAILED-CLOSED",
+                "operate_managed_agent_stack",
+            ),
+            ProcessErrorKind::NodeDiscovery => (
+                "PXDC-NODE-DISCOVERY-FAILED-CLOSED",
+                "observe_distributed_nodes_once",
+            ),
+            ProcessErrorKind::DistributedApply => (
+                "PXDC-DISTRIBUTED-APPLY-FAILED-CLOSED",
+                "apply_distributed_agent_stack_once",
+            ),
             ProcessErrorKind::Apply => ("PXDC-APPLY-FAILED-CLOSED", "apply_reference"),
             ProcessErrorKind::Reconcile => {
                 ("PXDC-RECONCILE-FAILED-CLOSED", "reconcile_reference_once")
@@ -85,6 +101,10 @@ enum ProcessErrorKind {
     Commit,
     Tenure,
     Bootstrap,
+    ServingObservation,
+    AgentStack,
+    NodeDiscovery,
+    DistributedApply,
     Apply,
     Reconcile,
     Output,
@@ -94,6 +114,15 @@ enum ProcessErrorKind {
 pub fn run_deploymentd_process() -> Result<(), DeploymentdProcessError> {
     platform::run()
 }
+
+#[cfg(unix)]
+pub(crate) use platform::{
+    DistributedAgentStackOwnerApplyErrorV1, DistributedAgentStackOwnerApplyOutcomeV1,
+    DistributedAgentStackOwnerConnectorInputV1, DistributedAgentStackOwnerNodeInputV1,
+    DistributedAgentStackOwnerTargetInputV1, DistributedCoordinatorContextV1,
+    run_developer_local_distributed_agent_stack_owner_v1,
+    verify_distributed_coordinator_context_v1,
+};
 
 #[cfg(not(unix))]
 mod platform {
@@ -111,31 +140,51 @@ mod platform {
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, File, Metadata};
     use std::io::{Read, Write};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::MetadataExt;
     use std::path::{Component, Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant as MonotonicInstant, SystemTime, UNIX_EPOCH};
 
     use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
     use nix::fcntl::{OFlag, open};
     use nix::sys::stat::Mode;
     use nix::unistd::{getegid, geteuid};
+    use paraegox_fabric::ResolvedRemoteMtlsIdentityFiles;
     use paraegox_kernel::digest::{Digest32, Digest32Builder};
     use paraegox_kernel::identity::PrincipalRef;
     use paraegox_kernel::time::BoundedDuration;
     use paraegox_runtime_contracts::apply::{
         PlanWriterRef, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm, TenureProofAuthority,
     };
+    use paraegox_runtime_contracts::assignment::BindingId;
+    use paraegox_runtime_contracts::distributed_agent_stack_plan::{
+        DistributedAgentStackTerminalOutcomeV1, DistributedFabricTopologyV1,
+        MAX_DISTRIBUTED_FABRIC_TOPOLOGY_BYTES,
+        MAX_RESTRICTED_RUNTIME_APPLY_TRANSPORT_PROFILE_BYTES,
+        RestrictedRuntimeApplyCarrierBindingFieldsV1, RestrictedRuntimeApplyCarrierBindingV1,
+        RestrictedRuntimeApplyTransportProfileV1,
+    };
     use paraegox_runtime_contracts::installation::MAX_INSTALLED_RUNTIME_MANIFEST_BYTES;
+    use paraegox_runtime_contracts::managed_agent_stack_plan::{
+        ManagedAgentIngressLimitsV1, ManagedAgentPortPlanV1, ManagedAgentProviderRefV1,
+        ManagedAgentProviderSelectionV1, ManagedAgentSecretRefV1, ManagedAgentSemanticLimitsV1,
+        ManagedAgentServicePlanV1, ManagedAgentStackTargetModeV1,
+    };
+    use paraegox_runtime_contracts::managed_service::{
+        ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
+    };
     use paraegox_runtime_contracts::reference_control::{
-        ReferenceAdmissionPolicyInputV1, ReferenceApplyTerminalHeadV1,
-        ReferenceApplyTerminalLifecycleEffectV1, ReferenceApplyTerminalOutcomeV1,
-        ReferenceBootstrapChannelPolicyInputV1, ReferenceBootstrapResponseV1,
-        ValidatedReferenceLifecycleBudgetsV1, ed25519_control_key_fingerprint,
-        reference_admission_policy_fingerprint_v1,
+        MAX_REFERENCE_QUERY_RESPONSE_BYTES, ReferenceAdmissionPolicyInputV1,
+        ReferenceApplyTerminalHeadV1, ReferenceApplyTerminalLifecycleEffectV1,
+        ReferenceApplyTerminalOutcomeV1, ReferenceBootstrapChannelPolicyInputV1,
+        ReferenceBootstrapResponseV1, ReferenceQueryIdV1, ReferenceQueryRequestDraftV1,
+        ReferenceQuerySelectorV1, ValidatedReferenceLifecycleBudgetsV1,
+        ed25519_control_key_fingerprint, reference_admission_policy_fingerprint_v1,
         reference_bootstrap_channel_policy_fingerprint_v1,
     };
-    use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
+    use paraegox_runtime_contracts::wire::{
+        ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
+    };
     use tokio::runtime::Builder as RuntimeBuilder;
     use zeroize::Zeroizing;
 
@@ -152,18 +201,59 @@ mod platform {
         ControllerInitializationInput, ControllerInitializationReceipt, initialize_controller_store,
     };
     use crate::controller_journal::{
-        ControllerAuthKeyFingerprint, ControllerJournalSnapshot, ControllerOperationId,
-        ControllerOwnerIdentityFingerprint, ControllerRequestAuthPin,
+        ControllerAuthKeyFingerprint, ControllerJournalError, ControllerJournalSnapshot,
+        ControllerOperationId, ControllerOwnerIdentityFingerprint, ControllerRequestAuthPin,
         ControllerTenureAuthorityDomainFingerprint, ControllerTenureTransaction,
     };
     use crate::controller_query::ControllerQueryProvisioningV1;
     use crate::controller_reconcile::{ControllerReconcileOutcomeV1, reconcile_reference_once_v1};
-    use crate::controller_store::{ControllerStore, ControllerStoreMigrationDisposition};
+    use crate::controller_store::ControllerStoreOpenError;
+    use crate::controller_store::{
+        ControllerDistributedAgentStackOwnerStateV1, ControllerStore,
+        ControllerStoreMigrationDisposition, DistributedRuntimeObservationCommitDispositionV1,
+    };
     use crate::controller_tenure::{ControllerAcquiredTenure, acquire_tenure_once};
     use crate::deck::{
         CardDefinitionVersionRequirement, CardUseKey, DeckCardConfig, DeckCardRole, DeckCardSpec,
         DeckCompiler, DeckExportRef, DeckKey, DeckLifetimeRequest, DeckOwnershipRequest,
         DeckResolverSnapshot, DeckSpec, ResolvedCardArtifact, ResolvedCardDefinition,
+    };
+    use crate::distributed_agent_stack_apply::DistributedAgentStackApplyJournalV1;
+    use crate::distributed_agent_stack_node_reconcile::{
+        DistributedAgentStackNodeDiscoveryStateV1, DistributedAgentStackNodeTargetV1,
+        DistributedAgentStackRuntimeQueryInputV1, DistributedAgentStackRuntimeQueryPhaseV1,
+        NodeObservationProcessGenerationV1, ReadyDistributedAgentStackRuntimeEndpointV1,
+        RuntimeObservationPublishFieldsV1, TransportAuthenticatedNodeResponseV1,
+        TrustedLocalNodeClientErrorV1, TrustedLocalNodeEndpointV1,
+        TrustedLocalRuntimeObservationEndpointV1,
+    };
+    use crate::distributed_agent_stack_producer::{
+        DistributedAgentStackRolloutIdV1, DistributedAgentStackTargetRolloutInputV1,
+        FreshDistributedAgentStackApplyV1, VerifiedDistributedAgentStackPredecessorV1,
+        produce_distributed_agent_stack_rollout_v1, validate_predecessor_pair,
+    };
+    use crate::distributed_agent_stack_store::{
+        DistributedAgentStackRolloutStatusV1, DistributedAgentStackStoreError,
+    };
+    use crate::managed_agent_stack_apply::{
+        ManagedAgentStackApplyJournalV1, ManagedAgentStackTerminalCommitV1,
+    };
+    use crate::managed_agent_stack_producer::{
+        FreshManagedAgentStackApplyV1, ManagedAgentStackActivationV1,
+    };
+    use crate::managed_fabric_apply::{
+        ManagedFabricApplyControllerError, ManagedFabricApplyJournalV1,
+    };
+    use crate::managed_fabric_producer::{
+        ManagedFabricControllerIdentityV1, ManagedFabricControllerProvisioningV1,
+        ManagedFabricRuntimeChannelPinV1, ManagedFabricServiceAccountsV1,
+        ManagedFabricTenureAuthorityPinV1, VerifiedManagedFabricProducerContextV1,
+    };
+    use crate::managed_fabric_store::{
+        ManagedAgentStackDurableStoreV1, ManagedFabricSuccessorStoreV1,
+    };
+    use crate::managed_serving_client::{
+        FreshManagedServingBootstrapV1, ManagedServingBootstrapPhaseV1, VerifiedManagedServingPinV1,
     };
     use crate::manifest_ingress::ControllerInstalledManifestPin;
     use crate::plan::{DeploymentId, DeploymentScopeId, DeploymentWriterRef};
@@ -173,9 +263,11 @@ mod platform {
         ValidatedReferenceLifecycleBudgets,
     };
     use crate::runtime_control_client::{
-        RuntimeApplyResponseVerifier, RuntimeControlSocketAcl, RuntimeQueryResponseVerifier,
-        RuntimeUnixCredentials, UnixRuntimeApplyClient, UnixRuntimeControlEndpoint,
-        UnixRuntimeQueryClient,
+        RuntimeApplyResponseVerifier, RuntimeControlSocketAcl,
+        RuntimeManagedAgentStackResponseVerifier, RuntimeManagedServingResponseVerifier,
+        RuntimeQueryExchangeError, RuntimeQueryResponseVerifier, RuntimeUnixCredentials,
+        UnixRuntimeApplyClient, UnixRuntimeControlEndpoint, UnixRuntimeManagedAgentStackClient,
+        UnixRuntimeManagedServingClient, UnixRuntimeQueryClient,
     };
     use crate::tenure_client::{
         AcquireTenureRequestToSign, AuthorityProofVerifier, AuthoritySocketAcl,
@@ -187,6 +279,14 @@ mod platform {
         AcquireTenureIntentV1, AcquireTenureOperationId, AcquireTenureRequestDraftV1,
         ControllerAcquireKeyRef, ControllerPublicKeyFingerprint,
         MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
+    };
+    use paraegox_node::observation::{
+        MAX_RUNTIME_OBSERVATION_CHALLENGE_NANOS, RuntimeObservationAuthorityV1,
+        RuntimeObservationEndpointRefV1, derive_runtime_observation_query_nonce_v1,
+    };
+    use paraegox_node::protocol::{NodeManagementRequestV1, NodeManagementTargetV1};
+    use paraegox_node::{
+        MAX_NODE_STATUS_FRESHNESS_NANOS, NodeId, NodeIncarnation, NodeManagementEndpointRefV1,
     };
 
     use super::{DeploymentdProcessError, ProcessErrorKind};
@@ -206,7 +306,7 @@ mod platform {
         b"paraegox.deployment.controller.commit-empty-receipt.sha256.v1";
     const EMPTY_COMMIT_RECEIPT_MAGIC: &[u8] = b"PXDCEMPTY\0";
     const EMPTY_COMMIT_RECEIPT_VERSION: u16 = 1;
-    const MAX_ARGUMENTS: usize = 24;
+    const MAX_ARGUMENTS: usize = 49;
     const PUBLIC_KEY_BYTES: usize = 32;
     const BOOTSTRAP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
     const BOOTSTRAP_ENTROPY_BYTES: usize = 48;
@@ -215,6 +315,27 @@ mod platform {
     const APPLY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
     const APPLY_ENTROPY_BYTES: usize = 64;
     const QUERY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+    const MANAGED_SERVING_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+    const MANAGED_SERVING_ENTROPY_BYTES: usize = 48;
+    const MANAGED_AGENT_STACK_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+    const MANAGED_AGENT_STACK_ENTROPY_BYTES: usize = 64;
+    const DISTRIBUTED_NODE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+    const DISTRIBUTED_ROLLOUT_ENTROPY_BYTES: usize = 144;
+    const DISTRIBUTED_OBSERVATION_ENTROPY_BYTES: usize = 48;
+    const DISTRIBUTED_RUNTIME_QUERY_ENTROPY_BYTES: usize = 32;
+    const DISTRIBUTED_CAPABILITY_MAGIC: &[u8; 4] = b"PXNC";
+    const DISTRIBUTED_CAPABILITY_VERSION_V1: u16 = 1;
+    const DISTRIBUTED_CAPABILITY_VERSION_V2: u16 = 2;
+    const DISTRIBUTED_CAPABILITY_HEADER_BYTES: usize = 32;
+    const DISTRIBUTED_CAPABILITY_CHECKSUM_BYTES: usize = 32;
+    const MAX_DISTRIBUTED_CAPABILITY_BYTES: usize = 256 * 1024;
+    const MAX_DISTRIBUTED_CAPABILITY_PATH_BYTES: usize = 1024;
+    const DISTRIBUTED_CAPABILITY_CHECKSUM_DOMAIN: &[u8] =
+        b"paraegox.deployment.distributed-local-node-capability.sha256.v1";
+    const DISTRIBUTED_CARRIER_BINDING_DOMAIN: &[u8] =
+        b"paraegox.deployment.distributed-local-node-carrier.sha256.v1";
+    const DISTRIBUTED_OWNER_ANCHOR_DOMAIN: &[u8] =
+        b"paraegox.deployment.distributed-agent-stack.owner-anchor.sha256.v1";
 
     pub(super) fn run() -> Result<(), DeploymentdProcessError> {
         let command = parse_arguments(std::env::args_os().skip(1))?;
@@ -231,6 +352,19 @@ mod platform {
             ProcessCommand::CommitReferenceEmpty(arguments) => commit_reference_empty(arguments),
             ProcessCommand::AcquireTenure(arguments) => acquire_tenure(arguments),
             ProcessCommand::BootstrapRuntime(arguments) => bootstrap_runtime(arguments),
+            ProcessCommand::ObserveManagedServing(arguments) => observe_managed_serving(arguments),
+            ProcessCommand::CommitAgentStack(arguments) => commit_agent_stack(*arguments),
+            ProcessCommand::ApplyAgentStack(arguments) => apply_agent_stack(arguments),
+            ProcessCommand::DeactivateAgentStack(arguments) => deactivate_agent_stack(arguments),
+            ProcessCommand::InitializeDistributedAgentStack(capability_path) => {
+                initialize_distributed_agent_stack(capability_path)
+            }
+            ProcessCommand::ObserveDistributedAgentStackNodesOnce(capability_path) => {
+                observe_distributed_agent_stack_nodes_once(capability_path)
+            }
+            ProcessCommand::ApplyDistributedAgentStackOnce(capability_path) => {
+                apply_distributed_agent_stack_once(capability_path)
+            }
             ProcessCommand::ApplyReference(arguments) => apply_reference(arguments),
             ProcessCommand::ReconcileReferenceOnce(arguments) => reconcile_reference(arguments),
         }
@@ -1158,6 +1292,2598 @@ mod platform {
         write_bootstrap_receipt(&receipt)
     }
 
+    fn observe_managed_serving(
+        arguments: ManagedServingArguments,
+    ) -> Result<(), DeploymentdProcessError> {
+        let ManagedServingArguments {
+            bootstrap: arguments,
+            successor_directory,
+            successor_store_id,
+        } = arguments;
+        validate_service_identity(arguments.common.expected_uid, arguments.common.expected_gid)?;
+        validate_bootstrap_separation(&arguments)?;
+        if successor_directory == arguments.common.state_directory
+            || successor_directory.starts_with(&arguments.common.state_directory)
+            || arguments
+                .common
+                .state_directory
+                .starts_with(&successor_directory)
+        {
+            return Err(process_error(ProcessErrorKind::Path));
+        }
+
+        let controller_public = read_pinned_file(
+            &arguments.common.public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let runtime_response_public = read_pinned_file(
+            &arguments.runtime_response_public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let authority_public = read_pinned_file(
+            &arguments.authority_public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let request_auth = request_auth_pin(&arguments.common, &controller_public.bytes)?;
+        let owner_identity = owner_identity(&arguments.common, request_auth.fingerprint)?;
+        let controller_public_bytes = exact_public_key(&controller_public.bytes)?;
+        let runtime_response_public_bytes = exact_public_key(&runtime_response_public.bytes)?;
+        let authority_public_bytes = exact_public_key(&authority_public.bytes)?;
+        if controller_public_bytes == runtime_response_public_bytes
+            || controller_public_bytes == authority_public_bytes
+            || runtime_response_public_bytes == authority_public_bytes
+        {
+            return Err(process_error(ProcessErrorKind::Key));
+        }
+        let controller_seed_file = read_pinned_file(
+            &arguments.controller_private_seed_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PrivateSeed,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let file_identities = [
+            controller_public.identity,
+            controller_seed_file.identity,
+            runtime_response_public.identity,
+            authority_public.identity,
+        ];
+        if file_identities
+            .iter()
+            .enumerate()
+            .any(|(index, identity)| file_identities[index + 1..].contains(identity))
+        {
+            return Err(process_error(ProcessErrorKind::Path));
+        }
+        let mut seed = Zeroizing::new([0; PUBLIC_KEY_BYTES]);
+        seed.copy_from_slice(&controller_seed_file.bytes);
+        let controller_signer = SigningKey::from_bytes(&seed);
+        if controller_signer.verifying_key().to_bytes() != controller_public_bytes
+            || controller_signer.verifying_key().is_weak()
+        {
+            return Err(process_error(ProcessErrorKind::Key));
+        }
+
+        let controller = ManagedFabricControllerIdentityV1::try_new(
+            PrincipalRef::from_bytes(arguments.controller_principal),
+            DeploymentWriterRef::from_bytes(arguments.writer_ref),
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let authority = ManagedFabricTenureAuthorityPinV1::try_new(
+            PrincipalRef::from_bytes(arguments.authority_principal),
+            arguments.authority_uid,
+            arguments.authority_gid,
+            TenureAuthorityRef::from_bytes(arguments.tenure_authority_ref),
+            TenureKeyRef::from_bytes(arguments.tenure_key_ref),
+            authority_public_bytes,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let accounts = ManagedFabricServiceAccountsV1::try_new(
+            arguments.runtime_uid,
+            arguments.runtime_gid,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let runtime_channel = ManagedFabricRuntimeChannelPinV1::try_new(
+            arguments.runtime_socket_path.as_os_str().as_bytes(),
+            PrincipalRef::from_bytes(arguments.runtime_principal),
+            ApplyAuthKeyRef::from_bytes(arguments.runtime_response_key_ref),
+            runtime_response_public_bytes,
+            accounts,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let provisioning =
+            ManagedFabricControllerProvisioningV1::new(controller, authority, runtime_channel);
+
+        let mut store = match ControllerStore::open(
+            &arguments.common.state_directory,
+            arguments.expected_store_id,
+            owner_identity,
+        ) {
+            Ok(legacy) => ManagedFabricSuccessorStoreV1::cutover_from_legacy(
+                legacy,
+                &arguments.common.state_directory,
+                &successor_directory,
+                successor_store_id,
+                owner_identity,
+                &controller_signer,
+                &provisioning,
+            ),
+            Err(ControllerStoreOpenError::Codec(ControllerJournalError::UnknownPayloadVersion)) => {
+                ManagedFabricSuccessorStoreV1::resume_from_cutover_marker(
+                    &arguments.common.state_directory,
+                    &successor_directory,
+                    successor_store_id,
+                    owner_identity,
+                    &controller_signer,
+                    &provisioning,
+                )
+            }
+            Err(_) => return Err(process_error(ProcessErrorKind::Store)),
+        }
+        .map_err(|_| process_error(ProcessErrorKind::Store))?;
+        let legacy_state = store.state().legacy_snapshot().state();
+        if legacy_state.scope() != DeploymentScopeId::from_bytes(arguments.common.scope)
+            || legacy_state.plan_lineage() != DeploymentId::from_bytes(arguments.common.plan)
+            || legacy_state.request_auth() != request_auth.pin
+        {
+            return Err(process_error(ProcessErrorKind::Provisioning));
+        }
+        let target = legacy_state.installed_manifest().target();
+        let endpoint = UnixRuntimeControlEndpoint::try_new(
+            arguments.runtime_socket_path,
+            RuntimeControlSocketAcl::new(arguments.runtime_uid, arguments.common.expected_gid),
+            RuntimeUnixCredentials::new(arguments.runtime_uid, arguments.runtime_gid),
+            target,
+            PrincipalRef::from_bytes(arguments.runtime_principal),
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let runtime_verifying_key = VerifyingKey::from_bytes(&runtime_response_public_bytes)
+            .map_err(|_| process_error(ProcessErrorKind::Key))?;
+        let runtime_key_fingerprint =
+            ed25519_control_key_fingerprint(runtime_verifying_key.as_bytes())
+                .map_err(|_| process_error(ProcessErrorKind::Key))?;
+        let response_verifier = RuntimeManagedServingResponseVerifier::try_new(
+            PrincipalRef::from_bytes(arguments.runtime_principal),
+            ApplyAuthKeyRef::from_bytes(arguments.runtime_response_key_ref),
+            request_auth.pin.algorithm(),
+            request_auth.pin.algorithm_version(),
+            runtime_key_fingerprint,
+            runtime_verifying_key,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let client = UnixRuntimeManagedServingClient::try_new(
+            endpoint,
+            response_verifier,
+            MANAGED_SERVING_EXCHANGE_TIMEOUT,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let mut journal = ManagedFabricApplyJournalV1::new(store.state().clone());
+        if journal.state().serving_phase() == ManagedServingBootstrapPhaseV1::AttemptInFlight {
+            journal
+                .close_recovered_serving_bootstrap_with(|next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                })
+                .map_err(|_| process_error(ProcessErrorKind::ServingObservation))?;
+        }
+        let prepared = if journal.state().serving_phase()
+            == ManagedServingBootstrapPhaseV1::RequestDurable
+        {
+            journal
+                .prepared_serving_bootstrap()
+                .map_err(|_| process_error(ProcessErrorKind::ServingObservation))?
+        } else {
+            let fresh = fresh_managed_serving_request()?;
+            journal
+                .prepare_serving_bootstrap_with(&controller_signer, &provisioning, fresh, |next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                })
+                .map_err(|_| process_error(ProcessErrorKind::ServingObservation))?
+        };
+        let action = journal
+            .claim_serving_bootstrap_with(prepared, |next| {
+                store
+                    .commit_state(next)
+                    .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+            })
+            .map_err(|_| process_error(ProcessErrorKind::ServingObservation))?;
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| process_error(ProcessErrorKind::ServingObservation))?;
+        let outcome = runtime.block_on(client.exchange(action));
+        let (action, response) = outcome.into_parts();
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                journal
+                    .close_serving_bootstrap_no_response_with(action, |next| {
+                        store
+                            .commit_state(next)
+                            .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                    })
+                    .map_err(|_| process_error(ProcessErrorKind::ServingObservation))?;
+                return Err(process_error(ProcessErrorKind::ServingObservation));
+            }
+        };
+        let pin = journal
+            .consume_serving_bootstrap_response_with(
+                action,
+                &response,
+                &controller_signer,
+                &provisioning,
+                |next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                },
+            )
+            .map_err(|_| process_error(ProcessErrorKind::ServingObservation))?;
+        write_managed_serving_receipt(&pin)
+    }
+
+    struct ManagedAgentStackProcessContext {
+        store: ManagedFabricSuccessorStoreV1,
+        controller_signer: SigningKey,
+        provisioning: ManagedFabricControllerProvisioningV1,
+        client: UnixRuntimeManagedAgentStackClient,
+    }
+
+    fn open_managed_agent_stack_context(
+        managed: ManagedServingArguments,
+    ) -> Result<ManagedAgentStackProcessContext, DeploymentdProcessError> {
+        let ManagedServingArguments {
+            bootstrap: arguments,
+            successor_directory,
+            successor_store_id,
+        } = managed;
+        validate_service_identity(arguments.common.expected_uid, arguments.common.expected_gid)?;
+        validate_bootstrap_separation(&arguments)?;
+        if successor_directory == arguments.common.state_directory
+            || successor_directory.starts_with(&arguments.common.state_directory)
+            || arguments
+                .common
+                .state_directory
+                .starts_with(&successor_directory)
+        {
+            return Err(process_error(ProcessErrorKind::Path));
+        }
+        let controller_public = read_pinned_file(
+            &arguments.common.public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let controller_seed_file = read_pinned_file(
+            &arguments.controller_private_seed_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PrivateSeed,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let runtime_response_public = read_pinned_file(
+            &arguments.runtime_response_public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let authority_public = read_pinned_file(
+            &arguments.authority_public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )?;
+        let identities = [
+            controller_public.identity,
+            controller_seed_file.identity,
+            runtime_response_public.identity,
+            authority_public.identity,
+        ];
+        if identities
+            .iter()
+            .enumerate()
+            .any(|(index, identity)| identities[index + 1..].contains(identity))
+        {
+            return Err(process_error(ProcessErrorKind::Path));
+        }
+        let request_auth = request_auth_pin(&arguments.common, &controller_public.bytes)?;
+        let owner_identity = owner_identity(&arguments.common, request_auth.fingerprint)?;
+        let controller_public_bytes = exact_public_key(&controller_public.bytes)?;
+        let runtime_response_public_bytes = exact_public_key(&runtime_response_public.bytes)?;
+        let authority_public_bytes = exact_public_key(&authority_public.bytes)?;
+        if controller_public_bytes == runtime_response_public_bytes
+            || controller_public_bytes == authority_public_bytes
+            || runtime_response_public_bytes == authority_public_bytes
+        {
+            return Err(process_error(ProcessErrorKind::Key));
+        }
+        let mut seed = Zeroizing::new([0; PUBLIC_KEY_BYTES]);
+        seed.copy_from_slice(&controller_seed_file.bytes);
+        let controller_signer = SigningKey::from_bytes(&seed);
+        if controller_signer.verifying_key().to_bytes() != controller_public_bytes
+            || controller_signer.verifying_key().is_weak()
+        {
+            return Err(process_error(ProcessErrorKind::Key));
+        }
+        let controller = ManagedFabricControllerIdentityV1::try_new(
+            PrincipalRef::from_bytes(arguments.controller_principal),
+            DeploymentWriterRef::from_bytes(arguments.writer_ref),
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let authority = ManagedFabricTenureAuthorityPinV1::try_new(
+            PrincipalRef::from_bytes(arguments.authority_principal),
+            arguments.authority_uid,
+            arguments.authority_gid,
+            TenureAuthorityRef::from_bytes(arguments.tenure_authority_ref),
+            TenureKeyRef::from_bytes(arguments.tenure_key_ref),
+            authority_public_bytes,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let accounts = ManagedFabricServiceAccountsV1::try_new(
+            arguments.runtime_uid,
+            arguments.runtime_gid,
+            arguments.common.expected_uid,
+            arguments.common.expected_gid,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let runtime_channel = ManagedFabricRuntimeChannelPinV1::try_new(
+            arguments.runtime_socket_path.as_os_str().as_bytes(),
+            PrincipalRef::from_bytes(arguments.runtime_principal),
+            ApplyAuthKeyRef::from_bytes(arguments.runtime_response_key_ref),
+            runtime_response_public_bytes,
+            accounts,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let provisioning =
+            ManagedFabricControllerProvisioningV1::new(controller, authority, runtime_channel);
+        let store = ManagedFabricSuccessorStoreV1::resume_from_cutover_marker(
+            &arguments.common.state_directory,
+            &successor_directory,
+            successor_store_id,
+            owner_identity,
+            &controller_signer,
+            &provisioning,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Store))?;
+        let legacy_state = store.state().legacy_snapshot().state();
+        if legacy_state.scope() != DeploymentScopeId::from_bytes(arguments.common.scope)
+            || legacy_state.plan_lineage() != DeploymentId::from_bytes(arguments.common.plan)
+            || legacy_state.request_auth() != request_auth.pin
+        {
+            return Err(process_error(ProcessErrorKind::Provisioning));
+        }
+        let target = legacy_state.installed_manifest().target();
+        let endpoint = UnixRuntimeControlEndpoint::try_new(
+            arguments.runtime_socket_path,
+            RuntimeControlSocketAcl::new(arguments.runtime_uid, arguments.common.expected_gid),
+            RuntimeUnixCredentials::new(arguments.runtime_uid, arguments.runtime_gid),
+            target,
+            PrincipalRef::from_bytes(arguments.runtime_principal),
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let runtime_verifying_key = VerifyingKey::from_bytes(&runtime_response_public_bytes)
+            .map_err(|_| process_error(ProcessErrorKind::Key))?;
+        let runtime_key_fingerprint =
+            ed25519_control_key_fingerprint(runtime_verifying_key.as_bytes())
+                .map_err(|_| process_error(ProcessErrorKind::Key))?;
+        let response_verifier = RuntimeManagedAgentStackResponseVerifier::try_new(
+            PrincipalRef::from_bytes(arguments.runtime_principal),
+            ApplyAuthKeyRef::from_bytes(arguments.runtime_response_key_ref),
+            request_auth.pin.algorithm(),
+            request_auth.pin.algorithm_version(),
+            runtime_key_fingerprint,
+            runtime_verifying_key,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        let client = UnixRuntimeManagedAgentStackClient::try_new(
+            endpoint,
+            response_verifier,
+            MANAGED_AGENT_STACK_EXCHANGE_TIMEOUT,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Provisioning))?;
+        Ok(ManagedAgentStackProcessContext {
+            store,
+            controller_signer,
+            provisioning,
+            client,
+        })
+    }
+
+    pub(crate) struct DistributedCoordinatorContextV1 {
+        store: ControllerStore,
+        owner_anchor: Digest32,
+        controller_signer: SigningKey,
+    }
+
+    /// Seals an already-open Controller writer as the distributed coordinator
+    /// authority. The caller cannot provide an owner anchor: it is recomputed
+    /// only from the validated durable store, exact owner and Controller key.
+    pub(crate) fn verify_distributed_coordinator_context_v1(
+        store: ControllerStore,
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+        controller_signer: SigningKey,
+    ) -> Result<DistributedCoordinatorContextV1, DeploymentdProcessError> {
+        let snapshot = store
+            .snapshot()
+            .map_err(|_| process_error(ProcessErrorKind::Store))?;
+        let request_auth = snapshot.state().request_auth();
+        let controller_key = controller_signer.verifying_key();
+        let controller_fingerprint = ed25519_control_key_fingerprint(controller_key.as_bytes())
+            .map_err(|_| process_error(ProcessErrorKind::Key))?;
+        if controller_key.is_weak()
+            || snapshot.owner_identity_fingerprint() != expected_owner_identity
+            || request_auth.algorithm().value() != ED25519_ALGORITHM
+            || request_auth.algorithm_version() != ED25519_ALGORITHM_VERSION
+            || request_auth.verification_key_fingerprint().value() != controller_fingerprint
+        {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        let mut anchor = Digest32Builder::try_new(DISTRIBUTED_OWNER_ANCHOR_DOMAIN)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        anchor
+            .field_bytes(snapshot.store_instance_id())
+            .and_then(|builder| builder.field_digest(&expected_owner_identity.value()))
+            .and_then(|builder| builder.field_bytes(snapshot.state().scope().as_bytes()))
+            .and_then(|builder| builder.field_bytes(snapshot.state().plan_lineage().as_bytes()))
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        Ok(DistributedCoordinatorContextV1 {
+            store,
+            owner_anchor: anchor.finish(),
+            controller_signer,
+        })
+    }
+
+    /// Owner-private DeveloperLocal PXNL facts for one distributed target.
+    /// The bearer token remains zeroizing and never appears in Debug output.
+    pub(crate) struct DistributedAgentStackOwnerNodeInputV1 {
+        management_target: NodeManagementTargetV1,
+        socket_path: PathBuf,
+        expected_uid: u32,
+        expected_gid: u32,
+        token: Zeroizing<[u8; 32]>,
+        observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+        observation_socket_path: PathBuf,
+        observation_token: Zeroizing<[u8; 32]>,
+    }
+
+    impl DistributedAgentStackOwnerNodeInputV1 {
+        pub(crate) fn new(
+            management_target: NodeManagementTargetV1,
+            socket_path: PathBuf,
+            expected_uid: u32,
+            expected_gid: u32,
+            token: Zeroizing<[u8; 32]>,
+            observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+            observation_socket_path: PathBuf,
+            observation_token: Zeroizing<[u8; 32]>,
+        ) -> Self {
+            Self {
+                management_target,
+                socket_path,
+                expected_uid,
+                expected_gid,
+                token,
+                observation_endpoint_ref,
+                observation_socket_path,
+                observation_token,
+            }
+        }
+    }
+
+    impl core::fmt::Debug for DistributedAgentStackOwnerNodeInputV1 {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter
+                .debug_struct("DistributedAgentStackOwnerNodeInputV1")
+                .field("management_target", &self.management_target)
+                .field("socket_path", &"<owner-private>")
+                .field("expected_uid", &self.expected_uid)
+                .field("expected_gid", &self.expected_gid)
+                .field("token", &"<redacted>")
+                .field("observation_endpoint_ref", &self.observation_endpoint_ref)
+                .field("observation_socket_path", &"<owner-private>")
+                .field("observation_token", &"<redacted>")
+                .finish()
+        }
+    }
+
+    /// Exact pre-start restricted Runtime carrier and its Controller connector
+    /// resolution. The carrier is recomputed from durable predecessor and
+    /// fresh Node facts before any send authority is created.
+    pub(crate) struct DistributedAgentStackOwnerConnectorInputV1 {
+        profile_ref: [u8; 16],
+        transport_profile: RestrictedRuntimeApplyTransportProfileV1,
+        expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        root_ca_certificate_file: PathBuf,
+        connector_certificate_file: PathBuf,
+        connector_private_key_file: PathBuf,
+    }
+
+    impl DistributedAgentStackOwnerConnectorInputV1 {
+        pub(crate) fn new(
+            profile_ref: [u8; 16],
+            transport_profile: RestrictedRuntimeApplyTransportProfileV1,
+            expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+            root_ca_certificate_file: PathBuf,
+            connector_certificate_file: PathBuf,
+            connector_private_key_file: PathBuf,
+        ) -> Self {
+            Self {
+                profile_ref,
+                transport_profile,
+                expected_carrier,
+                root_ca_certificate_file,
+                connector_certificate_file,
+                connector_private_key_file,
+            }
+        }
+    }
+
+    pub(crate) struct DistributedAgentStackOwnerTargetInputV1 {
+        topology: DistributedFabricTopologyV1,
+        node: DistributedAgentStackOwnerNodeInputV1,
+        connector: DistributedAgentStackOwnerConnectorInputV1,
+        observation_authority: RuntimeObservationAuthorityV1,
+        runtime_query_client: UnixRuntimeQueryClient,
+    }
+
+    impl DistributedAgentStackOwnerTargetInputV1 {
+        pub(crate) fn new(
+            topology: DistributedFabricTopologyV1,
+            node: DistributedAgentStackOwnerNodeInputV1,
+            connector: DistributedAgentStackOwnerConnectorInputV1,
+            observation_authority: RuntimeObservationAuthorityV1,
+            runtime_query_client: UnixRuntimeQueryClient,
+        ) -> Self {
+            Self {
+                topology,
+                node,
+                connector,
+                observation_authority,
+                runtime_query_client,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum DistributedAgentStackOwnerApplyErrorV1 {
+        Operation,
+        PendingNotSent,
+        TerminalNonReady,
+        Uncertain,
+        IndeterminateUncertain,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct DistributedAgentStackOwnerApplyOutcomeV1 {
+        target_receipts: [Box<[u8]>; 2],
+        replayed: bool,
+    }
+
+    impl DistributedAgentStackOwnerApplyOutcomeV1 {
+        pub(crate) fn into_parts(self) -> ([Box<[u8]>; 2], bool) {
+            (self.target_receipts, self.replayed)
+        }
+    }
+
+    struct DistributedAgentStackOwnerTargetV1 {
+        topology: DistributedFabricTopologyV1,
+        node_target: DistributedAgentStackNodeTargetV1,
+        node_endpoint: TrustedLocalNodeEndpointV1,
+        connector: DistributedAgentStackOwnerConnectorInputV1,
+        runtime_observation: Option<DistributedAgentStackOwnerRuntimeObservationV1>,
+    }
+
+    struct DistributedAgentStackOwnerRuntimeObservationV1 {
+        authority: RuntimeObservationAuthorityV1,
+        endpoint_ref: RuntimeObservationEndpointRefV1,
+        endpoint: TrustedLocalRuntimeObservationEndpointV1,
+        token: Zeroizing<[u8; 32]>,
+        query_client: UnixRuntimeQueryClient,
+    }
+
+    struct DistributedAgentStackOwnerInputV1 {
+        lifecycle: BoundedDuration,
+        targets: [DistributedAgentStackOwnerTargetV1; 2],
+    }
+
+    struct DistributedAgentStackOwnerTerminalV1 {
+        status: DistributedAgentStackRolloutStatusV1,
+        target_receipts: [Box<[u8]>; 2],
+        replayed: bool,
+    }
+
+    /// Completes the typed DeveloperLocal owner path without producing or
+    /// consuming PXNC. The coordinator and predecessor tokens were sealed by
+    /// Deployment during the prepare phase; only public Node carrier facts are
+    /// supplied after the two Node daemons have started.
+    pub(crate) fn run_developer_local_distributed_agent_stack_owner_v1(
+        mut coordinator: DistributedCoordinatorContextV1,
+        predecessors: [VerifiedDistributedAgentStackPredecessorV1; 2],
+        lifecycle: BoundedDuration,
+        targets: [DistributedAgentStackOwnerTargetInputV1; 2],
+    ) -> Result<DistributedAgentStackOwnerApplyOutcomeV1, DistributedAgentStackOwnerApplyErrorV1>
+    {
+        validate_predecessor_pair([&predecessors[0], &predecessors[1]])
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        validate_distributed_coordinator_predecessors(&coordinator, &predecessors)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let owner_input = build_developer_local_distributed_owner_input(
+            coordinator.owner_anchor,
+            &predecessors,
+            lifecycle,
+            targets,
+        )?;
+        let existing =
+            reopen_distributed_agent_stack_owner(&coordinator, &predecessors, &owner_input)
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        if let Some(owner) = existing {
+            validate_distributed_owner_configuration(&owner, &owner_input)
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        } else {
+            initialize_distributed_agent_stack_owner(&mut coordinator, &predecessors, &owner_input)
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        }
+        let terminal =
+            apply_distributed_agent_stack_owner(coordinator, &predecessors, &owner_input)?;
+        match terminal.status {
+            DistributedAgentStackRolloutStatusV1::ActiveReady => {
+                Ok(DistributedAgentStackOwnerApplyOutcomeV1 {
+                    target_receipts: terminal.target_receipts,
+                    replayed: terminal.replayed,
+                })
+            }
+            DistributedAgentStackRolloutStatusV1::PendingNotSent => {
+                Err(DistributedAgentStackOwnerApplyErrorV1::PendingNotSent)
+            }
+            DistributedAgentStackRolloutStatusV1::TerminalNonReady => {
+                Err(DistributedAgentStackOwnerApplyErrorV1::TerminalNonReady)
+            }
+            DistributedAgentStackRolloutStatusV1::Uncertain => {
+                Err(DistributedAgentStackOwnerApplyErrorV1::Uncertain)
+            }
+            DistributedAgentStackRolloutStatusV1::IndeterminateUncertain => {
+                Err(DistributedAgentStackOwnerApplyErrorV1::IndeterminateUncertain)
+            }
+        }
+    }
+
+    fn build_developer_local_distributed_owner_input(
+        owner_anchor: Digest32,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        lifecycle: BoundedDuration,
+        targets: [DistributedAgentStackOwnerTargetInputV1; 2],
+    ) -> Result<DistributedAgentStackOwnerInputV1, DistributedAgentStackOwnerApplyErrorV1> {
+        if lifecycle.value() == 0 {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        let [first, second] = targets;
+        if first.node.socket_path == first.node.observation_socket_path
+            || first.node.socket_path == second.node.socket_path
+            || first.node.socket_path == second.node.observation_socket_path
+            || first.node.observation_socket_path == second.node.socket_path
+            || first.node.observation_socket_path == second.node.observation_socket_path
+            || second.node.socket_path == second.node.observation_socket_path
+            || first.node.token.as_ref() == first.node.observation_token.as_ref()
+            || first.node.token.as_ref() == second.node.token.as_ref()
+            || first.node.token.as_ref() == second.node.observation_token.as_ref()
+            || first.node.observation_token.as_ref() == second.node.token.as_ref()
+            || first.node.observation_token.as_ref() == second.node.observation_token.as_ref()
+            || second.node.token.as_ref() == second.node.observation_token.as_ref()
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        let targets = [
+            build_developer_local_distributed_owner_target(
+                owner_anchor,
+                0,
+                predecessors[0].target(),
+                first,
+            )?,
+            build_developer_local_distributed_owner_target(
+                owner_anchor,
+                1,
+                predecessors[1].target(),
+                second,
+            )?,
+        ];
+        let first_observation = targets[0]
+            .runtime_observation
+            .as_ref()
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let second_observation = targets[1]
+            .runtime_observation
+            .as_ref()
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        if first_observation.endpoint_ref == second_observation.endpoint_ref
+            || first_observation.token.as_ref() == second_observation.token.as_ref()
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        Ok(DistributedAgentStackOwnerInputV1 { lifecycle, targets })
+    }
+
+    fn build_developer_local_distributed_owner_target(
+        owner_anchor: Digest32,
+        index: usize,
+        runtime_target: paraegox_kernel::identity::RuntimeHostId,
+        input: DistributedAgentStackOwnerTargetInputV1,
+    ) -> Result<DistributedAgentStackOwnerTargetV1, DistributedAgentStackOwnerApplyErrorV1> {
+        let DistributedAgentStackOwnerTargetInputV1 {
+            topology,
+            node,
+            connector,
+            observation_authority,
+            runtime_query_client,
+        } = input;
+        DistributedFabricTopologyV1::decode(runtime_target, topology.canonical_wire())
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let binding = developer_local_distributed_carrier_binding(
+            owner_anchor,
+            index,
+            runtime_target,
+            &node,
+        )?;
+        let node_target = DistributedAgentStackNodeTargetV1::try_new(
+            runtime_target,
+            node.management_target,
+            binding,
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let node_endpoint = TrustedLocalNodeEndpointV1::try_new(
+            node.socket_path.clone(),
+            node.expected_uid,
+            node.expected_gid,
+            *node.token,
+            binding,
+            DISTRIBUTED_NODE_EXCHANGE_TIMEOUT,
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        if observation_authority.runtime_host_id() != runtime_target
+            || node.socket_path == node.observation_socket_path
+            || node.token.as_ref() == node.observation_token.as_ref()
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        let observation_endpoint = TrustedLocalRuntimeObservationEndpointV1::try_new(
+            node.observation_endpoint_ref,
+            node.observation_socket_path,
+            node.expected_uid,
+            node.expected_gid,
+            *node.observation_token,
+            DISTRIBUTED_NODE_EXCHANGE_TIMEOUT,
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        Ok(DistributedAgentStackOwnerTargetV1 {
+            topology,
+            node_target,
+            node_endpoint,
+            connector,
+            runtime_observation: Some(DistributedAgentStackOwnerRuntimeObservationV1 {
+                authority: observation_authority,
+                endpoint_ref: node.observation_endpoint_ref,
+                endpoint: observation_endpoint,
+                token: node.observation_token,
+                query_client: runtime_query_client,
+            }),
+        })
+    }
+
+    fn developer_local_distributed_carrier_binding(
+        owner_anchor: Digest32,
+        index: usize,
+        runtime_target: paraegox_kernel::identity::RuntimeHostId,
+        node: &DistributedAgentStackOwnerNodeInputV1,
+    ) -> Result<Digest32, DistributedAgentStackOwnerApplyErrorV1> {
+        let index =
+            u64::try_from(index).map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let mut builder = Digest32Builder::try_new(DISTRIBUTED_CARRIER_BINDING_DOMAIN)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        builder
+            .field_digest(&owner_anchor)
+            .and_then(|builder| builder.field_u64(index))
+            .and_then(|builder| builder.field_bytes(runtime_target.as_bytes()))
+            .and_then(|builder| builder.field_bytes(node.management_target.node_id().as_bytes()))
+            .and_then(|builder| {
+                builder.field_bytes(node.management_target.management_endpoint_ref().as_bytes())
+            })
+            .and_then(|builder| {
+                builder.field_bytes(node.management_target.node_incarnation().as_bytes())
+            })
+            .and_then(|builder| builder.field_u64(node.management_target.registration_epoch()))
+            .and_then(|builder| builder.field_bytes(node.socket_path.as_os_str().as_bytes()))
+            .and_then(|builder| builder.field_u64(u64::from(node.expected_uid)))
+            .and_then(|builder| builder.field_u64(u64::from(node.expected_gid)))
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        Ok(builder.finish())
+    }
+
+    enum StagedNodeObservationV1 {
+        Response(TransportAuthenticatedNodeResponseV1),
+        Disconnected(u64),
+    }
+
+    struct CurrentProcessObservationClockV1 {
+        origin: MonotonicInstant,
+        last: u64,
+    }
+
+    impl CurrentProcessObservationClockV1 {
+        fn new() -> Self {
+            Self {
+                origin: MonotonicInstant::now(),
+                last: 0,
+            }
+        }
+
+        fn next(&mut self) -> u64 {
+            let elapsed = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let minimum = self.last.checked_add(1).unwrap_or(u64::MAX);
+            let next = elapsed.max(minimum);
+            self.last = next;
+            next
+        }
+    }
+
+    fn load_distributed_capability(
+        capability_path: &Path,
+    ) -> Result<DistributedLocalCapabilityV1, DeploymentdProcessError> {
+        let expected_uid = geteuid().as_raw();
+        let expected_gid = getegid().as_raw();
+        validate_service_identity(expected_uid, expected_gid)?;
+        let file = read_pinned_file(
+            capability_path,
+            FileLengthPolicy::BoundedNonZero(MAX_DISTRIBUTED_CAPABILITY_BYTES),
+            FileRole::Capability,
+            expected_uid,
+            expected_gid,
+        )?;
+        let capability = DistributedLocalCapabilityV1::decode(&file.bytes)?;
+        if capability.expected_uid != expected_uid || capability.expected_gid != expected_gid {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        Ok(capability)
+    }
+
+    fn open_distributed_coordinator(
+        capability: &DistributedLocalCapabilityV1,
+    ) -> Result<DistributedCoordinatorContextV1, DeploymentdProcessError> {
+        let coordinator = &capability.coordinator;
+        let public = read_pinned_file(
+            &coordinator.common.public_key_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PublicKey,
+            capability.expected_uid,
+            capability.expected_gid,
+        )?;
+        let seed_file = read_pinned_file(
+            &coordinator.controller_private_seed_path,
+            FileLengthPolicy::Exact(PUBLIC_KEY_BYTES),
+            FileRole::PrivateSeed,
+            capability.expected_uid,
+            capability.expected_gid,
+        )?;
+        if public.identity == seed_file.identity {
+            return Err(process_error(ProcessErrorKind::Path));
+        }
+        let public_bytes = exact_public_key(&public.bytes)?;
+        let mut seed = Zeroizing::new([0_u8; PUBLIC_KEY_BYTES]);
+        seed.copy_from_slice(&seed_file.bytes);
+        let controller_signer = SigningKey::from_bytes(&seed);
+        if controller_signer.verifying_key().is_weak()
+            || controller_signer.verifying_key().to_bytes() != public_bytes
+        {
+            return Err(process_error(ProcessErrorKind::Key));
+        }
+        let request_auth = request_auth_pin(&coordinator.common, &public.bytes)?;
+        let owner_identity = owner_identity(&coordinator.common, request_auth.fingerprint)?;
+        let store = ControllerStore::open(
+            &coordinator.common.state_directory,
+            coordinator.expected_store_id,
+            owner_identity,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Store))?;
+        let snapshot = store
+            .snapshot()
+            .map_err(|_| process_error(ProcessErrorKind::Store))?;
+        if snapshot.state().scope() != DeploymentScopeId::from_bytes(coordinator.common.scope)
+            || snapshot.state().plan_lineage() != DeploymentId::from_bytes(coordinator.common.plan)
+            || snapshot.state().request_auth() != request_auth.pin
+        {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        let mut anchor = Digest32Builder::try_new(DISTRIBUTED_OWNER_ANCHOR_DOMAIN)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        anchor
+            .field_bytes(snapshot.store_instance_id())
+            .and_then(|builder| builder.field_digest(&owner_identity.value()))
+            .and_then(|builder| builder.field_bytes(coordinator.common.scope.as_slice()))
+            .and_then(|builder| builder.field_bytes(coordinator.common.plan.as_slice()))
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        Ok(DistributedCoordinatorContextV1 {
+            store,
+            owner_anchor: anchor.finish(),
+            controller_signer,
+        })
+    }
+
+    fn load_verified_distributed_predecessors(
+        capability: &DistributedLocalCapabilityV1,
+    ) -> Result<
+        (
+            [VerifiedDistributedAgentStackPredecessorV1; 2],
+            [DistributedFabricTopologyV1; 2],
+        ),
+        DeploymentdProcessError,
+    > {
+        let first = verify_distributed_predecessor(&capability.predecessors[0])?;
+        let second = verify_distributed_predecessor(&capability.predecessors[1])?;
+        validate_predecessor_pair([&first, &second])
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let first_topology = DistributedFabricTopologyV1::decode(
+            first.target(),
+            &capability.predecessors[0].node.topology_wire,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let second_topology = DistributedFabricTopologyV1::decode(
+            second.target(),
+            &capability.predecessors[1].node.topology_wire,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        Ok(([first, second], [first_topology, second_topology]))
+    }
+
+    fn validate_distributed_coordinator_predecessors(
+        coordinator: &DistributedCoordinatorContextV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+    ) -> Result<(), DeploymentdProcessError> {
+        let state = coordinator
+            .store
+            .snapshot()
+            .map_err(|_| process_error(ProcessErrorKind::Store))?
+            .state();
+        let controller_verifying_key = coordinator.controller_signer.verifying_key().to_bytes();
+        if predecessors.iter().any(|predecessor| {
+            predecessor.source_scope().as_bytes() != state.scope().as_bytes()
+                || predecessor.source_plan().as_bytes() != state.plan_lineage().as_bytes()
+                || predecessor.request_key() != state.request_auth().key()
+                || predecessor.controller_verifying_key() != &controller_verifying_key
+        }) {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        Ok(())
+    }
+
+    fn reopen_distributed_agent_stack_owner(
+        coordinator: &DistributedCoordinatorContextV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        input: &DistributedAgentStackOwnerInputV1,
+    ) -> Result<Option<ControllerDistributedAgentStackOwnerStateV1>, DeploymentdProcessError> {
+        let predecessor_refs = [&predecessors[0], &predecessors[1]];
+        match (
+            input.targets[0].runtime_observation.as_ref(),
+            input.targets[1].runtime_observation.as_ref(),
+        ) {
+            (Some(first), Some(second)) => coordinator
+                .store
+                .reopen_distributed_agent_stack_with_runtime_observation(
+                    coordinator.owner_anchor,
+                    predecessor_refs,
+                    [&first.authority, &second.authority],
+                    [first.endpoint_ref, second.endpoint_ref],
+                ),
+            (None, None) => coordinator
+                .store
+                .reopen_distributed_agent_stack(coordinator.owner_anchor, predecessor_refs),
+            _ => return Err(process_error(ProcessErrorKind::NodeDiscovery)),
+        }
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))
+    }
+
+    fn verify_distributed_predecessor(
+        capability: &DistributedPredecessorCapabilityV1,
+    ) -> Result<VerifiedDistributedAgentStackPredecessorV1, DeploymentdProcessError> {
+        let context = open_managed_agent_stack_context(capability.managed.clone())?;
+        let base = VerifiedManagedFabricProducerContextV1::try_from_provisioning(
+            context.store.state().legacy_snapshot().state(),
+            &context.controller_signer,
+            &context.provisioning,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let state = context
+            .store
+            .state()
+            .agent_stack_state()
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let predecessor =
+            VerifiedDistributedAgentStackPredecessorV1::try_from_committed(&base, state)
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        if predecessor.target() != capability.expected_target {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        Ok(predecessor)
+    }
+
+    fn initialize_distributed_agent_stack_owner(
+        coordinator: &mut DistributedCoordinatorContextV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        input: &DistributedAgentStackOwnerInputV1,
+    ) -> Result<(), DeploymentdProcessError> {
+        validate_distributed_coordinator_predecessors(coordinator, predecessors)?;
+        if reopen_distributed_agent_stack_owner(coordinator, predecessors, input)?.is_some() {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        let entropy = read_exact_entropy::<DISTRIBUTED_ROLLOUT_ENTROPY_BYTES>(
+            ProcessErrorKind::NodeDiscovery,
+        )?;
+        let rollout_id = DistributedAgentStackRolloutIdV1::try_from_bytes(
+            entropy[0..16]
+                .try_into()
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let first_fresh = distributed_fresh(&entropy[16..80], input.lifecycle)?;
+        let second_fresh = distributed_fresh(&entropy[80..144], input.lifecycle)?;
+        let predecessor_refs = [&predecessors[0], &predecessors[1]];
+        let rollout = produce_distributed_agent_stack_rollout_v1(
+            rollout_id,
+            [
+                DistributedAgentStackTargetRolloutInputV1::new(
+                    predecessors[0].clone(),
+                    input.targets[0].topology.clone(),
+                    first_fresh,
+                ),
+                DistributedAgentStackTargetRolloutInputV1::new(
+                    predecessors[1].clone(),
+                    input.targets[1].topology.clone(),
+                    second_fresh,
+                ),
+            ],
+            &coordinator.controller_signer,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let mut journal = DistributedAgentStackApplyJournalV1::empty();
+        journal
+            .prepare_with(coordinator.owner_anchor, rollout, |_| Ok(()))
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let journal_wire = journal
+            .durable_wire()
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let node_state = DistributedAgentStackNodeDiscoveryStateV1::try_initialize(
+            coordinator.owner_anchor,
+            rollout_id,
+            [
+                input.targets[0].node_target.clone(),
+                input.targets[1].node_target.clone(),
+            ],
+            predecessor_refs,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let node_wire = node_state
+            .encode()
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        coordinator
+            .store
+            .commit_distributed_agent_stack_wires(journal_wire, &node_wire)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let expected_journal = journal_wire.to_vec();
+        let reopened = reopen_distributed_agent_stack_owner(coordinator, predecessors, input)?
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+        if reopened.apply_journal().durable_wire() != Some(expected_journal.as_slice())
+            || reopened.node_discovery() != &node_state
+        {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        validate_distributed_owner_configuration(&reopened, input)
+    }
+
+    fn validate_distributed_owner_configuration(
+        owner: &ControllerDistributedAgentStackOwnerStateV1,
+        input: &DistributedAgentStackOwnerInputV1,
+    ) -> Result<(), DeploymentdProcessError> {
+        let state = owner
+            .apply_journal()
+            .state()
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let runtime_targets = owner.node_discovery().runtime_targets();
+        for index in 0..2 {
+            let row = &state.targets()[index];
+            if row.target() != runtime_targets[index]
+                || row.request().target_execution().topology()
+                    != Some(&input.targets[index].topology)
+                || row.restricted_request().is_some_and(|request| {
+                    request.carrier() != &input.targets[index].connector.expected_carrier
+                })
+            {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+        }
+        Ok(())
+    }
+
+    fn initialize_distributed_agent_stack(
+        capability_path: PathBuf,
+    ) -> Result<(), DeploymentdProcessError> {
+        let capability = load_distributed_capability(&capability_path)?;
+        let (predecessors, topologies) = load_verified_distributed_predecessors(&capability)?;
+        let mut coordinator = open_distributed_coordinator(&capability)?;
+        let owner_input =
+            distributed_owner_input_from_capability(&capability, &predecessors, topologies)?;
+        initialize_distributed_agent_stack_owner(&mut coordinator, &predecessors, &owner_input)?;
+        std::io::stdout()
+            .lock()
+            .write_all(b"distributed_agent_stack_v1 outcome=initialized\n")
+            .map_err(|_| process_error(ProcessErrorKind::Output))
+    }
+
+    fn distributed_fresh(
+        bytes: &[u8],
+        lifecycle: BoundedDuration,
+    ) -> Result<FreshDistributedAgentStackApplyV1, DeploymentdProcessError> {
+        if bytes.len() != 64 {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        FreshDistributedAgentStackApplyV1::try_new(
+            bytes[0..16]
+                .try_into()
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+            bytes[16..32]
+                .try_into()
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+            bytes[32..64]
+                .try_into()
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+            lifecycle,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))
+    }
+
+    fn distributed_node_targets(
+        capability: &DistributedLocalCapabilityV1,
+    ) -> Result<[DistributedAgentStackNodeTargetV1; 2], DeploymentdProcessError> {
+        Ok([
+            distributed_node_target(capability, 0)?,
+            distributed_node_target(capability, 1)?,
+        ])
+    }
+
+    fn distributed_node_target(
+        capability: &DistributedLocalCapabilityV1,
+        index: usize,
+    ) -> Result<DistributedAgentStackNodeTargetV1, DeploymentdProcessError> {
+        let predecessor = capability
+            .predecessors
+            .get(index)
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+        DistributedAgentStackNodeTargetV1::try_new(
+            predecessor.expected_target,
+            predecessor.node.management_target,
+            distributed_carrier_binding(capability, index)?,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))
+    }
+
+    fn distributed_carrier_binding(
+        capability: &DistributedLocalCapabilityV1,
+        index: usize,
+    ) -> Result<Digest32, DeploymentdProcessError> {
+        let predecessor = capability
+            .predecessors
+            .get(index)
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let index =
+            u64::try_from(index).map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let mut builder = Digest32Builder::try_new(DISTRIBUTED_CARRIER_BINDING_DOMAIN)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        builder
+            .field_digest(&capability.checksum)
+            .and_then(|builder| builder.field_u64(index))
+            .and_then(|builder| builder.field_bytes(predecessor.expected_target.as_bytes()))
+            .and_then(|builder| {
+                builder.field_bytes(predecessor.node.management_target.node_id().as_bytes())
+            })
+            .and_then(|builder| {
+                builder.field_bytes(
+                    predecessor
+                        .node
+                        .management_target
+                        .management_endpoint_ref()
+                        .as_bytes(),
+                )
+            })
+            .and_then(|builder| {
+                builder.field_bytes(
+                    predecessor
+                        .node
+                        .management_target
+                        .node_incarnation()
+                        .as_bytes(),
+                )
+            })
+            .and_then(|builder| {
+                builder.field_u64(predecessor.node.management_target.registration_epoch())
+            })
+            .and_then(|builder| {
+                builder.field_bytes(predecessor.node.socket_path.as_os_str().as_bytes())
+            })
+            .and_then(|builder| builder.field_u64(u64::from(predecessor.node.expected_uid)))
+            .and_then(|builder| builder.field_u64(u64::from(predecessor.node.expected_gid)))
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        Ok(builder.finish())
+    }
+
+    fn distributed_owner_input_from_capability(
+        capability: &DistributedLocalCapabilityV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        topologies: [DistributedFabricTopologyV1; 2],
+    ) -> Result<DistributedAgentStackOwnerInputV1, DeploymentdProcessError> {
+        let [first_node_target, second_node_target] = distributed_node_targets(capability)?;
+        let [first_node_endpoint, second_node_endpoint] = distributed_node_endpoints(capability)?;
+        let connectors = capability.distributed_apply_connectors()?;
+        let [first_topology, second_topology] = topologies;
+        Ok(DistributedAgentStackOwnerInputV1 {
+            lifecycle: BoundedDuration::from_nanos(capability.lifecycle_budget_nanos),
+            targets: [
+                DistributedAgentStackOwnerTargetV1 {
+                    topology: first_topology,
+                    node_target: first_node_target,
+                    node_endpoint: first_node_endpoint,
+                    connector: distributed_owner_connector_from_capability(
+                        connectors[0],
+                        &predecessors[0],
+                    )?,
+                    runtime_observation: None,
+                },
+                DistributedAgentStackOwnerTargetV1 {
+                    topology: second_topology,
+                    node_target: second_node_target,
+                    node_endpoint: second_node_endpoint,
+                    connector: distributed_owner_connector_from_capability(
+                        connectors[1],
+                        &predecessors[1],
+                    )?,
+                    runtime_observation: None,
+                },
+            ],
+        })
+    }
+
+    fn distributed_owner_connector_from_capability(
+        connector: &DistributedRestrictedControllerConnectorCapabilityV1,
+        predecessor: &VerifiedDistributedAgentStackPredecessorV1,
+    ) -> Result<DistributedAgentStackOwnerConnectorInputV1, DeploymentdProcessError> {
+        let profile = &connector.transport_profile;
+        if profile.target() != predecessor.target()
+            || profile.controller_principal() != predecessor.controller_principal()
+            || profile.runtime_principal() != predecessor.runtime_principal()
+        {
+            return Err(process_error(ProcessErrorKind::DistributedApply));
+        }
+        let expected_carrier = RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: predecessor.target(),
+                runtime_principal: predecessor.runtime_principal(),
+                controller_principal: predecessor.controller_principal(),
+                endpoint_ref: profile.endpoint_ref(),
+                endpoint_generation: profile.endpoint_generation(),
+                route: profile.route(),
+                controller_request_key: predecessor.request_key(),
+                controller_request_key_fingerprint: ed25519_control_key_fingerprint(
+                    predecessor.controller_verifying_key(),
+                )
+                .map_err(|_| process_error(ProcessErrorKind::DistributedApply))?,
+                runtime_response_key: predecessor.runtime_response_key(),
+                runtime_response_key_fingerprint: ed25519_control_key_fingerprint(
+                    predecessor.runtime_response_public_key().as_bytes(),
+                )
+                .map_err(|_| process_error(ProcessErrorKind::DistributedApply))?,
+                control_transport_profile_ref: connector.profile_ref,
+                control_transport_profile_digest: profile.profile_digest(),
+            },
+        )
+        .map_err(|_| process_error(ProcessErrorKind::DistributedApply))?;
+        Ok(DistributedAgentStackOwnerConnectorInputV1 {
+            profile_ref: connector.profile_ref,
+            transport_profile: profile.clone(),
+            expected_carrier,
+            root_ca_certificate_file: connector.root_ca_certificate_file.clone(),
+            connector_certificate_file: connector.connector_certificate_file.clone(),
+            connector_private_key_file: connector.connector_private_key_file.clone(),
+        })
+    }
+
+    fn observe_distributed_agent_stack_nodes_once(
+        capability_path: PathBuf,
+    ) -> Result<(), DeploymentdProcessError> {
+        let capability = load_distributed_capability(&capability_path)?;
+        let (predecessors, topologies) = load_verified_distributed_predecessors(&capability)?;
+        let coordinator = open_distributed_coordinator(&capability)?;
+        let owner_input =
+            distributed_owner_input_from_capability(&capability, &predecessors, topologies)?;
+        let observation = fresh_distributed_agent_stack_owner_observation(
+            coordinator,
+            &predecessors,
+            &owner_input,
+        )?;
+        let outcome = if observation.ready_endpoints.is_some() {
+            b"ready".as_slice()
+        } else {
+            b"blocked".as_slice()
+        };
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(b"distributed_agent_stack_node_discovery_v1 outcome=")
+            .and_then(|()| stdout.write_all(outcome))
+            .and_then(|()| stdout.write_all(b"\n"))
+            .map_err(|_| process_error(ProcessErrorKind::Output))
+    }
+
+    struct FreshDistributedAgentStackNodeObservationV1 {
+        coordinator: DistributedCoordinatorContextV1,
+        owner: ControllerDistributedAgentStackOwnerStateV1,
+        ready_endpoints: Option<[ReadyDistributedAgentStackRuntimeEndpointV1; 2]>,
+        status_sequences: Option<[u64; 2]>,
+    }
+
+    fn fresh_distributed_agent_stack_owner_observation(
+        mut coordinator: DistributedCoordinatorContextV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        input: &DistributedAgentStackOwnerInputV1,
+    ) -> Result<FreshDistributedAgentStackNodeObservationV1, DeploymentdProcessError> {
+        validate_distributed_coordinator_predecessors(&coordinator, predecessors)?;
+        let owner = reopen_distributed_agent_stack_owner(&coordinator, predecessors, input)?
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+        validate_distributed_owner_configuration(&owner, input)?;
+        let journal_wire = owner
+            .apply_journal()
+            .durable_wire()
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?
+            .to_vec();
+        let durable_journal_before = journal_wire.clone();
+        let entropy = read_exact_entropy::<DISTRIBUTED_OBSERVATION_ENTROPY_BYTES>(
+            ProcessErrorKind::NodeDiscovery,
+        )?;
+        let generation = NodeObservationProcessGenerationV1::try_from_bytes(
+            entropy[0..16]
+                .try_into()
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let mut node_state = owner
+            .node_discovery()
+            .try_begin_observation_process(generation)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let targets = node_state.runtime_targets();
+        let requests = [
+            node_state
+                .request_for(
+                    targets[0],
+                    entropy[16..32]
+                        .try_into()
+                        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+                )
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+            node_state
+                .request_for(
+                    targets[1],
+                    entropy[32..48]
+                        .try_into()
+                        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+                )
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+        ];
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let mut clock = CurrentProcessObservationClockV1::new();
+        let first = stage_node_observation(
+            &runtime,
+            &input.targets[0].node_endpoint,
+            &requests[0],
+            generation,
+            &mut clock,
+        )?;
+        let second = stage_node_observation(
+            &runtime,
+            &input.targets[1].node_endpoint,
+            &requests[1],
+            generation,
+            &mut clock,
+        )?;
+        drop(owner);
+
+        for (target, request, staged) in [
+            (targets[0], &requests[0], first),
+            (targets[1], &requests[1], second),
+        ] {
+            node_state = match staged {
+                StagedNodeObservationV1::Response(response) => {
+                    node_state.try_observe_authenticated(target, request, response)
+                }
+                StagedNodeObservationV1::Disconnected(observed_at_nanos) => {
+                    node_state.try_observe_disconnect(target, generation, observed_at_nanos)
+                }
+            }
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+            let node_wire = node_state
+                .encode()
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+            coordinator
+                .store
+                .commit_distributed_agent_stack_wires(&journal_wire, &node_wire)
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        }
+        let persisted_journal = coordinator
+            .store
+            .snapshot()
+            .map_err(|_| process_error(ProcessErrorKind::Store))?
+            .distributed_agent_stack_journal_wire()
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+        if persisted_journal != durable_journal_before {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        let verified = reopen_distributed_agent_stack_owner(&coordinator, predecessors, input)?
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+        validate_distributed_owner_configuration(&verified, input)?;
+        if verified.apply_journal().durable_wire() != Some(durable_journal_before.as_slice()) {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        let qualified = verified
+            .node_discovery()
+            .try_qualify_verified_reopen(&node_state)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let ready_endpoints = qualified
+            .ready_endpoints(
+                clock.next(),
+                current_unix_nanos()?,
+                [&predecessors[0], &predecessors[1]],
+            )
+            .ok();
+        let status_sequences = match (
+            qualified.current_authenticated_status_sequence(targets[0]),
+            qualified.current_authenticated_status_sequence(targets[1]),
+        ) {
+            (Ok(first), Ok(second)) => Some([first, second]),
+            _ => None,
+        };
+        Ok(FreshDistributedAgentStackNodeObservationV1 {
+            coordinator,
+            owner: verified,
+            ready_endpoints,
+            status_sequences,
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DistributedRuntimeObservationStageV1 {
+        Complete,
+        NotSent,
+        Uncertain,
+        Rejected,
+    }
+
+    /// Advances only the durable request/response/publication chain. Fresh
+    /// PXQR authority exists solely between the pair commit readback and this
+    /// function's two one-shot Runtime exchanges; a reopened request-only row
+    /// is closed as ResidentAuthorityLost and is never reconstructed.
+    fn advance_distributed_runtime_observation_chain(
+        mut coordinator: DistributedCoordinatorContextV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        input: &DistributedAgentStackOwnerInputV1,
+        authenticated_status_sequences: [u64; 2],
+    ) -> Result<DistributedCoordinatorContextV1, DistributedAgentStackOwnerApplyErrorV1> {
+        let first_observation = input.targets[0]
+            .runtime_observation
+            .as_ref()
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::PendingNotSent)?;
+        let second_observation = input.targets[1]
+            .runtime_observation
+            .as_ref()
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::PendingNotSent)?;
+        let predecessor_refs = [&predecessors[0], &predecessors[1]];
+        let authority_refs = [&first_observation.authority, &second_observation.authority];
+        let endpoint_refs = [
+            first_observation.endpoint_ref,
+            second_observation.endpoint_ref,
+        ];
+
+        let mut owner = reopen_distributed_agent_stack_owner(&coordinator, predecessors, input)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let targets = owner.node_discovery().runtime_targets();
+        if let Some(phases) = owner.node_discovery().runtime_query_phases() {
+            let mut resident_authority_was_lost = false;
+            for index in 0..2 {
+                if phases[index] == DistributedAgentStackRuntimeQueryPhaseV1::RequestDurableNotSent
+                {
+                    coordinator
+                        .store
+                        .commit_distributed_runtime_query_closure(
+                            targets[index],
+                            DistributedAgentStackRuntimeQueryPhaseV1::ResidentAuthorityLost,
+                            coordinator.owner_anchor,
+                            predecessor_refs,
+                            authority_refs,
+                            endpoint_refs,
+                        )
+                        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+                    resident_authority_was_lost = true;
+                }
+            }
+            if resident_authority_was_lost {
+                return Err(DistributedAgentStackOwnerApplyErrorV1::PendingNotSent);
+            }
+            owner = reopen_distributed_agent_stack_owner(&coordinator, predecessors, input)
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?
+                .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        }
+
+        let append_fresh_pair = owner
+            .node_discovery()
+            .runtime_query_phases()
+            .is_none_or(|phases| phases.into_iter().all(runtime_query_phase_is_closed));
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        if append_fresh_pair {
+            let entropy = read_exact_entropy::<DISTRIBUTED_RUNTIME_QUERY_ENTROPY_BYTES>(
+                ProcessErrorKind::NodeDiscovery,
+            )
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+            let issued_at = current_unix_nanos()
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+            let freshness_budget =
+                MAX_RUNTIME_OBSERVATION_CHALLENGE_NANOS.min(MAX_NODE_STATUS_FRESHNESS_NANOS);
+            let expires_at = issued_at
+                .checked_add(freshness_budget)
+                .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+            let intended_sequences = [
+                authenticated_status_sequences[0]
+                    .checked_add(1)
+                    .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?,
+                authenticated_status_sequences[1]
+                    .checked_add(1)
+                    .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?,
+            ];
+            let inputs = [
+                build_distributed_runtime_query_input(
+                    &coordinator.controller_signer,
+                    &predecessors[0],
+                    input.targets[0].node_target.management_target(),
+                    first_observation,
+                    intended_sequences[0],
+                    entropy[..16]
+                        .try_into()
+                        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?,
+                    issued_at,
+                    expires_at,
+                    freshness_budget,
+                )?,
+                build_distributed_runtime_query_input(
+                    &coordinator.controller_signer,
+                    &predecessors[1],
+                    input.targets[1].node_target.management_target(),
+                    second_observation,
+                    intended_sequences[1],
+                    entropy[16..]
+                        .try_into()
+                        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?,
+                    issued_at,
+                    expires_at,
+                    freshness_budget,
+                )?,
+            ];
+            let next = owner
+                .node_discovery()
+                .try_prepare_runtime_query_pair(inputs)
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+            drop(owner);
+            let committed = coordinator
+                .store
+                .commit_distributed_runtime_query_pair(
+                    &next,
+                    predecessor_refs,
+                    authority_refs,
+                    endpoint_refs,
+                )
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+            let [first_query, second_query] = coordinator
+                .store
+                .claim_distributed_runtime_query_pair(
+                    committed,
+                    coordinator.owner_anchor,
+                    predecessor_refs,
+                    authority_refs,
+                    endpoint_refs,
+                )
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+            let _first_stage = exchange_distributed_runtime_query_once(
+                &runtime,
+                &mut coordinator,
+                predecessors,
+                input,
+                0,
+                first_query,
+            )?;
+            let _second_stage = exchange_distributed_runtime_query_once(
+                &runtime,
+                &mut coordinator,
+                predecessors,
+                input,
+                1,
+                second_query,
+            )?;
+        } else {
+            drop(owner);
+        }
+
+        let mut stages = [DistributedRuntimeObservationStageV1::Complete; 2];
+        for index in 0..2 {
+            let publication = advance_distributed_runtime_observation_once(
+                &runtime,
+                &mut coordinator,
+                predecessors,
+                input,
+                index,
+            )?;
+            stages[index] = publication;
+        }
+        if stages
+            .iter()
+            .copied()
+            .any(|stage| stage == DistributedRuntimeObservationStageV1::Uncertain)
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Uncertain);
+        }
+        if stages
+            .iter()
+            .copied()
+            .any(|stage| stage != DistributedRuntimeObservationStageV1::Complete)
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::PendingNotSent);
+        }
+        Ok(coordinator)
+    }
+
+    fn runtime_query_phase_is_closed(phase: DistributedAgentStackRuntimeQueryPhaseV1) -> bool {
+        phase == DistributedAgentStackRuntimeQueryPhaseV1::ObservationAckDurable
+            || phase.is_terminal_failure()
+    }
+
+    fn stage_from_runtime_query_phase(
+        phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    ) -> DistributedRuntimeObservationStageV1 {
+        match phase {
+            DistributedAgentStackRuntimeQueryPhaseV1::QueryUncertain
+            | DistributedAgentStackRuntimeQueryPhaseV1::ObservationUncertain => {
+                DistributedRuntimeObservationStageV1::Uncertain
+            }
+            DistributedAgentStackRuntimeQueryPhaseV1::QueryRejected
+            | DistributedAgentStackRuntimeQueryPhaseV1::ObservationRejected => {
+                DistributedRuntimeObservationStageV1::Rejected
+            }
+            DistributedAgentStackRuntimeQueryPhaseV1::ResidentAuthorityLost
+            | DistributedAgentStackRuntimeQueryPhaseV1::QueryNotSent
+            | DistributedAgentStackRuntimeQueryPhaseV1::ObservationNotSent => {
+                DistributedRuntimeObservationStageV1::NotSent
+            }
+            _ => DistributedRuntimeObservationStageV1::Complete,
+        }
+    }
+
+    fn build_distributed_runtime_query_input(
+        signer: &SigningKey,
+        predecessor: &VerifiedDistributedAgentStackPredecessorV1,
+        node_target: NodeManagementTargetV1,
+        observation: &DistributedAgentStackOwnerRuntimeObservationV1,
+        intended_status_sequence: u64,
+        query_id: [u8; 16],
+        issued_at_unix_nanos: u64,
+        expires_at_unix_nanos: u64,
+        freshness_budget_nanos: u64,
+    ) -> Result<DistributedAgentStackRuntimeQueryInputV1, DistributedAgentStackOwnerApplyErrorV1>
+    {
+        let nonce = derive_runtime_observation_query_nonce_v1(
+            &*observation.token,
+            node_target,
+            observation.endpoint_ref,
+            &observation.authority,
+            intended_status_sequence,
+            issued_at_unix_nanos,
+            expires_at_unix_nanos,
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let selector = ReferenceQuerySelectorV1::try_new(
+            ReferenceQueryIdV1::from_bytes(query_id),
+            predecessor.target(),
+            predecessor.source_scope(),
+            predecessor.request().expected_runtime_store_instance_id(),
+            predecessor.request().operation_id(),
+            Some(predecessor.request().envelope_request_digest()),
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let claim = ApplyRequestAuthClaim::try_new(
+            predecessor.controller_principal(),
+            predecessor.request_key(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?,
+            ED25519_ALGORITHM_VERSION,
+            nonce.as_bytes(),
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let draft = ReferenceQueryRequestDraftV1::try_new(
+            selector,
+            claim,
+            u32::try_from(MAX_REFERENCE_QUERY_RESPONSE_BYTES)
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?,
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let signature = signer.sign(
+            draft
+                .signing_transcript()
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?
+                .as_bytes(),
+        );
+        let request = draft
+            .finalize(&signature.to_bytes())
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        DistributedAgentStackRuntimeQueryInputV1::try_new(
+            request,
+            observation.authority.serving_baseline(),
+            observation.endpoint_ref,
+            RuntimeObservationPublishFieldsV1::new(
+                intended_status_sequence,
+                freshness_budget_nanos,
+                predecessor.target(),
+                observation.authority.authority_digest(),
+                issued_at_unix_nanos,
+                expires_at_unix_nanos,
+            ),
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)
+    }
+
+    fn exchange_distributed_runtime_query_once(
+        runtime: &tokio::runtime::Runtime,
+        coordinator: &mut DistributedCoordinatorContextV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        input: &DistributedAgentStackOwnerInputV1,
+        index: usize,
+        prepared: crate::runtime_control_client::PreparedRuntimeQueryRequest,
+    ) -> Result<DistributedRuntimeObservationStageV1, DistributedAgentStackOwnerApplyErrorV1> {
+        let observation = input.targets[index]
+            .runtime_observation
+            .as_ref()
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let other = input.targets[1 - index]
+            .runtime_observation
+            .as_ref()
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let authorities = if index == 0 {
+            [&observation.authority, &other.authority]
+        } else {
+            [&other.authority, &observation.authority]
+        };
+        let endpoint_refs = if index == 0 {
+            [observation.endpoint_ref, other.endpoint_ref]
+        } else {
+            [other.endpoint_ref, observation.endpoint_ref]
+        };
+        let target = predecessors[index].target();
+        match runtime.block_on(observation.query_client.exchange(prepared)) {
+            Ok(validated) => {
+                coordinator
+                    .store
+                    .commit_distributed_runtime_query_response(
+                        target,
+                        validated.response().clone(),
+                        coordinator.owner_anchor,
+                        [&predecessors[0], &predecessors[1]],
+                        authorities,
+                        endpoint_refs,
+                    )
+                    .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+                Ok(DistributedRuntimeObservationStageV1::Complete)
+            }
+            Err(error) => {
+                let (phase, stage) = match error {
+                    RuntimeQueryExchangeError::NotSent(_) => (
+                        DistributedAgentStackRuntimeQueryPhaseV1::QueryNotSent,
+                        DistributedRuntimeObservationStageV1::NotSent,
+                    ),
+                    RuntimeQueryExchangeError::Uncertain(_) => (
+                        DistributedAgentStackRuntimeQueryPhaseV1::QueryUncertain,
+                        DistributedRuntimeObservationStageV1::Uncertain,
+                    ),
+                    RuntimeQueryExchangeError::Rejected(_) => (
+                        DistributedAgentStackRuntimeQueryPhaseV1::QueryRejected,
+                        DistributedRuntimeObservationStageV1::Rejected,
+                    ),
+                };
+                coordinator
+                    .store
+                    .commit_distributed_runtime_query_closure(
+                        target,
+                        phase,
+                        coordinator.owner_anchor,
+                        [&predecessors[0], &predecessors[1]],
+                        authorities,
+                        endpoint_refs,
+                    )
+                    .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+                Ok(stage)
+            }
+        }
+    }
+
+    fn advance_distributed_runtime_observation_once(
+        runtime: &tokio::runtime::Runtime,
+        coordinator: &mut DistributedCoordinatorContextV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        input: &DistributedAgentStackOwnerInputV1,
+        index: usize,
+    ) -> Result<DistributedRuntimeObservationStageV1, DistributedAgentStackOwnerApplyErrorV1> {
+        let observation = input.targets[index]
+            .runtime_observation
+            .as_ref()
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let other = input.targets[1 - index]
+            .runtime_observation
+            .as_ref()
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let authorities = if index == 0 {
+            [&observation.authority, &other.authority]
+        } else {
+            [&other.authority, &observation.authority]
+        };
+        let endpoint_refs = if index == 0 {
+            [observation.endpoint_ref, other.endpoint_ref]
+        } else {
+            [other.endpoint_ref, observation.endpoint_ref]
+        };
+        let owner = reopen_distributed_agent_stack_owner(coordinator, predecessors, input)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let target = predecessors[index].target();
+        let phase = owner
+            .node_discovery()
+            .runtime_query_phase(target)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let prepared = match phase {
+            DistributedAgentStackRuntimeQueryPhaseV1::ResponseDurable => {
+                let next = owner
+                    .node_discovery()
+                    .try_prepare_runtime_observation(target)
+                    .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+                drop(owner);
+                coordinator
+                    .store
+                    .commit_distributed_runtime_observation(
+                        &next,
+                        target,
+                        [&predecessors[0], &predecessors[1]],
+                        authorities,
+                        endpoint_refs,
+                    )
+                    .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?
+            }
+            DistributedAgentStackRuntimeQueryPhaseV1::ObservationDurableNotSent
+            | DistributedAgentStackRuntimeQueryPhaseV1::ObservationUncertain => {
+                drop(owner);
+                coordinator
+                    .store
+                    .recover_distributed_runtime_observation(
+                        coordinator.owner_anchor,
+                        target,
+                        [&predecessors[0], &predecessors[1]],
+                        authorities,
+                        endpoint_refs,
+                    )
+                    .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?
+            }
+            _ => return Ok(stage_from_runtime_query_phase(phase)),
+        };
+        let claimed = coordinator
+            .store
+            .claim_distributed_runtime_observation(
+                prepared,
+                coordinator.owner_anchor,
+                [&predecessors[0], &predecessors[1]],
+                authorities,
+                endpoint_refs,
+            )
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let completed = runtime.block_on(observation.endpoint.exchange(claimed));
+        let disposition = completed
+            .commit_into(
+                &mut coordinator.store,
+                coordinator.owner_anchor,
+                [&predecessors[0], &predecessors[1]],
+                authorities,
+                endpoint_refs,
+            )
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        Ok(match disposition {
+            DistributedRuntimeObservationCommitDispositionV1::AckDurable => {
+                DistributedRuntimeObservationStageV1::Complete
+            }
+            DistributedRuntimeObservationCommitDispositionV1::NotSent => {
+                DistributedRuntimeObservationStageV1::NotSent
+            }
+            DistributedRuntimeObservationCommitDispositionV1::Uncertain => {
+                DistributedRuntimeObservationStageV1::Uncertain
+            }
+            DistributedRuntimeObservationCommitDispositionV1::Rejected => {
+                DistributedRuntimeObservationStageV1::Rejected
+            }
+        })
+    }
+
+    fn apply_distributed_agent_stack_owner(
+        coordinator: DistributedCoordinatorContextV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        input: &DistributedAgentStackOwnerInputV1,
+    ) -> Result<DistributedAgentStackOwnerTerminalV1, DistributedAgentStackOwnerApplyErrorV1> {
+        validate_distributed_coordinator_predecessors(&coordinator, predecessors)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let owner = reopen_distributed_agent_stack_owner(&coordinator, predecessors, input)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        validate_distributed_owner_configuration(&owner, input)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        match owner.apply_journal().status() {
+            Some(DistributedAgentStackRolloutStatusV1::PendingNotSent) => {}
+            Some(
+                DistributedAgentStackRolloutStatusV1::TerminalNonReady
+                | DistributedAgentStackRolloutStatusV1::ActiveReady,
+            ) => return distributed_owner_terminal_from_reopen(&owner, predecessors, input, true),
+            Some(DistributedAgentStackRolloutStatusV1::Uncertain) => {
+                return Err(DistributedAgentStackOwnerApplyErrorV1::Uncertain);
+            }
+            Some(DistributedAgentStackRolloutStatusV1::IndeterminateUncertain) => {
+                return Err(DistributedAgentStackOwnerApplyErrorV1::IndeterminateUncertain);
+            }
+            None => return Err(DistributedAgentStackOwnerApplyErrorV1::Operation),
+        }
+        drop(owner);
+
+        // Reopen through the same verified owner seam after the current-process
+        // Node observation. This path never rehydrates from caller bytes.
+        // The coordinator value itself is moved into the observation helper.
+        let FreshDistributedAgentStackNodeObservationV1 {
+            mut coordinator,
+            mut owner,
+            mut ready_endpoints,
+            status_sequences,
+        } = fresh_distributed_agent_stack_owner_observation(coordinator, predecessors, input)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        if owner.apply_journal().status()
+            != Some(DistributedAgentStackRolloutStatusV1::PendingNotSent)
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        if ready_endpoints.is_none()
+            || !owner.node_discovery().runtime_observation_pair_is_durable()
+        {
+            let status_sequences =
+                status_sequences.ok_or(DistributedAgentStackOwnerApplyErrorV1::PendingNotSent)?;
+            drop(owner);
+            coordinator = advance_distributed_runtime_observation_chain(
+                coordinator,
+                predecessors,
+                input,
+                status_sequences,
+            )?;
+            let refreshed =
+                fresh_distributed_agent_stack_owner_observation(coordinator, predecessors, input)
+                    .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+            coordinator = refreshed.coordinator;
+            owner = refreshed.owner;
+            ready_endpoints = refreshed.ready_endpoints;
+        }
+        if owner.apply_journal().status()
+            != Some(DistributedAgentStackRolloutStatusV1::PendingNotSent)
+            || !owner.node_discovery().runtime_observation_pair_is_durable()
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        let ready_endpoints =
+            ready_endpoints.ok_or(DistributedAgentStackOwnerApplyErrorV1::PendingNotSent)?;
+        let carriers = [
+            distributed_owner_restricted_apply_carrier(
+                &ready_endpoints[0],
+                &input.targets[0].connector,
+                &predecessors[0],
+            )?,
+            distributed_owner_restricted_apply_carrier(
+                &ready_endpoints[1],
+                &input.targets[1].connector,
+                &predecessors[1],
+            )?,
+        ];
+        let node_wire = owner
+            .node_discovery()
+            .encode()
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let targets = owner.node_discovery().runtime_targets();
+        let prepared_targets = [
+            owner
+                .apply_journal()
+                .prepared_target(targets[0])
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?,
+            owner
+                .apply_journal()
+                .prepared_target(targets[1])
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?,
+        ];
+        let prepared_pair = owner
+            .apply_journal()
+            .prepare_restricted_pair_for_preflight(
+                prepared_targets,
+                carriers,
+                [&predecessors[0], &predecessors[1]],
+                &coordinator.controller_signer,
+            )
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let connector_inputs = [
+            distributed_owner_restricted_connector_input(&input.targets[0].connector)?,
+            distributed_owner_restricted_connector_input(&input.targets[1].connector)?,
+        ];
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let (dispatch_outcomes, cleanup_failed) = {
+            let (journal, _) = owner.parts_mut();
+            match runtime.block_on(journal.start_dispatch_and_shutdown_restricted_pair_with(
+                prepared_pair,
+                connector_inputs,
+                |journal_wire| {
+                    coordinator
+                        .store
+                        .commit_distributed_agent_stack_wires(journal_wire, &node_wire)
+                        .map_err(|_| DistributedAgentStackStoreError::DurabilityRejected)
+                },
+            )) {
+                Ok(outcomes) => (outcomes, false),
+                Err(error) => match error.into_shutdown_after_dispatch_parts() {
+                    Ok((outcomes, _shutdown_results)) => (outcomes, true),
+                    Err(_) => return Err(DistributedAgentStackOwnerApplyErrorV1::Operation),
+                },
+            }
+        };
+        let terminal_outcomes = {
+            let (journal, _) = owner.parts_mut();
+            journal.consume_restricted_dispatch_pair_with(
+                dispatch_outcomes,
+                [&predecessors[0], &predecessors[1]],
+                |_target, journal_wire| {
+                    coordinator
+                        .store
+                        .commit_distributed_agent_stack_wires(journal_wire, &node_wire)
+                        .map_err(|_| DistributedAgentStackStoreError::DurabilityRejected)
+                },
+            )
+        };
+        let [first, second] = terminal_outcomes;
+        let first = first
+            .into_terminal_result()
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let second = second
+            .into_terminal_result()
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        if first.target() != targets[0]
+            || second.target() != targets[1]
+            || first.rollout_status() != second.rollout_status()
+            || !matches!(
+                second.rollout_status(),
+                DistributedAgentStackRolloutStatusV1::TerminalNonReady
+                    | DistributedAgentStackRolloutStatusV1::ActiveReady
+            )
+            || cleanup_failed
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        drop(owner);
+        let reopened = reopen_distributed_agent_stack_owner(&coordinator, predecessors, input)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        validate_distributed_owner_configuration(&reopened, input)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        distributed_owner_terminal_from_reopen(&reopened, predecessors, input, false)
+    }
+
+    fn distributed_owner_terminal_from_reopen(
+        owner: &ControllerDistributedAgentStackOwnerStateV1,
+        predecessors: &[VerifiedDistributedAgentStackPredecessorV1; 2],
+        input: &DistributedAgentStackOwnerInputV1,
+        replayed: bool,
+    ) -> Result<DistributedAgentStackOwnerTerminalV1, DistributedAgentStackOwnerApplyErrorV1> {
+        validate_distributed_owner_configuration(owner, input)
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let status = owner
+            .apply_journal()
+            .status()
+            .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        if !matches!(
+            status,
+            DistributedAgentStackRolloutStatusV1::TerminalNonReady
+                | DistributedAgentStackRolloutStatusV1::ActiveReady
+        ) || !distributed_owner_terminal_runtime_observation_is_admissible(
+            status,
+            owner.node_discovery().runtime_observation_pair_is_durable(),
+        ) {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        let targets = owner.node_discovery().runtime_targets();
+        let first = owner
+            .apply_journal()
+            .restricted_terminal_replay(targets[0])
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let second = owner
+            .apply_journal()
+            .restricted_terminal_replay(targets[1])
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        if targets != [predecessors[0].target(), predecessors[1].target()]
+            || first.target() != targets[0]
+            || second.target() != targets[1]
+            || first.rollout_status() != status
+            || second.rollout_status() != status
+            || !first.replayed_from_durable_state()
+            || !second.replayed_from_durable_state()
+            || status == DistributedAgentStackRolloutStatusV1::ActiveReady
+                && (first.outcome() != DistributedAgentStackTerminalOutcomeV1::ActiveReady
+                    || second.outcome() != DistributedAgentStackTerminalOutcomeV1::ActiveReady)
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        Ok(DistributedAgentStackOwnerTerminalV1 {
+            status,
+            target_receipts: [
+                first.canonical_receipt_bytes().into(),
+                second.canonical_receipt_bytes().into(),
+            ],
+            replayed,
+        })
+    }
+
+    fn distributed_owner_terminal_runtime_observation_is_admissible(
+        status: DistributedAgentStackRolloutStatusV1,
+        runtime_observation_pair_is_durable: bool,
+    ) -> bool {
+        status != DistributedAgentStackRolloutStatusV1::ActiveReady
+            || runtime_observation_pair_is_durable
+    }
+
+    fn distributed_owner_restricted_apply_carrier(
+        ready: &ReadyDistributedAgentStackRuntimeEndpointV1,
+        connector: &DistributedAgentStackOwnerConnectorInputV1,
+        predecessor: &VerifiedDistributedAgentStackPredecessorV1,
+    ) -> Result<RestrictedRuntimeApplyCarrierBindingV1, DistributedAgentStackOwnerApplyErrorV1>
+    {
+        let endpoint = ready.endpoint();
+        let endpoint_ref = *endpoint.endpoint_ref().as_bytes();
+        if ready.runtime_target() != predecessor.target()
+            || endpoint.runtime_host_id() != predecessor.target()
+            || connector.transport_profile.target() != ready.runtime_target()
+            || connector.transport_profile.endpoint_ref() != endpoint_ref
+            || connector.transport_profile.endpoint_generation() != endpoint.endpoint_generation()
+            || connector.transport_profile.route() != ready.route()
+            || connector.transport_profile.controller_principal()
+                != predecessor.controller_principal()
+            || connector.transport_profile.runtime_principal() != predecessor.runtime_principal()
+            || ApplyAuthKeyRef::from_bytes(endpoint.runtime_response_key_ref())
+                != predecessor.runtime_response_key()
+        {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        let controller_request_key_fingerprint =
+            ed25519_control_key_fingerprint(predecessor.controller_verifying_key())
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let runtime_response_key_fingerprint =
+            ed25519_control_key_fingerprint(&endpoint.runtime_response_public_key())
+                .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let carrier = RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: ready.runtime_target(),
+                runtime_principal: predecessor.runtime_principal(),
+                controller_principal: predecessor.controller_principal(),
+                endpoint_ref,
+                endpoint_generation: endpoint.endpoint_generation(),
+                route: ready.route(),
+                controller_request_key: predecessor.request_key(),
+                controller_request_key_fingerprint,
+                runtime_response_key: predecessor.runtime_response_key(),
+                runtime_response_key_fingerprint,
+                control_transport_profile_ref: connector.profile_ref,
+                control_transport_profile_digest: connector.transport_profile.profile_digest(),
+            },
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        if carrier != connector.expected_carrier {
+            return Err(DistributedAgentStackOwnerApplyErrorV1::Operation);
+        }
+        Ok(carrier)
+    }
+
+    fn distributed_owner_restricted_connector_input(
+        connector: &DistributedAgentStackOwnerConnectorInputV1,
+    ) -> Result<
+        (
+            [u8; 16],
+            RestrictedRuntimeApplyTransportProfileV1,
+            PathBuf,
+            ResolvedRemoteMtlsIdentityFiles,
+        ),
+        DistributedAgentStackOwnerApplyErrorV1,
+    > {
+        let identity = ResolvedRemoteMtlsIdentityFiles::try_new(
+            connector.connector_certificate_file.clone(),
+            connector.connector_private_key_file.clone(),
+        )
+        .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        Ok((
+            connector.profile_ref,
+            connector.transport_profile.clone(),
+            connector.root_ca_certificate_file.clone(),
+            identity,
+        ))
+    }
+
+    fn apply_distributed_agent_stack_once(
+        capability_path: PathBuf,
+    ) -> Result<(), DeploymentdProcessError> {
+        let capability = load_distributed_capability(&capability_path)
+            .map_err(|_| process_error(ProcessErrorKind::DistributedApply))?;
+        let (predecessors, topologies) = load_verified_distributed_predecessors(&capability)
+            .map_err(|_| process_error(ProcessErrorKind::DistributedApply))?;
+        let coordinator = open_distributed_coordinator(&capability)
+            .map_err(|_| process_error(ProcessErrorKind::DistributedApply))?;
+        let owner_input =
+            distributed_owner_input_from_capability(&capability, &predecessors, topologies)
+                .map_err(|_| process_error(ProcessErrorKind::DistributedApply))?;
+        let terminal =
+            apply_distributed_agent_stack_owner(coordinator, &predecessors, &owner_input)
+                .map_err(|_| process_error(ProcessErrorKind::DistributedApply))?;
+        write_distributed_agent_stack_apply_outcome(terminal.status, terminal.replayed)
+    }
+
+    fn write_distributed_agent_stack_apply_outcome(
+        status: DistributedAgentStackRolloutStatusV1,
+        replayed: bool,
+    ) -> Result<(), DeploymentdProcessError> {
+        let outcome = match status {
+            DistributedAgentStackRolloutStatusV1::TerminalNonReady => "terminal_non_ready",
+            DistributedAgentStackRolloutStatusV1::ActiveReady => "active_ready",
+            _ => return Err(process_error(ProcessErrorKind::DistributedApply)),
+        };
+        writeln!(
+            std::io::stdout().lock(),
+            "distributed_agent_stack_apply_v1 outcome={outcome} replayed={replayed}"
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Output))
+    }
+
+    fn distributed_node_endpoints(
+        capability: &DistributedLocalCapabilityV1,
+    ) -> Result<[TrustedLocalNodeEndpointV1; 2], DeploymentdProcessError> {
+        Ok([
+            distributed_node_endpoint(capability, 0)?,
+            distributed_node_endpoint(capability, 1)?,
+        ])
+    }
+
+    fn distributed_node_endpoint(
+        capability: &DistributedLocalCapabilityV1,
+        index: usize,
+    ) -> Result<TrustedLocalNodeEndpointV1, DeploymentdProcessError> {
+        let node = &capability
+            .predecessors
+            .get(index)
+            .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?
+            .node;
+        TrustedLocalNodeEndpointV1::try_new(
+            node.socket_path.clone(),
+            node.expected_uid,
+            node.expected_gid,
+            *node.token,
+            distributed_carrier_binding(capability, index)?,
+            DISTRIBUTED_NODE_EXCHANGE_TIMEOUT,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))
+    }
+
+    fn stage_node_observation(
+        runtime: &tokio::runtime::Runtime,
+        endpoint: &TrustedLocalNodeEndpointV1,
+        request: &NodeManagementRequestV1,
+        generation: NodeObservationProcessGenerationV1,
+        clock: &mut CurrentProcessObservationClockV1,
+    ) -> Result<StagedNodeObservationV1, DeploymentdProcessError> {
+        match runtime.block_on(endpoint.exchange(request, generation, || clock.next())) {
+            Ok(response) => Ok(StagedNodeObservationV1::Response(response)),
+            Err(TrustedLocalNodeClientErrorV1::Disconnected) => {
+                Ok(StagedNodeObservationV1::Disconnected(clock.next()))
+            }
+            Err(_) => Err(process_error(ProcessErrorKind::NodeDiscovery)),
+        }
+    }
+
+    fn current_unix_nanos() -> Result<u64, DeploymentdProcessError> {
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?
+                .as_nanos(),
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))
+    }
+
+    fn read_exact_entropy<const N: usize>(
+        kind: ProcessErrorKind,
+    ) -> Result<[u8; N], DeploymentdProcessError> {
+        let owned = open(
+            Path::new("/dev/urandom"),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|_| process_error(kind))?;
+        let mut source = File::from(owned);
+        let mut entropy = [0_u8; N];
+        source
+            .read_exact(&mut entropy)
+            .map_err(|_| process_error(kind))?;
+        Ok(entropy)
+    }
+
+    fn commit_agent_stack(
+        arguments: AgentStackCommitArguments,
+    ) -> Result<(), DeploymentdProcessError> {
+        let agent = build_agent_service_plan(&arguments)?;
+        let ManagedAgentStackProcessContext {
+            mut store,
+            controller_signer,
+            provisioning,
+            client: _,
+        } = open_managed_agent_stack_context(arguments.managed)?;
+        let expected_fabric = store
+            .state()
+            .desired()
+            .ok_or_else(|| process_error(ProcessErrorKind::AgentStack))?
+            .execution()
+            .clone();
+        let activation = ManagedAgentStackActivationV1::try_new(expected_fabric, agent)
+            .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let fresh = fresh_managed_agent_stack_request()?;
+        let mut journal = ManagedAgentStackApplyJournalV1::new(store.state().clone());
+        {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(&mut store)
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+            journal
+                .prepare_activate_with(
+                    &controller_signer,
+                    &provisioning,
+                    &activation,
+                    fresh,
+                    |next| durable.commit(next),
+                )
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        }
+        let stack = journal
+            .state()
+            .agent_stack_state()
+            .ok_or_else(|| process_error(ProcessErrorKind::AgentStack))?;
+        write_agent_stack_prepared(stack.request().envelope_request_digest())
+    }
+
+    fn apply_agent_stack(
+        arguments: ManagedServingArguments,
+    ) -> Result<(), DeploymentdProcessError> {
+        let ManagedAgentStackProcessContext {
+            mut store,
+            controller_signer,
+            provisioning,
+            client,
+        } = open_managed_agent_stack_context(arguments)?;
+        let mut journal = ManagedAgentStackApplyJournalV1::new(store.state().clone());
+        if let Some(terminal) = journal
+            .terminal(&controller_signer, &provisioning)
+            .map_err(|_| process_error(ProcessErrorKind::AgentStack))?
+        {
+            if terminal.receipt().facts().request_mode()
+                != ManagedAgentStackTargetModeV1::FabricAndAgent
+            {
+                return Err(process_error(ProcessErrorKind::AgentStack));
+            }
+            return write_agent_stack_terminal(&terminal);
+        }
+        let prepared = journal
+            .prepared(&controller_signer, &provisioning)
+            .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let action = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(&mut store)
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+            journal
+                .claim_send_with(prepared, &controller_signer, &provisioning, |next| {
+                    durable.commit(next)
+                })
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?
+        };
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let outcome = runtime.block_on(client.exchange(action));
+        let (action, response) = outcome.into_parts();
+        let response = response.map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let terminal = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(&mut store)
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+            journal
+                .consume_pxst_with(
+                    action,
+                    &response,
+                    &controller_signer,
+                    &provisioning,
+                    |next| durable.commit(next),
+                )
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?
+        };
+        write_agent_stack_terminal(&terminal)
+    }
+
+    fn deactivate_agent_stack(
+        arguments: ManagedServingArguments,
+    ) -> Result<(), DeploymentdProcessError> {
+        let ManagedAgentStackProcessContext {
+            mut store,
+            controller_signer,
+            provisioning,
+            client,
+        } = open_managed_agent_stack_context(arguments)?;
+        let mut journal = ManagedAgentStackApplyJournalV1::new(store.state().clone());
+        if let Some(terminal) = journal
+            .terminal(&controller_signer, &provisioning)
+            .map_err(|_| process_error(ProcessErrorKind::AgentStack))?
+            && terminal.receipt().facts().request_mode()
+                == ManagedAgentStackTargetModeV1::EmptyDeactivate
+        {
+            return write_agent_stack_terminal(&terminal);
+        }
+        let fresh = fresh_managed_agent_stack_request()?;
+        let prepared = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(&mut store)
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+            journal
+                .prepare_empty_deactivate_with(&controller_signer, &provisioning, fresh, |next| {
+                    durable.commit(next)
+                })
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?
+        };
+        let action = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(&mut store)
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+            journal
+                .claim_send_with(prepared, &controller_signer, &provisioning, |next| {
+                    durable.commit(next)
+                })
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?
+        };
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let outcome = runtime.block_on(client.exchange(action));
+        let (action, response) = outcome.into_parts();
+        let response = response.map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let terminal = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(&mut store)
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+            journal
+                .consume_pxst_with(
+                    action,
+                    &response,
+                    &controller_signer,
+                    &provisioning,
+                    |next| durable.commit(next),
+                )
+                .map_err(|_| process_error(ProcessErrorKind::AgentStack))?
+        };
+        write_agent_stack_terminal(&terminal)
+    }
+
+    fn build_agent_service_plan(
+        arguments: &AgentStackCommitArguments,
+    ) -> Result<ManagedAgentServicePlanV1, DeploymentdProcessError> {
+        let lifecycle = ManagedServiceLifecycleBudgetsV1::try_new(
+            BoundedDuration::from_nanos(arguments.lifecycle_budgets[0]),
+            BoundedDuration::from_nanos(arguments.lifecycle_budgets[1]),
+            BoundedDuration::from_nanos(arguments.lifecycle_budgets[2]),
+            BoundedDuration::from_nanos(arguments.lifecycle_budgets[3]),
+            BoundedDuration::from_nanos(arguments.lifecycle_budgets[4]),
+        )
+        .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let semantic = ManagedAgentSemanticLimitsV1::try_new(
+            arguments.semantic_limits[0],
+            arguments.semantic_limits[1],
+            arguments.semantic_limits[2],
+            arguments.semantic_limits[3],
+        )
+        .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let ingress = ManagedAgentIngressLimitsV1::try_new(
+            arguments.ingress_max_items,
+            arguments.ingress_max_bytes,
+            arguments.ingress_max_frame_bytes,
+            arguments.ingress_max_response_body_bytes,
+            arguments.handler_timeout_nanos,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let port = ManagedAgentPortPlanV1::try_new(
+            BindingId::from_bytes(arguments.submit_binding),
+            BindingId::from_bytes(arguments.control_binding),
+            &arguments.submit_key_expression,
+            &arguments.control_key_expression,
+            ingress,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let provider = match arguments.provider {
+            AgentStackProviderArguments::DeterministicFixture {
+                provider_ref,
+                config_digest,
+            } => ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+                ManagedAgentProviderRefV1::try_from_bytes(provider_ref)
+                    .map_err(|_| process_error(ProcessErrorKind::AgentStack))?,
+                Digest32::from_bytes(config_digest),
+            ),
+            AgentStackProviderArguments::Provisioned {
+                provider_ref,
+                config_digest,
+                secret_ref,
+            } => ManagedAgentProviderSelectionV1::try_provisioned(
+                ManagedAgentProviderRefV1::try_from_bytes(provider_ref)
+                    .map_err(|_| process_error(ProcessErrorKind::AgentStack))?,
+                Digest32::from_bytes(config_digest),
+                ManagedAgentSecretRefV1::try_from_bytes(secret_ref)
+                    .map_err(|_| process_error(ProcessErrorKind::AgentStack))?,
+            ),
+        }
+        .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        ManagedAgentServicePlanV1::try_new(
+            ManagedServiceSpecV1::new(
+                ManagedServiceId::from_bytes(arguments.service_id),
+                lifecycle,
+            ),
+            semantic,
+            port,
+            provider,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::AgentStack))
+    }
+
     fn apply_reference(arguments: BootstrapArguments) -> Result<(), DeploymentdProcessError> {
         validate_service_identity(arguments.common.expected_uid, arguments.common.expected_gid)?;
         validate_bootstrap_separation(&arguments)?;
@@ -1597,6 +4323,50 @@ mod platform {
         client_nonce.copy_from_slice(&entropy[16..]);
         FreshControllerBootstrapRequestV1::try_new(request_id, client_nonce)
             .map_err(|_| process_error(ProcessErrorKind::Bootstrap))
+    }
+
+    fn fresh_managed_serving_request()
+    -> Result<FreshManagedServingBootstrapV1, DeploymentdProcessError> {
+        let owned = open(
+            Path::new("/dev/urandom"),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|_| process_error(ProcessErrorKind::ServingObservation))?;
+        let mut source = File::from(owned);
+        let mut entropy = [0; MANAGED_SERVING_ENTROPY_BYTES];
+        source
+            .read_exact(&mut entropy)
+            .map_err(|_| process_error(ProcessErrorKind::ServingObservation))?;
+        let mut request_id = [0; 16];
+        request_id.copy_from_slice(&entropy[..16]);
+        let mut nonce = [0; 32];
+        nonce.copy_from_slice(&entropy[16..]);
+        FreshManagedServingBootstrapV1::try_new(request_id, nonce)
+            .map_err(|_| process_error(ProcessErrorKind::ServingObservation))
+    }
+
+    fn fresh_managed_agent_stack_request()
+    -> Result<FreshManagedAgentStackApplyV1, DeploymentdProcessError> {
+        let owned = open(
+            Path::new("/dev/urandom"),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let mut source = File::from(owned);
+        let mut entropy = [0; MANAGED_AGENT_STACK_ENTROPY_BYTES];
+        source
+            .read_exact(&mut entropy)
+            .map_err(|_| process_error(ProcessErrorKind::AgentStack))?;
+        let mut operation_id = [0; 16];
+        operation_id.copy_from_slice(&entropy[..16]);
+        let mut temporal_constraint_id = [0; 16];
+        temporal_constraint_id.copy_from_slice(&entropy[16..32]);
+        let mut nonce = [0; 32];
+        nonce.copy_from_slice(&entropy[32..]);
+        FreshManagedAgentStackApplyV1::try_new(operation_id, temporal_constraint_id, nonce)
+            .map_err(|_| process_error(ProcessErrorKind::AgentStack))
     }
 
     fn build_reference_candidate(
@@ -2383,6 +5153,96 @@ mod platform {
             .map_err(|_| process_error(ProcessErrorKind::Output))
     }
 
+    fn write_managed_serving_receipt(
+        pin: &VerifiedManagedServingPinV1,
+    ) -> Result<(), DeploymentdProcessError> {
+        let facts = pin.facts();
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        writeln!(
+            output,
+            "managed_serving_observation_v1 status=recovered_ready"
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        write_labeled_hex(&mut output, "target", facts.target().as_bytes())?;
+        write_labeled_hex(
+            &mut output,
+            "runtime_store_instance_id",
+            &facts.runtime_store_instance_id(),
+        )?;
+        writeln!(output, "runtime_host_epoch={}", facts.runtime_host_epoch())
+            .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        writeln!(output, "snapshot_sequence={}", facts.snapshot_sequence())
+            .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        write_labeled_hex(&mut output, "clock_domain", facts.clock_domain().as_bytes())?;
+        writeln!(
+            output,
+            "clock_generation={}",
+            facts.clock_generation().value()
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        writeln!(output, "observed_at_nanos={}", facts.observed_at_nanos())
+            .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        write_labeled_hex(
+            &mut output,
+            "request_digest",
+            pin.request_digest().as_bytes(),
+        )?;
+        write_labeled_hex(
+            &mut output,
+            "response_digest",
+            pin.response_digest().as_bytes(),
+        )?;
+        output
+            .flush()
+            .map_err(|_| process_error(ProcessErrorKind::Output))
+    }
+
+    fn write_agent_stack_prepared(request_digest: Digest32) -> Result<(), DeploymentdProcessError> {
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        writeln!(
+            output,
+            "managed_agent_stack_v1 status=request_committed mode=active"
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        write_labeled_hex(&mut output, "request_digest", request_digest.as_bytes())?;
+        output
+            .flush()
+            .map_err(|_| process_error(ProcessErrorKind::Output))
+    }
+
+    fn write_agent_stack_terminal(
+        terminal: &ManagedAgentStackTerminalCommitV1,
+    ) -> Result<(), DeploymentdProcessError> {
+        let receipt = terminal.receipt();
+        let mode = match receipt.facts().request_mode() {
+            ManagedAgentStackTargetModeV1::FabricAndAgent => "active",
+            ManagedAgentStackTargetModeV1::EmptyDeactivate => "empty_exact_zero",
+        };
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        writeln!(
+            output,
+            "managed_agent_stack_v1 status=applied mode={mode} replayed={}",
+            terminal.replayed_from_journal()
+        )
+        .map_err(|_| process_error(ProcessErrorKind::Output))?;
+        write_labeled_hex(
+            &mut output,
+            "request_digest",
+            receipt.facts().request_digest().as_bytes(),
+        )?;
+        write_labeled_hex(
+            &mut output,
+            "receipt_digest",
+            receipt.receipt_digest().as_bytes(),
+        )?;
+        output
+            .flush()
+            .map_err(|_| process_error(ProcessErrorKind::Output))
+    }
+
     fn write_reconcile_outcome(
         outcome: ControllerReconcileOutcomeV1,
     ) -> Result<(), DeploymentdProcessError> {
@@ -2460,6 +5320,615 @@ mod platform {
             .map_err(|_| process_error(ProcessErrorKind::Output))
     }
 
+    struct DistributedNodeCapabilityV1 {
+        expected_target: paraegox_kernel::identity::RuntimeHostId,
+        management_target: NodeManagementTargetV1,
+        socket_path: PathBuf,
+        token: Zeroizing<[u8; 32]>,
+        expected_uid: u32,
+        expected_gid: u32,
+        topology_wire: Box<[u8]>,
+    }
+
+    struct DistributedCoordinatorCapabilityV1 {
+        common: CommonArguments,
+        expected_store_id: [u8; 32],
+        controller_private_seed_path: PathBuf,
+    }
+
+    struct DistributedPredecessorCapabilityV1 {
+        expected_target: paraegox_kernel::identity::RuntimeHostId,
+        managed: ManagedServingArguments,
+        node: DistributedNodeCapabilityV1,
+        connector: Option<DistributedRestrictedControllerConnectorCapabilityV1>,
+    }
+
+    struct DistributedRestrictedControllerConnectorCapabilityV1 {
+        profile_ref: [u8; 16],
+        transport_profile: RestrictedRuntimeApplyTransportProfileV1,
+        root_ca_certificate_file: PathBuf,
+        connector_certificate_file: PathBuf,
+        connector_private_key_file: PathBuf,
+    }
+
+    pub(crate) struct DistributedLocalCapabilityV1 {
+        expected_uid: u32,
+        expected_gid: u32,
+        lifecycle_budget_nanos: u64,
+        coordinator: DistributedCoordinatorCapabilityV1,
+        predecessors: [DistributedPredecessorCapabilityV1; 2],
+        checksum: Digest32,
+    }
+
+    impl core::fmt::Debug for DistributedLocalCapabilityV1 {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter
+                .debug_struct("DistributedLocalCapabilityV1")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl DistributedLocalCapabilityV1 {
+        fn decode(frame: &[u8]) -> Result<Self, DeploymentdProcessError> {
+            if frame.len()
+                < DISTRIBUTED_CAPABILITY_HEADER_BYTES + DISTRIBUTED_CAPABILITY_CHECKSUM_BYTES
+                || frame.len() > MAX_DISTRIBUTED_CAPABILITY_BYTES
+            {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            let checksum_offset = frame.len() - DISTRIBUTED_CAPABILITY_CHECKSUM_BYTES;
+            let checksum = Digest32::from_bytes(
+                frame[checksum_offset..]
+                    .try_into()
+                    .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?,
+            );
+            if distributed_capability_checksum(&frame[..checksum_offset])? != checksum {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            let mut header =
+                DistributedCapabilityCursor::new(&frame[..DISTRIBUTED_CAPABILITY_HEADER_BYTES]);
+            if header.array::<4>()? != *DISTRIBUTED_CAPABILITY_MAGIC {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            let wire_version = header.u16()?;
+            if !matches!(
+                wire_version,
+                DISTRIBUTED_CAPABILITY_VERSION_V1 | DISTRIBUTED_CAPABILITY_VERSION_V2
+            ) || usize::from(header.u16()?) != DISTRIBUTED_CAPABILITY_HEADER_BYTES
+                || usize::try_from(header.u32()?).ok() != Some(frame.len())
+                || usize::try_from(header.u32()?).ok()
+                    != Some(
+                        frame.len()
+                            - DISTRIBUTED_CAPABILITY_HEADER_BYTES
+                            - DISTRIBUTED_CAPABILITY_CHECKSUM_BYTES,
+                    )
+            {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            let expected_uid = header.u32()?;
+            let expected_gid = header.u32()?;
+            if expected_uid == 0 || expected_gid == 0 || header.u64()? != 0 {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            header.finish()?;
+            let mut cursor = DistributedCapabilityCursor::new(
+                &frame[DISTRIBUTED_CAPABILITY_HEADER_BYTES..checksum_offset],
+            );
+            let coordinator = DistributedCoordinatorCapabilityV1 {
+                common: CommonArguments {
+                    state_directory: cursor.path()?,
+                    scope: cursor.nonzero_array()?,
+                    plan: cursor.nonzero_array()?,
+                    request_auth_key: cursor.nonzero_array()?,
+                    public_key_path: cursor.path()?,
+                    expected_uid,
+                    expected_gid,
+                },
+                expected_store_id: cursor.nonzero_array()?,
+                controller_private_seed_path: cursor.path()?,
+            };
+            let lifecycle_budget_nanos = cursor.nonzero_u64()?;
+            let predecessors = [
+                decode_distributed_predecessor(
+                    &mut cursor,
+                    expected_uid,
+                    expected_gid,
+                    wire_version,
+                )?,
+                decode_distributed_predecessor(
+                    &mut cursor,
+                    expected_uid,
+                    expected_gid,
+                    wire_version,
+                )?,
+            ];
+            cursor.finish()?;
+            let capability = Self {
+                expected_uid,
+                expected_gid,
+                lifecycle_budget_nanos,
+                coordinator,
+                predecessors,
+                checksum,
+            };
+            capability.validate()?;
+            if capability.encode()?.as_slice() != frame {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            Ok(capability)
+        }
+
+        fn encode(&self) -> Result<Zeroizing<Vec<u8>>, DeploymentdProcessError> {
+            self.validate()?;
+            let wire_version = self.wire_version()?;
+            let mut payload = Zeroizing::new(Vec::new());
+            encode_path(&mut payload, &self.coordinator.common.state_directory)?;
+            payload.extend_from_slice(&self.coordinator.common.scope);
+            payload.extend_from_slice(&self.coordinator.common.plan);
+            payload.extend_from_slice(&self.coordinator.common.request_auth_key);
+            encode_path(&mut payload, &self.coordinator.common.public_key_path)?;
+            payload.extend_from_slice(&self.coordinator.expected_store_id);
+            encode_path(&mut payload, &self.coordinator.controller_private_seed_path)?;
+            payload.extend_from_slice(&self.lifecycle_budget_nanos.to_be_bytes());
+            for predecessor in &self.predecessors {
+                encode_distributed_predecessor(&mut payload, predecessor, wire_version)?;
+            }
+            let total = DISTRIBUTED_CAPABILITY_HEADER_BYTES
+                .checked_add(payload.len())
+                .and_then(|value| value.checked_add(DISTRIBUTED_CAPABILITY_CHECKSUM_BYTES))
+                .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+            if total > MAX_DISTRIBUTED_CAPABILITY_BYTES {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            let mut wire = Zeroizing::new(Vec::with_capacity(total));
+            wire.extend_from_slice(DISTRIBUTED_CAPABILITY_MAGIC);
+            wire.extend_from_slice(&wire_version.to_be_bytes());
+            wire.extend_from_slice(&(DISTRIBUTED_CAPABILITY_HEADER_BYTES as u16).to_be_bytes());
+            wire.extend_from_slice(
+                &u32::try_from(total)
+                    .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?
+                    .to_be_bytes(),
+            );
+            wire.extend_from_slice(
+                &u32::try_from(payload.len())
+                    .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?
+                    .to_be_bytes(),
+            );
+            wire.extend_from_slice(&self.expected_uid.to_be_bytes());
+            wire.extend_from_slice(&self.expected_gid.to_be_bytes());
+            wire.extend_from_slice(&0_u64.to_be_bytes());
+            wire.extend_from_slice(payload.as_slice());
+            let checksum = distributed_capability_checksum(&wire)?;
+            wire.extend_from_slice(checksum.as_bytes());
+            Ok(wire)
+        }
+
+        fn wire_version(&self) -> Result<u16, DeploymentdProcessError> {
+            match [
+                self.predecessors[0].connector.is_some(),
+                self.predecessors[1].connector.is_some(),
+            ] {
+                [false, false] => Ok(DISTRIBUTED_CAPABILITY_VERSION_V1),
+                [true, true] => Ok(DISTRIBUTED_CAPABILITY_VERSION_V2),
+                _ => Err(process_error(ProcessErrorKind::NodeDiscovery)),
+            }
+        }
+
+        fn distributed_apply_connectors(
+            &self,
+        ) -> Result<
+            [&DistributedRestrictedControllerConnectorCapabilityV1; 2],
+            DeploymentdProcessError,
+        > {
+            Ok([
+                self.predecessors[0]
+                    .connector
+                    .as_ref()
+                    .ok_or_else(|| process_error(ProcessErrorKind::DistributedApply))?,
+                self.predecessors[1]
+                    .connector
+                    .as_ref()
+                    .ok_or_else(|| process_error(ProcessErrorKind::DistributedApply))?,
+            ])
+        }
+
+        fn validate(&self) -> Result<(), DeploymentdProcessError> {
+            if self.expected_uid == 0
+                || self.expected_gid == 0
+                || self.lifecycle_budget_nanos == 0
+                || self.predecessors[0].expected_target.as_bytes()
+                    >= self.predecessors[1].expected_target.as_bytes()
+                || self.predecessors[0].expected_target != self.predecessors[0].node.expected_target
+                || self.predecessors[1].expected_target != self.predecessors[1].node.expected_target
+                || self.predecessors[0].node.management_target.node_id()
+                    == self.predecessors[1].node.management_target.node_id()
+            {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            for predecessor in &self.predecessors {
+                if predecessor.managed.bootstrap.common.expected_uid != self.expected_uid
+                    || predecessor.managed.bootstrap.common.expected_gid != self.expected_gid
+                    || predecessor.node.expected_uid != self.expected_uid
+                    || predecessor.node.expected_gid != self.expected_gid
+                    || predecessor.node.topology_wire.is_empty()
+                    || predecessor.node.topology_wire.len() > MAX_DISTRIBUTED_FABRIC_TOPOLOGY_BYTES
+                {
+                    return Err(process_error(ProcessErrorKind::NodeDiscovery));
+                }
+                if let Some(connector) = predecessor.connector.as_ref() {
+                    connector.validate(predecessor)?;
+                }
+            }
+            self.wire_version()?;
+            if let (Some(first), Some(second)) = (
+                self.predecessors[0].connector.as_ref(),
+                self.predecessors[1].connector.as_ref(),
+            ) {
+                if first.profile_ref == second.profile_ref {
+                    return Err(process_error(ProcessErrorKind::NodeDiscovery));
+                }
+            }
+            let roots = [
+                &self.coordinator.common.state_directory,
+                &self.predecessors[0]
+                    .managed
+                    .bootstrap
+                    .common
+                    .state_directory,
+                &self.predecessors[0].managed.successor_directory,
+                &self.predecessors[1]
+                    .managed
+                    .bootstrap
+                    .common
+                    .state_directory,
+                &self.predecessors[1].managed.successor_directory,
+            ];
+            if roots.iter().enumerate().any(|(index, left)| {
+                roots[index + 1..].iter().any(|right| {
+                    left == right || left.starts_with(right) || right.starts_with(left)
+                })
+            }) {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            Ok(())
+        }
+    }
+
+    impl DistributedRestrictedControllerConnectorCapabilityV1 {
+        fn validate(
+            &self,
+            predecessor: &DistributedPredecessorCapabilityV1,
+        ) -> Result<(), DeploymentdProcessError> {
+            let paths = [
+                &self.root_ca_certificate_file,
+                &self.connector_certificate_file,
+                &self.connector_private_key_file,
+            ];
+            if self.profile_ref.iter().all(|byte| *byte == 0)
+                || self.transport_profile.target() != predecessor.expected_target
+                || self.transport_profile.controller_principal()
+                    != PrincipalRef::from_bytes(predecessor.managed.bootstrap.controller_principal)
+                || self.transport_profile.runtime_principal()
+                    != PrincipalRef::from_bytes(predecessor.managed.bootstrap.runtime_principal)
+                || paths.iter().any(|path| {
+                    path.as_os_str().as_bytes().len() > MAX_DISTRIBUTED_CAPABILITY_PATH_BYTES
+                        || path.to_str().is_none()
+                        || parse_absolute_file_path(path.as_os_str()).is_err()
+                })
+                || paths[0] == paths[1]
+                || paths[0] == paths[2]
+                || paths[1] == paths[2]
+                || RestrictedRuntimeApplyTransportProfileV1::decode(
+                    self.transport_profile.canonical_wire(),
+                )
+                .is_err()
+                || ResolvedRemoteMtlsIdentityFiles::try_new(
+                    self.connector_certificate_file.clone(),
+                    self.connector_private_key_file.clone(),
+                )
+                .is_err()
+            {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            Ok(())
+        }
+    }
+
+    fn decode_distributed_predecessor(
+        cursor: &mut DistributedCapabilityCursor<'_>,
+        expected_uid: u32,
+        expected_gid: u32,
+        wire_version: u16,
+    ) -> Result<DistributedPredecessorCapabilityV1, DeploymentdProcessError> {
+        let expected_target =
+            paraegox_kernel::identity::RuntimeHostId::from_bytes(cursor.nonzero_array()?);
+        let bootstrap = BootstrapArguments {
+            common: CommonArguments {
+                state_directory: cursor.path()?,
+                scope: cursor.nonzero_array()?,
+                plan: cursor.nonzero_array()?,
+                request_auth_key: cursor.nonzero_array()?,
+                public_key_path: cursor.path()?,
+                expected_uid,
+                expected_gid,
+            },
+            expected_store_id: cursor.nonzero_array()?,
+            controller_private_seed_path: cursor.path()?,
+            controller_principal: cursor.nonzero_array()?,
+            writer_ref: cursor.nonzero_array()?,
+            authority_principal: cursor.nonzero_array()?,
+            authority_uid: cursor.nonzero_u32()?,
+            authority_gid: cursor.nonzero_u32()?,
+            tenure_authority_ref: cursor.nonzero_array()?,
+            tenure_key_ref: cursor.nonzero_array()?,
+            authority_public_key_path: cursor.path()?,
+            runtime_socket_path: cursor.path()?,
+            runtime_principal: cursor.nonzero_array()?,
+            runtime_response_key_ref: cursor.nonzero_array()?,
+            runtime_response_public_key_path: cursor.path()?,
+            runtime_uid: cursor.nonzero_u32()?,
+            runtime_gid: cursor.nonzero_u32()?,
+        };
+        let successor_directory = cursor.path()?;
+        let successor_store_id = cursor.nonzero_array()?;
+        let node_id = NodeId::try_from_bytes(cursor.nonzero_array()?)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let management_endpoint_ref =
+            NodeManagementEndpointRefV1::try_from_bytes(cursor.nonzero_array()?)
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let node_incarnation = NodeIncarnation::try_from_bytes(cursor.nonzero_array()?)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let registration_epoch = cursor.nonzero_u64()?;
+        let management_target = NodeManagementTargetV1::try_new(
+            node_id,
+            management_endpoint_ref,
+            node_incarnation,
+            registration_epoch,
+        )
+        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        let socket_path = cursor.path()?;
+        let token = Zeroizing::new(cursor.nonzero_array()?);
+        let node_uid = cursor.nonzero_u32()?;
+        let node_gid = cursor.nonzero_u32()?;
+        let topology_length = cursor.usize_u32()?;
+        if topology_length == 0 || topology_length > MAX_DISTRIBUTED_FABRIC_TOPOLOGY_BYTES {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        let topology_wire = cursor.take(topology_length)?.into();
+        let connector = match wire_version {
+            DISTRIBUTED_CAPABILITY_VERSION_V1 => None,
+            DISTRIBUTED_CAPABILITY_VERSION_V2 => {
+                let profile_ref = cursor.nonzero_array()?;
+                let profile_length = cursor.usize_u32()?;
+                if profile_length == 0
+                    || profile_length > MAX_RESTRICTED_RUNTIME_APPLY_TRANSPORT_PROFILE_BYTES
+                {
+                    return Err(process_error(ProcessErrorKind::NodeDiscovery));
+                }
+                let transport_profile =
+                    RestrictedRuntimeApplyTransportProfileV1::decode(cursor.take(profile_length)?)
+                        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+                Some(DistributedRestrictedControllerConnectorCapabilityV1 {
+                    profile_ref,
+                    transport_profile,
+                    root_ca_certificate_file: cursor.path()?,
+                    connector_certificate_file: cursor.path()?,
+                    connector_private_key_file: cursor.path()?,
+                })
+            }
+            _ => return Err(process_error(ProcessErrorKind::NodeDiscovery)),
+        };
+        Ok(DistributedPredecessorCapabilityV1 {
+            expected_target,
+            managed: ManagedServingArguments {
+                bootstrap,
+                successor_directory,
+                successor_store_id,
+            },
+            node: DistributedNodeCapabilityV1 {
+                expected_target,
+                management_target,
+                socket_path,
+                token,
+                expected_uid: node_uid,
+                expected_gid: node_gid,
+                topology_wire,
+            },
+            connector,
+        })
+    }
+
+    fn encode_distributed_predecessor(
+        wire: &mut Vec<u8>,
+        predecessor: &DistributedPredecessorCapabilityV1,
+        wire_version: u16,
+    ) -> Result<(), DeploymentdProcessError> {
+        let arguments = &predecessor.managed.bootstrap;
+        wire.extend_from_slice(predecessor.expected_target.as_bytes());
+        encode_path(wire, &arguments.common.state_directory)?;
+        wire.extend_from_slice(&arguments.common.scope);
+        wire.extend_from_slice(&arguments.common.plan);
+        wire.extend_from_slice(&arguments.common.request_auth_key);
+        encode_path(wire, &arguments.common.public_key_path)?;
+        wire.extend_from_slice(&arguments.expected_store_id);
+        encode_path(wire, &arguments.controller_private_seed_path)?;
+        wire.extend_from_slice(&arguments.controller_principal);
+        wire.extend_from_slice(&arguments.writer_ref);
+        wire.extend_from_slice(&arguments.authority_principal);
+        wire.extend_from_slice(&arguments.authority_uid.to_be_bytes());
+        wire.extend_from_slice(&arguments.authority_gid.to_be_bytes());
+        wire.extend_from_slice(&arguments.tenure_authority_ref);
+        wire.extend_from_slice(&arguments.tenure_key_ref);
+        encode_path(wire, &arguments.authority_public_key_path)?;
+        encode_path(wire, &arguments.runtime_socket_path)?;
+        wire.extend_from_slice(&arguments.runtime_principal);
+        wire.extend_from_slice(&arguments.runtime_response_key_ref);
+        encode_path(wire, &arguments.runtime_response_public_key_path)?;
+        wire.extend_from_slice(&arguments.runtime_uid.to_be_bytes());
+        wire.extend_from_slice(&arguments.runtime_gid.to_be_bytes());
+        encode_path(wire, &predecessor.managed.successor_directory)?;
+        wire.extend_from_slice(&predecessor.managed.successor_store_id);
+        wire.extend_from_slice(predecessor.node.management_target.node_id().as_bytes());
+        wire.extend_from_slice(
+            predecessor
+                .node
+                .management_target
+                .management_endpoint_ref()
+                .as_bytes(),
+        );
+        wire.extend_from_slice(
+            predecessor
+                .node
+                .management_target
+                .node_incarnation()
+                .as_bytes(),
+        );
+        wire.extend_from_slice(
+            &predecessor
+                .node
+                .management_target
+                .registration_epoch()
+                .to_be_bytes(),
+        );
+        encode_path(wire, &predecessor.node.socket_path)?;
+        wire.extend_from_slice(predecessor.node.token.as_ref());
+        wire.extend_from_slice(&predecessor.node.expected_uid.to_be_bytes());
+        wire.extend_from_slice(&predecessor.node.expected_gid.to_be_bytes());
+        wire.extend_from_slice(
+            &u32::try_from(predecessor.node.topology_wire.len())
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?
+                .to_be_bytes(),
+        );
+        wire.extend_from_slice(&predecessor.node.topology_wire);
+        match (wire_version, predecessor.connector.as_ref()) {
+            (DISTRIBUTED_CAPABILITY_VERSION_V1, None) => {}
+            (DISTRIBUTED_CAPABILITY_VERSION_V2, Some(connector)) => {
+                wire.extend_from_slice(&connector.profile_ref);
+                wire.extend_from_slice(
+                    &u32::try_from(connector.transport_profile.canonical_wire().len())
+                        .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?
+                        .to_be_bytes(),
+                );
+                wire.extend_from_slice(connector.transport_profile.canonical_wire());
+                encode_path(wire, &connector.root_ca_certificate_file)?;
+                encode_path(wire, &connector.connector_certificate_file)?;
+                encode_path(wire, &connector.connector_private_key_file)?;
+            }
+            _ => return Err(process_error(ProcessErrorKind::NodeDiscovery)),
+        }
+        Ok(())
+    }
+
+    fn encode_path(wire: &mut Vec<u8>, path: &Path) -> Result<(), DeploymentdProcessError> {
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.is_empty() || bytes.len() > MAX_DISTRIBUTED_CAPABILITY_PATH_BYTES {
+            return Err(process_error(ProcessErrorKind::NodeDiscovery));
+        }
+        wire.extend_from_slice(
+            &u16::try_from(bytes.len())
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?
+                .to_be_bytes(),
+        );
+        wire.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn distributed_capability_checksum(bytes: &[u8]) -> Result<Digest32, DeploymentdProcessError> {
+        let mut builder = Digest32Builder::try_new(DISTRIBUTED_CAPABILITY_CHECKSUM_DOMAIN)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        builder
+            .field_bytes(bytes)
+            .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))?;
+        Ok(builder.finish())
+    }
+
+    struct DistributedCapabilityCursor<'a> {
+        bytes: &'a [u8],
+        position: usize,
+    }
+
+    impl<'a> DistributedCapabilityCursor<'a> {
+        const fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, position: 0 }
+        }
+
+        fn take(&mut self, length: usize) -> Result<&'a [u8], DeploymentdProcessError> {
+            let end = self
+                .position
+                .checked_add(length)
+                .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+            let value = self
+                .bytes
+                .get(self.position..end)
+                .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
+            self.position = end;
+            Ok(value)
+        }
+
+        fn array<const N: usize>(&mut self) -> Result<[u8; N], DeploymentdProcessError> {
+            self.take(N)?
+                .try_into()
+                .map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))
+        }
+
+        fn nonzero_array<const N: usize>(&mut self) -> Result<[u8; N], DeploymentdProcessError> {
+            let value = self.array()?;
+            if value.iter().all(|byte| *byte == 0) {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            Ok(value)
+        }
+
+        fn u16(&mut self) -> Result<u16, DeploymentdProcessError> {
+            Ok(u16::from_be_bytes(self.array()?))
+        }
+
+        fn u32(&mut self) -> Result<u32, DeploymentdProcessError> {
+            Ok(u32::from_be_bytes(self.array()?))
+        }
+
+        fn u64(&mut self) -> Result<u64, DeploymentdProcessError> {
+            Ok(u64::from_be_bytes(self.array()?))
+        }
+
+        fn nonzero_u32(&mut self) -> Result<u32, DeploymentdProcessError> {
+            let value = self.u32()?;
+            if value == 0 {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            Ok(value)
+        }
+
+        fn nonzero_u64(&mut self) -> Result<u64, DeploymentdProcessError> {
+            let value = self.u64()?;
+            if value == 0 {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            Ok(value)
+        }
+
+        fn usize_u32(&mut self) -> Result<usize, DeploymentdProcessError> {
+            usize::try_from(self.u32()?).map_err(|_| process_error(ProcessErrorKind::NodeDiscovery))
+        }
+
+        fn path(&mut self) -> Result<PathBuf, DeploymentdProcessError> {
+            let length = usize::from(self.u16()?);
+            if length == 0 || length > MAX_DISTRIBUTED_CAPABILITY_PATH_BYTES {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
+            }
+            let path = PathBuf::from(OsString::from_vec(self.take(length)?.to_vec()));
+            parse_absolute_path(path.as_os_str())
+        }
+
+        fn finish(self) -> Result<(), DeploymentdProcessError> {
+            if self.position == self.bytes.len() {
+                Ok(())
+            } else {
+                Err(process_error(ProcessErrorKind::NodeDiscovery))
+            }
+        }
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum ProcessCommand {
         Initialize(InitializeArguments),
@@ -2468,6 +5937,13 @@ mod platform {
         CommitReferenceEmpty(CommitEmptyArguments),
         AcquireTenure(AcquireTenureArguments),
         BootstrapRuntime(BootstrapArguments),
+        ObserveManagedServing(ManagedServingArguments),
+        CommitAgentStack(Box<AgentStackCommitArguments>),
+        ApplyAgentStack(ManagedServingArguments),
+        DeactivateAgentStack(ManagedServingArguments),
+        InitializeDistributedAgentStack(PathBuf),
+        ObserveDistributedAgentStackNodesOnce(PathBuf),
+        ApplyDistributedAgentStackOnce(PathBuf),
         ApplyReference(BootstrapArguments),
         ReconcileReferenceOnce(BootstrapArguments),
     }
@@ -2555,6 +6031,44 @@ mod platform {
         runtime_gid: u32,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ManagedServingArguments {
+        bootstrap: BootstrapArguments,
+        successor_directory: PathBuf,
+        successor_store_id: [u8; 32],
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct AgentStackCommitArguments {
+        managed: ManagedServingArguments,
+        service_id: [u8; 16],
+        lifecycle_budgets: [u64; 5],
+        semantic_limits: [u16; 4],
+        submit_binding: [u8; 16],
+        control_binding: [u8; 16],
+        submit_key_expression: String,
+        control_key_expression: String,
+        ingress_max_items: u32,
+        ingress_max_bytes: u64,
+        ingress_max_frame_bytes: u32,
+        ingress_max_response_body_bytes: u32,
+        handler_timeout_nanos: u64,
+        provider: AgentStackProviderArguments,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum AgentStackProviderArguments {
+        DeterministicFixture {
+            provider_ref: [u8; 16],
+            config_digest: [u8; 32],
+        },
+        Provisioned {
+            provider_ref: [u8; 16],
+            config_digest: [u8; 32],
+            secret_ref: [u8; 16],
+        },
+    }
+
     fn parse_arguments(
         arguments: impl IntoIterator<Item = OsString>,
     ) -> Result<ProcessCommand, DeploymentdProcessError> {
@@ -2566,6 +6080,21 @@ mod platform {
             return Err(process_error(ProcessErrorKind::Arguments));
         };
         match command {
+            "initialize-distributed-agent-stack-v1" if arguments.len() == 2 => {
+                Ok(ProcessCommand::InitializeDistributedAgentStack(
+                    parse_absolute_file_path(&arguments[1])?,
+                ))
+            }
+            "observe-distributed-agent-stack-nodes-once-v1" if arguments.len() == 2 => {
+                Ok(ProcessCommand::ObserveDistributedAgentStackNodesOnce(
+                    parse_absolute_file_path(&arguments[1])?,
+                ))
+            }
+            "apply-distributed-agent-stack-once-v1" if arguments.len() == 2 => {
+                Ok(ProcessCommand::ApplyDistributedAgentStackOnce(
+                    parse_absolute_file_path(&arguments[1])?,
+                ))
+            }
             "migrate-controller-journal-v7-to-v8-v1" if arguments.len() == 6 => Ok(
                 ProcessCommand::MigrateControllerJournal(ControllerJournalMigrationArguments {
                     state_directory: parse_absolute_path(&arguments[1])?,
@@ -2689,8 +6218,120 @@ mod platform {
                     Ok(ProcessCommand::ReconcileReferenceOnce(parsed))
                 }
             }
+            "observe-managed-serving-v1" if arguments.len() == 26 => Ok(
+                ProcessCommand::ObserveManagedServing(parse_managed_serving_arguments(&arguments)?),
+            ),
+            "apply-agent-stack-v1" if arguments.len() == 26 => Ok(ProcessCommand::ApplyAgentStack(
+                parse_managed_serving_arguments(&arguments)?,
+            )),
+            "deactivate-agent-stack-v1" if arguments.len() == 26 => Ok(
+                ProcessCommand::DeactivateAgentStack(parse_managed_serving_arguments(&arguments)?),
+            ),
+            "commit-agent-stack-v1" if arguments.len() == 49 => {
+                Ok(ProcessCommand::CommitAgentStack(Box::new(
+                    parse_agent_stack_commit_arguments(&arguments)?,
+                )))
+            }
             _ => Err(process_error(ProcessErrorKind::Arguments)),
         }
+    }
+
+    fn parse_managed_serving_arguments(
+        arguments: &[OsString],
+    ) -> Result<ManagedServingArguments, DeploymentdProcessError> {
+        Ok(ManagedServingArguments {
+            bootstrap: BootstrapArguments {
+                common: CommonArguments {
+                    state_directory: parse_absolute_path(&arguments[1])?,
+                    scope: parse_nonzero_hex(&arguments[5])?,
+                    plan: parse_nonzero_hex(&arguments[6])?,
+                    request_auth_key: parse_nonzero_hex(&arguments[7])?,
+                    public_key_path: parse_absolute_file_path(&arguments[8])?,
+                    expected_uid: parse_nonzero_u32(&arguments[10])?,
+                    expected_gid: parse_nonzero_u32(&arguments[11])?,
+                },
+                expected_store_id: parse_nonzero_hex(&arguments[3])?,
+                controller_private_seed_path: parse_absolute_file_path(&arguments[9])?,
+                controller_principal: parse_nonzero_hex(&arguments[12])?,
+                writer_ref: parse_nonzero_hex(&arguments[13])?,
+                authority_principal: parse_nonzero_hex(&arguments[14])?,
+                authority_uid: parse_nonzero_u32(&arguments[15])?,
+                authority_gid: parse_nonzero_u32(&arguments[16])?,
+                tenure_authority_ref: parse_nonzero_hex(&arguments[17])?,
+                tenure_key_ref: parse_nonzero_hex(&arguments[18])?,
+                authority_public_key_path: parse_absolute_file_path(&arguments[19])?,
+                runtime_socket_path: parse_absolute_file_path(&arguments[20])?,
+                runtime_principal: parse_nonzero_hex(&arguments[21])?,
+                runtime_response_key_ref: parse_nonzero_hex(&arguments[22])?,
+                runtime_response_public_key_path: parse_absolute_file_path(&arguments[23])?,
+                runtime_uid: parse_nonzero_u32(&arguments[24])?,
+                runtime_gid: parse_nonzero_u32(&arguments[25])?,
+            },
+            successor_directory: parse_absolute_path(&arguments[2])?,
+            successor_store_id: parse_nonzero_hex(&arguments[4])?,
+        })
+    }
+
+    fn parse_agent_stack_commit_arguments(
+        arguments: &[OsString],
+    ) -> Result<AgentStackCommitArguments, DeploymentdProcessError> {
+        let provider_ref = parse_nonzero_hex(&arguments[46])?;
+        let config_digest = parse_nonzero_hex(&arguments[47])?;
+        let profile = arguments[45]
+            .to_str()
+            .ok_or_else(|| process_error(ProcessErrorKind::Arguments))?;
+        let provider = match profile {
+            "deterministic-fixture" if arguments[48] == OsStr::new("none") => {
+                AgentStackProviderArguments::DeterministicFixture {
+                    provider_ref,
+                    config_digest,
+                }
+            }
+            "provisioned" => AgentStackProviderArguments::Provisioned {
+                provider_ref,
+                config_digest,
+                secret_ref: parse_nonzero_hex(&arguments[48])?,
+            },
+            _ => return Err(process_error(ProcessErrorKind::Arguments)),
+        };
+        let semantic = [
+            parse_nonzero_u16(&arguments[32])?,
+            parse_nonzero_u16(&arguments[33])?,
+            parse_nonzero_u16(&arguments[34])?,
+            parse_nonzero_u16(&arguments[35])?,
+        ];
+        let submit_key_expression = arguments[38]
+            .to_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| process_error(ProcessErrorKind::Arguments))?
+            .to_owned();
+        let control_key_expression = arguments[39]
+            .to_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| process_error(ProcessErrorKind::Arguments))?
+            .to_owned();
+        Ok(AgentStackCommitArguments {
+            managed: parse_managed_serving_arguments(arguments)?,
+            service_id: parse_nonzero_hex(&arguments[26])?,
+            lifecycle_budgets: [
+                parse_nonzero_u64(&arguments[27])?,
+                parse_nonzero_u64(&arguments[28])?,
+                parse_nonzero_u64(&arguments[29])?,
+                parse_nonzero_u64(&arguments[30])?,
+                parse_nonzero_u64(&arguments[31])?,
+            ],
+            semantic_limits: semantic,
+            submit_binding: parse_nonzero_hex(&arguments[36])?,
+            control_binding: parse_nonzero_hex(&arguments[37])?,
+            submit_key_expression,
+            control_key_expression,
+            ingress_max_items: parse_nonzero_u32(&arguments[40])?,
+            ingress_max_bytes: parse_nonzero_u64(&arguments[41])?,
+            ingress_max_frame_bytes: parse_nonzero_u32(&arguments[42])?,
+            ingress_max_response_body_bytes: parse_nonzero_u32(&arguments[43])?,
+            handler_timeout_nanos: parse_nonzero_u64(&arguments[44])?,
+            provider,
+        })
     }
 
     fn parse_absolute_file_path(value: &OsStr) -> Result<PathBuf, DeploymentdProcessError> {
@@ -2757,6 +6398,11 @@ mod platform {
         u32::try_from(value).map_err(|_| process_error(ProcessErrorKind::Arguments))
     }
 
+    fn parse_nonzero_u16(value: &OsStr) -> Result<u16, DeploymentdProcessError> {
+        let parsed = parse_nonzero_u32(value)?;
+        u16::try_from(parsed).map_err(|_| process_error(ProcessErrorKind::Arguments))
+    }
+
     fn parse_nonzero_u64(value: &OsStr) -> Result<u64, DeploymentdProcessError> {
         let value = value
             .to_str()
@@ -2800,6 +6446,7 @@ mod platform {
         Manifest,
         PublicKey,
         PrivateSeed,
+        Capability,
     }
 
     #[derive(Clone, Copy)]
@@ -2871,7 +6518,7 @@ mod platform {
         let mode = metadata.mode() & 0o7777;
         let valid_mode = match role {
             FileRole::Manifest => mode == 0o600,
-            FileRole::PrivateSeed => mode == 0o400,
+            FileRole::PrivateSeed | FileRole::Capability => mode == 0o400,
             FileRole::PublicKey => {
                 mode & 0o400 == 0o400
                     && mode & 0o022 == 0
@@ -2950,6 +6597,7 @@ mod platform {
             FileRole::PublicKey | FileRole::PrivateSeed => {
                 DeploymentdProcessError::new(ProcessErrorKind::Key)
             }
+            FileRole::Capability => DeploymentdProcessError::new(ProcessErrorKind::NodeDiscovery),
         }
     }
 
@@ -2970,8 +6618,16 @@ mod platform {
         use paraegox_kernel::digest::Digest32;
         use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
         use paraegox_kernel::time::BoundedDuration;
+        use paraegox_node::protocol::NodeManagementTargetV1;
+        use paraegox_node::{NodeId, NodeIncarnation, NodeManagementEndpointRefV1};
+        use paraegox_runtime_contracts::distributed_agent_stack_plan::{
+            DistributedFabricCredentialRefV1, DistributedFabricTrustAnchorRefV1,
+            DistributedFabricTrustDomainRefV1, RestrictedRuntimeApplyTransportProfileFieldsV1,
+            RestrictedRuntimeApplyTransportProfileV1,
+        };
         use paraegox_runtime_contracts::reference_control::ValidatedReferenceLifecycleBudgetsV1;
         use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
+        use zeroize::Zeroizing;
 
         use crate::controller_journal::{
             ControllerAuthKeyFingerprint, ControllerJournalError, ControllerJournalState,
@@ -2992,10 +6648,16 @@ mod platform {
         };
 
         use super::{
-            APPLY_ENTROPY_BYTES, DurableTenureRequest, FileLengthPolicy, FileRole,
-            FreshControllerApplyRequestV1, ProcessCommand, ProcessErrorKind, TENURE_ENTROPY_BYTES,
-            TenureRequestProfile, build_empty_commit_receipt, build_reference_candidate,
-            build_reference_empty_candidate, commit_reference_empty_in_store,
+            APPLY_ENTROPY_BYTES, BootstrapArguments, CommonArguments,
+            DistributedAgentStackRolloutStatusV1, DistributedCoordinatorCapabilityV1,
+            DistributedLocalCapabilityV1, DistributedNodeCapabilityV1,
+            DistributedPredecessorCapabilityV1,
+            DistributedRestrictedControllerConnectorCapabilityV1, DurableTenureRequest,
+            FileLengthPolicy, FileRole, FreshControllerApplyRequestV1, ManagedServingArguments,
+            ProcessCommand, ProcessErrorKind, TENURE_ENTROPY_BYTES, TenureRequestProfile,
+            build_empty_commit_receipt, build_reference_candidate, build_reference_empty_candidate,
+            commit_reference_empty_in_store,
+            distributed_owner_terminal_runtime_observation_is_admissible,
             fresh_apply_request_from_entropy, fresh_tenure_request_from_entropy, parse_arguments,
             parse_nonzero_hex, read_pinned_file, recover_tenure_request,
             select_durable_tenure_request, validate_committed_empty_state,
@@ -3027,6 +6689,37 @@ mod platform {
                 "bootstrap-runtime-v1".into(),
                 "/tmp/paraegox-controller".into(),
                 hex(0x31, 32),
+                hex(0x32, 16),
+                hex(0x33, 16),
+                hex(0x34, 16),
+                "/tmp/controller.pub".into(),
+                "/tmp/controller.seed".into(),
+                "501".into(),
+                "20".into(),
+                hex(0x35, 16),
+                hex(0x36, 16),
+                hex(0x37, 16),
+                "502".into(),
+                "21".into(),
+                hex(0x38, 16),
+                hex(0x39, 16),
+                "/tmp/authority.pub".into(),
+                "/tmp/runtime.sock".into(),
+                hex(0x3a, 16),
+                hex(0x3b, 16),
+                "/tmp/runtime-response.pub".into(),
+                "503".into(),
+                "22".into(),
+            ]
+        }
+
+        fn managed_serving_arguments() -> Vec<OsString> {
+            vec![
+                "observe-managed-serving-v1".into(),
+                "/tmp/paraegox-controller".into(),
+                "/tmp/paraegox-managed-controller".into(),
+                hex(0x31, 32),
+                hex(0x30, 32),
                 hex(0x32, 16),
                 hex(0x33, 16),
                 hex(0x34, 16),
@@ -3085,8 +6778,308 @@ mod platform {
             ]
         }
 
+        fn distributed_capability_fixture(
+            first_token: u8,
+            second_token: u8,
+        ) -> DistributedLocalCapabilityV1 {
+            let expected_uid = geteuid().as_raw().max(1);
+            let expected_gid = getegid().as_raw().max(1);
+            let common = |name: &str| CommonArguments {
+                state_directory: PathBuf::from(format!("/tmp/paraegox-pxnc-{name}-state")),
+                scope: [0x11; 16],
+                plan: [0x12; 16],
+                request_auth_key: [0x13; 16],
+                public_key_path: PathBuf::from(format!("/tmp/paraegox-pxnc-{name}-controller.pub")),
+                expected_uid,
+                expected_gid,
+            };
+            let predecessor = |name: &str, byte: u8, token: u8| {
+                let expected_target = RuntimeHostId::from_bytes([byte; 16]);
+                DistributedPredecessorCapabilityV1 {
+                    expected_target,
+                    managed: ManagedServingArguments {
+                        bootstrap: BootstrapArguments {
+                            common: common(name),
+                            expected_store_id: [byte.wrapping_add(1); 32],
+                            controller_private_seed_path: PathBuf::from(format!(
+                                "/tmp/paraegox-pxnc-{name}-controller.seed"
+                            )),
+                            controller_principal: [byte.wrapping_add(2); 16],
+                            writer_ref: [byte.wrapping_add(3); 16],
+                            authority_principal: [byte.wrapping_add(4); 16],
+                            authority_uid: expected_uid,
+                            authority_gid: expected_gid,
+                            tenure_authority_ref: [byte.wrapping_add(5); 16],
+                            tenure_key_ref: [byte.wrapping_add(6); 16],
+                            authority_public_key_path: PathBuf::from(format!(
+                                "/tmp/paraegox-pxnc-{name}-authority.pub"
+                            )),
+                            runtime_socket_path: PathBuf::from(format!(
+                                "/tmp/paraegox-pxnc-{name}-runtime.sock"
+                            )),
+                            runtime_principal: [byte.wrapping_add(7); 16],
+                            runtime_response_key_ref: [byte.wrapping_add(8); 16],
+                            runtime_response_public_key_path: PathBuf::from(format!(
+                                "/tmp/paraegox-pxnc-{name}-runtime.pub"
+                            )),
+                            runtime_uid: expected_uid,
+                            runtime_gid: expected_gid,
+                        },
+                        successor_directory: PathBuf::from(format!(
+                            "/tmp/paraegox-pxnc-{name}-successor"
+                        )),
+                        successor_store_id: [byte.wrapping_add(9); 32],
+                    },
+                    node: DistributedNodeCapabilityV1 {
+                        expected_target,
+                        management_target: NodeManagementTargetV1::try_new(
+                            NodeId::try_from_bytes([byte.wrapping_add(10); 16])
+                                .expect("nonzero node id"),
+                            NodeManagementEndpointRefV1::try_from_bytes(
+                                [byte.wrapping_add(11); 16],
+                            )
+                            .expect("nonzero endpoint ref"),
+                            NodeIncarnation::try_from_bytes([byte.wrapping_add(12); 16])
+                                .expect("nonzero incarnation"),
+                            u64::from(byte),
+                        )
+                        .expect("valid management target"),
+                        socket_path: PathBuf::from(format!("/tmp/paraegox-pxnc-{name}-node.sock")),
+                        token: Zeroizing::new([token; 32]),
+                        expected_uid,
+                        expected_gid,
+                        topology_wire: vec![0xa0, byte].into_boxed_slice(),
+                    },
+                    connector: Some(DistributedRestrictedControllerConnectorCapabilityV1 {
+                        profile_ref: [byte.wrapping_add(13); 16],
+                        transport_profile: RestrictedRuntimeApplyTransportProfileV1::try_new(
+                            RestrictedRuntimeApplyTransportProfileFieldsV1 {
+                                target: expected_target,
+                                endpoint_ref: [byte.wrapping_add(14); 16],
+                                endpoint_generation: u64::from(byte),
+                                tls_listener_locator: if byte == 0x21 {
+                                    "tls/192.0.2.21:7447"
+                                } else {
+                                    "tls/192.0.2.22:7447"
+                                },
+                                route: if byte == 0x21 {
+                                    "paraegox/runtime-first/apply"
+                                } else {
+                                    "paraegox/runtime-second/apply"
+                                },
+                                trust_domain_ref:
+                                    DistributedFabricTrustDomainRefV1::try_from_bytes(
+                                        [byte.wrapping_add(15); 16],
+                                    )
+                                    .expect("trust domain"),
+                                trust_anchor_ref:
+                                    DistributedFabricTrustAnchorRefV1::try_from_bytes(
+                                        [byte.wrapping_add(16); 16],
+                                    )
+                                    .expect("trust anchor"),
+                                controller_connector_credential_ref:
+                                    DistributedFabricCredentialRefV1::try_from_bytes(
+                                        [byte.wrapping_add(17); 16],
+                                    )
+                                    .expect("Controller connector credential"),
+                                runtime_listener_credential_ref:
+                                    DistributedFabricCredentialRefV1::try_from_bytes(
+                                        [byte.wrapping_add(18); 16],
+                                    )
+                                    .expect("Runtime listener credential"),
+                                controller_principal: PrincipalRef::from_bytes(
+                                    [byte.wrapping_add(2); 16],
+                                ),
+                                runtime_principal: PrincipalRef::from_bytes(
+                                    [byte.wrapping_add(7); 16],
+                                ),
+                                operation_timeout_nanos: 5_000_000_000,
+                            },
+                        )
+                        .expect("restricted transport profile"),
+                        root_ca_certificate_file: PathBuf::from(format!(
+                            "/tmp/paraegox-pxnc-{name}-root-ca.pem"
+                        )),
+                        connector_certificate_file: PathBuf::from(format!(
+                            "/tmp/paraegox-pxnc-{name}-connector-cert.pem"
+                        )),
+                        connector_private_key_file: PathBuf::from(format!(
+                            "/tmp/paraegox-pxnc-{name}-connector-key.pem"
+                        )),
+                    }),
+                }
+            };
+            DistributedLocalCapabilityV1 {
+                expected_uid,
+                expected_gid,
+                lifecycle_budget_nanos: 1_000_000,
+                coordinator: DistributedCoordinatorCapabilityV1 {
+                    common: common("coordinator"),
+                    expected_store_id: [0x14; 32],
+                    controller_private_seed_path: PathBuf::from(
+                        "/tmp/paraegox-pxnc-coordinator-controller.seed",
+                    ),
+                },
+                predecessors: [
+                    predecessor("first", 0x21, first_token),
+                    predecessor("second", 0x22, second_token),
+                ],
+                checksum: Digest32::from_bytes([0; 32]),
+            }
+        }
+
+        #[test]
+        fn legacy_active_ready_without_durable_runtime_observation_is_rejected() {
+            assert!(
+                !distributed_owner_terminal_runtime_observation_is_admissible(
+                    DistributedAgentStackRolloutStatusV1::ActiveReady,
+                    false,
+                )
+            );
+            assert!(
+                distributed_owner_terminal_runtime_observation_is_admissible(
+                    DistributedAgentStackRolloutStatusV1::ActiveReady,
+                    true,
+                )
+            );
+            assert!(
+                distributed_owner_terminal_runtime_observation_is_admissible(
+                    DistributedAgentStackRolloutStatusV1::TerminalNonReady,
+                    false,
+                )
+            );
+        }
+
+        #[test]
+        fn distributed_capability_codec_is_canonical_and_debug_redacts_tokens() {
+            let capability = distributed_capability_fixture(0xe1, 0xe2);
+            let wire = capability
+                .encode()
+                .expect("fixture must encode with the one PXNC codec");
+            assert_eq!(&wire[..6], b"PXNC\0\x02");
+            let decoded = DistributedLocalCapabilityV1::decode(&wire)
+                .expect("canonical PXNC must decode and revalidate");
+            assert_eq!(
+                decoded
+                    .encode()
+                    .expect("decoded PXNC must re-encode")
+                    .as_slice(),
+                wire.as_slice()
+            );
+            let mut tampered = wire.to_vec();
+            tampered[64] ^= 1;
+            assert!(
+                DistributedLocalCapabilityV1::decode(&tampered).is_err(),
+                "checksum-bound payload mutation must fail closed"
+            );
+
+            let debug = format!("{capability:?}");
+            assert_eq!(debug, "DistributedLocalCapabilityV1 { .. }");
+            assert!(!debug.contains(&"e1".repeat(32)));
+            assert!(!debug.contains(&"e2".repeat(32)));
+        }
+
+        #[test]
+        fn distributed_capability_v1_remains_canonical_but_cannot_apply() {
+            let mut capability = distributed_capability_fixture(0xe1, 0xe2);
+            capability.predecessors[0].connector = None;
+            capability.predecessors[1].connector = None;
+            let wire = capability
+                .encode()
+                .expect("legacy PXNC v1 remains an exact readable capability");
+            assert_eq!(&wire[..6], b"PXNC\0\x01");
+            let decoded = DistributedLocalCapabilityV1::decode(&wire)
+                .expect("legacy PXNC v1 must still reopen canonically");
+            assert_eq!(
+                decoded
+                    .encode()
+                    .expect("legacy PXNC v1 canonical replay")
+                    .as_slice(),
+                wire.as_slice()
+            );
+            assert!(decoded.distributed_apply_connectors().is_err());
+        }
+
+        #[test]
+        fn distributed_capability_rejects_partial_connector_authority() {
+            let mut capability = distributed_capability_fixture(0xe1, 0xe2);
+            capability.predecessors[1].connector = None;
+            assert!(capability.encode().is_err());
+        }
+
+        #[test]
+        fn distributed_capability_rejects_cross_target_transport_profiles() {
+            let mut capability = distributed_capability_fixture(0xe1, 0xe2);
+            let first = capability.predecessors[0]
+                .connector
+                .take()
+                .expect("first connector");
+            let second = capability.predecessors[1]
+                .connector
+                .take()
+                .expect("second connector");
+            capability.predecessors[0].connector = Some(second);
+            capability.predecessors[1].connector = Some(first);
+            assert!(capability.encode().is_err());
+        }
+
+        #[test]
+        fn distributed_capability_rejects_reused_cross_target_profile_ref() {
+            let mut capability = distributed_capability_fixture(0xe1, 0xe2);
+            let first_profile_ref = capability.predecessors[0]
+                .connector
+                .as_ref()
+                .expect("first connector")
+                .profile_ref;
+            capability.predecessors[1]
+                .connector
+                .as_mut()
+                .expect("second connector")
+                .profile_ref = first_profile_ref;
+            assert!(capability.encode().is_err());
+        }
+
         #[test]
         fn exact_versioned_positional_grammars_accept_only_complete_commands() {
+            let initialize_distributed = vec![
+                "initialize-distributed-agent-stack-v1".into(),
+                "/tmp/paraegox-distributed.pxnc".into(),
+            ];
+            assert!(matches!(
+                parse_arguments(initialize_distributed.clone()),
+                Ok(ProcessCommand::InitializeDistributedAgentStack(_))
+            ));
+            let mut extra_initialize_distributed = initialize_distributed.clone();
+            extra_initialize_distributed.push("unexpected".into());
+            assert!(parse_arguments(extra_initialize_distributed).is_err());
+
+            let observe_distributed = vec![
+                "observe-distributed-agent-stack-nodes-once-v1".into(),
+                "/tmp/paraegox-distributed.pxnc".into(),
+            ];
+            assert!(matches!(
+                parse_arguments(observe_distributed.clone()),
+                Ok(ProcessCommand::ObserveDistributedAgentStackNodesOnce(_))
+            ));
+            let mut missing_observe_distributed = observe_distributed;
+            missing_observe_distributed.pop();
+            assert!(parse_arguments(missing_observe_distributed).is_err());
+
+            let apply_distributed = vec![
+                "apply-distributed-agent-stack-once-v1".into(),
+                "/tmp/paraegox-distributed.pxnc".into(),
+            ];
+            assert!(matches!(
+                parse_arguments(apply_distributed.clone()),
+                Ok(ProcessCommand::ApplyDistributedAgentStackOnce(_))
+            ));
+            let mut extra_apply_distributed = apply_distributed.clone();
+            extra_apply_distributed.push("unexpected".into());
+            assert!(parse_arguments(extra_apply_distributed).is_err());
+            let mut missing_apply_distributed = apply_distributed;
+            missing_apply_distributed.pop();
+            assert!(parse_arguments(missing_apply_distributed).is_err());
+
             assert!(matches!(
                 parse_arguments(migration_arguments()),
                 Ok(ProcessCommand::MigrateControllerJournal(_))
@@ -3223,6 +7216,22 @@ mod platform {
                     .kind,
                 ProcessErrorKind::Arguments
             );
+
+            let mut serving = managed_serving_arguments();
+            assert!(matches!(
+                parse_arguments(serving.clone()),
+                Ok(ProcessCommand::ObserveManagedServing(_))
+            ));
+            serving.push(hex(0x43, 16));
+            assert_eq!(
+                parse_arguments(serving)
+                    .expect_err("managed serving must reject caller request-id/nonce entropy")
+                    .kind,
+                ProcessErrorKind::Arguments
+            );
+            let mut missing_serving = managed_serving_arguments();
+            missing_serving.pop();
+            assert!(parse_arguments(missing_serving).is_err());
         }
 
         #[test]

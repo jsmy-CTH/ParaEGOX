@@ -1,0 +1,85 @@
+name: macos-cli-artifact
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "build/macos-artifact-*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-paraegox-cli:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install repository-pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Report active Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Build the ParaEGOX CLI
+        run: cargo build --locked -p paraegox-local --bin paraegox
+
+      - name: Verify native binary and public CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binary="target/debug/paraegox"
+          test -x "$binary"
+
+          binary_description="$(file -b "$binary")"
+          printf '%s\n' "$binary_description"
+          case "$binary_description" in
+            "Mach-O 64-bit executable x86_64"*) ;;
+            *)
+              printf 'unexpected ParaEGOX artifact: %s\n' "$binary_description" >&2
+              exit 1
+              ;;
+          esac
+
+          help_output="$RUNNER_TEMP/paraegox-help.txt"
+          "$binary" --help | tee "$help_output"
+
+          grep -Fqx 'Usage: paraegox chat --config <absolute-paraegox.toml>' "$help_output"
+          grep -Fqx '       paraegox --help' "$help_output"
+          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 2
+
+          if grep -Eq 'paraegox-local|developer-|fixture-v1|openai-v1|deepseek-v1' "$help_output"; then
+            printf 'legacy provider-specific CLI surface is still exposed\n' >&2
+            exit 1
+          fi
+
+      - name: Stage binary and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifact
+          install -m 0755 target/debug/paraegox artifact/paraegox
+          (
+            cd artifact
+            shasum -a 256 paraegox > paraegox.sha256
+            shasum -a 256 -c paraegox.sha256
+          )
+
+      - name: Upload commit-addressed macOS CLI artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: paraegox-macos-x86_64-${{ github.sha }}
+          path: |
+            artifact/paraegox
+            artifact/paraegox.sha256
+          if-no-files-found: error
+          retention-days: 7

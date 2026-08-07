@@ -27,7 +27,8 @@ use crate::runtime_host::{RuntimeHostProcessError, run_runtime_host_process};
 use crate::runtime_build_metadata::runtime_compiled_installation_facts;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 use crate::runtime_control_endpoint::{
-    RuntimeBootstrapEndpointError, run_runtime_bootstrap_process,
+    RuntimeBootstrapEndpointError, RuntimeManagedFabricServiceDependenciesV1,
+    run_runtime_bootstrap_process,
 };
 
 #[cfg(unix)]
@@ -490,6 +491,7 @@ fn run_bootstrap_service(
         arguments.expected_store_instance_id,
         compiled,
         provisioning,
+        RuntimeManagedFabricServiceDependenciesV1::unavailable(),
     )?;
     Ok(())
 }

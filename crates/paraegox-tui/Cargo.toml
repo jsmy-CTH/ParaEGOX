@@ -1,0 +1,26 @@
+[package]
+name = "paraegox-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+crossterm.workspace = true
+paraegox-agent-contracts.workspace = true
+paraegox-inspection.workspace = true
+paraegox-kernel.workspace = true
+ratatui.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+
+[target.'cfg(unix)'.dependencies]
+paraegox-runtime = { path = "../paraegox-runtime" }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "paraegox-tui"
+path = "src/main.rs"

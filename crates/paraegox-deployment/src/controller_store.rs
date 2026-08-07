@@ -22,11 +22,29 @@ use nix::fcntl::{RenameFlags, renameat2};
 use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
 use paraegox_kernel::digest::{Digest32, Digest32Builder};
+use paraegox_kernel::identity::RuntimeHostId;
+use paraegox_node::observation::{
+    RuntimeObservationAckV1, RuntimeObservationAuthorityV1, RuntimeObservationEndpointRefV1,
+    RuntimeObservationRequestV1,
+};
+use paraegox_runtime_contracts::reference_control::ReferenceQueryResponseV1;
+use paraegox_runtime_contracts::wire::ApplyAuthAlgorithm;
 
 use crate::controller_journal::{
     CONTROLLER_PAYLOAD_VERSION, ControllerJournalError, ControllerJournalPayloadV7Migration,
     ControllerJournalSnapshot, ControllerOwnerIdentityFingerprint, MAX_CONTROLLER_SNAPSHOT_BYTES,
 };
+use crate::distributed_agent_stack_apply::{
+    DistributedAgentStackApplyError, DistributedAgentStackApplyJournalV1,
+};
+use crate::distributed_agent_stack_node_reconcile::{
+    DistributedAgentStackNodeDiscoveryStateV1, DistributedAgentStackNodeReconcileError,
+    DistributedAgentStackRuntimeQueryMaterialV1, DistributedAgentStackRuntimeQueryPhaseV1,
+    DistributedRuntimeObservationCompletionIngressV1,
+    TrustedLocalRuntimeObservationExchangeErrorV1,
+};
+use crate::distributed_agent_stack_producer::VerifiedDistributedAgentStackPredecessorV1;
+use crate::runtime_control_client::PreparedRuntimeQueryRequest;
 
 pub(crate) const CONTROLLER_LOCK_FILE_NAME: &str = "controller.lock";
 pub(crate) const CONTROLLER_ACTIVE_FILE_NAME: &str = "controller.snapshot";
@@ -57,6 +75,8 @@ const PRIVATE_FILE_MODE_MASK: u32 = 0o7777;
 const PRIVATE_FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
 const READ_ONLY_EVIDENCE_MODE_BITS: u32 = 0o400;
 const READ_ONLY_EVIDENCE_MODE: Mode = Mode::S_IRUSR;
+const ED25519_ALGORITHM: u16 = 1;
+const ED25519_ALGORITHM_VERSION: u16 = 1;
 #[cfg(any(target_os = "linux", test))]
 const MAX_LINUX_FDINFO_BYTES: usize = 64 * 1024;
 #[cfg(any(target_os = "linux", test))]
@@ -73,6 +93,7 @@ const MAX_LINUX_MOUNTINFO_LINE_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControllerFilesystemPolicy {
     ProductionReference,
+    DeveloperLocal,
     #[cfg(test)]
     ExplicitFixture,
 }
@@ -98,6 +119,15 @@ impl FileIdentity {
             inode: metadata.ino(),
         }
     }
+}
+
+/// Exact filesystem capability identity held by one operational Controller writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerStoreCutoverIdentity {
+    pub(crate) directory_device: u64,
+    pub(crate) directory_inode: u64,
+    pub(crate) lock_device: u64,
+    pub(crate) lock_inode: u64,
 }
 
 impl fmt::Debug for ControllerDirectoryHandle {
@@ -364,6 +394,169 @@ pub(crate) struct ControllerStore {
     lock_file: File,
     snapshot: ControllerJournalSnapshot,
     state: ControllerStoreState,
+    resident_generation: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+    runtime_observation_grants: Vec<RuntimeObservationResidentGrantV1>,
+    active_runtime_observation_claim: Option<RuntimeObservationActiveClaimV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeObservationResidentGrantV1 {
+    attempt_count: usize,
+    target: RuntimeHostId,
+    request_digest: Digest32,
+    phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    claimed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeObservationActiveClaimV1 {
+    snapshot_sequence: u64,
+    attempt_count: usize,
+    target: RuntimeHostId,
+    request_digest: Digest32,
+    phase: DistributedAgentStackRuntimeQueryPhaseV1,
+}
+
+#[derive(Debug)]
+pub(crate) struct ControllerDistributedAgentStackOwnerStateV1 {
+    apply_journal: DistributedAgentStackApplyJournalV1,
+    node_discovery: DistributedAgentStackNodeDiscoveryStateV1,
+}
+
+impl ControllerDistributedAgentStackOwnerStateV1 {
+    #[must_use]
+    pub(crate) const fn apply_journal(&self) -> &DistributedAgentStackApplyJournalV1 {
+        &self.apply_journal
+    }
+
+    #[must_use]
+    pub(crate) const fn node_discovery(&self) -> &DistributedAgentStackNodeDiscoveryStateV1 {
+        &self.node_discovery
+    }
+
+    pub(crate) fn parts_mut(
+        &mut self,
+    ) -> (
+        &mut DistributedAgentStackApplyJournalV1,
+        &mut DistributedAgentStackNodeDiscoveryStateV1,
+    ) {
+        (&mut self.apply_journal, &mut self.node_discovery)
+    }
+}
+
+/// Resident one-shot authority created only by the successful
+/// None-to-request-pair commit seam below. Decode/reopen never constructs it.
+pub(crate) struct CommittedDistributedRuntimeQueryPairV1 {
+    resident_generation: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+    store_instance_id: [u8; 32],
+    snapshot_sequence: u64,
+    node_state_digest: Digest32,
+    attempt_count: usize,
+    rows: [DistributedAgentStackRuntimeQueryMaterialV1; 2],
+}
+
+impl fmt::Debug for CommittedDistributedRuntimeQueryPairV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommittedDistributedRuntimeQueryPairV1")
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("attempt_count", &self.attempt_count)
+            .field("targets", &[self.rows[0].target(), self.rows[1].target()])
+            .finish_non_exhaustive()
+    }
+}
+
+/// Sealed authority for one exact already-durable PXNO. Unlike PXQR, this may
+/// be reconstructed by the explicit exact-replay seam after restart.
+pub(crate) struct CommittedDistributedRuntimeObservationV1 {
+    resident_generation: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+    store_instance_id: [u8; 32],
+    snapshot_sequence: u64,
+    node_state_digest: Digest32,
+    attempt_count: usize,
+    phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    target: RuntimeHostId,
+    observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+    request: RuntimeObservationRequestV1,
+}
+
+impl fmt::Debug for CommittedDistributedRuntimeObservationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommittedDistributedRuntimeObservationV1")
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("target", &self.target)
+            .field("request_digest", &self.request.request_digest())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact PXNO released for one transport exchange after current-store
+/// revalidation. It retains the snapshot witness required by PXNA commit.
+pub(crate) struct ClaimedDistributedRuntimeObservationV1 {
+    resident_generation: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+    store_instance_id: [u8; 32],
+    snapshot_sequence: u64,
+    node_state_digest: Digest32,
+    attempt_count: usize,
+    phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    target: RuntimeHostId,
+    observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+    request: RuntimeObservationRequestV1,
+}
+
+impl ClaimedDistributedRuntimeObservationV1 {
+    #[must_use]
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &RuntimeObservationRequestV1 {
+        &self.request
+    }
+
+    #[must_use]
+    pub(crate) const fn observation_endpoint_ref(&self) -> RuntimeObservationEndpointRefV1 {
+        self.observation_endpoint_ref
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_transport_test(
+        observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+        request: RuntimeObservationRequestV1,
+    ) -> Self {
+        Self {
+            resident_generation: [0x91; CONTROLLER_TEMP_TOKEN_BYTES],
+            store_instance_id: [0x92; 32],
+            snapshot_sequence: 1,
+            node_state_digest: Digest32::from_bytes([0x93; 32]),
+            attempt_count: 1,
+            phase: DistributedAgentStackRuntimeQueryPhaseV1::ObservationDurableNotSent,
+            target: request.runtime_host_id(),
+            observation_endpoint_ref,
+            request,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DistributedRuntimeObservationCommitDispositionV1 {
+    AckDurable,
+    NotSent,
+    Uncertain,
+    Rejected,
+}
+
+impl fmt::Debug for ClaimedDistributedRuntimeObservationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaimedDistributedRuntimeObservationV1")
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("target", &self.target)
+            .field("request_digest", &self.request.request_digest())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -532,6 +725,34 @@ impl ControllerStore {
         )
     }
 
+    pub(crate) fn open_developer_local(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+    ) -> Result<Self, ControllerStoreOpenError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            expected_owner_identity,
+            ControllerFilesystemPolicy::DeveloperLocal,
+        )
+    }
+
+    /// Reopens a developer-local legacy store when its random store identity
+    /// is owned only by the durable snapshot. The owner fingerprint and every
+    /// snapshot invariant are still verified before the identity is observed.
+    pub(crate) fn open_developer_local_observed_identity(
+        directory: &Path,
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+    ) -> Result<Self, ControllerStoreOpenError> {
+        Self::open_validated(
+            directory,
+            None,
+            expected_owner_identity,
+            ControllerFilesystemPolicy::DeveloperLocal,
+        )
+    }
+
     pub(crate) fn open_for_sequence_one_receipt(
         directory: &Path,
         expected_owner_identity: ControllerOwnerIdentityFingerprint,
@@ -541,6 +762,18 @@ impl ControllerStore {
             None,
             expected_owner_identity,
             ControllerFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    pub(crate) fn open_for_sequence_one_receipt_developer_local(
+        directory: &Path,
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+    ) -> Result<Self, ControllerStoreOpenError> {
+        Self::open_validated(
+            directory,
+            None,
+            expected_owner_identity,
+            ControllerFilesystemPolicy::DeveloperLocal,
         )
     }
 
@@ -609,17 +842,941 @@ impl ControllerStore {
             return Err(ControllerStoreOpenError::OwnerIdentityMismatch);
         }
         clean_valid_orphan_temps(&directory)?;
+        let resident_generation = system_random_token().map_err(|error| {
+            ControllerStoreOpenError::Io(ControllerIoFailure::new(
+                ControllerFileStage::GenerateTempName,
+                &error,
+            ))
+        })?;
         Ok(Self {
             directory,
             lock_file,
             snapshot,
             state: ControllerStoreState::Operational,
+            resident_generation,
+            runtime_observation_grants: Vec::new(),
+            active_runtime_observation_claim: None,
         })
     }
 
     pub(crate) fn snapshot(&self) -> Result<&ControllerJournalSnapshot, ControllerStoreError> {
         self.ensure_operational()?;
         Ok(&self.snapshot)
+    }
+
+    /// Reopens only an owner extension that has not yet introduced PXQR. Once
+    /// query history exists, callers must supply exact PXOB authorities and
+    /// PXOB endpoint refs through the bound reopen seam below.
+    pub(crate) fn reopen_distributed_agent_stack(
+        &self,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+    ) -> Result<
+        Option<ControllerDistributedAgentStackOwnerStateV1>,
+        ControllerDistributedAgentStackError,
+    > {
+        let owner =
+            self.reopen_distributed_agent_stack_unbound(expected_owner_anchor, predecessors)?;
+        if owner
+            .as_ref()
+            .is_some_and(|owner| owner.node_discovery.runtime_query_attempt_count() != 0)
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        Ok(owner)
+    }
+
+    pub(crate) fn reopen_distributed_agent_stack_with_runtime_observation(
+        &self,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<
+        Option<ControllerDistributedAgentStackOwnerStateV1>,
+        ControllerDistributedAgentStackError,
+    > {
+        let owner =
+            self.reopen_distributed_agent_stack_unbound(expected_owner_anchor, predecessors)?;
+        if let Some(owner) = &owner {
+            owner
+                .node_discovery
+                .validate_runtime_queries(predecessors, authorities, observation_endpoint_refs)
+                .map_err(ControllerDistributedAgentStackError::Node)?;
+        }
+        Ok(owner)
+    }
+
+    /// PXJR/PXDE checksum validation performed during store open is followed
+    /// here by PXDJ predecessor and Runtime signature reauthentication. This
+    /// unbound helper never escapes ControllerStore.
+    fn reopen_distributed_agent_stack_unbound(
+        &self,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+    ) -> Result<
+        Option<ControllerDistributedAgentStackOwnerStateV1>,
+        ControllerDistributedAgentStackError,
+    > {
+        self.ensure_operational()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        let journal_wire = self.snapshot.distributed_agent_stack_journal_wire();
+        let node_wire = self.snapshot.distributed_agent_stack_node_discovery_wire();
+        let (Some(journal_wire), Some(node_wire)) = (journal_wire, node_wire) else {
+            if journal_wire.is_some() || node_wire.is_some() {
+                return Err(ControllerDistributedAgentStackError::IncompleteExtension);
+            }
+            return Ok(None);
+        };
+        let apply_journal = DistributedAgentStackApplyJournalV1::try_reopen(
+            journal_wire,
+            expected_owner_anchor,
+            predecessors,
+        )
+        .map_err(ControllerDistributedAgentStackError::Apply)?;
+        let node_discovery = DistributedAgentStackNodeDiscoveryStateV1::decode(node_wire)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        node_discovery
+            .validate_runtime_queries_against_predecessors(predecessors)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let apply_state = apply_journal
+            .state()
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        if node_discovery.owner_anchor() != expected_owner_anchor
+            || node_discovery.owner_anchor() != apply_state.owner_anchor()
+            || node_discovery.rollout_id() != apply_state.rollout().rollout_id()
+            || node_discovery.runtime_targets()
+                != [predecessors[0].target(), predecessors[1].target()]
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        Ok(Some(ControllerDistributedAgentStackOwnerStateV1 {
+            apply_journal,
+            node_discovery,
+        }))
+    }
+
+    /// Commits exact PXDJ and PXDN bytes inside this store's existing atomic
+    /// replace/fsync boundary. No second path, lock, or journal is created.
+    pub(crate) fn commit_distributed_agent_stack_wires(
+        &mut self,
+        journal_wire: &[u8],
+        node_discovery_wire: &[u8],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        self.ensure_operational()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if self.active_runtime_observation_claim.is_some() {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let next = self
+            .snapshot
+            .try_distributed_agent_stack_successor(journal_wire, node_discovery_wire)
+            .map_err(ControllerDistributedAgentStackError::Journal)?;
+        self.commit(next)
+            .map_err(ControllerDistributedAgentStackError::Store)
+    }
+
+    fn commit_claimed_runtime_observation_successor(
+        &mut self,
+        journal_wire: &[u8],
+        node_discovery_wire: &[u8],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        self.ensure_operational()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if self.active_runtime_observation_claim.is_none() {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let next = self
+            .snapshot
+            .try_distributed_agent_stack_successor(journal_wire, node_discovery_wire)
+            .map_err(ControllerDistributedAgentStackError::Journal)?;
+        let result = self
+            .commit(next)
+            .map_err(ControllerDistributedAgentStackError::Store);
+        let result = result.and_then(|()| {
+            self.revalidate_current()
+                .map_err(ControllerDistributedAgentStackError::Store)?;
+            if self.snapshot.distributed_agent_stack_journal_wire() != Some(journal_wire)
+                || self.snapshot.distributed_agent_stack_node_discovery_wire()
+                    != Some(node_discovery_wire)
+            {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            Ok(())
+        });
+        if result.is_ok() {
+            self.active_runtime_observation_claim = None;
+        } else {
+            self.state = ControllerStoreState::Stopped;
+        }
+        result
+    }
+
+    /// Atomically appends one request-only A/B PXQR attempt, then performs an
+    /// exact active-snapshot readback before creating resident send authority.
+    /// No reopen path calls this constructor.
+    pub(crate) fn commit_distributed_runtime_query_pair(
+        &mut self,
+        next_node_discovery: &DistributedAgentStackNodeDiscoveryStateV1,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<CommittedDistributedRuntimeQueryPairV1, ControllerDistributedAgentStackError> {
+        next_node_discovery
+            .validate_runtime_queries(predecessors, authorities, observation_endpoint_refs)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let owner_anchor = next_node_discovery.owner_anchor();
+        let before = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        if next_node_discovery.runtime_query_attempt_count()
+            != before
+                .node_discovery
+                .runtime_query_attempt_count()
+                .saturating_add(1)
+            || next_node_discovery.runtime_query_phases()
+                != Some([
+                    DistributedAgentStackRuntimeQueryPhaseV1::RequestDurableNotSent,
+                    DistributedAgentStackRuntimeQueryPhaseV1::RequestDurableNotSent,
+                ])
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let expected_wire = next_node_discovery
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_distributed_agent_stack_wires(&journal_wire, &expected_wire)?;
+        let readback_result = (|| {
+            self.revalidate_current()
+                .map_err(ControllerDistributedAgentStackError::Store)?;
+            if self.snapshot.distributed_agent_stack_node_discovery_wire()
+                != Some(expected_wire.as_ref())
+            {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            let readback = self
+                .reopen_distributed_agent_stack_with_runtime_observation(
+                    owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?
+                .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+            let targets = readback.node_discovery.runtime_targets();
+            let rows = [
+                readback
+                    .node_discovery
+                    .current_runtime_query_material(targets[0], predecessors[0])
+                    .map_err(ControllerDistributedAgentStackError::Node)?,
+                readback
+                    .node_discovery
+                    .current_runtime_query_material(targets[1], predecessors[1])
+                    .map_err(ControllerDistributedAgentStackError::Node)?,
+            ];
+            Ok(CommittedDistributedRuntimeQueryPairV1 {
+                resident_generation: self.resident_generation,
+                store_instance_id: *self.snapshot.store_instance_id(),
+                snapshot_sequence: self.snapshot.snapshot_sequence(),
+                node_state_digest: readback
+                    .node_discovery
+                    .durable_digest()
+                    .map_err(ControllerDistributedAgentStackError::Node)?,
+                attempt_count: readback.node_discovery.runtime_query_attempt_count(),
+                rows,
+            })
+        })();
+        if readback_result.is_err() {
+            self.state = ControllerStoreState::Stopped;
+        }
+        readback_result
+    }
+
+    /// Consumes the resident post-commit pair token and releases both PXQR
+    /// requests together. The token becomes stale after any successor commit.
+    pub(crate) fn claim_distributed_runtime_query_pair(
+        &mut self,
+        prepared: CommittedDistributedRuntimeQueryPairV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<[PreparedRuntimeQueryRequest; 2], ControllerDistributedAgentStackError> {
+        self.revalidate_current()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if prepared.resident_generation != self.resident_generation
+            || prepared.store_instance_id != *self.snapshot.store_instance_id()
+            || prepared.snapshot_sequence != self.snapshot.snapshot_sequence()
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let readback = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        if prepared.node_state_digest
+            != readback
+                .node_discovery
+                .durable_digest()
+                .map_err(ControllerDistributedAgentStackError::Node)?
+            || prepared.attempt_count != readback.node_discovery.runtime_query_attempt_count()
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let targets = readback.node_discovery.runtime_targets();
+        let current_rows = [
+            readback
+                .node_discovery
+                .current_runtime_query_material(targets[0], predecessors[0])
+                .map_err(ControllerDistributedAgentStackError::Node)?,
+            readback
+                .node_discovery
+                .current_runtime_query_material(targets[1], predecessors[1])
+                .map_err(ControllerDistributedAgentStackError::Node)?,
+        ];
+        if prepared.rows != current_rows {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let algorithm = ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM).map_err(|_| {
+            ControllerDistributedAgentStackError::Node(
+                DistributedAgentStackNodeReconcileError::InvalidState,
+            )
+        })?;
+        Ok([
+            PreparedRuntimeQueryRequest::try_new(
+                prepared.rows[0].request().clone(),
+                predecessors[0].runtime_channel(),
+                predecessors[0].runtime_response_key(),
+                algorithm,
+                ED25519_ALGORITHM_VERSION,
+                prepared.rows[0].serving_baseline(),
+            )
+            .map_err(|_| {
+                ControllerDistributedAgentStackError::Node(
+                    DistributedAgentStackNodeReconcileError::InvalidState,
+                )
+            })?,
+            PreparedRuntimeQueryRequest::try_new(
+                prepared.rows[1].request().clone(),
+                predecessors[1].runtime_channel(),
+                predecessors[1].runtime_response_key(),
+                algorithm,
+                ED25519_ALGORITHM_VERSION,
+                prepared.rows[1].serving_baseline(),
+            )
+            .map_err(|_| {
+                ControllerDistributedAgentStackError::Node(
+                    DistributedAgentStackNodeReconcileError::InvalidState,
+                )
+            })?,
+        ])
+    }
+
+    /// Commits one validated PXQS as its own successor before any PXNO for
+    /// either target can be introduced.
+    pub(crate) fn commit_distributed_runtime_query_response(
+        &mut self,
+        target: RuntimeHostId,
+        response: ReferenceQueryResponseV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let current = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let index = if target == predecessors[0].target() {
+            0
+        } else if target == predecessors[1].target() {
+            1
+        } else {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        };
+        let next = current
+            .node_discovery
+            .try_record_runtime_query_response(target, response, predecessors[index])
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let next_wire = next
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_distributed_agent_stack_wires(&journal_wire, &next_wire)?;
+        self.verify_runtime_query_successor_readback(
+            &next,
+            &next_wire,
+            expected_owner_anchor,
+            predecessors,
+            authorities,
+            observation_endpoint_refs,
+        )
+    }
+
+    /// Durably closes one request-only PXQR row with its classified outcome.
+    /// Restart callers must select ResidentAuthorityLost; no method here can
+    /// recreate the consumed pair token.
+    pub(crate) fn commit_distributed_runtime_query_closure(
+        &mut self,
+        target: RuntimeHostId,
+        closure: DistributedAgentStackRuntimeQueryPhaseV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let current = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let next = current
+            .node_discovery
+            .try_close_runtime_query(target, closure)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let next_wire = next
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_distributed_agent_stack_wires(&journal_wire, &next_wire)?;
+        self.verify_runtime_query_successor_readback(
+            &next,
+            &next_wire,
+            expected_owner_anchor,
+            predecessors,
+            authorities,
+            observation_endpoint_refs,
+        )
+    }
+
+    fn verify_runtime_query_successor_readback(
+        &mut self,
+        expected: &DistributedAgentStackNodeDiscoveryStateV1,
+        expected_wire: &[u8],
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let result = (|| {
+            self.revalidate_current()
+                .map_err(ControllerDistributedAgentStackError::Store)?;
+            if self.snapshot.distributed_agent_stack_node_discovery_wire() != Some(expected_wire) {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            let readback = self
+                .reopen_distributed_agent_stack_with_runtime_observation(
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?
+                .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+            if &readback.node_discovery != expected {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.state = ControllerStoreState::Stopped;
+        }
+        result
+    }
+
+    /// Commits one exact PXNO before minting any authority to send it.
+    pub(crate) fn commit_distributed_runtime_observation(
+        &mut self,
+        next_node_discovery: &DistributedAgentStackNodeDiscoveryStateV1,
+        target: RuntimeHostId,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<CommittedDistributedRuntimeObservationV1, ControllerDistributedAgentStackError>
+    {
+        next_node_discovery
+            .validate_runtime_queries(predecessors, authorities, observation_endpoint_refs)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let owner_anchor = next_node_discovery.owner_anchor();
+        let before = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        if before
+            .node_discovery
+            .runtime_query_phase(target)
+            .map_err(ControllerDistributedAgentStackError::Node)?
+            != DistributedAgentStackRuntimeQueryPhaseV1::ResponseDurable
+            || next_node_discovery
+                .runtime_query_phase(target)
+                .map_err(ControllerDistributedAgentStackError::Node)?
+                != DistributedAgentStackRuntimeQueryPhaseV1::ObservationDurableNotSent
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let expected_wire = next_node_discovery
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_distributed_agent_stack_wires(&journal_wire, &expected_wire)?;
+        let readback_result = (|| {
+            self.revalidate_current()
+                .map_err(ControllerDistributedAgentStackError::Store)?;
+            if self.snapshot.distributed_agent_stack_node_discovery_wire()
+                != Some(expected_wire.as_ref())
+            {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            let readback = self
+                .reopen_distributed_agent_stack_with_runtime_observation(
+                    owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?
+                .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+            let request = readback
+                .node_discovery
+                .current_runtime_observation(target)
+                .map_err(ControllerDistributedAgentStackError::Node)?;
+            let snapshot_sequence = self.snapshot.snapshot_sequence();
+            let node_state_digest = readback
+                .node_discovery
+                .durable_digest()
+                .map_err(ControllerDistributedAgentStackError::Node)?;
+            let attempt_count = readback.node_discovery.runtime_query_attempt_count();
+            let phase = readback
+                .node_discovery
+                .runtime_query_phase(target)
+                .map_err(ControllerDistributedAgentStackError::Node)?;
+            let observation_endpoint_ref = runtime_observation_endpoint_ref_for_target(
+                target,
+                predecessors,
+                observation_endpoint_refs,
+            )?;
+            self.grant_runtime_observation_once(
+                attempt_count,
+                target,
+                request.request_digest(),
+                phase,
+            )?;
+            Ok(CommittedDistributedRuntimeObservationV1 {
+                resident_generation: self.resident_generation,
+                store_instance_id: *self.snapshot.store_instance_id(),
+                snapshot_sequence,
+                node_state_digest,
+                attempt_count,
+                phase,
+                target,
+                observation_endpoint_ref,
+                request,
+            })
+        })();
+        if readback_result.is_err() {
+            self.state = ControllerStoreState::Stopped;
+        }
+        readback_result
+    }
+
+    /// Explicit restart seam for exact PXNO replay. It never returns PXQR
+    /// authority and accepts only a durable-not-sent or uncertain PXNO row.
+    pub(crate) fn recover_distributed_runtime_observation(
+        &mut self,
+        expected_owner_anchor: Digest32,
+        target: RuntimeHostId,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<CommittedDistributedRuntimeObservationV1, ControllerDistributedAgentStackError>
+    {
+        self.revalidate_current()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        let readback = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let request = readback
+            .node_discovery
+            .current_runtime_observation(target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let snapshot_sequence = self.snapshot.snapshot_sequence();
+        let node_state_digest = readback
+            .node_discovery
+            .durable_digest()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let attempt_count = readback.node_discovery.runtime_query_attempt_count();
+        let phase = readback
+            .node_discovery
+            .runtime_query_phase(target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let observation_endpoint_ref = runtime_observation_endpoint_ref_for_target(
+            target,
+            predecessors,
+            observation_endpoint_refs,
+        )?;
+        self.grant_runtime_observation_once(
+            attempt_count,
+            target,
+            request.request_digest(),
+            phase,
+        )?;
+        Ok(CommittedDistributedRuntimeObservationV1 {
+            resident_generation: self.resident_generation,
+            store_instance_id: *self.snapshot.store_instance_id(),
+            snapshot_sequence,
+            node_state_digest,
+            attempt_count,
+            phase,
+            target,
+            observation_endpoint_ref,
+            request,
+        })
+    }
+
+    /// Revalidates one sealed PXNO against the exact current snapshot before
+    /// releasing its canonical request bytes to the transport owner.
+    pub(crate) fn claim_distributed_runtime_observation(
+        &mut self,
+        prepared: CommittedDistributedRuntimeObservationV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<ClaimedDistributedRuntimeObservationV1, ControllerDistributedAgentStackError> {
+        self.revalidate_current()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if prepared.resident_generation != self.resident_generation
+            || prepared.store_instance_id != *self.snapshot.store_instance_id()
+            || prepared.snapshot_sequence != self.snapshot.snapshot_sequence()
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let readback = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let request = readback
+            .node_discovery
+            .current_runtime_observation(prepared.target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let phase = readback
+            .node_discovery
+            .runtime_query_phase(prepared.target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let observation_endpoint_ref = runtime_observation_endpoint_ref_for_target(
+            prepared.target,
+            predecessors,
+            observation_endpoint_refs,
+        )?;
+        if prepared.node_state_digest
+            != readback
+                .node_discovery
+                .durable_digest()
+                .map_err(ControllerDistributedAgentStackError::Node)?
+            || prepared.request != request
+            || prepared.attempt_count != readback.node_discovery.runtime_query_attempt_count()
+            || prepared.phase != phase
+            || prepared.observation_endpoint_ref != observation_endpoint_ref
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        self.consume_runtime_observation_grant(
+            prepared.attempt_count,
+            prepared.target,
+            prepared.request.request_digest(),
+            prepared.phase,
+        )?;
+        self.active_runtime_observation_claim = Some(RuntimeObservationActiveClaimV1 {
+            snapshot_sequence: prepared.snapshot_sequence,
+            attempt_count: prepared.attempt_count,
+            target: prepared.target,
+            request_digest: prepared.request.request_digest(),
+            phase: prepared.phase,
+        });
+        Ok(ClaimedDistributedRuntimeObservationV1 {
+            resident_generation: prepared.resident_generation,
+            store_instance_id: prepared.store_instance_id,
+            snapshot_sequence: prepared.snapshot_sequence,
+            node_state_digest: prepared.node_state_digest,
+            attempt_count: prepared.attempt_count,
+            phase: prepared.phase,
+            target: prepared.target,
+            observation_endpoint_ref: prepared.observation_endpoint_ref,
+            request,
+        })
+    }
+
+    pub(crate) fn commit_distributed_runtime_observation_ingress(
+        &mut self,
+        ingress: DistributedRuntimeObservationCompletionIngressV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<
+        DistributedRuntimeObservationCommitDispositionV1,
+        ControllerDistributedAgentStackError,
+    > {
+        let (claimed, result) = ingress.into_store_parts();
+        match result {
+            Ok(ack) => {
+                self.commit_distributed_runtime_observation_ack(
+                    claimed,
+                    ack,
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?;
+                Ok(DistributedRuntimeObservationCommitDispositionV1::AckDurable)
+            }
+            Err(TrustedLocalRuntimeObservationExchangeErrorV1::NotSent(_)) => {
+                self.commit_distributed_runtime_observation_closure(
+                    claimed,
+                    DistributedAgentStackRuntimeQueryPhaseV1::ObservationNotSent,
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?;
+                Ok(DistributedRuntimeObservationCommitDispositionV1::NotSent)
+            }
+            Err(TrustedLocalRuntimeObservationExchangeErrorV1::Uncertain(_)) => {
+                self.commit_distributed_runtime_observation_closure(
+                    claimed,
+                    DistributedAgentStackRuntimeQueryPhaseV1::ObservationUncertain,
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?;
+                Ok(DistributedRuntimeObservationCommitDispositionV1::Uncertain)
+            }
+            Err(TrustedLocalRuntimeObservationExchangeErrorV1::Rejected(_)) => {
+                self.commit_distributed_runtime_observation_closure(
+                    claimed,
+                    DistributedAgentStackRuntimeQueryPhaseV1::ObservationRejected,
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?;
+                Ok(DistributedRuntimeObservationCommitDispositionV1::Rejected)
+            }
+        }
+    }
+
+    /// Commits PXNA only while the claimed PXNO still names the exact current
+    /// store instance, snapshot sequence, and PXDN digest.
+    fn commit_distributed_runtime_observation_ack(
+        &mut self,
+        claimed: ClaimedDistributedRuntimeObservationV1,
+        ack: RuntimeObservationAckV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let current = self.validate_claimed_runtime_observation(
+            &claimed,
+            expected_owner_anchor,
+            predecessors,
+            authorities,
+            observation_endpoint_refs,
+        )?;
+        let next = current
+            .node_discovery
+            .try_record_runtime_observation_ack(claimed.target, &claimed.request, ack)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let next_wire = next
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_claimed_runtime_observation_successor(&journal_wire, &next_wire)
+    }
+
+    /// Durably records the classified PXNO transport outcome while the exact
+    /// claimed store witness is still current.
+    fn commit_distributed_runtime_observation_closure(
+        &mut self,
+        claimed: ClaimedDistributedRuntimeObservationV1,
+        closure: DistributedAgentStackRuntimeQueryPhaseV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let current = self.validate_claimed_runtime_observation(
+            &claimed,
+            expected_owner_anchor,
+            predecessors,
+            authorities,
+            observation_endpoint_refs,
+        )?;
+        let next = current
+            .node_discovery
+            .try_close_runtime_observation(claimed.target, closure)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let next_wire = next
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_claimed_runtime_observation_successor(&journal_wire, &next_wire)
+    }
+
+    fn validate_claimed_runtime_observation(
+        &mut self,
+        claimed: &ClaimedDistributedRuntimeObservationV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<ControllerDistributedAgentStackOwnerStateV1, ControllerDistributedAgentStackError>
+    {
+        self.revalidate_current()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if claimed.resident_generation != self.resident_generation
+            || claimed.store_instance_id != *self.snapshot.store_instance_id()
+            || claimed.snapshot_sequence != self.snapshot.snapshot_sequence()
+            || self.active_runtime_observation_claim
+                != Some(RuntimeObservationActiveClaimV1 {
+                    snapshot_sequence: claimed.snapshot_sequence,
+                    attempt_count: claimed.attempt_count,
+                    target: claimed.target,
+                    request_digest: claimed.request.request_digest(),
+                    phase: claimed.phase,
+                })
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let current = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let current_phase = current
+            .node_discovery
+            .runtime_query_phase(claimed.target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let current_endpoint_ref = runtime_observation_endpoint_ref_for_target(
+            claimed.target,
+            predecessors,
+            observation_endpoint_refs,
+        )?;
+        if claimed.node_state_digest
+            != current
+                .node_discovery
+                .durable_digest()
+                .map_err(ControllerDistributedAgentStackError::Node)?
+            || current
+                .node_discovery
+                .current_runtime_observation(claimed.target)
+                .map_err(ControllerDistributedAgentStackError::Node)?
+                != claimed.request
+            || claimed.attempt_count != current.node_discovery.runtime_query_attempt_count()
+            || claimed.phase != current_phase
+            || claimed.observation_endpoint_ref != current_endpoint_ref
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        Ok(current)
+    }
+
+    fn grant_runtime_observation_once(
+        &mut self,
+        attempt_count: usize,
+        target: RuntimeHostId,
+        request_digest: Digest32,
+        phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        if self.runtime_observation_grants.iter().any(|grant| {
+            grant.attempt_count == attempt_count
+                && grant.target == target
+                && grant.request_digest == request_digest
+                && grant.phase == phase
+        }) {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        self.runtime_observation_grants
+            .try_reserve(1)
+            .map_err(|_| ControllerDistributedAgentStackError::CrossBindingMismatch)?;
+        self.runtime_observation_grants
+            .push(RuntimeObservationResidentGrantV1 {
+                attempt_count,
+                target,
+                request_digest,
+                phase,
+                claimed: false,
+            });
+        Ok(())
+    }
+
+    fn current_distributed_agent_stack_journal_wire(
+        &self,
+    ) -> Result<Vec<u8>, ControllerDistributedAgentStackError> {
+        self.ensure_operational()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        self.snapshot
+            .distributed_agent_stack_journal_wire()
+            .map(ToOwned::to_owned)
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)
+    }
+
+    fn consume_runtime_observation_grant(
+        &mut self,
+        attempt_count: usize,
+        target: RuntimeHostId,
+        request_digest: Digest32,
+        phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        if self.active_runtime_observation_claim.is_some() {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let grant = self
+            .runtime_observation_grants
+            .iter_mut()
+            .find(|grant| {
+                grant.attempt_count == attempt_count
+                    && grant.target == target
+                    && grant.request_digest == request_digest
+                    && grant.phase == phase
+            })
+            .ok_or(ControllerDistributedAgentStackError::CrossBindingMismatch)?;
+        if grant.claimed {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        grant.claimed = true;
+        Ok(())
     }
 
     pub(crate) fn revalidate_current(
@@ -635,6 +1792,38 @@ impl ControllerStore {
             return Err(ControllerStoreError::ActiveSnapshotChanged);
         }
         Ok(&self.snapshot)
+    }
+
+    /// Revalidates and exposes only the exact directory/lock capability needed
+    /// to bind a one-way successor cutover to this consumed writer.
+    pub(crate) fn managed_fabric_cutover_identity(
+        &mut self,
+    ) -> Result<ControllerStoreCutoverIdentity, ControllerStoreError> {
+        self.revalidate_current()?;
+        let lock_metadata = self.lock_file.metadata().map_err(|error| {
+            self.state = ControllerStoreState::Stopped;
+            ControllerStoreError::Open(ControllerStoreOpenError::Io(ControllerIoFailure::new(
+                ControllerFileStage::ValidateLockIdentity,
+                &error,
+            )))
+        })?;
+        let lock_identity = FileIdentity::from_metadata(&lock_metadata);
+        validate_named_file_identity(
+            &self.directory,
+            CONTROLLER_LOCK_FILE_NAME,
+            lock_identity,
+            ControllerFileStage::ValidateLockIdentity,
+        )
+        .map_err(|error| {
+            self.state = ControllerStoreState::Stopped;
+            ControllerStoreError::Open(error)
+        })?;
+        Ok(ControllerStoreCutoverIdentity {
+            directory_device: self.directory.identity.device,
+            directory_inode: self.directory.identity.inode,
+            lock_device: lock_identity.device,
+            lock_inode: lock_identity.inode,
+        })
     }
 
     pub(crate) fn commit(
@@ -708,6 +1897,20 @@ impl ControllerStore {
             return Err(ControllerStoreError::Stopped);
         }
         Ok(())
+    }
+}
+
+fn runtime_observation_endpoint_ref_for_target(
+    target: RuntimeHostId,
+    predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+    observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+) -> Result<RuntimeObservationEndpointRefV1, ControllerDistributedAgentStackError> {
+    if target == predecessors[0].target() {
+        Ok(observation_endpoint_refs[0])
+    } else if target == predecessors[1].target() {
+        Ok(observation_endpoint_refs[1])
+    } else {
+        Err(ControllerDistributedAgentStackError::CrossBindingMismatch)
     }
 }
 
@@ -2221,8 +3424,7 @@ fn verify_filesystem(
     directory: &File,
     _policy: ControllerFilesystemPolicy,
 ) -> Result<(), ControllerStoreOpenError> {
-    #[cfg(test)]
-    if _policy == ControllerFilesystemPolicy::ExplicitFixture {
+    if _policy != ControllerFilesystemPolicy::ProductionReference {
         return Ok(());
     }
     #[cfg(not(target_os = "macos"))]
@@ -2699,6 +3901,27 @@ pub(crate) enum ControllerStoreError {
     Codec(ControllerJournalError),
     Publish(ControllerPublishFailure),
 }
+
+#[derive(Debug)]
+pub(crate) enum ControllerDistributedAgentStackError {
+    Store(ControllerStoreError),
+    Journal(ControllerJournalError),
+    Apply(DistributedAgentStackApplyError),
+    Node(DistributedAgentStackNodeReconcileError),
+    IncompleteExtension,
+    CrossBindingMismatch,
+}
+
+impl fmt::Display for ControllerDistributedAgentStackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Controller distributed Agent stack extension failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for ControllerDistributedAgentStackError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControllerStoreMigrationError {

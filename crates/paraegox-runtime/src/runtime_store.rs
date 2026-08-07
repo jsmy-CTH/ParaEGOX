@@ -24,16 +24,67 @@ use nix::fcntl::{RenameFlags, renameat2};
 use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
 use paraegox_kernel::digest::{Digest32, Digest32Builder};
+use sha2::{Digest as ShaDigest, Sha256};
 
+use crate::distributed_agent_stack_state::MAX_DISTRIBUTED_AGENT_STACK_SNAPSHOT_BYTES;
+use crate::managed_agent_stack_state::MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES;
+use crate::managed_model_agent_stack_state::MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES;
 use crate::runtime_journal::{
-    MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, RUNTIME_JOURNAL_PAYLOAD_V4,
+    LiveMaterialization, MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, RUNTIME_JOURNAL_PAYLOAD_V4,
     RUNTIME_JOURNAL_PAYLOAD_VERSION, RuntimeJournalError, RuntimeJournalPayloadV3Migration,
-    RuntimeJournalPayloadV4Migration, RuntimeJournalSnapshot,
+    RuntimeJournalPayloadV4Migration, RuntimeJournalSnapshot, RuntimeJournalTransaction,
+    StartupRecoveryEligibility,
 };
 
 const LOCK_FILE_NAME: &str = "runtime.lock";
 const ACTIVE_FILE_NAME: &str = "runtime.snapshot";
 const TEMP_FILE_PREFIX: &str = ".runtime.snapshot.tmp-";
+const MANAGED_FABRIC_CUTOVER_FILE_NAME: &str = "managed-fabric.cutover-v1";
+const MANAGED_FABRIC_ACTIVE_FILE_NAME: &str = "managed-fabric.snapshot-v1";
+const MANAGED_FABRIC_TEMP_FILE_PREFIX: &str = ".managed-fabric.snapshot-v1.tmp-";
+const MANAGED_AGENT_STACK_CUTOVER_FILE_NAME: &str = "managed-agent-stack.cutover-v1";
+const MANAGED_AGENT_STACK_ACTIVE_FILE_NAME: &str = "managed-agent-stack.snapshot-v1";
+const MANAGED_AGENT_STACK_TEMP_FILE_PREFIX: &str = ".managed-agent-stack.snapshot-v1.tmp-";
+const MANAGED_MODEL_AGENT_STACK_CUTOVER_FILE_NAME: &str = "managed-model-agent-stack.cutover-v1";
+const MANAGED_MODEL_AGENT_STACK_ACTIVE_FILE_NAME: &str = "managed-model-agent-stack.snapshot-v1";
+const MANAGED_MODEL_AGENT_STACK_TEMP_FILE_PREFIX: &str =
+    ".managed-model-agent-stack.snapshot-v1.tmp-";
+const DISTRIBUTED_AGENT_STACK_CUTOVER_FILE_NAME: &str = "distributed-agent-stack.cutover-v1";
+const DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME: &str = "distributed-agent-stack.snapshot-v1";
+const DISTRIBUTED_AGENT_STACK_TEMP_FILE_PREFIX: &str = ".distributed-agent-stack.snapshot-v1.tmp-";
+const MANAGED_AGENT_JOURNAL_DIRECTORY_PREFIX: &str = "managed-agent-service-";
+const MANAGED_AGENT_JOURNAL_DIRECTORY_SUFFIX: &str = "-v1";
+const MANAGED_AGENT_JOURNAL_ID_HEX_BYTES: usize = 32;
+const MANAGED_FABRIC_CUTOVER_MAGIC: &[u8; 4] = b"PXCO";
+const MANAGED_FABRIC_CUTOVER_VERSION: u16 = 1;
+const MANAGED_FABRIC_SUCCESSOR_FORMAT_VERSION: u16 = 1;
+const MANAGED_FABRIC_CUTOVER_DOMAIN: &[u8] = b"paraegox.runtime.managed-fabric-cutover.sha256.v1";
+const MANAGED_FABRIC_CUTOVER_WITHOUT_CHECKSUM_BYTES: usize = 116;
+const MANAGED_FABRIC_CUTOVER_BYTES: usize = MANAGED_FABRIC_CUTOVER_WITHOUT_CHECKSUM_BYTES + 32;
+const MAX_MANAGED_FABRIC_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+const MANAGED_AGENT_STACK_CUTOVER_MAGIC: &[u8; 4] = b"PXSC";
+const MANAGED_AGENT_STACK_CUTOVER_VERSION: u16 = 1;
+const MANAGED_AGENT_STACK_SUCCESSOR_FORMAT_VERSION: u16 = 1;
+const MANAGED_AGENT_STACK_CUTOVER_DOMAIN: &[u8] =
+    b"paraegox.runtime.managed-agent-stack-cutover.sha256.v1";
+const MANAGED_AGENT_STACK_CUTOVER_HEADER_WITHOUT_CHECKSUM_BYTES: usize = 148;
+const MANAGED_AGENT_STACK_CUTOVER_HEADER_BYTES: usize = 180;
+const MANAGED_MODEL_AGENT_STACK_CUTOVER_MAGIC: &[u8; 4] = b"PXMC";
+const MANAGED_MODEL_AGENT_STACK_CUTOVER_VERSION: u16 = 1;
+const MANAGED_MODEL_AGENT_STACK_SUCCESSOR_FORMAT_VERSION: u16 = 1;
+const MANAGED_MODEL_AGENT_STACK_CUTOVER_DOMAIN: &[u8] =
+    b"paraegox.runtime.managed-model-agent-stack-cutover.sha256.v1";
+const MANAGED_MODEL_AGENT_STACK_CUTOVER_HEADER_WITHOUT_CHECKSUM_BYTES: usize = 148;
+const MANAGED_MODEL_AGENT_STACK_CUTOVER_HEADER_BYTES: usize = 180;
+const DISTRIBUTED_AGENT_STACK_CUTOVER_MAGIC: &[u8; 4] = b"PXDC";
+const DISTRIBUTED_AGENT_STACK_CUTOVER_VERSION: u16 = 1;
+const DISTRIBUTED_AGENT_STACK_SUCCESSOR_FORMAT_VERSION: u16 = 1;
+const DISTRIBUTED_AGENT_STACK_CUTOVER_DOMAIN: &[u8] =
+    b"paraegox.runtime.distributed-agent-stack-cutover.sha256.v1";
+const DISTRIBUTED_AGENT_STACK_PREDECESSOR_SNAPSHOT_DOMAIN: &[u8] =
+    b"paraegox.runtime.distributed-agent-stack-predecessor-snapshot.sha256.v1";
+const DISTRIBUTED_AGENT_STACK_CUTOVER_HEADER_WITHOUT_CHECKSUM_BYTES: usize = 180;
+const DISTRIBUTED_AGENT_STACK_CUTOVER_HEADER_BYTES: usize = 212;
 const MIGRATION_SOURCE_FILE_PREFIX: &str = "runtime.snapshot.source-v3-";
 const MIGRATION_SOURCE_FILE_SUFFIX: &str = ".evidence";
 const MIGRATION_RECEIPT_FILE_PREFIX: &str = "runtime.snapshot.migration-v1-";
@@ -79,6 +130,12 @@ const MAX_LINUX_MOUNTINFO_LINE_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeFilesystemPolicy {
     ProductionReference,
+    /// Explicit non-production policy for the single-process DeveloperLocal
+    /// launcher.  This changes only the production filesystem-capability
+    /// admission (ext4 plus reviewed Linux mount evidence); every owner,
+    /// mode, link-count, no-follow, checksum, atomic-publication, and strict
+    /// reopen check remains shared with production.
+    ExplicitDeveloperLocal,
     #[cfg(test)]
     ExplicitFixture,
 }
@@ -635,6 +692,587 @@ pub(crate) struct RuntimeStore {
     state: RuntimeStoreState,
 }
 
+/// Durable one-way marker published while the frozen payload-v5 writer lock is
+/// still held.  Its presence is intentionally an unknown directory entry to
+/// the legacy opener, so `serve-bootstrap-v1` cannot regain desired-state
+/// authority after any crash point at or beyond marker publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedFabricCutoverMarker {
+    legacy_store_instance_id: [u8; 32],
+    legacy_target_fingerprint: Digest32,
+    legacy_sequence: u64,
+    transition_projection_digest: Digest32,
+    canonical_wire: [u8; MANAGED_FABRIC_CUTOVER_BYTES],
+}
+
+impl ManagedFabricCutoverMarker {
+    fn try_new(
+        legacy: &RuntimeJournalSnapshot,
+        transition_projection_digest: Digest32,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        if transition_projection_digest
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return Err(ManagedFabricStoreError::InvalidProjectionDigest);
+        }
+        let mut wire = [0_u8; MANAGED_FABRIC_CUTOVER_BYTES];
+        wire[..4].copy_from_slice(MANAGED_FABRIC_CUTOVER_MAGIC);
+        wire[4..6].copy_from_slice(&MANAGED_FABRIC_CUTOVER_VERSION.to_be_bytes());
+        wire[6..8].copy_from_slice(&MANAGED_FABRIC_SUCCESSOR_FORMAT_VERSION.to_be_bytes());
+        wire[8..40].copy_from_slice(legacy.store_instance_id());
+        wire[40..72].copy_from_slice(legacy.owner_target_fingerprint().as_bytes());
+        wire[72..80].copy_from_slice(&legacy.sequence().to_be_bytes());
+        wire[80..112].copy_from_slice(transition_projection_digest.as_bytes());
+        wire[112..116].copy_from_slice(&(MAX_MANAGED_FABRIC_SNAPSHOT_BYTES as u32).to_be_bytes());
+        let checksum = managed_fabric_cutover_checksum(&wire[..116]);
+        wire[116..].copy_from_slice(checksum.as_bytes());
+        Ok(Self {
+            legacy_store_instance_id: *legacy.store_instance_id(),
+            legacy_target_fingerprint: *legacy.owner_target_fingerprint(),
+            legacy_sequence: legacy.sequence(),
+            transition_projection_digest,
+            canonical_wire: wire,
+        })
+    }
+
+    fn decode(frame: &[u8]) -> Result<Self, ManagedFabricStoreError> {
+        if frame.len() != MANAGED_FABRIC_CUTOVER_BYTES
+            || &frame[..4] != MANAGED_FABRIC_CUTOVER_MAGIC
+            || u16::from_be_bytes([frame[4], frame[5]]) != MANAGED_FABRIC_CUTOVER_VERSION
+            || u16::from_be_bytes([frame[6], frame[7]]) != MANAGED_FABRIC_SUCCESSOR_FORMAT_VERSION
+            || u32::from_be_bytes([frame[112], frame[113], frame[114], frame[115]]) as usize
+                != MAX_MANAGED_FABRIC_SNAPSHOT_BYTES
+        {
+            return Err(ManagedFabricStoreError::InvalidCutoverMarker);
+        }
+        let expected = managed_fabric_cutover_checksum(&frame[..116]);
+        if frame[116..] != *expected.as_bytes() {
+            return Err(ManagedFabricStoreError::InvalidCutoverMarker);
+        }
+        let legacy_store_instance_id: [u8; 32] = frame[8..40]
+            .try_into()
+            .map_err(|_| ManagedFabricStoreError::InvalidCutoverMarker)?;
+        let legacy_target_fingerprint = Digest32::from_bytes(
+            frame[40..72]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidCutoverMarker)?,
+        );
+        let legacy_sequence = u64::from_be_bytes(
+            frame[72..80]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidCutoverMarker)?,
+        );
+        let transition_projection_digest = Digest32::from_bytes(
+            frame[80..112]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidCutoverMarker)?,
+        );
+        if legacy_store_instance_id.iter().all(|byte| *byte == 0)
+            || legacy_target_fingerprint
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || legacy_sequence == 0
+            || transition_projection_digest
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+        {
+            return Err(ManagedFabricStoreError::InvalidCutoverMarker);
+        }
+        let mut canonical_wire = [0_u8; MANAGED_FABRIC_CUTOVER_BYTES];
+        canonical_wire.copy_from_slice(frame);
+        Ok(Self {
+            legacy_store_instance_id,
+            legacy_target_fingerprint,
+            legacy_sequence,
+            transition_projection_digest,
+            canonical_wire,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn legacy_sequence(&self) -> u64 {
+        self.legacy_sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn transition_projection_digest(&self) -> Digest32 {
+        self.transition_projection_digest
+    }
+}
+
+/// Immutable, atomic authority-transfer record for the PXAR-v7 stack owner.
+/// The initial PXAS snapshot is embedded so no crash can expose a cutover
+/// marker without the exact admitted request and response channel needed for
+/// recovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedAgentStackCutoverMarker {
+    store_instance_id: [u8; 32],
+    target_fingerprint: Digest32,
+    predecessor_projection_digest: Digest32,
+    stack_projection_digest: Digest32,
+    predecessor_legacy_sequence: u64,
+    initial_snapshot: Box<[u8]>,
+    canonical_wire: Box<[u8]>,
+}
+
+impl ManagedAgentStackCutoverMarker {
+    fn try_new(
+        predecessor: &ManagedFabricCutoverMarker,
+        stack_projection_digest: Digest32,
+        initial_snapshot: &[u8],
+    ) -> Result<Self, ManagedFabricStoreError> {
+        if stack_projection_digest
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+            || initial_snapshot.is_empty()
+            || initial_snapshot.len() > MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES
+        {
+            return Err(ManagedFabricStoreError::InvalidManagedAgentStackCutover);
+        }
+        let snapshot_length = u32::try_from(initial_snapshot.len())
+            .map_err(|_| ManagedFabricStoreError::InvalidManagedAgentStackSnapshotLength)?;
+        let mut wire = vec![0_u8; MANAGED_AGENT_STACK_CUTOVER_HEADER_BYTES];
+        wire[..4].copy_from_slice(MANAGED_AGENT_STACK_CUTOVER_MAGIC);
+        wire[4..6].copy_from_slice(&MANAGED_AGENT_STACK_CUTOVER_VERSION.to_be_bytes());
+        wire[6..8].copy_from_slice(&MANAGED_AGENT_STACK_SUCCESSOR_FORMAT_VERSION.to_be_bytes());
+        wire[8..40].copy_from_slice(&predecessor.legacy_store_instance_id);
+        wire[40..72].copy_from_slice(predecessor.legacy_target_fingerprint.as_bytes());
+        wire[72..104].copy_from_slice(predecessor.transition_projection_digest.as_bytes());
+        wire[104..136].copy_from_slice(stack_projection_digest.as_bytes());
+        wire[136..144].copy_from_slice(&predecessor.legacy_sequence.to_be_bytes());
+        wire[144..148].copy_from_slice(&snapshot_length.to_be_bytes());
+        let checksum = managed_agent_stack_cutover_checksum(&wire[..148], initial_snapshot);
+        wire[148..180].copy_from_slice(checksum.as_bytes());
+        wire.extend_from_slice(initial_snapshot);
+        Ok(Self {
+            store_instance_id: predecessor.legacy_store_instance_id,
+            target_fingerprint: predecessor.legacy_target_fingerprint,
+            predecessor_projection_digest: predecessor.transition_projection_digest,
+            stack_projection_digest,
+            predecessor_legacy_sequence: predecessor.legacy_sequence,
+            initial_snapshot: initial_snapshot.into(),
+            canonical_wire: wire.into_boxed_slice(),
+        })
+    }
+
+    fn decode(frame: &[u8]) -> Result<Self, ManagedFabricStoreError> {
+        if frame.len() < MANAGED_AGENT_STACK_CUTOVER_HEADER_BYTES
+            || frame.len()
+                > MANAGED_AGENT_STACK_CUTOVER_HEADER_BYTES + MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES
+            || &frame[..4] != MANAGED_AGENT_STACK_CUTOVER_MAGIC
+            || u16::from_be_bytes([frame[4], frame[5]]) != MANAGED_AGENT_STACK_CUTOVER_VERSION
+            || u16::from_be_bytes([frame[6], frame[7]])
+                != MANAGED_AGENT_STACK_SUCCESSOR_FORMAT_VERSION
+        {
+            return Err(ManagedFabricStoreError::InvalidManagedAgentStackCutover);
+        }
+        let snapshot_length =
+            u32::from_be_bytes([frame[144], frame[145], frame[146], frame[147]]) as usize;
+        if snapshot_length == 0
+            || snapshot_length > MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES
+            || MANAGED_AGENT_STACK_CUTOVER_HEADER_BYTES.checked_add(snapshot_length)
+                != Some(frame.len())
+        {
+            return Err(ManagedFabricStoreError::InvalidManagedAgentStackCutover);
+        }
+        let initial_snapshot = &frame[MANAGED_AGENT_STACK_CUTOVER_HEADER_BYTES..];
+        let expected = managed_agent_stack_cutover_checksum(&frame[..148], initial_snapshot);
+        if frame[148..180] != *expected.as_bytes() {
+            return Err(ManagedFabricStoreError::InvalidManagedAgentStackCutover);
+        }
+        let store_instance_id: [u8; 32] = frame[8..40]
+            .try_into()
+            .map_err(|_| ManagedFabricStoreError::InvalidManagedAgentStackCutover)?;
+        let target_fingerprint = Digest32::from_bytes(
+            frame[40..72]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidManagedAgentStackCutover)?,
+        );
+        let predecessor_projection_digest = Digest32::from_bytes(
+            frame[72..104]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidManagedAgentStackCutover)?,
+        );
+        let stack_projection_digest = Digest32::from_bytes(
+            frame[104..136]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidManagedAgentStackCutover)?,
+        );
+        let predecessor_legacy_sequence = u64::from_be_bytes(
+            frame[136..144]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidManagedAgentStackCutover)?,
+        );
+        if store_instance_id.iter().all(|byte| *byte == 0)
+            || target_fingerprint.as_bytes().iter().all(|byte| *byte == 0)
+            || predecessor_projection_digest
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || stack_projection_digest
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || predecessor_legacy_sequence == 0
+        {
+            return Err(ManagedFabricStoreError::InvalidManagedAgentStackCutover);
+        }
+        Ok(Self {
+            store_instance_id,
+            target_fingerprint,
+            predecessor_projection_digest,
+            stack_projection_digest,
+            predecessor_legacy_sequence,
+            initial_snapshot: initial_snapshot.into(),
+            canonical_wire: frame.into(),
+        })
+    }
+}
+
+/// Immutable sibling authority transfer from PXAR-v6 to the managed
+/// Fabric+Model+Agent owner. It binds the same frozen PXMS predecessor as the
+/// PXAR-v7 Agent-only branch, but uses an independent marker and snapshot
+/// namespace so the two branches can never be mistaken for one another.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedModelAgentStackCutoverMarker {
+    store_instance_id: [u8; 32],
+    target_fingerprint: Digest32,
+    predecessor_projection_digest: Digest32,
+    stack_projection_digest: Digest32,
+    predecessor_legacy_sequence: u64,
+    initial_snapshot: Box<[u8]>,
+    canonical_wire: Box<[u8]>,
+}
+
+impl ManagedModelAgentStackCutoverMarker {
+    fn try_new(
+        predecessor: &ManagedFabricCutoverMarker,
+        stack_projection_digest: Digest32,
+        initial_snapshot: &[u8],
+    ) -> Result<Self, ManagedFabricStoreError> {
+        if stack_projection_digest
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+            || initial_snapshot.is_empty()
+            || initial_snapshot.len() > MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES
+        {
+            return Err(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover);
+        }
+        let snapshot_length = u32::try_from(initial_snapshot.len())
+            .map_err(|_| ManagedFabricStoreError::InvalidManagedModelAgentStackSnapshotLength)?;
+        let mut wire = vec![0_u8; MANAGED_MODEL_AGENT_STACK_CUTOVER_HEADER_BYTES];
+        wire[..4].copy_from_slice(MANAGED_MODEL_AGENT_STACK_CUTOVER_MAGIC);
+        wire[4..6].copy_from_slice(&MANAGED_MODEL_AGENT_STACK_CUTOVER_VERSION.to_be_bytes());
+        wire[6..8]
+            .copy_from_slice(&MANAGED_MODEL_AGENT_STACK_SUCCESSOR_FORMAT_VERSION.to_be_bytes());
+        wire[8..40].copy_from_slice(&predecessor.legacy_store_instance_id);
+        wire[40..72].copy_from_slice(predecessor.legacy_target_fingerprint.as_bytes());
+        wire[72..104].copy_from_slice(predecessor.transition_projection_digest.as_bytes());
+        wire[104..136].copy_from_slice(stack_projection_digest.as_bytes());
+        wire[136..144].copy_from_slice(&predecessor.legacy_sequence.to_be_bytes());
+        wire[144..148].copy_from_slice(&snapshot_length.to_be_bytes());
+        let checksum = managed_model_agent_stack_cutover_checksum(&wire[..148], initial_snapshot);
+        wire[148..180].copy_from_slice(checksum.as_bytes());
+        wire.extend_from_slice(initial_snapshot);
+        Ok(Self {
+            store_instance_id: predecessor.legacy_store_instance_id,
+            target_fingerprint: predecessor.legacy_target_fingerprint,
+            predecessor_projection_digest: predecessor.transition_projection_digest,
+            stack_projection_digest,
+            predecessor_legacy_sequence: predecessor.legacy_sequence,
+            initial_snapshot: initial_snapshot.into(),
+            canonical_wire: wire.into_boxed_slice(),
+        })
+    }
+
+    fn decode(frame: &[u8]) -> Result<Self, ManagedFabricStoreError> {
+        if frame.len() < MANAGED_MODEL_AGENT_STACK_CUTOVER_HEADER_BYTES
+            || frame.len()
+                > MANAGED_MODEL_AGENT_STACK_CUTOVER_HEADER_BYTES
+                    + MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES
+            || &frame[..4] != MANAGED_MODEL_AGENT_STACK_CUTOVER_MAGIC
+            || u16::from_be_bytes([frame[4], frame[5]]) != MANAGED_MODEL_AGENT_STACK_CUTOVER_VERSION
+            || u16::from_be_bytes([frame[6], frame[7]])
+                != MANAGED_MODEL_AGENT_STACK_SUCCESSOR_FORMAT_VERSION
+        {
+            return Err(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover);
+        }
+        let snapshot_length =
+            u32::from_be_bytes([frame[144], frame[145], frame[146], frame[147]]) as usize;
+        if snapshot_length == 0
+            || snapshot_length > MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES
+            || MANAGED_MODEL_AGENT_STACK_CUTOVER_HEADER_BYTES.checked_add(snapshot_length)
+                != Some(frame.len())
+        {
+            return Err(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover);
+        }
+        let initial_snapshot = &frame[MANAGED_MODEL_AGENT_STACK_CUTOVER_HEADER_BYTES..];
+        let expected = managed_model_agent_stack_cutover_checksum(&frame[..148], initial_snapshot);
+        if frame[148..180] != *expected.as_bytes() {
+            return Err(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover);
+        }
+        let store_instance_id: [u8; 32] = frame[8..40]
+            .try_into()
+            .map_err(|_| ManagedFabricStoreError::InvalidManagedModelAgentStackCutover)?;
+        let target_fingerprint = Digest32::from_bytes(
+            frame[40..72]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidManagedModelAgentStackCutover)?,
+        );
+        let predecessor_projection_digest = Digest32::from_bytes(
+            frame[72..104]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidManagedModelAgentStackCutover)?,
+        );
+        let stack_projection_digest = Digest32::from_bytes(
+            frame[104..136]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidManagedModelAgentStackCutover)?,
+        );
+        let predecessor_legacy_sequence = u64::from_be_bytes(
+            frame[136..144]
+                .try_into()
+                .map_err(|_| ManagedFabricStoreError::InvalidManagedModelAgentStackCutover)?,
+        );
+        if store_instance_id.iter().all(|byte| *byte == 0)
+            || target_fingerprint.as_bytes().iter().all(|byte| *byte == 0)
+            || predecessor_projection_digest
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || stack_projection_digest
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || predecessor_legacy_sequence == 0
+        {
+            return Err(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover);
+        }
+        Ok(Self {
+            store_instance_id,
+            target_fingerprint,
+            predecessor_projection_digest,
+            stack_projection_digest,
+            predecessor_legacy_sequence,
+            initial_snapshot: initial_snapshot.into(),
+            canonical_wire: frame.into(),
+        })
+    }
+}
+
+/// Immutable authority transfer from the frozen PXAR-v7 owner to PXAR-v8.
+///
+/// The marker binds the exact authoritative predecessor PXAS bytes as well as
+/// the successor projection and embeds the first complete PXDA snapshot. The
+/// existing Runtime lock remains held throughout publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DistributedAgentStackCutoverMarker {
+    store_instance_id: [u8; 32],
+    target_fingerprint: Digest32,
+    predecessor_stack_projection_digest: Digest32,
+    distributed_projection_digest: Digest32,
+    predecessor_snapshot_digest: Digest32,
+    predecessor_legacy_sequence: u64,
+    initial_snapshot: Box<[u8]>,
+    canonical_wire: Box<[u8]>,
+}
+
+impl DistributedAgentStackCutoverMarker {
+    fn try_new(
+        predecessor: &ManagedAgentStackCutoverMarker,
+        distributed_projection_digest: Digest32,
+        predecessor_snapshot: &[u8],
+        initial_snapshot: &[u8],
+    ) -> Result<Self, ManagedFabricStoreError> {
+        if distributed_projection_digest
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+            || predecessor_snapshot.is_empty()
+            || predecessor_snapshot.len() > MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES
+            || initial_snapshot.is_empty()
+            || initial_snapshot.len() > MAX_DISTRIBUTED_AGENT_STACK_SNAPSHOT_BYTES
+        {
+            return Err(ManagedFabricStoreError::InvalidDistributedAgentStackCutover);
+        }
+        let predecessor_snapshot_digest =
+            distributed_predecessor_snapshot_digest(predecessor_snapshot);
+        let snapshot_length = u32::try_from(initial_snapshot.len())
+            .map_err(|_| ManagedFabricStoreError::InvalidDistributedAgentStackSnapshotLength)?;
+        let mut wire = vec![0_u8; DISTRIBUTED_AGENT_STACK_CUTOVER_HEADER_BYTES];
+        wire[..4].copy_from_slice(DISTRIBUTED_AGENT_STACK_CUTOVER_MAGIC);
+        wire[4..6].copy_from_slice(&DISTRIBUTED_AGENT_STACK_CUTOVER_VERSION.to_be_bytes());
+        wire[6..8].copy_from_slice(&DISTRIBUTED_AGENT_STACK_SUCCESSOR_FORMAT_VERSION.to_be_bytes());
+        wire[8..40].copy_from_slice(&predecessor.store_instance_id);
+        wire[40..72].copy_from_slice(predecessor.target_fingerprint.as_bytes());
+        wire[72..104].copy_from_slice(predecessor.stack_projection_digest.as_bytes());
+        wire[104..136].copy_from_slice(distributed_projection_digest.as_bytes());
+        wire[136..168].copy_from_slice(predecessor_snapshot_digest.as_bytes());
+        wire[168..176].copy_from_slice(&predecessor.predecessor_legacy_sequence.to_be_bytes());
+        wire[176..180].copy_from_slice(&snapshot_length.to_be_bytes());
+        let checksum = distributed_agent_stack_cutover_checksum(&wire[..180], initial_snapshot);
+        wire[180..212].copy_from_slice(checksum.as_bytes());
+        wire.extend_from_slice(initial_snapshot);
+        Ok(Self {
+            store_instance_id: predecessor.store_instance_id,
+            target_fingerprint: predecessor.target_fingerprint,
+            predecessor_stack_projection_digest: predecessor.stack_projection_digest,
+            distributed_projection_digest,
+            predecessor_snapshot_digest,
+            predecessor_legacy_sequence: predecessor.predecessor_legacy_sequence,
+            initial_snapshot: initial_snapshot.into(),
+            canonical_wire: wire.into_boxed_slice(),
+        })
+    }
+
+    fn decode(frame: &[u8]) -> Result<Self, ManagedFabricStoreError> {
+        if frame.len() < DISTRIBUTED_AGENT_STACK_CUTOVER_HEADER_BYTES
+            || frame.len()
+                > DISTRIBUTED_AGENT_STACK_CUTOVER_HEADER_BYTES
+                    + MAX_DISTRIBUTED_AGENT_STACK_SNAPSHOT_BYTES
+            || &frame[..4] != DISTRIBUTED_AGENT_STACK_CUTOVER_MAGIC
+            || u16::from_be_bytes([frame[4], frame[5]]) != DISTRIBUTED_AGENT_STACK_CUTOVER_VERSION
+            || u16::from_be_bytes([frame[6], frame[7]])
+                != DISTRIBUTED_AGENT_STACK_SUCCESSOR_FORMAT_VERSION
+        {
+            return Err(ManagedFabricStoreError::InvalidDistributedAgentStackCutover);
+        }
+        let snapshot_length =
+            u32::from_be_bytes([frame[176], frame[177], frame[178], frame[179]]) as usize;
+        if snapshot_length == 0
+            || snapshot_length > MAX_DISTRIBUTED_AGENT_STACK_SNAPSHOT_BYTES
+            || DISTRIBUTED_AGENT_STACK_CUTOVER_HEADER_BYTES.checked_add(snapshot_length)
+                != Some(frame.len())
+        {
+            return Err(ManagedFabricStoreError::InvalidDistributedAgentStackCutover);
+        }
+        let initial_snapshot = &frame[DISTRIBUTED_AGENT_STACK_CUTOVER_HEADER_BYTES..];
+        let expected = distributed_agent_stack_cutover_checksum(&frame[..180], initial_snapshot);
+        if frame[180..212] != *expected.as_bytes() {
+            return Err(ManagedFabricStoreError::InvalidDistributedAgentStackCutover);
+        }
+        let store_instance_id = read_fixed_array(&frame[8..40])?;
+        let target_fingerprint = Digest32::from_bytes(read_fixed_array(&frame[40..72])?);
+        let predecessor_stack_projection_digest =
+            Digest32::from_bytes(read_fixed_array(&frame[72..104])?);
+        let distributed_projection_digest =
+            Digest32::from_bytes(read_fixed_array(&frame[104..136])?);
+        let predecessor_snapshot_digest = Digest32::from_bytes(read_fixed_array(&frame[136..168])?);
+        let predecessor_legacy_sequence = u64::from_be_bytes(read_fixed_array(&frame[168..176])?);
+        if store_instance_id.iter().all(|byte| *byte == 0)
+            || target_fingerprint.as_bytes().iter().all(|byte| *byte == 0)
+            || predecessor_stack_projection_digest
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || distributed_projection_digest
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || predecessor_snapshot_digest
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || predecessor_legacy_sequence == 0
+        {
+            return Err(ManagedFabricStoreError::InvalidDistributedAgentStackCutover);
+        }
+        Ok(Self {
+            store_instance_id,
+            target_fingerprint,
+            predecessor_stack_projection_digest,
+            distributed_projection_digest,
+            predecessor_snapshot_digest,
+            predecessor_legacy_sequence,
+            initial_snapshot: initial_snapshot.into(),
+            canonical_wire: frame.into(),
+        })
+    }
+}
+
+struct ManagedFabricActiveSnapshot {
+    encoded: Box<[u8]>,
+    identity: FileIdentity,
+}
+
+/// Opaque atomic store for the successor journal codec.  The semantic state
+/// machine remains in `managed_fabric_runtime`; this type owns only the exact
+/// POSIX lock/read/replace boundary and the frozen cutover marker.
+pub(crate) struct ManagedFabricStore {
+    directory: RuntimeDirectory,
+    lock_file: File,
+    lock_identity: FileIdentity,
+    marker: ManagedFabricCutoverMarker,
+    legacy_snapshot: RuntimeJournalSnapshot,
+    active: Option<ManagedFabricActiveSnapshot>,
+    managed_agent_stack_marker: Option<ManagedAgentStackCutoverMarker>,
+    managed_agent_stack_active: Option<ManagedFabricActiveSnapshot>,
+    managed_model_agent_stack_marker: Option<ManagedModelAgentStackCutoverMarker>,
+    managed_model_agent_stack_active: Option<ManagedFabricActiveSnapshot>,
+    distributed_agent_stack_marker: Option<DistributedAgentStackCutoverMarker>,
+    distributed_agent_stack_active: Option<ManagedFabricActiveSnapshot>,
+    stopped: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedFabricCommitFailpoint {
+    None,
+    #[cfg(test)]
+    BeforeTempSync,
+    #[cfg(test)]
+    AfterRename,
+}
+
+impl Drop for ManagedFabricStore {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
+}
+
+impl fmt::Debug for ManagedFabricStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedFabricStore")
+            .field("directory", &self.directory)
+            .field("lock_identity", &self.lock_identity)
+            .field("marker", &self.marker)
+            .field("legacy_sequence", &self.legacy_snapshot.sequence())
+            .field("initialized", &self.active.is_some())
+            .field(
+                "managed_agent_stack_cutover",
+                &self.managed_agent_stack_marker.is_some(),
+            )
+            .field(
+                "managed_agent_stack_active",
+                &self.managed_agent_stack_active.is_some(),
+            )
+            .field(
+                "managed_model_agent_stack_cutover",
+                &self.managed_model_agent_stack_marker.is_some(),
+            )
+            .field(
+                "managed_model_agent_stack_active",
+                &self.managed_model_agent_stack_active.is_some(),
+            )
+            .field(
+                "distributed_agent_stack_cutover",
+                &self.distributed_agent_stack_marker.is_some(),
+            )
+            .field(
+                "distributed_agent_stack_active",
+                &self.distributed_agent_stack_active.is_some(),
+            )
+            .field("stopped", &self.stopped)
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for RuntimeStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -808,6 +1446,43 @@ impl RuntimeStore {
         )
     }
 
+    pub(crate) fn open_developer_local(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+    ) -> Result<Self, RuntimeStoreOpenError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            expected_target_fingerprint,
+            RuntimeFilesystemPolicy::ExplicitDeveloperLocal,
+        )
+    }
+
+    /// Strictly observes the identity of an already published DeveloperLocal
+    /// store.  This is discovery, never reconstruction: the active snapshot is
+    /// decoded and checksummed under the same owner-private directory checks,
+    /// and the caller must immediately reopen it with the returned identity.
+    pub(crate) fn observe_developer_local_store_instance_id(
+        directory: &Path,
+        expected_target_fingerprint: Digest32,
+    ) -> Result<[u8; 32], RuntimeStoreOpenError> {
+        if expected_target_fingerprint
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return Err(RuntimeStoreOpenError::InvalidExpectedTargetFingerprint);
+        }
+        let directory =
+            open_runtime_directory(directory, RuntimeFilesystemPolicy::ExplicitDeveloperLocal)?;
+        let active = read_active_snapshot(&directory)?;
+        if active.snapshot.owner_target_fingerprint() != &expected_target_fingerprint {
+            return Err(RuntimeStoreOpenError::TargetFingerprintMismatch);
+        }
+        Ok(*active.snapshot.store_instance_id())
+    }
+
     fn open_with_policy(
         directory: &Path,
         expected_store_instance_id: [u8; 32],
@@ -872,6 +1547,49 @@ impl RuntimeStore {
     pub(crate) fn snapshot(&self) -> Result<&RuntimeJournalSnapshot, RuntimeStoreError> {
         self.ensure_operational()?;
         Ok(&self.active.snapshot)
+    }
+
+    /// Irreversibly transfers desired-state authority to the managed-fabric
+    /// successor format.  Publication is allowed only while this object holds
+    /// the frozen payload-v5 writer lock and the legacy state is provably
+    /// fresh/empty.  The marker is directory-durable before this legacy writer
+    /// is stopped; all subsequent legacy opens reject the marker as unknown.
+    pub(crate) fn publish_managed_fabric_cutover_marker(
+        &mut self,
+        transition_projection_digest: Digest32,
+    ) -> Result<ManagedFabricCutoverMarker, ManagedFabricStoreError> {
+        self.ensure_operational()
+            .map_err(ManagedFabricStoreError::LegacyStore)?;
+        self.revalidate_current()
+            .map_err(ManagedFabricStoreError::LegacyStore)?;
+        if !legacy_snapshot_is_fresh_for_managed_fabric(&self.active.snapshot) {
+            return Err(ManagedFabricStoreError::LegacyStoreNotFresh);
+        }
+        ensure_named_file_missing(
+            &self.directory,
+            MANAGED_FABRIC_CUTOVER_FILE_NAME,
+            RuntimeFileStage::RequireMissingActive,
+        )?;
+        ensure_named_file_missing(
+            &self.directory,
+            MANAGED_FABRIC_ACTIVE_FILE_NAME,
+            RuntimeFileStage::RequireMissingActive,
+        )?;
+        let marker = ManagedFabricCutoverMarker::try_new(
+            &self.active.snapshot,
+            transition_projection_digest,
+        )?;
+        let published = create_durable_named_file(
+            &self.directory,
+            MANAGED_FABRIC_CUTOVER_FILE_NAME,
+            &marker.canonical_wire,
+        );
+
+        // Marker durability is the one-way boundary.  Even if a caller retains
+        // this Rust value, it can no longer commit the frozen legacy journal.
+        self.state = RuntimeStoreState::Stopped;
+        published?;
+        Ok(marker)
     }
 
     pub(crate) fn revalidate_current(
@@ -979,6 +1697,1569 @@ impl RuntimeStore {
         Ok(())
     }
 }
+
+impl ManagedFabricStore {
+    /// Selects the one-way successor mode from a validated marker. A malformed
+    /// or unsafe marker is an error and must never be treated as legacy mode.
+    pub(crate) fn cutover_present(directory: &Path) -> Result<bool, ManagedFabricStoreError> {
+        Self::cutover_present_with_policy(directory, RuntimeFilesystemPolicy::ProductionReference)
+    }
+
+    pub(crate) fn cutover_present_developer_local(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ExplicitDeveloperLocal,
+        )
+    }
+
+    /// Selects the additive PXAR-v7 owner before the predecessor PXMS core is
+    /// recovered. A malformed marker is always fatal and never falls back to
+    /// PXAR-v6 authority.
+    pub(crate) fn managed_agent_stack_cutover_present(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::managed_agent_stack_cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    pub(crate) fn managed_agent_stack_cutover_present_developer_local(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::managed_agent_stack_cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ExplicitDeveloperLocal,
+        )
+    }
+
+    /// Selects the managed Fabric+Model+Agent sibling authority before the
+    /// PXAR-v6 predecessor is recovered. A malformed marker is fatal and must
+    /// never dispatch to either the PXAR-v6 or PXAR-v7 owner.
+    pub(crate) fn managed_model_agent_stack_cutover_present(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::managed_model_agent_stack_cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    pub(crate) fn managed_model_agent_stack_cutover_present_developer_local(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::managed_model_agent_stack_cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ExplicitDeveloperLocal,
+        )
+    }
+
+    /// Selects PXAR-v8 authority before either predecessor owner is recovered.
+    /// A malformed marker is fatal and never falls back to PXAR-v7 dispatch.
+    pub(crate) fn distributed_agent_stack_cutover_present(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::distributed_agent_stack_cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    pub(crate) fn distributed_agent_stack_cutover_present_developer_local(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::distributed_agent_stack_cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ExplicitDeveloperLocal,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn distributed_agent_stack_cutover_present_fixture(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::distributed_agent_stack_cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+    }
+
+    fn distributed_agent_stack_cutover_present_with_policy(
+        directory: &Path,
+        filesystem_policy: RuntimeFilesystemPolicy,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        let directory = open_runtime_directory(directory, filesystem_policy)
+            .map_err(ManagedFabricStoreError::Open)?;
+        Ok(read_optional_distributed_agent_stack_cutover(&directory)?.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_agent_stack_cutover_present_fixture(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::managed_agent_stack_cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+    }
+
+    fn managed_agent_stack_cutover_present_with_policy(
+        directory: &Path,
+        filesystem_policy: RuntimeFilesystemPolicy,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        let directory = open_runtime_directory(directory, filesystem_policy)
+            .map_err(ManagedFabricStoreError::Open)?;
+        Ok(read_optional_managed_agent_stack_cutover(&directory)?.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_model_agent_stack_cutover_present_fixture(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::managed_model_agent_stack_cutover_present_with_policy(
+            directory,
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+    }
+
+    fn managed_model_agent_stack_cutover_present_with_policy(
+        directory: &Path,
+        filesystem_policy: RuntimeFilesystemPolicy,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        let directory = open_runtime_directory(directory, filesystem_policy)
+            .map_err(ManagedFabricStoreError::Open)?;
+        Ok(read_optional_managed_model_agent_stack_cutover(&directory)?.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cutover_present_fixture(
+        directory: &Path,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        Self::cutover_present_with_policy(directory, RuntimeFilesystemPolicy::ExplicitFixture)
+    }
+
+    fn cutover_present_with_policy(
+        directory: &Path,
+        filesystem_policy: RuntimeFilesystemPolicy,
+    ) -> Result<bool, ManagedFabricStoreError> {
+        let directory = open_runtime_directory(directory, filesystem_policy)
+            .map_err(ManagedFabricStoreError::Open)?;
+        match openat(
+            &directory.file,
+            MANAGED_FABRIC_CUTOVER_FILE_NAME,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(file) => {
+                drop(file);
+                let _ = read_managed_fabric_cutover_marker(&directory)?;
+                Ok(true)
+            }
+            Err(nix::errno::Errno::ENOENT) => Ok(false),
+            Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(
+                RuntimeFileStage::OpenCutover,
+                error,
+            ))),
+        }
+    }
+
+    pub(crate) fn open(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+        expected_transition_projection_digest: Digest32,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            expected_target_fingerprint,
+            Some(expected_transition_projection_digest),
+            RuntimeFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    /// Opens a marked successor store before the caller has derived the
+    /// transition projection from the frozen, locally decoded legacy
+    /// installation facts. The caller must compare the derived projection to
+    /// `marker()` before decoding or initializing the successor snapshot.
+    pub(crate) fn open_unbound_projection(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            expected_target_fingerprint,
+            None,
+            RuntimeFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    pub(crate) fn open_unbound_projection_developer_local(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            expected_target_fingerprint,
+            None,
+            RuntimeFilesystemPolicy::ExplicitDeveloperLocal,
+        )
+    }
+
+    pub(crate) fn open_developer_local(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+        expected_transition_projection_digest: Digest32,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            expected_target_fingerprint,
+            Some(expected_transition_projection_digest),
+            RuntimeFilesystemPolicy::ExplicitDeveloperLocal,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_fixture(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+        expected_transition_projection_digest: Digest32,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            expected_target_fingerprint,
+            Some(expected_transition_projection_digest),
+            RuntimeFilesystemPolicy::ExplicitFixture,
+        )
+    }
+
+    fn open_with_policy(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_target_fingerprint: Digest32,
+        expected_transition_projection_digest: Option<Digest32>,
+        filesystem_policy: RuntimeFilesystemPolicy,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        if expected_store_instance_id.iter().all(|byte| *byte == 0)
+            || expected_target_fingerprint
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || expected_transition_projection_digest
+                .is_some_and(|digest| digest.as_bytes().iter().all(|byte| *byte == 0))
+        {
+            return Err(ManagedFabricStoreError::InvalidExpectedIdentity);
+        }
+        let directory = open_runtime_directory(directory, filesystem_policy)
+            .map_err(ManagedFabricStoreError::Open)?;
+        let OpenedRegularFile {
+            file: lock_file,
+            identity: lock_identity,
+        } = open_existing_regular(
+            &directory,
+            LOCK_FILE_NAME,
+            OFlag::O_RDWR,
+            RuntimeFileStage::OpenLock,
+        )
+        .map_err(ManagedFabricStoreError::Open)?;
+        lock_file.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => ManagedFabricStoreError::LockContended,
+            TryLockError::Error(error) => ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::AcquireLock,
+                &error,
+            )),
+        })?;
+        validate_named_file_identity(
+            &directory,
+            LOCK_FILE_NAME,
+            lock_identity,
+            RuntimeFileStage::ValidateLockIdentity,
+        )
+        .map_err(ManagedFabricStoreError::Open)?;
+
+        let legacy = read_active_snapshot(&directory).map_err(ManagedFabricStoreError::Open)?;
+        if legacy.snapshot.store_instance_id() != &expected_store_instance_id
+            || legacy.snapshot.owner_target_fingerprint() != &expected_target_fingerprint
+        {
+            return Err(ManagedFabricStoreError::LegacyIdentityMismatch);
+        }
+        if !legacy_snapshot_is_fresh_for_managed_fabric(&legacy.snapshot) {
+            return Err(ManagedFabricStoreError::LegacyStoreNotFresh);
+        }
+        let marker = read_managed_fabric_cutover_marker(&directory)?;
+        if marker.legacy_store_instance_id != expected_store_instance_id
+            || marker.legacy_target_fingerprint != expected_target_fingerprint
+            || marker.legacy_sequence != legacy.snapshot.sequence()
+            || expected_transition_projection_digest
+                .is_some_and(|expected| marker.transition_projection_digest != expected)
+        {
+            return Err(ManagedFabricStoreError::CutoverBindingMismatch);
+        }
+        let managed_agent_stack_marker = read_optional_managed_agent_stack_cutover(&directory)?;
+        if let Some(stack_marker) = &managed_agent_stack_marker
+            && (stack_marker.store_instance_id != expected_store_instance_id
+                || stack_marker.target_fingerprint != expected_target_fingerprint
+                || stack_marker.predecessor_projection_digest
+                    != marker.transition_projection_digest
+                || stack_marker.predecessor_legacy_sequence != marker.legacy_sequence)
+        {
+            return Err(ManagedFabricStoreError::ManagedAgentStackCutoverBindingMismatch);
+        }
+        let managed_agent_stack_active = read_optional_managed_agent_stack_snapshot(&directory)?;
+        if managed_agent_stack_active.is_some() && managed_agent_stack_marker.is_none() {
+            return Err(ManagedFabricStoreError::InvalidManagedAgentStackCutover);
+        }
+        let managed_model_agent_stack_marker =
+            read_optional_managed_model_agent_stack_cutover(&directory)?;
+        if let Some(stack_marker) = &managed_model_agent_stack_marker
+            && (stack_marker.store_instance_id != expected_store_instance_id
+                || stack_marker.target_fingerprint != expected_target_fingerprint
+                || stack_marker.predecessor_projection_digest
+                    != marker.transition_projection_digest
+                || stack_marker.predecessor_legacy_sequence != marker.legacy_sequence)
+        {
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackCutoverBindingMismatch);
+        }
+        let managed_model_agent_stack_active =
+            read_optional_managed_model_agent_stack_snapshot(&directory)?;
+        if managed_model_agent_stack_active.is_some() && managed_model_agent_stack_marker.is_none()
+        {
+            return Err(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover);
+        }
+        let authoritative_stack_snapshot = match (
+            managed_agent_stack_active.as_ref(),
+            managed_agent_stack_marker.as_ref(),
+        ) {
+            (Some(active), Some(_)) => Some(active.encoded.as_ref()),
+            (None, Some(stack_marker)) => Some(stack_marker.initial_snapshot.as_ref()),
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(ManagedFabricStoreError::InvalidManagedAgentStackCutover);
+            }
+        };
+        let distributed_agent_stack_marker =
+            read_optional_distributed_agent_stack_cutover(&directory)?;
+        let distributed_agent_stack_active =
+            read_optional_distributed_agent_stack_snapshot(&directory)?;
+        if distributed_agent_stack_active.is_some() && distributed_agent_stack_marker.is_none() {
+            return Err(ManagedFabricStoreError::InvalidDistributedAgentStackCutover);
+        }
+        let model_authority_present = managed_model_agent_stack_marker.is_some()
+            || managed_model_agent_stack_active.is_some();
+        let agent_authority_present =
+            managed_agent_stack_marker.is_some() || managed_agent_stack_active.is_some();
+        let distributed_authority_present =
+            distributed_agent_stack_marker.is_some() || distributed_agent_stack_active.is_some();
+        if model_authority_present && (agent_authority_present || distributed_authority_present) {
+            return Err(ManagedFabricStoreError::ConflictingStackAuthorities);
+        }
+        if let Some(distributed_marker) = &distributed_agent_stack_marker {
+            let stack_marker = managed_agent_stack_marker
+                .as_ref()
+                .ok_or(ManagedFabricStoreError::InvalidDistributedAgentStackCutover)?;
+            let stack_snapshot = authoritative_stack_snapshot
+                .ok_or(ManagedFabricStoreError::InvalidDistributedAgentStackCutover)?;
+            if distributed_marker.store_instance_id != expected_store_instance_id
+                || distributed_marker.target_fingerprint != expected_target_fingerprint
+                || distributed_marker.predecessor_stack_projection_digest
+                    != stack_marker.stack_projection_digest
+                || distributed_marker.predecessor_legacy_sequence
+                    != stack_marker.predecessor_legacy_sequence
+                || distributed_marker.predecessor_snapshot_digest
+                    != distributed_predecessor_snapshot_digest(stack_snapshot)
+            {
+                return Err(ManagedFabricStoreError::DistributedAgentStackCutoverBindingMismatch);
+            }
+        }
+        validate_managed_fabric_directory_entries(
+            &directory,
+            managed_agent_stack_marker.is_some() || managed_model_agent_stack_marker.is_some(),
+        )?;
+        clean_managed_fabric_orphan_temps(&directory)?;
+        let active = read_optional_managed_fabric_snapshot(&directory)?;
+        Ok(Self {
+            directory,
+            lock_file,
+            lock_identity,
+            marker,
+            legacy_snapshot: legacy.snapshot,
+            active,
+            managed_agent_stack_marker,
+            managed_agent_stack_active,
+            managed_model_agent_stack_marker,
+            managed_model_agent_stack_active,
+            distributed_agent_stack_marker,
+            distributed_agent_stack_active,
+            stopped: false,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn marker(&self) -> &ManagedFabricCutoverMarker {
+        &self.marker
+    }
+
+    #[must_use]
+    pub(crate) const fn frozen_legacy_snapshot(&self) -> &RuntimeJournalSnapshot {
+        &self.legacy_snapshot
+    }
+
+    #[must_use]
+    pub(crate) fn managed_agent_stack_projection_digest(&self) -> Option<Digest32> {
+        self.managed_agent_stack_marker
+            .as_ref()
+            .map(|marker| marker.stack_projection_digest)
+    }
+
+    pub(crate) fn managed_agent_stack_snapshot_bytes(
+        &self,
+    ) -> Result<Option<&[u8]>, ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        Ok(
+            match (
+                self.managed_agent_stack_active.as_ref(),
+                self.managed_agent_stack_marker.as_ref(),
+            ) {
+                (Some(active), Some(_)) => Some(active.encoded.as_ref()),
+                (None, Some(marker)) => Some(marker.initial_snapshot.as_ref()),
+                (None, None) => None,
+                (Some(_), None) => {
+                    return Err(ManagedFabricStoreError::InvalidManagedAgentStackCutover);
+                }
+            },
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn managed_model_agent_stack_projection_digest(&self) -> Option<Digest32> {
+        self.managed_model_agent_stack_marker
+            .as_ref()
+            .map(|marker| marker.stack_projection_digest)
+    }
+
+    pub(crate) fn managed_model_agent_stack_snapshot_bytes(
+        &self,
+    ) -> Result<Option<&[u8]>, ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        Ok(
+            match (
+                self.managed_model_agent_stack_active.as_ref(),
+                self.managed_model_agent_stack_marker.as_ref(),
+            ) {
+                (Some(active), Some(_)) => Some(active.encoded.as_ref()),
+                (None, Some(marker)) => Some(marker.initial_snapshot.as_ref()),
+                (None, None) => None,
+                (Some(_), None) => {
+                    return Err(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover);
+                }
+            },
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn distributed_agent_stack_projection_digest(&self) -> Option<Digest32> {
+        self.distributed_agent_stack_marker
+            .as_ref()
+            .map(|marker| marker.distributed_projection_digest)
+    }
+
+    pub(crate) fn distributed_agent_stack_snapshot_bytes(
+        &self,
+    ) -> Result<Option<&[u8]>, ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        Ok(
+            match (
+                self.distributed_agent_stack_active.as_ref(),
+                self.distributed_agent_stack_marker.as_ref(),
+            ) {
+                (Some(active), Some(_)) => Some(active.encoded.as_ref()),
+                (None, Some(marker)) => Some(marker.initial_snapshot.as_ref()),
+                (None, None) => None,
+                (Some(_), None) => {
+                    return Err(ManagedFabricStoreError::InvalidDistributedAgentStackCutover);
+                }
+            },
+        )
+    }
+
+    /// Atomically transfers apply authority by embedding the first complete
+    /// PXAS intent snapshot in the immutable cutover record.
+    pub(crate) fn initialize_managed_agent_stack(
+        &mut self,
+        stack_projection_digest: Digest32,
+        initial_snapshot: &[u8],
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.distributed_agent_stack_marker.is_some()
+            || self.distributed_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::DistributedAgentStackAuthorityActive);
+        }
+        if self.managed_model_agent_stack_marker.is_some()
+            || self.managed_model_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackAuthorityActive);
+        }
+        self.revalidate_managed_agent_stack(None)?;
+        if self.managed_agent_stack_marker.is_some() || self.managed_agent_stack_active.is_some() {
+            return Err(ManagedFabricStoreError::ManagedAgentStackAlreadyInitialized);
+        }
+        let marker = ManagedAgentStackCutoverMarker::try_new(
+            &self.marker,
+            stack_projection_digest,
+            initial_snapshot,
+        )?;
+        let published = create_durable_managed_agent_stack_cutover(
+            &self.directory,
+            MANAGED_AGENT_STACK_CUTOVER_FILE_NAME,
+            &marker.canonical_wire,
+        );
+        if let Err(error) = published {
+            self.stopped = true;
+            return Err(error);
+        }
+        let disk = read_optional_managed_agent_stack_cutover(&self.directory)?
+            .ok_or(ManagedFabricStoreError::InvalidManagedAgentStackCutover)?;
+        if disk != marker {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::ManagedAgentStackSnapshotMismatch);
+        }
+        self.managed_agent_stack_marker = Some(marker);
+        Ok(())
+    }
+
+    pub(crate) fn commit_managed_agent_stack(
+        &mut self,
+        encoded: &[u8],
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.distributed_agent_stack_marker.is_some()
+            || self.distributed_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::DistributedAgentStackAuthorityActive);
+        }
+        if self.managed_model_agent_stack_marker.is_some()
+            || self.managed_model_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackAuthorityActive);
+        }
+        if encoded.is_empty() || encoded.len() > MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES {
+            return Err(ManagedFabricStoreError::InvalidManagedAgentStackSnapshotLength);
+        }
+        let marker = self
+            .managed_agent_stack_marker
+            .as_ref()
+            .ok_or(ManagedFabricStoreError::ManagedAgentStackNotInitialized)?
+            .clone();
+        let expected = self
+            .managed_agent_stack_active
+            .as_ref()
+            .map(|active| active.identity);
+        self.revalidate_managed_agent_stack(expected)?;
+        let token = system_random_token().map_err(|error| {
+            ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::GenerateTempName,
+                &error,
+            ))
+        })?;
+        let temp_name = managed_agent_stack_temp_name(token);
+        let owned = openat(
+            &self.directory.file,
+            temp_name.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+        .map_err(|error| {
+            ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::CreateTemp, error))
+        })?;
+        let mut temp = File::from(owned);
+        let prepared = (|| -> Result<(), ManagedFabricStoreError> {
+            fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+                ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
+            })?;
+            validate_regular_file(
+                &temp.metadata().map_err(|error| {
+                    ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                        RuntimeFileStage::InspectTemp,
+                        &error,
+                    ))
+                })?,
+                self.directory.owner_uid,
+                self.directory.owner_gid,
+            )
+            .map_err(ManagedFabricStoreError::Open)?;
+            temp.write_all(encoded).map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::WriteTemp,
+                    &error,
+                ))
+            })?;
+            temp.sync_all().map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::SyncTemp,
+                    &error,
+                ))
+            })?;
+            self.revalidate_managed_agent_stack(expected)
+        })();
+        if let Err(error) = prepared {
+            self.stopped = true;
+            return Err(error);
+        }
+        if let Err(error) = renameat(
+            &self.directory.file,
+            temp_name.as_str(),
+            &self.directory.file,
+            MANAGED_AGENT_STACK_ACTIVE_FILE_NAME,
+        ) {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::Io(nix_failure(
+                RuntimeFileStage::Rename,
+                error,
+            )));
+        }
+        if let Err(error) = self.directory.file.sync_all() {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::UncertainAfterPublish(
+                RuntimeIoFailure::new(RuntimeFileStage::SyncDirectory, &error),
+            ));
+        }
+        let active = read_optional_managed_agent_stack_snapshot(&self.directory)?
+            .ok_or(ManagedFabricStoreError::ManagedAgentStackSnapshotMissing)?;
+        if active.encoded.as_ref() != encoded
+            || read_optional_managed_agent_stack_cutover(&self.directory)?.as_ref() != Some(&marker)
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::ManagedAgentStackSnapshotMismatch);
+        }
+        self.managed_agent_stack_active = Some(active);
+        Ok(())
+    }
+
+    fn revalidate_managed_agent_stack(
+        &mut self,
+        expected_active: Option<FileIdentity>,
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.managed_model_agent_stack_marker.is_some()
+            || self.managed_model_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackAuthorityActive);
+        }
+        if validate_runtime_directory_handle(&self.directory).is_err()
+            || validate_held_lock(&self.directory, &self.lock_file, self.lock_identity).is_err()
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::LockOrDirectoryIdentityChanged);
+        }
+        let predecessor = read_managed_fabric_cutover_marker(&self.directory)?;
+        if predecessor != self.marker {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::CutoverBindingMismatch);
+        }
+        if read_optional_managed_model_agent_stack_cutover(&self.directory)?.is_some()
+            || read_optional_managed_model_agent_stack_snapshot(&self.directory)?.is_some()
+            || read_optional_distributed_agent_stack_cutover(&self.directory)?.is_some()
+            || read_optional_distributed_agent_stack_snapshot(&self.directory)?.is_some()
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::ConflictingStackAuthorities);
+        }
+        match (&self.managed_agent_stack_marker, expected_active) {
+            (None, None) => {
+                ensure_named_file_missing(
+                    &self.directory,
+                    MANAGED_AGENT_STACK_CUTOVER_FILE_NAME,
+                    RuntimeFileStage::RequireMissingActive,
+                )?;
+                ensure_named_file_missing(
+                    &self.directory,
+                    MANAGED_AGENT_STACK_ACTIVE_FILE_NAME,
+                    RuntimeFileStage::RequireMissingActive,
+                )
+            }
+            (Some(expected_marker), active) => {
+                let marker = read_optional_managed_agent_stack_cutover(&self.directory)?
+                    .ok_or(ManagedFabricStoreError::InvalidManagedAgentStackCutover)?;
+                if &marker != expected_marker {
+                    return Err(ManagedFabricStoreError::ManagedAgentStackCutoverBindingMismatch);
+                }
+                match active {
+                    Some(identity) => validate_named_file_identity(
+                        &self.directory,
+                        MANAGED_AGENT_STACK_ACTIVE_FILE_NAME,
+                        identity,
+                        RuntimeFileStage::ValidateActiveIdentity,
+                    )
+                    .map_err(ManagedFabricStoreError::Open),
+                    None => ensure_named_file_missing(
+                        &self.directory,
+                        MANAGED_AGENT_STACK_ACTIVE_FILE_NAME,
+                        RuntimeFileStage::RequireMissingActive,
+                    ),
+                }
+            }
+            (None, Some(_)) => Err(ManagedFabricStoreError::InvalidManagedAgentStackCutover),
+        }
+    }
+
+    /// Atomically transfers authority from PXAR-v6 to the independent managed
+    /// Fabric+Model+Agent branch by embedding its first complete snapshot in
+    /// the immutable cutover marker.
+    pub(crate) fn initialize_managed_model_agent_stack(
+        &mut self,
+        stack_projection_digest: Digest32,
+        initial_snapshot: &[u8],
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.distributed_agent_stack_marker.is_some()
+            || self.distributed_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::DistributedAgentStackAuthorityActive);
+        }
+        if self.managed_agent_stack_marker.is_some() || self.managed_agent_stack_active.is_some() {
+            return Err(ManagedFabricStoreError::ManagedAgentStackAuthorityActive);
+        }
+        self.revalidate_managed_model_agent_stack(None)?;
+        if self.managed_model_agent_stack_marker.is_some()
+            || self.managed_model_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackAlreadyInitialized);
+        }
+        let marker = ManagedModelAgentStackCutoverMarker::try_new(
+            &self.marker,
+            stack_projection_digest,
+            initial_snapshot,
+        )?;
+        if let Err(error) = create_durable_managed_model_agent_stack_cutover(
+            &self.directory,
+            MANAGED_MODEL_AGENT_STACK_CUTOVER_FILE_NAME,
+            &marker.canonical_wire,
+        ) {
+            self.stopped = true;
+            return Err(error);
+        }
+        let disk = read_optional_managed_model_agent_stack_cutover(&self.directory)?
+            .ok_or(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover)?;
+        if disk != marker {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackSnapshotMismatch);
+        }
+        self.managed_model_agent_stack_marker = Some(marker);
+        Ok(())
+    }
+
+    pub(crate) fn commit_managed_model_agent_stack(
+        &mut self,
+        encoded: &[u8],
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.distributed_agent_stack_marker.is_some()
+            || self.distributed_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::DistributedAgentStackAuthorityActive);
+        }
+        if self.managed_agent_stack_marker.is_some() || self.managed_agent_stack_active.is_some() {
+            return Err(ManagedFabricStoreError::ManagedAgentStackAuthorityActive);
+        }
+        if encoded.is_empty() || encoded.len() > MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES {
+            return Err(ManagedFabricStoreError::InvalidManagedModelAgentStackSnapshotLength);
+        }
+        let marker = self
+            .managed_model_agent_stack_marker
+            .as_ref()
+            .ok_or(ManagedFabricStoreError::ManagedModelAgentStackNotInitialized)?
+            .clone();
+        let expected = self
+            .managed_model_agent_stack_active
+            .as_ref()
+            .map(|active| active.identity);
+        self.revalidate_managed_model_agent_stack(expected)?;
+        let token = system_random_token().map_err(|error| {
+            ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::GenerateTempName,
+                &error,
+            ))
+        })?;
+        let temp_name = managed_model_agent_stack_temp_name(token);
+        let owned = openat(
+            &self.directory.file,
+            temp_name.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+        .map_err(|error| {
+            ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::CreateTemp, error))
+        })?;
+        let mut temp = File::from(owned);
+        let prepared = (|| -> Result<(), ManagedFabricStoreError> {
+            fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+                ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
+            })?;
+            validate_regular_file(
+                &temp.metadata().map_err(|error| {
+                    ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                        RuntimeFileStage::InspectTemp,
+                        &error,
+                    ))
+                })?,
+                self.directory.owner_uid,
+                self.directory.owner_gid,
+            )
+            .map_err(ManagedFabricStoreError::Open)?;
+            temp.write_all(encoded).map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::WriteTemp,
+                    &error,
+                ))
+            })?;
+            temp.sync_all().map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::SyncTemp,
+                    &error,
+                ))
+            })?;
+            self.revalidate_managed_model_agent_stack(expected)
+        })();
+        if let Err(error) = prepared {
+            self.stopped = true;
+            return Err(error);
+        }
+        if let Err(error) = renameat(
+            &self.directory.file,
+            temp_name.as_str(),
+            &self.directory.file,
+            MANAGED_MODEL_AGENT_STACK_ACTIVE_FILE_NAME,
+        ) {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::Io(nix_failure(
+                RuntimeFileStage::Rename,
+                error,
+            )));
+        }
+        if let Err(error) = self.directory.file.sync_all() {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::UncertainAfterPublish(
+                RuntimeIoFailure::new(RuntimeFileStage::SyncDirectory, &error),
+            ));
+        }
+        let active = read_optional_managed_model_agent_stack_snapshot(&self.directory)?
+            .ok_or(ManagedFabricStoreError::ManagedModelAgentStackSnapshotMissing)?;
+        if active.encoded.as_ref() != encoded
+            || read_optional_managed_model_agent_stack_cutover(&self.directory)?.as_ref()
+                != Some(&marker)
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackSnapshotMismatch);
+        }
+        self.managed_model_agent_stack_active = Some(active);
+        Ok(())
+    }
+
+    fn revalidate_managed_model_agent_stack(
+        &mut self,
+        expected_active: Option<FileIdentity>,
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.distributed_agent_stack_marker.is_some()
+            || self.distributed_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::DistributedAgentStackAuthorityActive);
+        }
+        if self.managed_agent_stack_marker.is_some() || self.managed_agent_stack_active.is_some() {
+            return Err(ManagedFabricStoreError::ManagedAgentStackAuthorityActive);
+        }
+        if validate_runtime_directory_handle(&self.directory).is_err()
+            || validate_held_lock(&self.directory, &self.lock_file, self.lock_identity).is_err()
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::LockOrDirectoryIdentityChanged);
+        }
+        let predecessor = read_managed_fabric_cutover_marker(&self.directory)?;
+        if predecessor != self.marker {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::CutoverBindingMismatch);
+        }
+        if read_optional_managed_agent_stack_cutover(&self.directory)?.is_some()
+            || read_optional_managed_agent_stack_snapshot(&self.directory)?.is_some()
+            || read_optional_distributed_agent_stack_cutover(&self.directory)?.is_some()
+            || read_optional_distributed_agent_stack_snapshot(&self.directory)?.is_some()
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::ConflictingStackAuthorities);
+        }
+        match (&self.managed_model_agent_stack_marker, expected_active) {
+            (None, None) => {
+                ensure_named_file_missing(
+                    &self.directory,
+                    MANAGED_MODEL_AGENT_STACK_CUTOVER_FILE_NAME,
+                    RuntimeFileStage::RequireMissingActive,
+                )?;
+                ensure_named_file_missing(
+                    &self.directory,
+                    MANAGED_MODEL_AGENT_STACK_ACTIVE_FILE_NAME,
+                    RuntimeFileStage::RequireMissingActive,
+                )
+            }
+            (Some(expected_marker), active) => {
+                let marker = read_optional_managed_model_agent_stack_cutover(&self.directory)?
+                    .ok_or(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover)?;
+                if &marker != expected_marker {
+                    return Err(
+                        ManagedFabricStoreError::ManagedModelAgentStackCutoverBindingMismatch,
+                    );
+                }
+                match active {
+                    Some(identity) => validate_named_file_identity(
+                        &self.directory,
+                        MANAGED_MODEL_AGENT_STACK_ACTIVE_FILE_NAME,
+                        identity,
+                        RuntimeFileStage::ValidateActiveIdentity,
+                    )
+                    .map_err(ManagedFabricStoreError::Open),
+                    None => ensure_named_file_missing(
+                        &self.directory,
+                        MANAGED_MODEL_AGENT_STACK_ACTIVE_FILE_NAME,
+                        RuntimeFileStage::RequireMissingActive,
+                    ),
+                }
+            }
+            (None, Some(_)) => Err(ManagedFabricStoreError::InvalidManagedModelAgentStackCutover),
+        }
+    }
+
+    /// Atomically transfers authority from the frozen PXAR-v7 snapshot and
+    /// embeds the first complete PXDA PreparedNoEffects snapshot.
+    pub(crate) fn initialize_distributed_agent_stack(
+        &mut self,
+        distributed_projection_digest: Digest32,
+        initial_snapshot: &[u8],
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.managed_model_agent_stack_marker.is_some()
+            || self.managed_model_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackAuthorityActive);
+        }
+        self.revalidate_distributed_agent_stack(None)?;
+        if self.distributed_agent_stack_marker.is_some()
+            || self.distributed_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::DistributedAgentStackAlreadyInitialized);
+        }
+        let predecessor = self
+            .managed_agent_stack_marker
+            .as_ref()
+            .ok_or(ManagedFabricStoreError::ManagedAgentStackNotInitialized)?;
+        let predecessor_snapshot = match self.managed_agent_stack_active.as_ref() {
+            Some(active) => active.encoded.as_ref(),
+            None => predecessor.initial_snapshot.as_ref(),
+        };
+        let marker = DistributedAgentStackCutoverMarker::try_new(
+            predecessor,
+            distributed_projection_digest,
+            predecessor_snapshot,
+            initial_snapshot,
+        )?;
+        if let Err(error) = create_durable_distributed_agent_stack_cutover(
+            &self.directory,
+            DISTRIBUTED_AGENT_STACK_CUTOVER_FILE_NAME,
+            &marker.canonical_wire,
+        ) {
+            self.stopped = true;
+            return Err(error);
+        }
+        let disk = read_optional_distributed_agent_stack_cutover(&self.directory)?
+            .ok_or(ManagedFabricStoreError::InvalidDistributedAgentStackCutover)?;
+        if disk != marker {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::DistributedAgentStackSnapshotMismatch);
+        }
+        self.distributed_agent_stack_marker = Some(marker);
+        Ok(())
+    }
+
+    pub(crate) fn commit_distributed_agent_stack(
+        &mut self,
+        encoded: &[u8],
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.managed_model_agent_stack_marker.is_some()
+            || self.managed_model_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackAuthorityActive);
+        }
+        if encoded.is_empty() || encoded.len() > MAX_DISTRIBUTED_AGENT_STACK_SNAPSHOT_BYTES {
+            return Err(ManagedFabricStoreError::InvalidDistributedAgentStackSnapshotLength);
+        }
+        let marker = self
+            .distributed_agent_stack_marker
+            .as_ref()
+            .ok_or(ManagedFabricStoreError::DistributedAgentStackNotInitialized)?
+            .clone();
+        let expected = self
+            .distributed_agent_stack_active
+            .as_ref()
+            .map(|active| active.identity);
+        self.revalidate_distributed_agent_stack(expected)?;
+        let token = system_random_token().map_err(|error| {
+            ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::GenerateTempName,
+                &error,
+            ))
+        })?;
+        let temp_name = distributed_agent_stack_temp_name(token);
+        let owned = openat(
+            &self.directory.file,
+            temp_name.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+        .map_err(|error| {
+            ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::CreateTemp, error))
+        })?;
+        let mut temp = File::from(owned);
+        let prepared = (|| -> Result<(), ManagedFabricStoreError> {
+            fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+                ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
+            })?;
+            validate_regular_file(
+                &temp.metadata().map_err(|error| {
+                    ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                        RuntimeFileStage::InspectTemp,
+                        &error,
+                    ))
+                })?,
+                self.directory.owner_uid,
+                self.directory.owner_gid,
+            )
+            .map_err(ManagedFabricStoreError::Open)?;
+            temp.write_all(encoded).map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::WriteTemp,
+                    &error,
+                ))
+            })?;
+            temp.sync_all().map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::SyncTemp,
+                    &error,
+                ))
+            })?;
+            self.revalidate_distributed_agent_stack(expected)
+        })();
+        if let Err(error) = prepared {
+            self.stopped = true;
+            return Err(error);
+        }
+        if let Err(error) = renameat(
+            &self.directory.file,
+            temp_name.as_str(),
+            &self.directory.file,
+            DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME,
+        ) {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::Io(nix_failure(
+                RuntimeFileStage::Rename,
+                error,
+            )));
+        }
+        if let Err(error) = self.directory.file.sync_all() {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::UncertainAfterPublish(
+                RuntimeIoFailure::new(RuntimeFileStage::SyncDirectory, &error),
+            ));
+        }
+        let active = read_optional_distributed_agent_stack_snapshot(&self.directory)?
+            .ok_or(ManagedFabricStoreError::DistributedAgentStackSnapshotMissing)?;
+        if active.encoded.as_ref() != encoded
+            || read_optional_distributed_agent_stack_cutover(&self.directory)?.as_ref()
+                != Some(&marker)
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::DistributedAgentStackSnapshotMismatch);
+        }
+        self.distributed_agent_stack_active = Some(active);
+        Ok(())
+    }
+
+    fn revalidate_distributed_agent_stack(
+        &mut self,
+        expected_active: Option<FileIdentity>,
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.managed_model_agent_stack_marker.is_some()
+            || self.managed_model_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::ManagedModelAgentStackAuthorityActive);
+        }
+        if validate_runtime_directory_handle(&self.directory).is_err()
+            || validate_held_lock(&self.directory, &self.lock_file, self.lock_identity).is_err()
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::LockOrDirectoryIdentityChanged);
+        }
+        if read_optional_managed_model_agent_stack_cutover(&self.directory)?.is_some()
+            || read_optional_managed_model_agent_stack_snapshot(&self.directory)?.is_some()
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::ConflictingStackAuthorities);
+        }
+        let predecessor = read_optional_managed_agent_stack_cutover(&self.directory)?
+            .ok_or(ManagedFabricStoreError::ManagedAgentStackNotInitialized)?;
+        if self.managed_agent_stack_marker.as_ref() != Some(&predecessor) {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::ManagedAgentStackCutoverBindingMismatch);
+        }
+        let predecessor_snapshot = match self.managed_agent_stack_active.as_ref() {
+            Some(active) => {
+                validate_named_file_identity(
+                    &self.directory,
+                    MANAGED_AGENT_STACK_ACTIVE_FILE_NAME,
+                    active.identity,
+                    RuntimeFileStage::ValidateActiveIdentity,
+                )
+                .map_err(ManagedFabricStoreError::Open)?;
+                let current = read_optional_managed_agent_stack_snapshot(&self.directory)?
+                    .ok_or(ManagedFabricStoreError::ManagedAgentStackSnapshotMissing)?;
+                if current.identity != active.identity || current.encoded != active.encoded {
+                    self.stopped = true;
+                    return Err(ManagedFabricStoreError::ManagedAgentStackSnapshotMismatch);
+                }
+                active.encoded.as_ref()
+            }
+            None => predecessor.initial_snapshot.as_ref(),
+        };
+        match (&self.distributed_agent_stack_marker, expected_active) {
+            (None, None) => {
+                ensure_named_file_missing(
+                    &self.directory,
+                    DISTRIBUTED_AGENT_STACK_CUTOVER_FILE_NAME,
+                    RuntimeFileStage::RequireMissingActive,
+                )?;
+                ensure_named_file_missing(
+                    &self.directory,
+                    DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME,
+                    RuntimeFileStage::RequireMissingActive,
+                )
+            }
+            (Some(expected_marker), active) => {
+                let marker = read_optional_distributed_agent_stack_cutover(&self.directory)?
+                    .ok_or(ManagedFabricStoreError::InvalidDistributedAgentStackCutover)?;
+                if &marker != expected_marker
+                    || marker.predecessor_snapshot_digest
+                        != distributed_predecessor_snapshot_digest(predecessor_snapshot)
+                {
+                    return Err(
+                        ManagedFabricStoreError::DistributedAgentStackCutoverBindingMismatch,
+                    );
+                }
+                match active {
+                    Some(identity) => validate_named_file_identity(
+                        &self.directory,
+                        DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME,
+                        identity,
+                        RuntimeFileStage::ValidateActiveIdentity,
+                    )
+                    .map_err(ManagedFabricStoreError::Open),
+                    None => ensure_named_file_missing(
+                        &self.directory,
+                        DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME,
+                        RuntimeFileStage::RequireMissingActive,
+                    ),
+                }
+            }
+            (None, Some(_)) => Err(ManagedFabricStoreError::InvalidDistributedAgentStackCutover),
+        }
+    }
+
+    pub(crate) fn snapshot_bytes(&self) -> Result<Option<&[u8]>, ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        Ok(self.active.as_ref().map(|active| active.encoded.as_ref()))
+    }
+
+    pub(crate) fn initialize(&mut self, encoded: &[u8]) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.distributed_agent_stack_marker.is_some()
+            || self.distributed_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::DistributedAgentStackAuthorityActive);
+        }
+        if self.active.is_some() {
+            return Err(ManagedFabricStoreError::AlreadyInitialized);
+        }
+        self.publish(encoded, None, ManagedFabricCommitFailpoint::None)
+    }
+
+    pub(crate) fn commit(&mut self, encoded: &[u8]) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if self.distributed_agent_stack_marker.is_some()
+            || self.distributed_agent_stack_active.is_some()
+        {
+            return Err(ManagedFabricStoreError::DistributedAgentStackAuthorityActive);
+        }
+        let expected = self
+            .active
+            .as_ref()
+            .ok_or(ManagedFabricStoreError::NotInitialized)?
+            .identity;
+        self.publish(encoded, Some(expected), ManagedFabricCommitFailpoint::None)
+    }
+
+    #[cfg(test)]
+    fn commit_with_failpoint(
+        &mut self,
+        encoded: &[u8],
+        failpoint: ManagedFabricCommitFailpoint,
+    ) -> Result<(), ManagedFabricStoreError> {
+        let expected = self
+            .active
+            .as_ref()
+            .ok_or(ManagedFabricStoreError::NotInitialized)?
+            .identity;
+        self.publish(encoded, Some(expected), failpoint)
+    }
+
+    fn publish(
+        &mut self,
+        encoded: &[u8],
+        expected: Option<FileIdentity>,
+        failpoint: ManagedFabricCommitFailpoint,
+    ) -> Result<(), ManagedFabricStoreError> {
+        if encoded.is_empty() || encoded.len() > MAX_MANAGED_FABRIC_SNAPSHOT_BYTES {
+            return Err(ManagedFabricStoreError::InvalidSnapshotLength);
+        }
+        if let Err(error) = self.revalidate(expected) {
+            self.stopped = true;
+            return Err(error);
+        }
+        let token = system_random_token().map_err(|error| {
+            ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::GenerateTempName,
+                &error,
+            ))
+        })?;
+        let temp_name = managed_fabric_temp_name(token);
+        let owned = openat(
+            &self.directory.file,
+            temp_name.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+        .map_err(|error| {
+            ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::CreateTemp, error))
+        })?;
+        let mut temp = File::from(owned);
+        let prepared = (|| -> Result<(), ManagedFabricStoreError> {
+            fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+                ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
+            })?;
+            validate_regular_file(
+                &temp.metadata().map_err(|error| {
+                    ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                        RuntimeFileStage::InspectTemp,
+                        &error,
+                    ))
+                })?,
+                self.directory.owner_uid,
+                self.directory.owner_gid,
+            )
+            .map_err(ManagedFabricStoreError::Open)?;
+            temp.write_all(encoded).map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::WriteTemp,
+                    &error,
+                ))
+            })?;
+            #[cfg(test)]
+            if failpoint == ManagedFabricCommitFailpoint::BeforeTempSync {
+                return Err(ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::SyncTemp,
+                    &io::Error::other("injected managed-fabric temp sync failure"),
+                )));
+            }
+            temp.sync_all().map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::SyncTemp,
+                    &error,
+                ))
+            })?;
+            self.revalidate(expected)
+        })();
+        if let Err(error) = prepared {
+            self.stopped = true;
+            return Err(error);
+        }
+        if let Err(error) = renameat(
+            &self.directory.file,
+            temp_name.as_str(),
+            &self.directory.file,
+            MANAGED_FABRIC_ACTIVE_FILE_NAME,
+        ) {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::Io(nix_failure(
+                RuntimeFileStage::Rename,
+                error,
+            )));
+        }
+        #[cfg(test)]
+        if failpoint == ManagedFabricCommitFailpoint::AfterRename {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::UncertainSnapshotMismatch);
+        }
+        let _ = failpoint;
+        if let Err(error) = self.directory.file.sync_all() {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::UncertainAfterPublish(
+                RuntimeIoFailure::new(RuntimeFileStage::SyncDirectory, &error),
+            ));
+        }
+        let active = match read_optional_managed_fabric_snapshot(&self.directory) {
+            Ok(Some(active)) => active,
+            Ok(None) => {
+                self.stopped = true;
+                return Err(ManagedFabricStoreError::UncertainSnapshotMissing);
+            }
+            Err(error) => {
+                self.stopped = true;
+                return Err(error);
+            }
+        };
+        if active.encoded.as_ref() != encoded {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::UncertainSnapshotMismatch);
+        }
+        self.active = Some(active);
+        Ok(())
+    }
+
+    fn revalidate(
+        &mut self,
+        expected: Option<FileIdentity>,
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if validate_runtime_directory_handle(&self.directory).is_err()
+            || validate_held_lock(&self.directory, &self.lock_file, self.lock_identity).is_err()
+        {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::LockOrDirectoryIdentityChanged);
+        }
+        let marker = read_managed_fabric_cutover_marker(&self.directory)?;
+        if marker != self.marker {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::CutoverBindingMismatch);
+        }
+        match expected {
+            Some(identity) => validate_named_file_identity(
+                &self.directory,
+                MANAGED_FABRIC_ACTIVE_FILE_NAME,
+                identity,
+                RuntimeFileStage::ValidateActiveIdentity,
+            )
+            .map_err(ManagedFabricStoreError::Open),
+            None => ensure_named_file_missing(
+                &self.directory,
+                MANAGED_FABRIC_ACTIVE_FILE_NAME,
+                RuntimeFileStage::RequireMissingActive,
+            ),
+        }
+    }
+
+    fn ensure_operational(&self) -> Result<(), ManagedFabricStoreError> {
+        if self.stopped {
+            Err(ManagedFabricStoreError::Stopped)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ManagedFabricStoreError {
+    InvalidExpectedIdentity,
+    InvalidProjectionDigest,
+    InvalidCutoverMarker,
+    CutoverBindingMismatch,
+    LegacyStoreNotFresh,
+    LegacyIdentityMismatch,
+    LockContended,
+    AlreadyInitialized,
+    NotInitialized,
+    InvalidSnapshotLength,
+    InvalidManagedAgentStackCutover,
+    ManagedAgentStackCutoverBindingMismatch,
+    ManagedAgentStackAlreadyInitialized,
+    ManagedAgentStackNotInitialized,
+    InvalidManagedAgentStackSnapshotLength,
+    ManagedAgentStackSnapshotMissing,
+    ManagedAgentStackSnapshotMismatch,
+    InvalidManagedModelAgentStackCutover,
+    ManagedModelAgentStackCutoverBindingMismatch,
+    ManagedModelAgentStackAlreadyInitialized,
+    ManagedModelAgentStackNotInitialized,
+    InvalidManagedModelAgentStackSnapshotLength,
+    ManagedModelAgentStackSnapshotMissing,
+    ManagedModelAgentStackSnapshotMismatch,
+    InvalidDistributedAgentStackCutover,
+    DistributedAgentStackCutoverBindingMismatch,
+    DistributedAgentStackAlreadyInitialized,
+    DistributedAgentStackNotInitialized,
+    InvalidDistributedAgentStackSnapshotLength,
+    DistributedAgentStackSnapshotMissing,
+    DistributedAgentStackSnapshotMismatch,
+    ManagedAgentStackAuthorityActive,
+    ManagedModelAgentStackAuthorityActive,
+    DistributedAgentStackAuthorityActive,
+    ConflictingStackAuthorities,
+    UnknownDirectoryEntry,
+    TooManyOrphanTemps,
+    UncertainSnapshotMissing,
+    UncertainSnapshotMismatch,
+    LockOrDirectoryIdentityChanged,
+    Stopped,
+    Open(RuntimeStoreOpenError),
+    LegacyStore(RuntimeStoreError),
+    Io(RuntimeIoFailure),
+    UncertainAfterPublish(RuntimeIoFailure),
+}
+
+impl fmt::Display for ManagedFabricStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidExpectedIdentity => formatter.write_str("invalid successor identity"),
+            Self::InvalidProjectionDigest => {
+                formatter.write_str("invalid managed-fabric projection digest")
+            }
+            Self::InvalidCutoverMarker => formatter.write_str("invalid managed-fabric cutover"),
+            Self::CutoverBindingMismatch => {
+                formatter.write_str("managed-fabric cutover binding mismatch")
+            }
+            Self::LegacyStoreNotFresh => {
+                formatter.write_str("legacy Runtime desired state is not fresh")
+            }
+            Self::LegacyIdentityMismatch => {
+                formatter.write_str("legacy Runtime store identity mismatch")
+            }
+            Self::LockContended => formatter.write_str("Runtime writer lock is contended"),
+            Self::AlreadyInitialized => {
+                formatter.write_str("managed-fabric successor is already initialized")
+            }
+            Self::NotInitialized => {
+                formatter.write_str("managed-fabric successor is not initialized")
+            }
+            Self::InvalidSnapshotLength => {
+                formatter.write_str("invalid managed-fabric snapshot length")
+            }
+            Self::InvalidManagedAgentStackCutover => {
+                formatter.write_str("invalid managed Agent-stack cutover")
+            }
+            Self::ManagedAgentStackCutoverBindingMismatch => {
+                formatter.write_str("managed Agent-stack cutover binding mismatch")
+            }
+            Self::ManagedAgentStackAlreadyInitialized => {
+                formatter.write_str("managed Agent-stack successor is already initialized")
+            }
+            Self::ManagedAgentStackNotInitialized => {
+                formatter.write_str("managed Agent-stack successor is not initialized")
+            }
+            Self::InvalidManagedAgentStackSnapshotLength => {
+                formatter.write_str("invalid managed Agent-stack snapshot length")
+            }
+            Self::ManagedAgentStackSnapshotMissing => {
+                formatter.write_str("managed Agent-stack publish completed but snapshot is missing")
+            }
+            Self::ManagedAgentStackSnapshotMismatch => {
+                formatter.write_str("managed Agent-stack publish read-back mismatch")
+            }
+            Self::InvalidManagedModelAgentStackCutover => {
+                formatter.write_str("invalid managed Model+Agent-stack cutover")
+            }
+            Self::ManagedModelAgentStackCutoverBindingMismatch => {
+                formatter.write_str("managed Model+Agent-stack cutover binding mismatch")
+            }
+            Self::ManagedModelAgentStackAlreadyInitialized => {
+                formatter.write_str("managed Model+Agent-stack successor is already initialized")
+            }
+            Self::ManagedModelAgentStackNotInitialized => {
+                formatter.write_str("managed Model+Agent-stack successor is not initialized")
+            }
+            Self::InvalidManagedModelAgentStackSnapshotLength => {
+                formatter.write_str("invalid managed Model+Agent-stack snapshot length")
+            }
+            Self::ManagedModelAgentStackSnapshotMissing => formatter
+                .write_str("managed Model+Agent-stack publish completed but snapshot is missing"),
+            Self::ManagedModelAgentStackSnapshotMismatch => {
+                formatter.write_str("managed Model+Agent-stack publish read-back mismatch")
+            }
+            Self::InvalidDistributedAgentStackCutover => {
+                formatter.write_str("invalid distributed Agent-stack cutover")
+            }
+            Self::DistributedAgentStackCutoverBindingMismatch => {
+                formatter.write_str("distributed Agent-stack cutover binding mismatch")
+            }
+            Self::DistributedAgentStackAlreadyInitialized => {
+                formatter.write_str("distributed Agent-stack successor is already initialized")
+            }
+            Self::DistributedAgentStackNotInitialized => {
+                formatter.write_str("distributed Agent-stack successor is not initialized")
+            }
+            Self::InvalidDistributedAgentStackSnapshotLength => {
+                formatter.write_str("invalid distributed Agent-stack snapshot length")
+            }
+            Self::DistributedAgentStackSnapshotMissing => formatter
+                .write_str("distributed Agent-stack publish completed but snapshot is missing"),
+            Self::DistributedAgentStackSnapshotMismatch => {
+                formatter.write_str("distributed Agent-stack publish read-back mismatch")
+            }
+            Self::ManagedAgentStackAuthorityActive => {
+                formatter.write_str("managed Agent-stack sibling authority is active")
+            }
+            Self::ManagedModelAgentStackAuthorityActive => {
+                formatter.write_str("managed Model+Agent-stack sibling authority is active")
+            }
+            Self::DistributedAgentStackAuthorityActive => {
+                formatter.write_str("distributed Agent-stack authority has frozen predecessors")
+            }
+            Self::ConflictingStackAuthorities => {
+                formatter.write_str("conflicting Runtime stack authorities are present")
+            }
+            Self::UnknownDirectoryEntry => {
+                formatter.write_str("unknown Runtime directory entry after cutover")
+            }
+            Self::TooManyOrphanTemps => {
+                formatter.write_str("too many managed-fabric orphan temporary files")
+            }
+            Self::UncertainSnapshotMissing => {
+                formatter.write_str("managed-fabric publish completed but snapshot is missing")
+            }
+            Self::UncertainSnapshotMismatch => {
+                formatter.write_str("managed-fabric publish read-back mismatch")
+            }
+            Self::LockOrDirectoryIdentityChanged => {
+                formatter.write_str("Runtime lock or directory identity changed")
+            }
+            Self::Stopped => formatter.write_str("managed-fabric store is stopped"),
+            Self::Open(error) => write!(formatter, "managed-fabric store open failed: {error}"),
+            Self::LegacyStore(error) => write!(formatter, "legacy Runtime store failed: {error}"),
+            Self::Io(error) => write!(formatter, "managed-fabric store I/O failed: {error:?}"),
+            Self::UncertainAfterPublish(error) => {
+                write!(formatter, "managed-fabric publish is uncertain: {error:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ManagedFabricStoreError {}
 
 fn validate_migration_inputs(
     expected_store_instance_id: [u8; 32],
@@ -2235,6 +4516,10 @@ impl RuntimeInitializerPreflight {
         Self::open_with_policy(path, RuntimeFilesystemPolicy::ProductionReference)
     }
 
+    pub(crate) fn open_developer_local(path: &Path) -> Result<Self, RuntimeInitializerBeginError> {
+        Self::open_with_policy(path, RuntimeFilesystemPolicy::ExplicitDeveloperLocal)
+    }
+
     #[cfg(test)]
     pub(crate) fn open_fixture(path: &Path) -> Result<Self, RuntimeInitializerBeginError> {
         Self::open_with_policy(path, RuntimeFilesystemPolicy::ExplicitFixture)
@@ -2520,6 +4805,730 @@ fn read_active_snapshot_bytes(
         RuntimeFileStage::ValidateActiveIdentity,
     )?;
     Ok(ActiveSnapshotBytes { encoded, identity })
+}
+
+fn managed_fabric_cutover_checksum(frame: &[u8]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(MANAGED_FABRIC_CUTOVER_DOMAIN);
+    hasher.update((frame.len() as u64).to_be_bytes());
+    hasher.update(frame);
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+fn managed_agent_stack_cutover_checksum(header: &[u8], initial_snapshot: &[u8]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(MANAGED_AGENT_STACK_CUTOVER_DOMAIN);
+    hasher.update((header.len() as u64).to_be_bytes());
+    hasher.update(header);
+    hasher.update((initial_snapshot.len() as u64).to_be_bytes());
+    hasher.update(initial_snapshot);
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+fn managed_model_agent_stack_cutover_checksum(header: &[u8], initial_snapshot: &[u8]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(MANAGED_MODEL_AGENT_STACK_CUTOVER_DOMAIN);
+    hasher.update((header.len() as u64).to_be_bytes());
+    hasher.update(header);
+    hasher.update((initial_snapshot.len() as u64).to_be_bytes());
+    hasher.update(initial_snapshot);
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+fn distributed_predecessor_snapshot_digest(snapshot: &[u8]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(DISTRIBUTED_AGENT_STACK_PREDECESSOR_SNAPSHOT_DOMAIN);
+    hasher.update((snapshot.len() as u64).to_be_bytes());
+    hasher.update(snapshot);
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+fn distributed_agent_stack_cutover_checksum(header: &[u8], initial_snapshot: &[u8]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(DISTRIBUTED_AGENT_STACK_CUTOVER_DOMAIN);
+    hasher.update((header.len() as u64).to_be_bytes());
+    hasher.update(header);
+    hasher.update((initial_snapshot.len() as u64).to_be_bytes());
+    hasher.update(initial_snapshot);
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+fn read_fixed_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], ManagedFabricStoreError> {
+    bytes
+        .try_into()
+        .map_err(|_| ManagedFabricStoreError::InvalidDistributedAgentStackCutover)
+}
+
+fn legacy_snapshot_is_fresh_for_managed_fabric(snapshot: &RuntimeJournalSnapshot) -> bool {
+    let state = snapshot.state();
+    let empty_owner_facts = state.writer_fence.is_none()
+        && state.source_revision_high_water.is_none()
+        && state.prepared.is_none()
+        && state.active_desired.is_none()
+        && state.recovery_action.is_none()
+        && state.recovery_terminals.is_empty()
+        && state.owned_resources.is_empty()
+        && state.terminal_operations.is_empty()
+        && state.host.tenure_nonces.is_empty()
+        && state.host.request_nonces.is_empty()
+        && state.host.temporal_lineages.is_empty();
+    if !empty_owner_facts {
+        return false;
+    }
+    match state.live_materialization {
+        LiveMaterialization::None => {
+            snapshot.sequence() == 1
+                && state.last_transaction == RuntimeJournalTransaction::Initialized
+        }
+        LiveMaterialization::StartupInvalidated {
+            active_slice_digest: None,
+            recovery_eligibility: StartupRecoveryEligibility::NoActiveHead,
+            failure_evidence_digest: None,
+            ..
+        } => state.last_transaction == RuntimeJournalTransaction::StartupInvalidation,
+        _ => false,
+    }
+}
+
+fn ensure_named_file_missing(
+    directory: &RuntimeDirectory,
+    name: &str,
+    stage: RuntimeFileStage,
+) -> Result<(), ManagedFabricStoreError> {
+    match openat(
+        &directory.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(existing) => {
+            drop(existing);
+            Err(ManagedFabricStoreError::AlreadyInitialized)
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(()),
+        Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(stage, error))),
+    }
+}
+
+fn create_durable_named_file(
+    directory: &RuntimeDirectory,
+    name: &str,
+    encoded: &[u8],
+) -> Result<(), ManagedFabricStoreError> {
+    let token = system_random_token().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::GenerateTempName,
+            &error,
+        ))
+    })?;
+    // A pre-marker crash leaves a legacy-recognized orphan temp. The frozen
+    // opener can remove that temp and safely remain authoritative because the
+    // one-way marker was never published.
+    let temp_name = temp_name(token);
+    let owned = openat(
+        &directory.file,
+        temp_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        PRIVATE_FILE_MODE,
+    )
+    .map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::CreateTemp, error))
+    })?;
+    let mut temp = File::from(owned);
+    fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
+    })?;
+    validate_regular_file(
+        &temp.metadata().map_err(|error| {
+            ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::InspectTemp,
+                &error,
+            ))
+        })?,
+        directory.owner_uid,
+        directory.owner_gid,
+    )
+    .map_err(ManagedFabricStoreError::Open)?;
+    temp.write_all(encoded).map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::WriteTemp, &error))
+    })?;
+    temp.sync_all().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::SyncTemp, &error))
+    })?;
+    ensure_named_file_missing(directory, name, RuntimeFileStage::RequireMissingActive)?;
+    renameat(&directory.file, temp_name.as_str(), &directory.file, name).map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::Rename, error))
+    })?;
+    directory.file.sync_all().map_err(|error| {
+        ManagedFabricStoreError::UncertainAfterPublish(RuntimeIoFailure::new(
+            RuntimeFileStage::SyncDirectory,
+            &error,
+        ))
+    })
+}
+
+fn create_durable_managed_agent_stack_cutover(
+    directory: &RuntimeDirectory,
+    name: &str,
+    encoded: &[u8],
+) -> Result<(), ManagedFabricStoreError> {
+    let token = system_random_token().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::GenerateTempName,
+            &error,
+        ))
+    })?;
+    let temp_name = managed_agent_stack_temp_name(token);
+    let owned = openat(
+        &directory.file,
+        temp_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        PRIVATE_FILE_MODE,
+    )
+    .map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::CreateTemp, error))
+    })?;
+    let mut temp = File::from(owned);
+    fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
+    })?;
+    validate_regular_file(
+        &temp.metadata().map_err(|error| {
+            ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::InspectTemp,
+                &error,
+            ))
+        })?,
+        directory.owner_uid,
+        directory.owner_gid,
+    )
+    .map_err(ManagedFabricStoreError::Open)?;
+    temp.write_all(encoded).map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::WriteTemp, &error))
+    })?;
+    temp.sync_all().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::SyncTemp, &error))
+    })?;
+    ensure_named_file_missing(directory, name, RuntimeFileStage::RequireMissingActive)?;
+    renameat(&directory.file, temp_name.as_str(), &directory.file, name).map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::Rename, error))
+    })?;
+    directory.file.sync_all().map_err(|error| {
+        ManagedFabricStoreError::UncertainAfterPublish(RuntimeIoFailure::new(
+            RuntimeFileStage::SyncDirectory,
+            &error,
+        ))
+    })
+}
+
+fn create_durable_managed_model_agent_stack_cutover(
+    directory: &RuntimeDirectory,
+    name: &str,
+    encoded: &[u8],
+) -> Result<(), ManagedFabricStoreError> {
+    let token = system_random_token().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::GenerateTempName,
+            &error,
+        ))
+    })?;
+    let temp_name = managed_model_agent_stack_temp_name(token);
+    let owned = openat(
+        &directory.file,
+        temp_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        PRIVATE_FILE_MODE,
+    )
+    .map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::CreateTemp, error))
+    })?;
+    let mut temp = File::from(owned);
+    fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
+    })?;
+    validate_regular_file(
+        &temp.metadata().map_err(|error| {
+            ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::InspectTemp,
+                &error,
+            ))
+        })?,
+        directory.owner_uid,
+        directory.owner_gid,
+    )
+    .map_err(ManagedFabricStoreError::Open)?;
+    temp.write_all(encoded).map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::WriteTemp, &error))
+    })?;
+    temp.sync_all().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::SyncTemp, &error))
+    })?;
+    ensure_named_file_missing(directory, name, RuntimeFileStage::RequireMissingActive)?;
+    renameat(&directory.file, temp_name.as_str(), &directory.file, name).map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::Rename, error))
+    })?;
+    directory.file.sync_all().map_err(|error| {
+        ManagedFabricStoreError::UncertainAfterPublish(RuntimeIoFailure::new(
+            RuntimeFileStage::SyncDirectory,
+            &error,
+        ))
+    })
+}
+
+fn create_durable_distributed_agent_stack_cutover(
+    directory: &RuntimeDirectory,
+    name: &str,
+    encoded: &[u8],
+) -> Result<(), ManagedFabricStoreError> {
+    let token = system_random_token().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::GenerateTempName,
+            &error,
+        ))
+    })?;
+    let temp_name = distributed_agent_stack_temp_name(token);
+    let owned = openat(
+        &directory.file,
+        temp_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        PRIVATE_FILE_MODE,
+    )
+    .map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::CreateTemp, error))
+    })?;
+    let mut temp = File::from(owned);
+    fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
+    })?;
+    validate_regular_file(
+        &temp.metadata().map_err(|error| {
+            ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::InspectTemp,
+                &error,
+            ))
+        })?,
+        directory.owner_uid,
+        directory.owner_gid,
+    )
+    .map_err(ManagedFabricStoreError::Open)?;
+    temp.write_all(encoded).map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::WriteTemp, &error))
+    })?;
+    temp.sync_all().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::SyncTemp, &error))
+    })?;
+    ensure_named_file_missing(directory, name, RuntimeFileStage::RequireMissingActive)?;
+    renameat(&directory.file, temp_name.as_str(), &directory.file, name).map_err(|error| {
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::Rename, error))
+    })?;
+    directory.file.sync_all().map_err(|error| {
+        ManagedFabricStoreError::UncertainAfterPublish(RuntimeIoFailure::new(
+            RuntimeFileStage::SyncDirectory,
+            &error,
+        ))
+    })
+}
+
+fn read_managed_fabric_cutover_marker(
+    directory: &RuntimeDirectory,
+) -> Result<ManagedFabricCutoverMarker, ManagedFabricStoreError> {
+    let (encoded, _) = read_bounded_named_file(
+        directory,
+        MANAGED_FABRIC_CUTOVER_FILE_NAME,
+        MANAGED_FABRIC_CUTOVER_BYTES,
+    )?;
+    ManagedFabricCutoverMarker::decode(&encoded)
+}
+
+fn read_optional_managed_agent_stack_cutover(
+    directory: &RuntimeDirectory,
+) -> Result<Option<ManagedAgentStackCutoverMarker>, ManagedFabricStoreError> {
+    match openat(
+        &directory.file,
+        MANAGED_AGENT_STACK_CUTOVER_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            let (encoded, _) = read_bounded_named_file(
+                directory,
+                MANAGED_AGENT_STACK_CUTOVER_FILE_NAME,
+                MANAGED_AGENT_STACK_CUTOVER_HEADER_BYTES + MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES,
+            )?;
+            Ok(Some(ManagedAgentStackCutoverMarker::decode(&encoded)?))
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(None),
+        Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(
+            RuntimeFileStage::OpenCutover,
+            error,
+        ))),
+    }
+}
+
+fn read_optional_managed_model_agent_stack_cutover(
+    directory: &RuntimeDirectory,
+) -> Result<Option<ManagedModelAgentStackCutoverMarker>, ManagedFabricStoreError> {
+    match openat(
+        &directory.file,
+        MANAGED_MODEL_AGENT_STACK_CUTOVER_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            let (encoded, _) = read_bounded_named_file(
+                directory,
+                MANAGED_MODEL_AGENT_STACK_CUTOVER_FILE_NAME,
+                MANAGED_MODEL_AGENT_STACK_CUTOVER_HEADER_BYTES
+                    + MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES,
+            )?;
+            Ok(Some(ManagedModelAgentStackCutoverMarker::decode(&encoded)?))
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(None),
+        Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(
+            RuntimeFileStage::OpenCutover,
+            error,
+        ))),
+    }
+}
+
+fn read_optional_distributed_agent_stack_cutover(
+    directory: &RuntimeDirectory,
+) -> Result<Option<DistributedAgentStackCutoverMarker>, ManagedFabricStoreError> {
+    match openat(
+        &directory.file,
+        DISTRIBUTED_AGENT_STACK_CUTOVER_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            let (encoded, _) = read_bounded_named_file(
+                directory,
+                DISTRIBUTED_AGENT_STACK_CUTOVER_FILE_NAME,
+                DISTRIBUTED_AGENT_STACK_CUTOVER_HEADER_BYTES
+                    + MAX_DISTRIBUTED_AGENT_STACK_SNAPSHOT_BYTES,
+            )?;
+            Ok(Some(DistributedAgentStackCutoverMarker::decode(&encoded)?))
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(None),
+        Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(
+            RuntimeFileStage::OpenCutover,
+            error,
+        ))),
+    }
+}
+
+fn read_optional_managed_fabric_snapshot(
+    directory: &RuntimeDirectory,
+) -> Result<Option<ManagedFabricActiveSnapshot>, ManagedFabricStoreError> {
+    match openat(
+        &directory.file,
+        MANAGED_FABRIC_ACTIVE_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            let (encoded, identity) = read_bounded_named_file(
+                directory,
+                MANAGED_FABRIC_ACTIVE_FILE_NAME,
+                MAX_MANAGED_FABRIC_SNAPSHOT_BYTES,
+            )?;
+            Ok(Some(ManagedFabricActiveSnapshot {
+                encoded: encoded.into_boxed_slice(),
+                identity,
+            }))
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(None),
+        Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(
+            RuntimeFileStage::OpenActive,
+            error,
+        ))),
+    }
+}
+
+fn read_optional_managed_agent_stack_snapshot(
+    directory: &RuntimeDirectory,
+) -> Result<Option<ManagedFabricActiveSnapshot>, ManagedFabricStoreError> {
+    match openat(
+        &directory.file,
+        MANAGED_AGENT_STACK_ACTIVE_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            let (encoded, identity) = read_bounded_named_file(
+                directory,
+                MANAGED_AGENT_STACK_ACTIVE_FILE_NAME,
+                MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES,
+            )?;
+            Ok(Some(ManagedFabricActiveSnapshot {
+                encoded: encoded.into_boxed_slice(),
+                identity,
+            }))
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(None),
+        Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(
+            RuntimeFileStage::OpenActive,
+            error,
+        ))),
+    }
+}
+
+fn read_optional_managed_model_agent_stack_snapshot(
+    directory: &RuntimeDirectory,
+) -> Result<Option<ManagedFabricActiveSnapshot>, ManagedFabricStoreError> {
+    match openat(
+        &directory.file,
+        MANAGED_MODEL_AGENT_STACK_ACTIVE_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            let (encoded, identity) = read_bounded_named_file(
+                directory,
+                MANAGED_MODEL_AGENT_STACK_ACTIVE_FILE_NAME,
+                MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES,
+            )?;
+            Ok(Some(ManagedFabricActiveSnapshot {
+                encoded: encoded.into_boxed_slice(),
+                identity,
+            }))
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(None),
+        Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(
+            RuntimeFileStage::OpenActive,
+            error,
+        ))),
+    }
+}
+
+fn read_optional_distributed_agent_stack_snapshot(
+    directory: &RuntimeDirectory,
+) -> Result<Option<ManagedFabricActiveSnapshot>, ManagedFabricStoreError> {
+    match openat(
+        &directory.file,
+        DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            let (encoded, identity) = read_bounded_named_file(
+                directory,
+                DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME,
+                MAX_DISTRIBUTED_AGENT_STACK_SNAPSHOT_BYTES,
+            )?;
+            Ok(Some(ManagedFabricActiveSnapshot {
+                encoded: encoded.into_boxed_slice(),
+                identity,
+            }))
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(None),
+        Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(
+            RuntimeFileStage::OpenActive,
+            error,
+        ))),
+    }
+}
+
+fn read_bounded_named_file(
+    directory: &RuntimeDirectory,
+    name: &str,
+    maximum: usize,
+) -> Result<(Vec<u8>, FileIdentity), ManagedFabricStoreError> {
+    let OpenedRegularFile { mut file, identity } = open_existing_regular(
+        directory,
+        name,
+        OFlag::O_RDONLY,
+        RuntimeFileStage::OpenActive,
+    )
+    .map_err(ManagedFabricStoreError::Open)?;
+    let before = file.metadata().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::ReadActive, &error))
+    })?;
+    let length = usize::try_from(before.len())
+        .map_err(|_| ManagedFabricStoreError::InvalidSnapshotLength)?;
+    if length == 0 || length > maximum {
+        return Err(ManagedFabricStoreError::InvalidSnapshotLength);
+    }
+    let mut encoded = vec![0_u8; length];
+    file.read_exact(&mut encoded).map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::ReadActive, &error))
+    })?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing).map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::ReadActive, &error))
+    })? != 0
+    {
+        return Err(ManagedFabricStoreError::InvalidSnapshotLength);
+    }
+    let after = file.metadata().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::ReadActive, &error))
+    })?;
+    validate_regular_file(&after, directory.owner_uid, directory.owner_gid)
+        .map_err(ManagedFabricStoreError::Open)?;
+    if FileIdentity::from_metadata(&after) != identity || after.len() != before.len() {
+        return Err(ManagedFabricStoreError::LockOrDirectoryIdentityChanged);
+    }
+    validate_named_file_identity(
+        directory,
+        name,
+        identity,
+        RuntimeFileStage::ValidateActiveIdentity,
+    )
+    .map_err(ManagedFabricStoreError::Open)?;
+    Ok((encoded, identity))
+}
+
+fn validate_managed_fabric_directory_entries(
+    directory: &RuntimeDirectory,
+    allow_managed_agent_journal: bool,
+) -> Result<(), ManagedFabricStoreError> {
+    let mut entries =
+        duplicate_directory_stream(directory).map_err(ManagedFabricStoreError::Open)?;
+    let mut orphan_count = 0_usize;
+    let mut managed_agent_journal_count = 0_usize;
+    for entry in entries.iter() {
+        let entry = entry.map_err(|error| {
+            ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::ScanDirectory, error))
+        })?;
+        let name_bytes = entry.file_name().to_bytes();
+        if is_dot_entry(name_bytes) {
+            continue;
+        }
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| ManagedFabricStoreError::UnknownDirectoryEntry)?;
+        if matches!(
+            name,
+            LOCK_FILE_NAME
+                | ACTIVE_FILE_NAME
+                | MANAGED_FABRIC_CUTOVER_FILE_NAME
+                | MANAGED_FABRIC_ACTIVE_FILE_NAME
+                | MANAGED_AGENT_STACK_CUTOVER_FILE_NAME
+                | MANAGED_AGENT_STACK_ACTIVE_FILE_NAME
+                | MANAGED_MODEL_AGENT_STACK_CUTOVER_FILE_NAME
+                | MANAGED_MODEL_AGENT_STACK_ACTIVE_FILE_NAME
+                | DISTRIBUTED_AGENT_STACK_CUTOVER_FILE_NAME
+                | DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME
+        ) {
+            continue;
+        }
+        if allow_managed_agent_journal && valid_managed_agent_journal_directory_name(name) {
+            managed_agent_journal_count = managed_agent_journal_count
+                .checked_add(1)
+                .ok_or(ManagedFabricStoreError::UnknownDirectoryEntry)?;
+            if managed_agent_journal_count != 1 {
+                return Err(ManagedFabricStoreError::UnknownDirectoryEntry);
+            }
+            let owned = openat(
+                &directory.file,
+                name,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| {
+                ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::ScanDirectory, error))
+            })?;
+            let journal = File::from(owned);
+            let metadata = journal.metadata().map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::ScanDirectory,
+                    &error,
+                ))
+            })?;
+            if !metadata.is_dir()
+                || metadata.uid() != directory.owner_uid
+                || metadata.mode() & STATE_DIRECTORY_MODE_MASK != STATE_DIRECTORY_MODE_BITS
+            {
+                return Err(ManagedFabricStoreError::UnknownDirectoryEntry);
+            }
+            continue;
+        }
+        if !valid_managed_fabric_temp_name(name)
+            && !valid_managed_agent_stack_temp_name(name)
+            && !valid_managed_model_agent_stack_temp_name(name)
+            && !valid_distributed_agent_stack_temp_name(name)
+        {
+            return Err(ManagedFabricStoreError::UnknownDirectoryEntry);
+        }
+        orphan_count = orphan_count
+            .checked_add(1)
+            .ok_or(ManagedFabricStoreError::TooManyOrphanTemps)?;
+        if orphan_count > MAX_ORPHAN_TEMP_FILES {
+            return Err(ManagedFabricStoreError::TooManyOrphanTemps);
+        }
+    }
+    Ok(())
+}
+
+fn clean_managed_fabric_orphan_temps(
+    directory: &RuntimeDirectory,
+) -> Result<(), ManagedFabricStoreError> {
+    let mut entries =
+        duplicate_directory_stream(directory).map_err(ManagedFabricStoreError::Open)?;
+    let mut names = Vec::new();
+    for entry in entries.iter() {
+        let entry = entry.map_err(|error| {
+            ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::ScanDirectory, error))
+        })?;
+        let name_bytes = entry.file_name().to_bytes();
+        if is_dot_entry(name_bytes) {
+            continue;
+        }
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| ManagedFabricStoreError::UnknownDirectoryEntry)?;
+        if valid_managed_fabric_temp_name(name)
+            || valid_managed_agent_stack_temp_name(name)
+            || valid_managed_model_agent_stack_temp_name(name)
+            || valid_distributed_agent_stack_temp_name(name)
+        {
+            names.push(name.to_owned());
+        }
+    }
+    for name in names {
+        let orphan = open_existing_regular(
+            directory,
+            &name,
+            OFlag::O_RDONLY,
+            RuntimeFileStage::InspectOrphanTemp,
+        )
+        .map_err(ManagedFabricStoreError::Open)?;
+        validate_named_file_identity(
+            directory,
+            &name,
+            orphan.identity,
+            RuntimeFileStage::InspectOrphanTemp,
+        )
+        .map_err(ManagedFabricStoreError::Open)?;
+        unlinkat(&directory.file, name.as_str(), UnlinkatFlags::NoRemoveDir).map_err(|error| {
+            ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::RemoveOrphanTemp, error))
+        })?;
+        if orphan
+            .file
+            .metadata()
+            .map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::RemoveOrphanTemp,
+                    &error,
+                ))
+            })?
+            .nlink()
+            != 0
+        {
+            return Err(ManagedFabricStoreError::LockOrDirectoryIdentityChanged);
+        }
+    }
+    directory.file.sync_all().map_err(|error| {
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+            RuntimeFileStage::SyncOrphanCleanup,
+            &error,
+        ))
+    })
 }
 
 fn clean_valid_orphan_temps(directory: &RuntimeDirectory) -> Result<(), RuntimeStoreOpenError> {
@@ -2904,6 +5913,53 @@ fn temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
     name
 }
 
+fn managed_fabric_temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::with_capacity(MANAGED_FABRIC_TEMP_FILE_PREFIX.len() + TEMP_HEX_BYTES);
+    name.push_str(MANAGED_FABRIC_TEMP_FILE_PREFIX);
+    for byte in token {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    name
+}
+
+fn managed_agent_stack_temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name =
+        String::with_capacity(MANAGED_AGENT_STACK_TEMP_FILE_PREFIX.len() + TEMP_HEX_BYTES);
+    name.push_str(MANAGED_AGENT_STACK_TEMP_FILE_PREFIX);
+    for byte in token {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    name
+}
+
+fn managed_model_agent_stack_temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name =
+        String::with_capacity(MANAGED_MODEL_AGENT_STACK_TEMP_FILE_PREFIX.len() + TEMP_HEX_BYTES);
+    name.push_str(MANAGED_MODEL_AGENT_STACK_TEMP_FILE_PREFIX);
+    for byte in token {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    name
+}
+
+fn distributed_agent_stack_temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name =
+        String::with_capacity(DISTRIBUTED_AGENT_STACK_TEMP_FILE_PREFIX.len() + TEMP_HEX_BYTES);
+    name.push_str(DISTRIBUTED_AGENT_STACK_TEMP_FILE_PREFIX);
+    for byte in token {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    name
+}
+
 fn valid_temp_name(name: &str) -> bool {
     let Some(suffix) = name.strip_prefix(TEMP_FILE_PREFIX) else {
         return false;
@@ -2914,10 +5970,66 @@ fn valid_temp_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn valid_managed_fabric_temp_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(MANAGED_FABRIC_TEMP_FILE_PREFIX) else {
+        return false;
+    };
+    suffix.len() == TEMP_HEX_BYTES
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_managed_agent_stack_temp_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(MANAGED_AGENT_STACK_TEMP_FILE_PREFIX) else {
+        return false;
+    };
+    suffix.len() == TEMP_HEX_BYTES
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_managed_model_agent_stack_temp_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(MANAGED_MODEL_AGENT_STACK_TEMP_FILE_PREFIX) else {
+        return false;
+    };
+    suffix.len() == TEMP_HEX_BYTES
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_distributed_agent_stack_temp_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(DISTRIBUTED_AGENT_STACK_TEMP_FILE_PREFIX) else {
+        return false;
+    };
+    suffix.len() == TEMP_HEX_BYTES
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_managed_agent_journal_directory_name(name: &str) -> bool {
+    let Some(with_suffix) = name.strip_prefix(MANAGED_AGENT_JOURNAL_DIRECTORY_PREFIX) else {
+        return false;
+    };
+    let Some(identity) = with_suffix.strip_suffix(MANAGED_AGENT_JOURNAL_DIRECTORY_SUFFIX) else {
+        return false;
+    };
+    identity.len() == MANAGED_AGENT_JOURNAL_ID_HEX_BYTES
+        && identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn verify_filesystem(
     directory: &File,
     _policy: RuntimeFilesystemPolicy,
 ) -> Result<(), RuntimeStoreOpenError> {
+    if _policy == RuntimeFilesystemPolicy::ExplicitDeveloperLocal {
+        return Ok(());
+    }
     #[cfg(test)]
     if _policy == RuntimeFilesystemPolicy::ExplicitFixture {
         return Ok(());
@@ -3322,6 +6434,7 @@ pub(crate) enum RuntimeFileStage {
     GenerateTempName,
     ValidateEncodedSnapshot,
     RequireMissingActive,
+    OpenCutover,
     CreateTemp,
     InspectTemp,
     WriteTemp,
@@ -3523,7 +6636,7 @@ impl fmt::Display for RuntimeStoreMigrationError {
 impl std::error::Error for RuntimeStoreMigrationError {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::Cell;
     use std::fs::{self, OpenOptions};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -3535,20 +6648,21 @@ mod tests {
     use paraegox_kernel::digest::Digest32;
 
     use super::{
-        ACTIVE_FILE_NAME, LOCK_FILE_NAME, LinuxMountEvidenceError, MAX_LINUX_FDINFO_BYTES,
-        MAX_LINUX_FDINFO_LINE_BYTES, MAX_LINUX_FDINFO_RECORDS, MAX_LINUX_MOUNTINFO_BYTES,
-        MAX_LINUX_MOUNTINFO_LINE_BYTES, MAX_LINUX_MOUNTINFO_RECORDS,
-        MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES, MAX_MIGRATION_EVIDENCE_ORPHAN_TEMPS,
-        MAX_ORPHAN_TEMP_FILES, MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, MigrationEvidenceKind,
-        PRIVATE_FILE_MODE_BITS, PRIVATE_FILE_MODE_MASK, RuntimeCommitFailpoint, RuntimeFileStage,
-        RuntimeFilesystemPolicy, RuntimeInitializerBeginError, RuntimeInitializerGuard,
-        RuntimeInitializerPreflight, RuntimeInitializerPublishError, RuntimeJournalMigrationKind,
-        RuntimeMigrationFailpoints, RuntimeMigrationRequest, RuntimeMigrationTokens,
-        RuntimePublishFailure, RuntimeStore, RuntimeStoreError, RuntimeStoreMigrationDisposition,
-        RuntimeStoreMigrationError, RuntimeStoreMigrationReceipt, RuntimeStoreOpenError,
-        TEMP_FILE_PREFIX, TEMP_TOKEN_BYTES, migration_evidence_temp_name,
-        migration_receipt_file_name, migration_receipt_file_name_for, migration_source_file_name,
-        migration_source_file_name_for, parse_linux_fdinfo_mount_id,
+        ACTIVE_FILE_NAME, LOCK_FILE_NAME, LinuxMountEvidenceError,
+        MANAGED_FABRIC_CUTOVER_FILE_NAME, MAX_LINUX_FDINFO_BYTES, MAX_LINUX_FDINFO_LINE_BYTES,
+        MAX_LINUX_FDINFO_RECORDS, MAX_LINUX_MOUNTINFO_BYTES, MAX_LINUX_MOUNTINFO_LINE_BYTES,
+        MAX_LINUX_MOUNTINFO_RECORDS, MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES,
+        MAX_MIGRATION_EVIDENCE_ORPHAN_TEMPS, MAX_ORPHAN_TEMP_FILES,
+        MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, ManagedFabricCommitFailpoint, ManagedFabricStore,
+        ManagedFabricStoreError, MigrationEvidenceKind, PRIVATE_FILE_MODE_BITS,
+        PRIVATE_FILE_MODE_MASK, RuntimeCommitFailpoint, RuntimeFileStage, RuntimeFilesystemPolicy,
+        RuntimeInitializerBeginError, RuntimeInitializerGuard, RuntimeInitializerPreflight,
+        RuntimeInitializerPublishError, RuntimeJournalMigrationKind, RuntimeMigrationFailpoints,
+        RuntimeMigrationRequest, RuntimeMigrationTokens, RuntimePublishFailure, RuntimeStore,
+        RuntimeStoreError, RuntimeStoreMigrationDisposition, RuntimeStoreMigrationError,
+        RuntimeStoreMigrationReceipt, RuntimeStoreOpenError, TEMP_FILE_PREFIX, TEMP_TOKEN_BYTES,
+        migration_evidence_temp_name, migration_receipt_file_name, migration_receipt_file_name_for,
+        migration_source_file_name, migration_source_file_name_for, parse_linux_fdinfo_mount_id,
         parse_linux_mountinfo_exact_ext4, temp_name, validate_runtime_service_identity,
     };
     use crate::runtime_journal::{
@@ -3724,7 +6838,7 @@ mod tests {
         );
     }
 
-    struct TestDirectory(PathBuf);
+    pub(crate) struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
@@ -3742,7 +6856,7 @@ mod tests {
             Self(path)
         }
 
-        fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -3889,6 +7003,325 @@ mod tests {
         let directory = TestDirectory::new();
         install_store(directory.path(), snapshot);
         directory
+    }
+
+    pub(crate) fn managed_fabric_store_fixture(
+        store_byte: u8,
+        target_byte: u8,
+        projection_digest: Digest32,
+    ) -> (TestDirectory, ManagedFabricStore) {
+        let snapshot = sequence_one_snapshot(store_byte, target_byte);
+        managed_fabric_store_fixture_from_snapshot(&snapshot, projection_digest)
+    }
+
+    pub(crate) fn managed_fabric_store_fixture_from_snapshot(
+        snapshot: &RuntimeJournalSnapshot,
+        projection_digest: Digest32,
+    ) -> (TestDirectory, ManagedFabricStore) {
+        let directory = fixture_with_snapshot(snapshot);
+        let mut legacy = open_fixture(directory.path(), snapshot)
+            .unwrap_or_else(|error| panic!("legacy fixture open failed: {error}"));
+        legacy
+            .publish_managed_fabric_cutover_marker(projection_digest)
+            .unwrap_or_else(|error| panic!("managed-fabric cutover fixture failed: {error}"));
+        drop(legacy);
+        let store = ManagedFabricStore::open_fixture(
+            directory.path(),
+            *snapshot.store_instance_id(),
+            *snapshot.owner_target_fingerprint(),
+            projection_digest,
+        )
+        .unwrap_or_else(|error| panic!("managed-fabric fixture open failed: {error}"));
+        (directory, store)
+    }
+
+    #[test]
+    fn managed_fabric_cutover_is_one_way_and_missing_sidecar_initializes_once() {
+        let projection_digest = digest(0x91);
+        let (directory, mut successor) =
+            managed_fabric_store_fixture(0x92, 0x93, projection_digest);
+        assert!(matches!(
+            ManagedFabricStore::cutover_present_fixture(directory.path()),
+            Ok(true)
+        ));
+        assert_eq!(
+            successor.snapshot_bytes().expect("store must be live"),
+            None
+        );
+        successor
+            .initialize(b"successor-sequence-one")
+            .expect("missing successor sidecar must initialize");
+        assert_eq!(
+            successor.snapshot_bytes().expect("store must remain live"),
+            Some(b"successor-sequence-one".as_slice())
+        );
+        drop(successor);
+
+        let legacy = sequence_one_snapshot(0x92, 0x93);
+        assert_eq!(
+            open_fixture(directory.path(), &legacy).expect_err("legacy reopen must reject marker"),
+            RuntimeStoreOpenError::UnknownDirectoryEntry
+        );
+    }
+
+    #[test]
+    fn malformed_managed_fabric_marker_is_never_treated_as_legacy_mode() {
+        let snapshot = sequence_one_snapshot(0x8e, 0x8f);
+        let directory = fixture_with_snapshot(&snapshot);
+        install_private_file(
+            &directory.path().join(MANAGED_FABRIC_CUTOVER_FILE_NAME),
+            b"malformed-cutover",
+        );
+        assert!(matches!(
+            ManagedFabricStore::cutover_present_fixture(directory.path()),
+            Err(ManagedFabricStoreError::InvalidCutoverMarker)
+        ));
+        assert_eq!(
+            open_fixture(directory.path(), &snapshot)
+                .expect_err("legacy mode must reject even a malformed successor marker"),
+            RuntimeStoreOpenError::UnknownDirectoryEntry
+        );
+    }
+
+    #[test]
+    fn managed_fabric_cutover_rejects_nonfresh_legacy_authority() {
+        let initial = idle_snapshot(0x94, 0x95);
+        let nonfresh = tenure_successor(&initial);
+        let directory = fixture_with_snapshot(&nonfresh);
+        let mut legacy = open_fixture(directory.path(), &nonfresh)
+            .expect("nonfresh legacy fixture must open before cutover attempt");
+        assert!(matches!(
+            legacy.publish_managed_fabric_cutover_marker(digest(0x96)),
+            Err(ManagedFabricStoreError::LegacyStoreNotFresh)
+        ));
+        assert_eq!(
+            legacy
+                .snapshot()
+                .expect("rejected cutover must preserve legacy owner"),
+            &nonfresh
+        );
+    }
+
+    #[test]
+    fn managed_fabric_pre_rename_temp_failure_fail_stops_and_reopen_keeps_old_snapshot() {
+        let projection_digest = digest(0x97);
+        let (directory, mut store) = managed_fabric_store_fixture(0x98, 0x99, projection_digest);
+        store
+            .initialize(b"old")
+            .expect("initial successor publish must pass");
+        assert!(matches!(
+            store.commit_with_failpoint(
+                b"not-published",
+                ManagedFabricCommitFailpoint::BeforeTempSync,
+            ),
+            Err(ManagedFabricStoreError::Io(_))
+        ));
+        assert!(matches!(
+            store.snapshot_bytes(),
+            Err(ManagedFabricStoreError::Stopped)
+        ));
+        assert!(matches!(
+            store.commit(b"retry"),
+            Err(ManagedFabricStoreError::Stopped)
+        ));
+        drop(store);
+
+        let reopened = ManagedFabricStore::open_fixture(
+            directory.path(),
+            [0x98; 32],
+            digest(0x99),
+            projection_digest,
+        )
+        .expect("reopen must clean the one bounded orphan temp");
+        assert_eq!(
+            reopened
+                .snapshot_bytes()
+                .expect("reopened store must be live"),
+            Some(b"old".as_slice())
+        );
+    }
+
+    #[test]
+    fn managed_fabric_post_rename_uncertainty_fail_stops_and_reopen_reads_new_snapshot() {
+        let projection_digest = digest(0x9a);
+        let (directory, mut store) = managed_fabric_store_fixture(0x9b, 0x9c, projection_digest);
+        store
+            .initialize(b"old")
+            .expect("initial successor publish must pass");
+        assert!(matches!(
+            store.commit_with_failpoint(b"new", ManagedFabricCommitFailpoint::AfterRename),
+            Err(ManagedFabricStoreError::UncertainSnapshotMismatch)
+        ));
+        assert!(matches!(
+            store.snapshot_bytes(),
+            Err(ManagedFabricStoreError::Stopped)
+        ));
+        assert!(matches!(
+            store.commit(b"retry"),
+            Err(ManagedFabricStoreError::Stopped)
+        ));
+        drop(store);
+
+        let reopened = ManagedFabricStore::open_fixture(
+            directory.path(),
+            [0x9b; 32],
+            digest(0x9c),
+            projection_digest,
+        )
+        .expect("strict reopen must resolve the durable post-rename snapshot");
+        assert_eq!(
+            reopened
+                .snapshot_bytes()
+                .expect("reopened store must be live"),
+            Some(b"new".as_slice())
+        );
+    }
+
+    #[test]
+    fn managed_model_agent_stack_cutover_commit_and_reopen_share_the_runtime_store() {
+        let fabric_projection = digest(0xa1);
+        let stack_projection = digest(0xa2);
+        let (directory, mut store) = managed_fabric_store_fixture(0xa3, 0xa4, fabric_projection);
+        assert!(matches!(
+            ManagedFabricStore::managed_model_agent_stack_cutover_present_fixture(directory.path()),
+            Ok(false)
+        ));
+
+        store
+            .initialize_managed_model_agent_stack(stack_projection, b"initial-model-agent")
+            .expect("model-agent sibling cutover must initialize");
+        assert_eq!(
+            store.managed_model_agent_stack_projection_digest(),
+            Some(stack_projection)
+        );
+        assert_eq!(
+            store
+                .managed_model_agent_stack_snapshot_bytes()
+                .expect("model-agent snapshot getter must remain live"),
+            Some(b"initial-model-agent".as_slice())
+        );
+        assert_eq!(store.managed_agent_stack_projection_digest(), None);
+        assert_eq!(store.distributed_agent_stack_projection_digest(), None);
+
+        store
+            .commit_managed_model_agent_stack(b"committed-model-agent")
+            .expect("model-agent successor commit must publish");
+        drop(store);
+
+        let orphan = directory
+            .path()
+            .join(super::managed_model_agent_stack_temp_name(
+                [0xa5; TEMP_TOKEN_BYTES],
+            ));
+        install_private_file(&orphan, b"unpublished-model-agent");
+        let reopened = ManagedFabricStore::open_fixture(
+            directory.path(),
+            [0xa3; 32],
+            digest(0xa4),
+            fabric_projection,
+        )
+        .expect("model-agent branch must recover under the original Runtime lock");
+        assert!(
+            !orphan.exists(),
+            "valid model-agent orphan temp must be removed"
+        );
+        assert!(matches!(
+            ManagedFabricStore::managed_model_agent_stack_cutover_present_fixture(directory.path()),
+            Ok(true)
+        ));
+        assert_eq!(
+            reopened.managed_model_agent_stack_projection_digest(),
+            Some(stack_projection)
+        );
+        assert_eq!(
+            reopened
+                .managed_model_agent_stack_snapshot_bytes()
+                .expect("reopened model-agent snapshot getter must remain live"),
+            Some(b"committed-model-agent".as_slice())
+        );
+    }
+
+    #[test]
+    fn managed_agent_and_model_agent_sibling_authorities_are_mutually_exclusive() {
+        let fabric_projection = digest(0xa6);
+        let (_agent_directory, mut agent_store) =
+            managed_fabric_store_fixture(0xa7, 0xa8, fabric_projection);
+        agent_store
+            .initialize_managed_agent_stack(digest(0xa9), b"agent-initial")
+            .expect("managed Agent branch must initialize");
+        assert!(matches!(
+            agent_store.initialize_managed_model_agent_stack(digest(0xaa), b"model-agent-initial"),
+            Err(ManagedFabricStoreError::ManagedAgentStackAuthorityActive)
+        ));
+
+        let (_model_directory, mut model_store) =
+            managed_fabric_store_fixture(0xab, 0xac, digest(0xad));
+        model_store
+            .initialize_managed_model_agent_stack(digest(0xae), b"model-agent-initial")
+            .expect("managed Model+Agent branch must initialize");
+        assert!(matches!(
+            model_store.initialize_managed_agent_stack(digest(0xaf), b"agent-initial"),
+            Err(ManagedFabricStoreError::ManagedModelAgentStackAuthorityActive)
+        ));
+        assert!(matches!(
+            model_store.initialize_distributed_agent_stack(digest(0xb0), b"distributed-initial"),
+            Err(ManagedFabricStoreError::ManagedModelAgentStackAuthorityActive)
+        ));
+    }
+
+    #[test]
+    fn distributed_authority_rejects_the_model_agent_sibling_branch() {
+        let (_directory, mut store) = managed_fabric_store_fixture(0xb1, 0xb2, digest(0xb3));
+        store
+            .initialize_managed_agent_stack(digest(0xb4), b"agent-initial")
+            .expect("managed Agent predecessor must initialize");
+        store
+            .initialize_distributed_agent_stack(digest(0xb5), b"distributed-initial")
+            .expect("distributed successor must initialize");
+        assert!(matches!(
+            store.initialize_managed_model_agent_stack(digest(0xb6), b"model-agent-initial"),
+            Err(ManagedFabricStoreError::DistributedAgentStackAuthorityActive)
+        ));
+    }
+
+    #[test]
+    fn reopen_fails_closed_when_sibling_cutover_markers_coexist() {
+        let fabric_projection = digest(0xb7);
+        let (directory, mut store) = managed_fabric_store_fixture(0xb8, 0xb9, fabric_projection);
+        store
+            .initialize_managed_model_agent_stack(digest(0xba), b"model-agent-initial")
+            .expect("managed Model+Agent branch must initialize");
+        let conflicting = super::ManagedAgentStackCutoverMarker::try_new(
+            store.marker(),
+            digest(0xbb),
+            b"agent-initial",
+        )
+        .expect("conflicting marker fixture must encode");
+        install_private_file(
+            &directory
+                .path()
+                .join(super::MANAGED_AGENT_STACK_CUTOVER_FILE_NAME),
+            &conflicting.canonical_wire,
+        );
+        assert!(matches!(
+            store.commit_managed_model_agent_stack(b"must-not-publish"),
+            Err(ManagedFabricStoreError::ConflictingStackAuthorities)
+        ));
+        assert!(matches!(
+            store.managed_model_agent_stack_snapshot_bytes(),
+            Err(ManagedFabricStoreError::Stopped)
+        ));
+        drop(store);
+
+        assert!(matches!(
+            ManagedFabricStore::open_fixture(
+                directory.path(),
+                [0xb8; 32],
+                digest(0xb9),
+                fabric_projection,
+            ),
+            Err(ManagedFabricStoreError::ConflictingStackAuthorities)
+        ));
     }
 
     fn migration_tokens(byte: u8) -> RuntimeMigrationTokens {

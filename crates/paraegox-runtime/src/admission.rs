@@ -9,7 +9,7 @@ use core::{fmt, num::NonZeroUsize};
 use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use paraegox_kernel::digest::{Digest32, DigestBuildError};
+use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::{BoundedDuration, ClockReading, MonotonicDeadline, TimeError};
 use paraegox_runtime_contracts::apply::{
@@ -17,7 +17,13 @@ use paraegox_runtime_contracts::apply::{
     TenureProofError,
 };
 use paraegox_runtime_contracts::assignment::RuntimeApplyRequest;
+use paraegox_runtime_contracts::distributed_agent_stack_plan::DistributedAgentStackApplyRequestV1;
 use paraegox_runtime_contracts::execution::RuntimeApplyRequestV2;
+use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentStackApplyRequestV1;
+use paraegox_runtime_contracts::managed_fabric_plan::{
+    ManagedFabricApplyRequestV1, ManagedFabricPlanError,
+};
+use paraegox_runtime_contracts::managed_model_agent_stack_plan::ManagedModelAgentStackApplyRequestV1;
 use paraegox_runtime_contracts::process_execution::{
     RequestV4WireError, RuntimeApplyRequestV4, RuntimePlanSliceV4,
 };
@@ -452,6 +458,550 @@ impl ApplyAdmissionPolicy {
             admitted_at_nanos,
         })
     }
+
+    /// Authenticates one strict PXAR v6 without aliasing the PXAR v5 facade.
+    /// The returned replay identities are Runtime-private successor-journal
+    /// keys; request/proof digests remain contract-owned values.
+    pub(crate) fn authenticate_managed_fabric_apply_request(
+        &self,
+        request: &ManagedFabricApplyRequestV1,
+    ) -> Result<AuthenticatedManagedFabricApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-fabric-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-fabric-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-fabric-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedManagedFabricApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_managed_fabric_apply_request(
+        &self,
+        request: &ManagedFabricApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedManagedFabricApplyIngressV1, ManagedFabricApplyAdmissionError> {
+        let authenticated = self.authenticate_managed_fabric_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedManagedFabricApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
+    /// Authenticates one strict PXAR v7 while keeping its replay namespace
+    /// independent from the predecessor PXAR-v6 owner.
+    pub(crate) fn authenticate_managed_agent_stack_apply_request(
+        &self,
+        request: &ManagedAgentStackApplyRequestV1,
+    ) -> Result<AuthenticatedManagedAgentStackApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-agent-stack-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-agent-stack-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-agent-stack-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedManagedAgentStackApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_managed_agent_stack_apply_request(
+        &self,
+        request: &ManagedAgentStackApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedManagedAgentStackApplyIngressV1, ManagedFabricApplyAdmissionError> {
+        let authenticated = self.authenticate_managed_agent_stack_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedManagedAgentStackApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
+    /// Authenticates one strict PXAR v9 in a replay namespace independent
+    /// from the PXAR-v6, PXAR-v7, and PXAR-v8 owners.
+    pub(crate) fn authenticate_managed_model_agent_stack_apply_request(
+        &self,
+        request: &ManagedModelAgentStackApplyRequestV1,
+    ) -> Result<AuthenticatedManagedModelAgentStackApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedManagedModelAgentStackApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_managed_model_agent_stack_apply_request(
+        &self,
+        request: &ManagedModelAgentStackApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedManagedModelAgentStackApplyIngressV1, ManagedFabricApplyAdmissionError>
+    {
+        let authenticated = self.authenticate_managed_model_agent_stack_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedManagedModelAgentStackApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
+    /// Authenticates one strict PXAR v8 while keeping replay identities
+    /// independent from both PXAR-v6 Fabric and PXAR-v7 fixed-stack owners.
+    pub(crate) fn authenticate_distributed_agent_stack_apply_request(
+        &self,
+        request: &DistributedAgentStackApplyRequestV1,
+    ) -> Result<AuthenticatedDistributedAgentStackApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.distributed-agent-stack-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.distributed-agent-stack-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.distributed-agent-stack-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedDistributedAgentStackApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_distributed_agent_stack_apply_request(
+        &self,
+        request: &DistributedAgentStackApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedDistributedAgentStackApplyIngressV1, ManagedFabricApplyAdmissionError> {
+        let authenticated = self.authenticate_distributed_agent_stack_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedDistributedAgentStackApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+}
+
+fn managed_fabric_replay_identity(
+    domain: &'static [u8],
+    fields: &[&[u8]],
+) -> Result<Digest32, ManagedFabricApplyAdmissionError> {
+    let mut builder =
+        Digest32Builder::try_new(domain).map_err(ManagedFabricApplyAdmissionError::Digest)?;
+    for field in fields {
+        builder
+            .field_bytes(field)
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+    }
+    Ok(builder.finish())
 }
 
 fn parse_reference_signature(signature: &[u8]) -> Option<Signature> {
@@ -477,6 +1027,316 @@ impl AuthenticatedReferenceApplyV1 {
 pub(crate) struct VerifiedReferenceApplyIngressV1 {
     identities: ReferenceApplyIngressIdentitiesV1,
     admitted_at_nanos: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedManagedFabricApplyV1 {
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedManagedFabricApplyV1 {
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedManagedFabricApplyIngressV1 {
+    authenticated: AuthenticatedManagedFabricApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedManagedFabricApplyIngressV1 {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        admitted_at_nanos: u64,
+        deadline_nanos: u64,
+        clock_generation: paraegox_kernel::time::ClockGeneration,
+        identity_seed: u8,
+    ) -> Self {
+        assert!(
+            identity_seed != 0,
+            "test replay identity seed must be nonzero"
+        );
+        Self {
+            authenticated: AuthenticatedManagedFabricApplyV1 {
+                proof_envelope_digest: Digest32::from_bytes([0xa0; 32]),
+                tenure_nonce_identity: Digest32::from_bytes([0xa1; 32]),
+                request_nonce_identity: Digest32::from_bytes([identity_seed; 32]),
+                temporal_lineage_identity: Digest32::from_bytes(
+                    [identity_seed.wrapping_add(1); 32],
+                ),
+            },
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedManagedFabricApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedManagedAgentStackApplyV1 {
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedManagedAgentStackApplyV1 {
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedManagedAgentStackApplyIngressV1 {
+    authenticated: AuthenticatedManagedAgentStackApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedManagedAgentStackApplyIngressV1 {
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedManagedAgentStackApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedManagedModelAgentStackApplyV1 {
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedManagedModelAgentStackApplyV1 {
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedManagedModelAgentStackApplyIngressV1 {
+    authenticated: AuthenticatedManagedModelAgentStackApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedManagedModelAgentStackApplyIngressV1 {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        admitted_at_nanos: u64,
+        deadline_nanos: u64,
+        clock_generation: paraegox_kernel::time::ClockGeneration,
+        identity_seed: u8,
+    ) -> Self {
+        assert!(
+            identity_seed != 0,
+            "test replay identity seed must be nonzero"
+        );
+        Self {
+            authenticated: AuthenticatedManagedModelAgentStackApplyV1 {
+                proof_envelope_digest: Digest32::from_bytes([0xb0; 32]),
+                tenure_nonce_identity: Digest32::from_bytes([0xb1; 32]),
+                request_nonce_identity: Digest32::from_bytes([identity_seed; 32]),
+                temporal_lineage_identity: Digest32::from_bytes(
+                    [identity_seed.wrapping_add(1); 32],
+                ),
+            },
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedManagedModelAgentStackApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedDistributedAgentStackApplyV1 {
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedDistributedAgentStackApplyV1 {
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedDistributedAgentStackApplyIngressV1 {
+    authenticated: AuthenticatedDistributedAgentStackApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedDistributedAgentStackApplyIngressV1 {
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedDistributedAgentStackApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedFabricApplyAdmissionError {
+    CanonicalCorrelation,
+    UntrustedTenureKey,
+    UntrustedApplyKey,
+    InvalidTenureTranscript,
+    InvalidRequestTranscript,
+    InvalidTenureSignature,
+    InvalidRequestSignature,
+    ClockDomainMismatch,
+    ClockGenerationMismatch,
+    BudgetExceedsPolicy,
+    BudgetExpired,
+    DeadlineOverflow,
+    Digest(DigestBuildError),
+    Contract(ManagedFabricPlanError),
 }
 
 impl VerifiedReferenceApplyIngressV1 {
@@ -1388,6 +2248,9 @@ mod tests {
         MailboxSpec, OverflowPolicy, PortCardinality, PortDirection, PortEndpoint, PortRef,
         PortSpec, RuntimeApplyRequest, RuntimePlanSlice, SchemaRef, TargetAssignments,
     };
+    use paraegox_runtime_contracts::distributed_agent_stack_plan::{
+        DistributedAgentStackApplyRequestDraftV1, DistributedAgentStackApplyRequestV1,
+    };
     use paraegox_runtime_contracts::execution::{
         CardDefinitionRef, CardImplementationRef, RuntimeApplyRequestV2,
     };
@@ -1437,8 +2300,9 @@ mod tests {
     use super::{
         AdmissionConfigurationError, AdmissionDisposition, AdmissionError, AdmissionState,
         AdmissionStateLimits, ApplyAdmission, ApplyAdmissionPolicy, ED25519_ALGORITHM,
-        ED25519_ALGORITHM_VERSION, RuntimeProcessExecutionRequestAdmissionError,
-        TrustedApplyIdentity, TrustedApplyKey, TrustedTenureIdentity, TrustedTenureKey,
+        ED25519_ALGORITHM_VERSION, ManagedFabricApplyAdmissionError,
+        RuntimeProcessExecutionRequestAdmissionError, TrustedApplyIdentity, TrustedApplyKey,
+        TrustedTenureIdentity, TrustedTenureKey,
     };
 
     const SCOPE: u8 = 1;
@@ -1463,6 +2327,9 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/s5_runtime_apply_request_v3.json");
     const PYTHON_PROCESS_EXECUTION_REQUEST_FIXTURE_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s6_runtime_apply_request_v4.json");
+    const DISTRIBUTED_AGENT_STACK_GOLDEN: &str = include_str!(
+        "../../paraegox-runtime-contracts/tests/fixtures/distributed_agent_stack_v1.hex"
+    );
     // TEST-ONLY keys matching the independently encoded Python contract fixture.
     const PYTHON_FIXTURE_TENURE_SEED: [u8; 32] = [0x11; 32];
     const PYTHON_FIXTURE_REQUEST_SEED: [u8; 32] = [0x22; 32];
@@ -1950,6 +2817,46 @@ mod tests {
             decoded.push((hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]));
         }
         decoded
+    }
+
+    fn distributed_agent_stack_golden(key: &str) -> Vec<u8> {
+        let prefix = format!("{key}=");
+        let value = DISTRIBUTED_AGENT_STACK_GOLDEN
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("distributed fixture field {key} must exist"));
+        assert_eq!(value.len() % 2, 0, "fixture hex must contain full bytes");
+        let mut decoded = Vec::with_capacity(value.len() / 2);
+        for pair in value.as_bytes().chunks_exact(2) {
+            decoded.push((hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]));
+        }
+        decoded
+    }
+
+    fn signed_distributed_agent_stack_request(
+        signing_seed: [u8; 32],
+    ) -> DistributedAgentStackApplyRequestV1 {
+        let fixture =
+            DistributedAgentStackApplyRequestV1::decode(&distributed_agent_stack_golden("request"))
+                .unwrap_or_else(|error| panic!("distributed PXAR v8 fixture must decode: {error}"));
+        let draft = DistributedAgentStackApplyRequestDraftV1::try_new(
+            fixture.target_execution().clone(),
+            fixture.provenance(),
+            fixture.control_commitment().control().clone(),
+            fixture.temporal(),
+            fixture.expected_runtime_store_instance_id(),
+            fixture.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("distributed PXAR v8 draft must build: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("distributed PXAR v8 transcript must build: {error}"));
+        let signature = SigningKey::from_bytes(&signing_seed)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("distributed PXAR v8 must finalize: {error}"))
     }
 
     fn python_fixture_admission_for_target(
@@ -3590,6 +4497,59 @@ mod tests {
             )
             .err(),
             Some(ApplyRejection::OperationConflict)
+        );
+    }
+
+    #[test]
+    fn distributed_pxar8_has_an_independent_authenticated_temporal_admission_namespace() {
+        let request = signed_distributed_agent_stack_request(PYTHON_FIXTURE_REQUEST_SEED);
+        let (admission, _) = python_fixture_admission_and_reading();
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0a; 16]),
+            ClockGeneration::try_new(3).expect("fixture clock generation must be nonzero"),
+            MonotonicInstant::from_ticks(1),
+        );
+
+        let authenticated = admission
+            .policy
+            .authenticate_distributed_agent_stack_apply_request(&request)
+            .expect("valid PXAR v8 signatures must authenticate");
+        let zero_digest = Digest32::from_bytes([0; 32]);
+        assert_ne!(authenticated.proof_envelope_digest(), zero_digest);
+        assert_ne!(authenticated.tenure_nonce_identity(), zero_digest);
+        assert_ne!(authenticated.request_nonce_identity(), zero_digest);
+        assert_ne!(authenticated.temporal_lineage_identity(), zero_digest);
+
+        let verified = admission
+            .policy
+            .verify_distributed_agent_stack_apply_request(&request, reading)
+            .expect("valid PXAR v8 temporal ingress must verify");
+        assert_eq!(verified.authenticated(), authenticated);
+        assert_eq!(verified.admitted_at_nanos(), 1);
+        assert_eq!(verified.deadline_nanos(), 61);
+        assert_eq!(verified.clock_generation().value(), 3);
+
+        let wrong_signature = signed_distributed_agent_stack_request([0x23; 32]);
+        assert_eq!(
+            admission
+                .policy
+                .authenticate_distributed_agent_stack_apply_request(&wrong_signature)
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::InvalidRequestSignature
+        );
+
+        let fixture_with_predecessor_signature =
+            DistributedAgentStackApplyRequestV1::decode(&distributed_agent_stack_golden("request"))
+                .expect("canonical PXAR v8 fixture must decode");
+        assert_eq!(
+            admission
+                .policy
+                .authenticate_distributed_agent_stack_apply_request(
+                    &fixture_with_predecessor_signature,
+                )
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::InvalidRequestSignature,
+            "canonical bytes alone must never bypass the PXAR v8 signature"
         );
     }
 }

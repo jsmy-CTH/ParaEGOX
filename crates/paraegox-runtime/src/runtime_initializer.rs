@@ -172,6 +172,18 @@ pub(crate) fn initialize_runtime_store(
     initialize_runtime_store_after_preflight(preflight, input)
 }
 
+/// Initializes the explicit non-production DeveloperLocal store.  The only
+/// policy difference is the admitted filesystem capability; entropy,
+/// sequence-one validation, owner-private publication, fsync, read-back, and
+/// corruption behavior are identical to the production initializer.
+pub(crate) fn initialize_runtime_store_developer_local(
+    directory: &Path,
+    input: RuntimeInitializationInputV1,
+) -> Result<RuntimeInitializationReceiptV1, RuntimeInitializationError> {
+    let preflight = RuntimeInitializerPreflight::open_developer_local(directory)?;
+    initialize_runtime_store_after_preflight(preflight, input)
+}
+
 /// Completes initialization from a still-linear read-only directory proof.
 ///
 /// The system install operation uses this seam to validate both its Runtime

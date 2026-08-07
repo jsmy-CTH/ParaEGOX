@@ -15,6 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(test)]
 use ed25519_dalek::SigningKey;
@@ -26,6 +27,11 @@ use nix::{
     sys::stat::Mode,
     unistd::{Gid, UnlinkatFlags, chown, getpid, unlinkat},
 };
+use paraegox_fabric::{
+    RestrictedRuntimeApplyEndpointConfigV1, RestrictedRuntimeApplyEndpointV1,
+    RestrictedRuntimeApplyErrorV1, RestrictedRuntimeApplyReceiverV1,
+    RestrictedRuntimeApplyRespondErrorV1,
+};
 #[cfg(test)]
 use paraegox_kernel::identity::PrincipalRef;
 use paraegox_kernel::{
@@ -35,10 +41,44 @@ use paraegox_kernel::{
 };
 use paraegox_runtime_contracts::{
     apply::ExpectedActive,
+    distributed_agent_stack_plan::{
+        ControllerAuthenticatedDistributedAgentStackApplyRequestV1,
+        DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_VERSION, DistributedAgentStackApplyRequestV1,
+        DistributedAgentStackPlanError, DistributedAgentStackProjectionV1,
+        DistributedAgentStackRestrictedApplyRequestV1, DistributedAgentStackTerminalFactsV1,
+        DistributedAgentStackTerminalOutcomeV1, DistributedAgentStackTerminalReceiptDraftV2,
+        DistributedAgentStackTerminalReceiptV1, MAX_DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_BYTES,
+        MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES,
+        MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
+        MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES,
+        RestrictedRuntimeApplyCarrierBindingV1,
+    },
     installation::{
         RuntimeCompiledInstallationFactsV1, RuntimeInstallationError,
         VerifiedRuntimeInstallationV1, VerifiedRuntimeManifestIngressV1,
         verify_immutable_manifest_ingress, verify_pinned_startup,
+    },
+    managed_agent_stack_plan::{
+        MANAGED_AGENT_STACK_APPLY_REQUEST_VERSION, MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES,
+        MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedAgentStackApplyRequestV1,
+        ManagedAgentStackPlanError, ManagedAgentStackProjectionV1,
+    },
+    managed_fabric_plan::{
+        MANAGED_FABRIC_APPLY_REQUEST_VERSION, MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES,
+        MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES, ManagedFabricApplyRequestV1,
+        ManagedFabricManifestProjectionV1, ManagedFabricPlanError,
+    },
+    managed_model_agent_stack_plan::{
+        MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION,
+        MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
+        MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedModelAgentStackApplyRequestV1,
+        ManagedModelAgentStackPlanError, ManagedModelAgentStackProjectionV1,
+    },
+    managed_serving_bootstrap::{
+        MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES, MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES,
+        ManagedServingBootstrapError, ManagedServingBootstrapFactsV1,
+        ManagedServingBootstrapRequestV1, ManagedServingBootstrapResponseAuthClaimV1,
+        ManagedServingBootstrapResponseDraftV1,
     },
     provenance::{SourcePlanRevision, TargetSliceDigest},
     reference_control::{
@@ -54,7 +94,8 @@ use paraegox_runtime_contracts::{
         ReferenceQueryLiveFactsV1, ReferenceQueryLiveStateV1, ReferenceQueryOperationLookupV1,
         ReferenceQueryOperationStateV1, ReferenceQueryOwnerStateV1, ReferenceQueryRequestV1,
         ReferenceQueryResponseAuthClaimV1, ReferenceQueryResponseDraftV1,
-        ReferenceTargetExecutionPlanV4, reference_local_control_endpoint_identity_digest_v1,
+        ReferenceTargetExecutionPlanV4, ed25519_control_key_fingerprint,
+        reference_local_control_endpoint_identity_digest_v1,
         reference_runtime_peer_credentials_digest_v1, verify_reference_durable_slice_v1,
     },
     wire::ApplyAuthAlgorithm,
@@ -69,6 +110,32 @@ use tokio::{
 
 use crate::{
     admission::{ED25519_ALGORITHM, ED25519_ALGORITHM_VERSION},
+    distributed_agent_stack_runtime::{
+        DistributedAgentStackApplyOutcome, DistributedAgentStackEvidenceStoreConfigV1,
+        DistributedAgentStackOwnerConfig, DistributedAgentStackRuntimeCore,
+        DistributedAgentStackRuntimeError,
+    },
+    distributed_fabric_runtime::RuntimeFabricCredentialResolverV2,
+    managed_agent_stack_runtime::{
+        ManagedAgentStackApplyOutcome, ManagedAgentStackOwnerConfig, ManagedAgentStackRuntimeCore,
+        ManagedAgentStackRuntimeError, RuntimeAgentHandleBroker,
+    },
+    managed_fabric_runtime::{
+        ManagedFabricApplyOutcome, ManagedFabricOwnerConfig, ManagedFabricRuntimeCore,
+        ManagedFabricRuntimeError, transition_projection_digest,
+    },
+    managed_fabric_state::{ManagedFabricSnapshot, ManagedFabricStateError},
+    managed_model_agent_stack_runtime::{
+        ManagedModelAgentStackApplyOutcome, ManagedModelAgentStackCutoverOutcome,
+        ManagedModelAgentStackOwnerConfig, ManagedModelAgentStackRuntimeCore,
+        ManagedModelAgentStackRuntimeError,
+    },
+    managed_model_runtime::{
+        RuntimeModelBackendResolverV1, UnavailableRuntimeModelBackendResolver,
+    },
+    runtime_agent_provider::{
+        RuntimeAgentProviderResolverV1, UnavailableRuntimeAgentProviderResolver,
+    },
     runtime_clock::RuntimeClock,
     runtime_control_state::{
         RuntimeControlState, RuntimeControlStateError, RuntimeJournalBootstrapReason,
@@ -87,11 +154,16 @@ use crate::{
         RuntimeDeadlineObservation, RuntimeJournalSnapshot, StorePinnedBuildIdentity,
     },
     runtime_provisioning::{
-        CONTROL_SOCKET_DIRECTORY_MODE, CONTROL_SOCKET_MODE, RuntimeProvisioningError,
-        RuntimeProvisioningV1, validate_canonical_absolute_path,
+        RuntimeProvisioningError, RuntimeProvisioningV1, validate_canonical_absolute_path,
     },
-    runtime_store::{RuntimeStore, RuntimeStoreError, RuntimeStoreOpenError},
+    runtime_store::{
+        ManagedFabricStore, ManagedFabricStoreError, RuntimeStore, RuntimeStoreError,
+        RuntimeStoreOpenError,
+    },
 };
+
+#[cfg(test)]
+use crate::runtime_provisioning::CONTROL_SOCKET_DIRECTORY_MODE;
 
 #[cfg(test)]
 use crate::runtime_journal::ResourcePhase;
@@ -99,24 +171,219 @@ use crate::runtime_journal::ResourcePhase;
 const ED25519_SIGNATURE_BYTES: usize = 64;
 const CONTROL_FRAME_HEADER_BYTES: usize = 4;
 const BOOTSTRAP_REQUEST_MAGIC: &[u8; 4] = b"PXBR";
+const MANAGED_BOOTSTRAP_REQUEST_MAGIC: &[u8; 4] = b"PXFB";
 const QUERY_REQUEST_MAGIC: &[u8; 4] = b"PXQR";
 const APPLY_REQUEST_MAGIC: &[u8; 4] = b"PXAR";
 const MODE_MASK: u32 = 0o7777;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CONTROL_REQUEST_BYTES: usize = maximum_three(
+const MAX_CONTROL_REQUEST_BYTES: usize = maximum_eight(
     MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES,
     MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES,
     MAX_REFERENCE_QUERY_REQUEST_BYTES,
+    MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES,
+    MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES,
+    MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES,
+    MAX_DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_BYTES,
+    MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
 );
-const MAX_CONTROL_RESPONSE_BYTES: usize = maximum_three(
+const MAX_CONTROL_RESPONSE_BYTES: usize = maximum_eight(
     MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES,
     MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES,
     MAX_REFERENCE_QUERY_RESPONSE_BYTES,
+    MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES,
+    MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES,
+    MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
+    MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
+    MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
 );
 
-const fn maximum_three(first: usize, second: usize, third: usize) -> usize {
+/// Builds the scheduler used by every process owner that can host managed
+/// Fabric. Zenoh requires Tokio's multi-thread scheduler; one worker keeps the
+/// Runtime's bounded owner model without relying on the unsupported
+/// current-thread flavor.
+pub(crate) fn build_managed_fabric_owner_runtime()
+-> Result<tokio::runtime::Runtime, RuntimeBootstrapEndpointError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| RuntimeBootstrapEndpointError::Runtime)
+}
+
+fn unavailable_provider_resolver() -> Arc<dyn RuntimeAgentProviderResolverV1> {
+    Arc::new(UnavailableRuntimeAgentProviderResolver)
+}
+
+fn unavailable_model_backend_resolver() -> Arc<dyn RuntimeModelBackendResolverV1> {
+    Arc::new(UnavailableRuntimeModelBackendResolver)
+}
+
+/// Strict experimental V2 dependency required by the distributed Agent stack.
+///
+/// Live-link observation is not injectable: PXAR-v8 reads the exact
+/// lifecycle-owned Fabric session through its generation fence. Composition
+/// supplies one complete resolver-and-Evidence configuration or selects the
+/// explicit unavailable path; partial distributed composition cannot exist.
+#[derive(Clone)]
+pub(crate) struct RuntimeDistributedAgentStackDependenciesV1 {
+    fabric_credential_resolver: Arc<dyn RuntimeFabricCredentialResolverV2>,
+    evidence_store_config: DistributedAgentStackEvidenceStoreConfigV1,
+}
+
+impl RuntimeDistributedAgentStackDependenciesV1 {
+    pub(crate) fn new(
+        fabric_credential_resolver: Arc<dyn RuntimeFabricCredentialResolverV2>,
+        evidence_store_config: DistributedAgentStackEvidenceStoreConfigV1,
+    ) -> Self {
+        Self {
+            fabric_credential_resolver,
+            evidence_store_config,
+        }
+    }
+}
+
+impl fmt::Debug for RuntimeDistributedAgentStackDependenciesV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeDistributedAgentStackDependenciesV1")
+            .field("fabric_credential_resolver", &"<injected>")
+            .field("evidence_store_config", &"<composition-pinned>")
+            .finish()
+    }
+}
+
+/// Composition-owned restricted Runtime apply endpoint generation.
+///
+/// The Fabric configuration owns resolved listener/TLS mechanics while the
+/// exact PXCB remains the Runtime admission correlation value. In particular,
+/// `control_transport_profile_ref` and `control_transport_profile_digest` are
+/// opaque composition assertions: Runtime provisioning does not resolve or
+/// fabricate them. The composition root must bind them to this exact resolved
+/// endpoint generation; Runtime additionally checks the route and all
+/// Provisioning-owned identity/key pins before opening the listener.
+#[derive(Clone)]
+pub(crate) struct RuntimeRestrictedApplyEndpointDependenciesV1 {
+    endpoint_config: RestrictedRuntimeApplyEndpointConfigV1,
+    expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+}
+
+impl RuntimeRestrictedApplyEndpointDependenciesV1 {
+    pub(crate) fn new(
+        endpoint_config: RestrictedRuntimeApplyEndpointConfigV1,
+        expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> Self {
+        Self {
+            endpoint_config,
+            expected_carrier,
+        }
+    }
+}
+
+impl fmt::Debug for RuntimeRestrictedApplyEndpointDependenciesV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeRestrictedApplyEndpointDependenciesV1")
+            .field("endpoint_config", &"<composition-pinned>")
+            .field("expected_carrier", &"<composition-pinned>")
+            .finish()
+    }
+}
+
+/// Process-local managed-service composition dependencies.
+///
+/// Agent-provider and Model-backend resolution are independent non-optional
+/// seams. A composition that cannot serve either seam must inject its explicit
+/// rejecting resolver; Runtime never substitutes one for the other and never
+/// falls back. Distributed V2 and restricted-apply capabilities remain
+/// explicit optional values whose exact dependencies survive restart and
+/// cutover unchanged.
+#[derive(Clone)]
+pub(crate) struct RuntimeManagedFabricServiceDependenciesV1 {
+    agent_provider_resolver: Arc<dyn RuntimeAgentProviderResolverV1>,
+    model_backend_resolver: Arc<dyn RuntimeModelBackendResolverV1>,
+    distributed_agent_stack: Option<RuntimeDistributedAgentStackDependenciesV1>,
+    restricted_runtime_apply_endpoint: Option<RuntimeRestrictedApplyEndpointDependenciesV1>,
+}
+
+impl RuntimeManagedFabricServiceDependenciesV1 {
+    pub(crate) fn new(
+        agent_provider_resolver: Arc<dyn RuntimeAgentProviderResolverV1>,
+        model_backend_resolver: Arc<dyn RuntimeModelBackendResolverV1>,
+        distributed_agent_stack: Option<RuntimeDistributedAgentStackDependenciesV1>,
+        restricted_runtime_apply_endpoint: Option<RuntimeRestrictedApplyEndpointDependenciesV1>,
+    ) -> Self {
+        Self {
+            agent_provider_resolver,
+            model_backend_resolver,
+            distributed_agent_stack,
+            restricted_runtime_apply_endpoint,
+        }
+    }
+
+    pub(crate) fn unavailable() -> Self {
+        Self::new(
+            unavailable_provider_resolver(),
+            unavailable_model_backend_resolver(),
+            None,
+            None,
+        )
+    }
+
+    fn agent_provider_resolver(&self) -> Arc<dyn RuntimeAgentProviderResolverV1> {
+        Arc::clone(&self.agent_provider_resolver)
+    }
+
+    fn model_backend_resolver(&self) -> Arc<dyn RuntimeModelBackendResolverV1> {
+        Arc::clone(&self.model_backend_resolver)
+    }
+
+    fn distributed_agent_stack_owner_dependencies(
+        &self,
+    ) -> Option<&RuntimeDistributedAgentStackDependenciesV1> {
+        self.distributed_agent_stack.as_ref()
+    }
+}
+
+impl fmt::Debug for RuntimeManagedFabricServiceDependenciesV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeManagedFabricServiceDependenciesV1")
+            .field("agent_provider_resolver", &"<injected>")
+            .field("model_backend_resolver", &"<injected>")
+            .field(
+                "distributed_agent_stack",
+                &self.distributed_agent_stack.is_some(),
+            )
+            .field(
+                "restricted_runtime_apply_endpoint",
+                &self.restricted_runtime_apply_endpoint.is_some(),
+            )
+            .finish()
+    }
+}
+
+const fn maximum_eight(
+    first: usize,
+    second: usize,
+    third: usize,
+    fourth: usize,
+    fifth: usize,
+    sixth: usize,
+    seventh: usize,
+    eighth: usize,
+) -> usize {
     let pair = if first > second { first } else { second };
-    if pair > third { pair } else { third }
+    let triple = if pair > third { pair } else { third };
+    let quadruple = if triple > fourth { triple } else { fourth };
+    let quintuple = if quadruple > fifth { quadruple } else { fifth };
+    let sextuple = if quintuple > sixth { quintuple } else { sixth };
+    let septuple = if sextuple > seventh {
+        sextuple
+    } else {
+        seventh
+    };
+    if septuple > eighth { septuple } else { eighth }
 }
 
 fn validate_snapshot_pins(
@@ -1039,7 +1306,1081 @@ fn map_apply_error(error: RuntimeReferenceApplyError) -> RuntimeControlRequestEr
 #[derive(Debug)]
 enum RuntimeControlRequestError {
     Rejected,
+    Unavailable,
     Internal(RuntimeBootstrapEndpointError),
+}
+
+/// Display-safe outcome of the restricted remote PXRC processing seam.
+///
+/// The transport owner distinguishes generic rejection, retryable owner
+/// unavailability, and fatal owner failure. No variant carries request,
+/// carrier, key, or signature material across the boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeRestrictedRemoteApplyErrorV1 {
+    Rejected,
+    Unavailable,
+    Internal,
+}
+
+impl fmt::Display for RuntimeRestrictedRemoteApplyErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Rejected => "restricted Runtime apply rejected",
+            Self::Unavailable => "restricted Runtime apply temporarily unavailable",
+            Self::Internal => "restricted Runtime apply owner failed",
+        })
+    }
+}
+
+impl std::error::Error for RuntimeRestrictedRemoteApplyErrorV1 {}
+
+pub(crate) struct StartedManagedFabricService {
+    core: ManagedFabricRuntimeCore,
+    stack: Option<ManagedAgentStackRuntimeCore>,
+    stack_projection: ManagedAgentStackProjectionV1,
+    model_stack: Option<ManagedModelAgentStackRuntimeCore>,
+    model_stack_projection: ManagedModelAgentStackProjectionV1,
+    distributed: Option<DistributedAgentStackRuntimeCore>,
+    distributed_projection: DistributedAgentStackProjectionV1,
+    handle_broker: RuntimeAgentHandleBroker,
+    state_directory: PathBuf,
+    provisioning: RuntimeProvisioningV1,
+    dependencies: RuntimeManagedFabricServiceDependenciesV1,
+}
+
+impl StartedManagedFabricService {
+    fn try_start(
+        state_directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        compiled: RuntimeCompiledInstallationFactsV1,
+        provisioning: RuntimeProvisioningV1,
+        dependencies: RuntimeManagedFabricServiceDependenciesV1,
+    ) -> Result<Self, RuntimeBootstrapEndpointError> {
+        let store = ManagedFabricStore::open_unbound_projection(
+            state_directory,
+            expected_store_instance_id,
+            provisioning.owner_target_fingerprint(),
+        )?;
+        Self::try_start_from_store(
+            state_directory,
+            expected_store_instance_id,
+            compiled,
+            provisioning,
+            store,
+            dependencies,
+        )
+    }
+
+    pub(crate) fn try_start_developer_local(
+        state_directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        compiled: RuntimeCompiledInstallationFactsV1,
+        provisioning: RuntimeProvisioningV1,
+        dependencies: RuntimeManagedFabricServiceDependenciesV1,
+    ) -> Result<Self, RuntimeBootstrapEndpointError> {
+        if ManagedFabricStore::cutover_present_developer_local(state_directory)? {
+            let store = ManagedFabricStore::open_unbound_projection_developer_local(
+                state_directory,
+                expected_store_instance_id,
+                provisioning.owner_target_fingerprint(),
+            )?;
+            return Self::try_start_from_store(
+                state_directory,
+                expected_store_instance_id,
+                compiled,
+                provisioning,
+                store,
+                dependencies,
+            );
+        }
+
+        let legacy_store = RuntimeStore::open_developer_local(
+            state_directory,
+            expected_store_instance_id,
+            provisioning.owner_target_fingerprint(),
+        )?;
+        Self::try_cutover_developer_local_from_store(
+            state_directory,
+            expected_store_instance_id,
+            compiled,
+            provisioning,
+            legacy_store,
+            RuntimeAgentHandleBroker::default(),
+            dependencies,
+        )
+    }
+
+    fn try_cutover_developer_local_from_store(
+        state_directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        compiled: RuntimeCompiledInstallationFactsV1,
+        provisioning: RuntimeProvisioningV1,
+        legacy_store: RuntimeStore,
+        handle_broker: RuntimeAgentHandleBroker,
+        dependencies: RuntimeManagedFabricServiceDependenciesV1,
+    ) -> Result<Self, RuntimeBootstrapEndpointError> {
+        let frozen = legacy_store.snapshot()?.clone();
+        let installation = verify_startup_installation(&frozen, provisioning.target(), compiled)?;
+        validate_snapshot_pins(&provisioning, &frozen)?;
+        let manifest = installation.immutable_manifest_ingress()?;
+        validate_startup_durable_control_state(&frozen, &manifest, compiled, &provisioning)?;
+        let projection =
+            ManagedFabricManifestProjectionV1::try_from_verified_legacy_manifest(&manifest)?;
+        let legacy_host = &frozen.state().host;
+        let runtime_host_epoch = legacy_host
+            .runtime_host_epoch_high_water
+            .max(legacy_host.clock_generation_high_water)
+            .checked_add(1)
+            .ok_or(RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        let generation = ClockGeneration::try_new(runtime_host_epoch)
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        let clock = RuntimeClock::new(
+            ClockDomainRef::from_bytes(legacy_host.clock_domain),
+            generation,
+            1,
+        );
+        let core = ManagedFabricRuntimeCore::cutover_developer_local(
+            legacy_store,
+            ManagedFabricOwnerConfig {
+                state_directory: state_directory.to_path_buf(),
+                store_instance_id: expected_store_instance_id,
+                owner_target_fingerprint: provisioning.owner_target_fingerprint(),
+                projection: projection.clone(),
+                runtime_host_epoch,
+                clock,
+                response_key_ref: provisioning.runtime_response_key_ref(),
+                response_signer: provisioning.response_signer().clone(),
+            },
+        )?;
+        let stack_projection =
+            ManagedAgentStackProjectionV1::try_from_managed_fabric_projection(projection)?;
+        let model_stack_projection =
+            ManagedModelAgentStackProjectionV1::try_from_managed_agent_stack_projection(
+                stack_projection.clone(),
+            )?;
+        let distributed_projection =
+            DistributedAgentStackProjectionV1::try_from_managed_agent_stack_projection(
+                stack_projection.clone(),
+            )?;
+        Ok(Self {
+            core,
+            stack: None,
+            stack_projection,
+            model_stack: None,
+            model_stack_projection,
+            distributed: None,
+            distributed_projection,
+            handle_broker,
+            state_directory: state_directory.to_path_buf(),
+            provisioning,
+            dependencies,
+        })
+    }
+
+    fn try_start_from_store(
+        state_directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        compiled: RuntimeCompiledInstallationFactsV1,
+        provisioning: RuntimeProvisioningV1,
+        store: ManagedFabricStore,
+        dependencies: RuntimeManagedFabricServiceDependenciesV1,
+    ) -> Result<Self, RuntimeBootstrapEndpointError> {
+        let frozen = store.frozen_legacy_snapshot().clone();
+        let installation = verify_startup_installation(&frozen, provisioning.target(), compiled)?;
+        validate_snapshot_pins(&provisioning, &frozen)?;
+        let manifest = installation.immutable_manifest_ingress()?;
+        validate_startup_durable_control_state(&frozen, &manifest, compiled, &provisioning)?;
+        let projection =
+            ManagedFabricManifestProjectionV1::try_from_verified_legacy_manifest(&manifest)?;
+        let projection_digest =
+            transition_projection_digest(&projection).map_err(ManagedFabricRuntimeError::from)?;
+        if store.marker().transition_projection_digest() != projection_digest {
+            return Err(RuntimeBootstrapEndpointError::ManagedFabric(
+                ManagedFabricRuntimeError::ProjectionMismatch,
+            ));
+        }
+
+        // Production deliberately uses one monotonically increasing value for
+        // both the successor RuntimeHost epoch and its process-local clock
+        // generation. Taking the maximum of both frozen legacy high-waters and
+        // the previous successor epoch prevents either namespace from
+        // regressing across the one-way transition or a later restart.
+        let previous_successor_epoch = match store.snapshot_bytes()? {
+            Some(frame) => ManagedFabricSnapshot::decode(
+                frame,
+                expected_store_instance_id,
+                provisioning.owner_target_fingerprint(),
+                projection_digest,
+                &projection,
+            )?
+            .runtime_host_epoch(),
+            None => 0,
+        };
+        let legacy_host = &frozen.state().host;
+        let runtime_host_epoch = legacy_host
+            .runtime_host_epoch_high_water
+            .max(legacy_host.clock_generation_high_water)
+            .max(previous_successor_epoch)
+            .checked_add(1)
+            .ok_or(RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        let generation = ClockGeneration::try_new(runtime_host_epoch)
+            .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        let clock = RuntimeClock::new(
+            ClockDomainRef::from_bytes(legacy_host.clock_domain),
+            generation,
+            1,
+        );
+        let core = ManagedFabricRuntimeCore::from_preopened_store(
+            store,
+            ManagedFabricOwnerConfig {
+                state_directory: state_directory.to_path_buf(),
+                store_instance_id: expected_store_instance_id,
+                owner_target_fingerprint: provisioning.owner_target_fingerprint(),
+                projection: projection.clone(),
+                runtime_host_epoch,
+                clock,
+                response_key_ref: provisioning.runtime_response_key_ref(),
+                response_signer: provisioning.response_signer().clone(),
+            },
+        )?;
+        let stack_projection =
+            ManagedAgentStackProjectionV1::try_from_managed_fabric_projection(projection)?;
+        let handle_broker = RuntimeAgentHandleBroker::default();
+        let model_stack_projection =
+            ManagedModelAgentStackProjectionV1::try_from_managed_agent_stack_projection(
+                stack_projection.clone(),
+            )?;
+        let model_stack = ManagedModelAgentStackRuntimeCore::open(
+            &core,
+            ManagedModelAgentStackOwnerConfig {
+                state_directory: state_directory.to_path_buf(),
+                projection: model_stack_projection.clone(),
+                runtime_host_epoch,
+                clock,
+                response_key_ref: provisioning.runtime_response_key_ref(),
+                response_signer: provisioning.response_signer().clone(),
+                handle_broker: handle_broker.clone(),
+                model_backend_resolver: dependencies.model_backend_resolver(),
+            },
+        )?;
+        let stack = ManagedAgentStackRuntimeCore::open(
+            &core,
+            ManagedAgentStackOwnerConfig {
+                state_directory: state_directory.to_path_buf(),
+                projection: stack_projection.clone(),
+                runtime_host_epoch,
+                clock,
+                response_key_ref: provisioning.runtime_response_key_ref(),
+                response_signer: provisioning.response_signer().clone(),
+                handle_broker: handle_broker.clone(),
+                provider_resolver: dependencies.agent_provider_resolver(),
+            },
+        )?;
+        let distributed_projection =
+            DistributedAgentStackProjectionV1::try_from_managed_agent_stack_projection(
+                stack_projection.clone(),
+            )?;
+        let distributed_dependencies = dependencies.distributed_agent_stack_owner_dependencies();
+        let fabric_credential_resolver = distributed_dependencies
+            .map(|dependencies| Arc::clone(&dependencies.fabric_credential_resolver));
+        let evidence_store_config =
+            distributed_dependencies.map(|dependencies| dependencies.evidence_store_config.clone());
+        let distributed = DistributedAgentStackRuntimeCore::open(
+            &core,
+            DistributedAgentStackOwnerConfig {
+                state_directory: state_directory.to_path_buf(),
+                projection: distributed_projection.clone(),
+                runtime_host_epoch,
+                clock,
+                response_key_ref: provisioning.runtime_response_key_ref(),
+                response_signer: provisioning.response_signer().clone(),
+                handle_broker: handle_broker.clone(),
+                fabric_credential_resolver,
+                evidence_store_config,
+                agent_provider_resolver: dependencies.agent_provider_resolver(),
+            },
+        )?;
+        if distributed.is_some() && stack.is_none() {
+            return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+        }
+        if model_stack.is_some() && (stack.is_some() || distributed.is_some()) {
+            return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+        }
+        Ok(Self {
+            core,
+            stack,
+            stack_projection,
+            model_stack,
+            model_stack_projection,
+            distributed,
+            distributed_projection,
+            handle_broker,
+            state_directory: state_directory.to_path_buf(),
+            provisioning,
+            dependencies,
+        })
+    }
+}
+
+pub(crate) struct ManagedFabricControlService {
+    core: ManagedFabricRuntimeCore,
+    stack: Option<ManagedAgentStackRuntimeCore>,
+    stack_projection: ManagedAgentStackProjectionV1,
+    model_stack: Option<ManagedModelAgentStackRuntimeCore>,
+    model_stack_projection: ManagedModelAgentStackProjectionV1,
+    distributed: Option<DistributedAgentStackRuntimeCore>,
+    distributed_projection: DistributedAgentStackProjectionV1,
+    handle_broker: RuntimeAgentHandleBroker,
+    state_directory: PathBuf,
+    provisioning: RuntimeProvisioningV1,
+    channel: ReferenceChannelBindingV1,
+    dependencies: RuntimeManagedFabricServiceDependenciesV1,
+}
+
+impl ManagedFabricControlService {
+    async fn handle_request(
+        &mut self,
+        frame: &[u8],
+        live_channel: ReferenceChannelBindingV1,
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if live_channel != self.channel || frame.len() < 4 {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        if frame.starts_with(MANAGED_BOOTSTRAP_REQUEST_MAGIC) {
+            self.handle_serving_bootstrap(frame)
+        } else if frame.starts_with(APPLY_REQUEST_MAGIC) {
+            self.handle_apply(frame).await
+        } else {
+            Err(RuntimeControlRequestError::Rejected)
+        }
+    }
+
+    /// Processes one already transport-bounded canonical PXRC v1 value.
+    ///
+    /// This seam does not own a listener or TLS configuration. The caller must
+    /// supply the exact PXCB selected by its restricted transport generation.
+    /// Runtime authenticates that outer value against protected provisioning
+    /// before the existing PXAR v8 mutable owner can be reached.
+    pub(crate) async fn handle_restricted_distributed_agent_stack_apply_v1(
+        &mut self,
+        canonical_pxrc: &[u8],
+        expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> Result<Box<[u8]>, RuntimeRestrictedRemoteApplyErrorV1> {
+        if canonical_pxrc.is_empty()
+            || canonical_pxrc.len() > MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES
+        {
+            return Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected);
+        }
+        let restricted = DistributedAgentStackRestrictedApplyRequestV1::decode(canonical_pxrc)
+            .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Rejected)?;
+        let authenticated = authenticate_restricted_distributed_agent_stack_apply(
+            &self.provisioning,
+            &restricted,
+            expected_carrier,
+        )?;
+
+        // The inner bytes remain contract-owned and inaccessible until the
+        // concrete pinned-key verifier above issues the authenticated marker.
+        // The existing handler remains the sole PXAR v8 mutable owner.
+        let terminal_v1_wire = self
+            .handle_distributed_agent_stack_apply(authenticated.request().canonical_wire())
+            .await
+            .map_err(map_restricted_inner_apply_error)?;
+        let terminal_facts = validate_restricted_inner_terminal(
+            &self.provisioning,
+            authenticated,
+            self.channel,
+            &terminal_v1_wire,
+        )?;
+        let draft =
+            DistributedAgentStackTerminalReceiptDraftV2::try_new(authenticated, terminal_facts)
+                .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+        let signature = self
+            .provisioning
+            .response_signer()
+            .sign(
+                draft
+                    .signing_transcript()
+                    .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?
+                    .as_bytes(),
+            )
+            .to_bytes();
+        let receipt = draft
+            .finalize(&signature)
+            .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+        let wire = receipt.canonical_wire();
+        if wire.is_empty() || wire.len() > MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES {
+            return Err(RuntimeRestrictedRemoteApplyErrorV1::Internal);
+        }
+        // Non-ready terminals remain reportable but never enter the handle
+        // broker. An ActiveReady outer receipt is not returned unless its
+        // exact inner PXDS1 is still the currently published capability root.
+        if receipt.facts().outcome() == DistributedAgentStackTerminalOutcomeV1::ActiveReady {
+            self.handle_broker
+                .register_restricted_distributed_alias(&terminal_v1_wire, wire)
+                .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+        }
+        Ok(wire.into())
+    }
+
+    fn handle_serving_bootstrap(
+        &self,
+        frame: &[u8],
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if self.stack.is_some()
+            || self.model_stack.is_some()
+            || self.distributed.is_some()
+            || frame.is_empty()
+            || frame.len() > MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES
+        {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let request = ManagedServingBootstrapRequestV1::decode(frame)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        authenticate_managed_serving_request(&self.provisioning, &request, self.channel)?;
+        let observed = self
+            .core
+            .recovered_observation()
+            .map_err(map_managed_fabric_error)?;
+        if request.target() != observed.target
+            || request.expected_runtime_store_instance_id() != observed.store_instance_id
+            || request.projection() != &observed.projection
+            || request.channel() != self.channel
+            || transition_projection_digest(request.projection())
+                .map_err(ManagedFabricRuntimeError::from)
+                .map_err(map_managed_fabric_error)?
+                != observed.transition_projection_digest
+        {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let facts = ManagedServingBootstrapFactsV1::try_recovered_ready(
+            observed.target,
+            observed.store_instance_id,
+            observed.projection,
+            observed.runtime_host_epoch,
+            observed.successor_snapshot_sequence,
+            observed.clock,
+        )
+        .map_err(|error| {
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedServingContract(error),
+            )
+        })?;
+        let algorithm = ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM).map_err(|_| {
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::InvalidStartedState)
+        })?;
+        let auth_claim = ManagedServingBootstrapResponseAuthClaimV1::try_new(
+            self.channel,
+            self.provisioning.runtime_response_key_ref(),
+            algorithm,
+            ED25519_ALGORITHM_VERSION,
+        )
+        .map_err(|error| {
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedServingContract(error),
+            )
+        })?;
+        let draft = ManagedServingBootstrapResponseDraftV1::try_new(
+            &request,
+            facts,
+            self.channel,
+            auth_claim,
+        )
+        .map_err(|error| {
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedServingContract(error),
+            )
+        })?;
+        let signature = self
+            .provisioning
+            .response_signer()
+            .sign(
+                draft
+                    .signing_transcript()
+                    .map_err(|error| {
+                        RuntimeControlRequestError::Internal(
+                            RuntimeBootstrapEndpointError::ManagedServingContract(error),
+                        )
+                    })?
+                    .as_bytes(),
+            )
+            .to_bytes();
+        let response = draft.finalize(&signature).map_err(|error| {
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedServingContract(error),
+            )
+        })?;
+        let wire = response.canonical_wire();
+        if wire.is_empty() || wire.len() > MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES {
+            return Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::InvalidStartedState,
+            ));
+        }
+        Ok(wire.into())
+    }
+
+    async fn handle_apply(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if frame.len() < 6 {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        match u16::from_be_bytes([frame[4], frame[5]]) {
+            MANAGED_FABRIC_APPLY_REQUEST_VERSION
+                if self.stack.is_none()
+                    && self.model_stack.is_none()
+                    && self.distributed.is_none() =>
+            {
+                self.handle_managed_fabric_apply(frame).await
+            }
+            MANAGED_AGENT_STACK_APPLY_REQUEST_VERSION
+                if self.model_stack.is_none() && self.distributed.is_none() =>
+            {
+                self.handle_managed_agent_stack_apply(frame).await
+            }
+            MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION
+                if self.stack.is_none() && self.distributed.is_none() =>
+            {
+                self.handle_managed_model_agent_stack_apply(frame).await
+            }
+            DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_VERSION if self.model_stack.is_none() => {
+                self.handle_distributed_agent_stack_apply(frame).await
+            }
+            _ => Err(RuntimeControlRequestError::Rejected),
+        }
+    }
+
+    async fn handle_managed_fabric_apply(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if frame.len() > MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let request = ManagedFabricApplyRequestV1::decode(frame)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+
+        // Exact terminal replay authenticates signatures and local pins but
+        // intentionally does not re-admit the old temporal generation.
+        self.provisioning
+            .admission_policy()
+            .authenticate_managed_fabric_apply_request(&request)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        match self
+            .core
+            .authenticated_terminal_replay(&request, self.channel)
+        {
+            Ok(Some(receipt)) => return managed_terminal_response_wire(&receipt),
+            Ok(None) => {}
+            Err(error) => return Err(map_managed_fabric_error(error)),
+        }
+
+        let reading = self
+            .core
+            .clock_reading()
+            .map_err(map_managed_fabric_error)?;
+        let verified = self
+            .provisioning
+            .admission_policy()
+            .verify_managed_fabric_apply_request(&request, reading)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        let outcome = self
+            .core
+            .apply(request, verified, self.channel)
+            .await
+            .map_err(map_managed_fabric_error)?;
+        match outcome {
+            ManagedFabricApplyOutcome::Committed(receipt)
+            | ManagedFabricApplyOutcome::Replayed(receipt) => {
+                managed_terminal_response_wire(&receipt)
+            }
+        }
+    }
+
+    async fn handle_managed_agent_stack_apply(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if frame.len() > MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let request = ManagedAgentStackApplyRequestV1::decode(frame)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        self.provisioning
+            .admission_policy()
+            .authenticate_managed_agent_stack_apply_request(&request)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        if let Some(stack) = self.stack.as_ref() {
+            match stack.authenticated_terminal_replay(&request, self.channel) {
+                Ok(Some(receipt)) => return managed_agent_stack_terminal_response_wire(&receipt),
+                Ok(None) => {}
+                Err(error) => return Err(map_managed_agent_stack_error(error)),
+            }
+        }
+        let reading = self
+            .core
+            .clock_reading()
+            .map_err(map_managed_fabric_error)?;
+        let verified = self
+            .provisioning
+            .admission_policy()
+            .verify_managed_agent_stack_apply_request(&request, reading)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        let outcome = match self.stack.as_mut() {
+            Some(stack) => stack
+                .apply(&mut self.core, request, verified, self.channel)
+                .await
+                .map_err(map_managed_agent_stack_error)?,
+            None => {
+                let runtime_host_epoch = self.core.runtime_host_epoch();
+                let clock = self.core.stack_clock();
+                let (stack, outcome) = ManagedAgentStackRuntimeCore::cutover(
+                    &mut self.core,
+                    ManagedAgentStackOwnerConfig {
+                        state_directory: self.state_directory.clone(),
+                        projection: self.stack_projection.clone(),
+                        runtime_host_epoch,
+                        clock,
+                        response_key_ref: self.provisioning.runtime_response_key_ref(),
+                        response_signer: self.provisioning.response_signer().clone(),
+                        handle_broker: self.handle_broker.clone(),
+                        provider_resolver: self.dependencies.agent_provider_resolver(),
+                    },
+                    request,
+                    verified,
+                    self.channel,
+                )
+                .await
+                .map_err(map_managed_agent_stack_error)?;
+                self.stack = Some(stack);
+                outcome
+            }
+        };
+        match outcome {
+            ManagedAgentStackApplyOutcome::Committed(receipt)
+            | ManagedAgentStackApplyOutcome::Replayed(receipt) => {
+                managed_agent_stack_terminal_response_wire(&receipt)
+            }
+        }
+    }
+
+    async fn handle_managed_model_agent_stack_apply(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if frame.len() > MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let request = ManagedModelAgentStackApplyRequestV1::decode(frame)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        self.provisioning
+            .admission_policy()
+            .authenticate_managed_model_agent_stack_apply_request(&request)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        if let Some(model_stack) = self.model_stack.as_ref() {
+            match model_stack.authenticated_terminal_replay(&request, self.channel) {
+                Ok(Some(receipt)) => {
+                    return managed_model_agent_stack_terminal_response_wire(&receipt);
+                }
+                Ok(None) => {}
+                Err(error) => return Err(map_managed_model_agent_stack_error(error)),
+            }
+        }
+        let reading = self
+            .core
+            .clock_reading()
+            .map_err(map_managed_fabric_error)?;
+        let verified = self
+            .provisioning
+            .admission_policy()
+            .verify_managed_model_agent_stack_apply_request(&request, reading)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        let outcome = match self.model_stack.as_mut() {
+            Some(model_stack) => model_stack
+                .apply(&mut self.core, request, verified, self.channel)
+                .await
+                .map_err(map_managed_model_agent_stack_error)?,
+            None => {
+                let runtime_host_epoch = self.core.runtime_host_epoch();
+                let clock = self.core.stack_clock();
+                let cutover = ManagedModelAgentStackRuntimeCore::cutover(
+                    &mut self.core,
+                    ManagedModelAgentStackOwnerConfig {
+                        state_directory: self.state_directory.clone(),
+                        projection: self.model_stack_projection.clone(),
+                        runtime_host_epoch,
+                        clock,
+                        response_key_ref: self.provisioning.runtime_response_key_ref(),
+                        response_signer: self.provisioning.response_signer().clone(),
+                        handle_broker: self.handle_broker.clone(),
+                        model_backend_resolver: self.dependencies.model_backend_resolver(),
+                    },
+                    request,
+                    verified,
+                    self.channel,
+                )
+                .await
+                .map_err(map_managed_model_agent_stack_error)?;
+                match cutover {
+                    ManagedModelAgentStackCutoverOutcome::NoEffect(receipt) => {
+                        return managed_model_agent_stack_terminal_response_wire(&receipt);
+                    }
+                    ManagedModelAgentStackCutoverOutcome::Installed(model_stack, outcome) => {
+                        self.model_stack = Some(model_stack);
+                        outcome
+                    }
+                }
+            }
+        };
+        match outcome {
+            ManagedModelAgentStackApplyOutcome::Committed(receipt)
+            | ManagedModelAgentStackApplyOutcome::Replayed(receipt) => {
+                managed_model_agent_stack_terminal_response_wire(&receipt)
+            }
+        }
+    }
+
+    async fn handle_distributed_agent_stack_apply(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if frame.len() > MAX_DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_BYTES {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let request = DistributedAgentStackApplyRequestV1::decode(frame)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        self.provisioning
+            .admission_policy()
+            .authenticate_distributed_agent_stack_apply_request(&request)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        if let Some(distributed) = self.distributed.as_mut() {
+            match distributed.authenticated_terminal_replay(&self.core, &request, self.channel) {
+                Ok(Some(receipt)) => {
+                    return distributed_agent_stack_terminal_response_wire(&receipt);
+                }
+                Ok(None) => {}
+                Err(error) => return Err(map_distributed_agent_stack_error(error)),
+            }
+        }
+        let reading = self
+            .core
+            .clock_reading()
+            .map_err(map_managed_fabric_error)?;
+        let verified = self
+            .provisioning
+            .admission_policy()
+            .verify_distributed_agent_stack_apply_request(&request, reading)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        let outcome = match self.distributed.as_mut() {
+            Some(distributed) => distributed
+                .apply(&mut self.core, request, verified, self.channel)
+                .await
+                .map_err(map_distributed_agent_stack_error)?,
+            None => {
+                let distributed_dependencies = self
+                    .dependencies
+                    .distributed_agent_stack_owner_dependencies();
+                let fabric_credential_resolver = distributed_dependencies
+                    .map(|dependencies| Arc::clone(&dependencies.fabric_credential_resolver));
+                let evidence_store_config = distributed_dependencies
+                    .map(|dependencies| dependencies.evidence_store_config.clone());
+                let predecessor = self
+                    .stack
+                    .as_mut()
+                    .ok_or(RuntimeControlRequestError::Rejected)?;
+                let runtime_host_epoch = self.core.runtime_host_epoch();
+                let clock = self.core.stack_clock();
+                let (distributed, outcome) = DistributedAgentStackRuntimeCore::cutover(
+                    &mut self.core,
+                    predecessor,
+                    DistributedAgentStackOwnerConfig {
+                        state_directory: self.state_directory.clone(),
+                        projection: self.distributed_projection.clone(),
+                        runtime_host_epoch,
+                        clock,
+                        response_key_ref: self.provisioning.runtime_response_key_ref(),
+                        response_signer: self.provisioning.response_signer().clone(),
+                        handle_broker: self.handle_broker.clone(),
+                        fabric_credential_resolver,
+                        evidence_store_config,
+                        agent_provider_resolver: self.dependencies.agent_provider_resolver(),
+                    },
+                    request,
+                    verified,
+                    self.channel,
+                )
+                .await
+                .map_err(map_distributed_agent_stack_error)?;
+                self.distributed = Some(distributed);
+                outcome
+            }
+        };
+        distributed_agent_stack_apply_response_wire(outcome)
+    }
+}
+
+pub(crate) fn validate_restricted_runtime_apply_carrier_pins(
+    provisioning: &RuntimeProvisioningV1,
+    expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+) -> Result<Digest32, RuntimeRestrictedRemoteApplyErrorV1> {
+    provisioning
+        .validate_runtime_credentials()
+        .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+    let controller_key_fingerprint =
+        ed25519_control_key_fingerprint(provisioning.controller_key().as_bytes())
+            .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+    let runtime_response_key_fingerprint =
+        ed25519_control_key_fingerprint(provisioning.response_signer().verifying_key().as_bytes())
+            .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+    if controller_key_fingerprint != provisioning.controller_key_fingerprint() {
+        return Err(RuntimeRestrictedRemoteApplyErrorV1::Internal);
+    }
+    if expected_carrier.target() != provisioning.target()
+        || expected_carrier.runtime_principal() != provisioning.runtime_principal()
+        || expected_carrier.controller_principal() != provisioning.controller_principal()
+        || expected_carrier.controller_request_key() != provisioning.controller_request_key_ref()
+        || expected_carrier.controller_request_key_fingerprint() != controller_key_fingerprint
+        || expected_carrier.runtime_response_key() != provisioning.runtime_response_key_ref()
+        || expected_carrier.runtime_response_key_fingerprint() != runtime_response_key_fingerprint
+    {
+        return Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected);
+    }
+    Ok(controller_key_fingerprint)
+}
+
+fn authenticate_restricted_distributed_agent_stack_apply<'a>(
+    provisioning: &RuntimeProvisioningV1,
+    restricted: &'a DistributedAgentStackRestrictedApplyRequestV1,
+    expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+) -> Result<
+    ControllerAuthenticatedDistributedAgentStackApplyRequestV1<'a>,
+    RuntimeRestrictedRemoteApplyErrorV1,
+> {
+    let controller_key_fingerprint =
+        validate_restricted_runtime_apply_carrier_pins(provisioning, expected_carrier)?;
+
+    restricted
+        .verify_controller_carrier_before_mutation(
+            expected_carrier,
+            |principal, key, fingerprint, transcript, signature| {
+                if principal != provisioning.controller_principal()
+                    || key != provisioning.controller_request_key_ref()
+                    || fingerprint != controller_key_fingerprint
+                {
+                    return false;
+                }
+                let Ok(signature) = Signature::from_slice(signature) else {
+                    return false;
+                };
+                provisioning
+                    .controller_key()
+                    .verify_strict(transcript, &signature)
+                    .is_ok()
+            },
+        )
+        .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Rejected)
+}
+
+fn validate_restricted_inner_terminal(
+    provisioning: &RuntimeProvisioningV1,
+    authenticated: ControllerAuthenticatedDistributedAgentStackApplyRequestV1<'_>,
+    channel: ReferenceChannelBindingV1,
+    terminal_wire: &[u8],
+) -> Result<DistributedAgentStackTerminalFactsV1, RuntimeRestrictedRemoteApplyErrorV1> {
+    let receipt = DistributedAgentStackTerminalReceiptV1::decode(terminal_wire)
+        .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+    let facts = receipt
+        .validate_against_request(authenticated.request(), channel)
+        .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+    if channel.target() != provisioning.target()
+        || channel.runtime_peer() != provisioning.runtime_principal()
+        || receipt.authentication_key() != provisioning.runtime_response_key_ref()
+        || receipt.authentication_algorithm().value() != ED25519_ALGORITHM
+        || receipt.authentication_algorithm_version() != ED25519_ALGORITHM_VERSION
+    {
+        return Err(RuntimeRestrictedRemoteApplyErrorV1::Internal);
+    }
+    let signature_bytes: &[u8; ED25519_SIGNATURE_BYTES] = receipt
+        .authentication_signature()
+        .try_into()
+        .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+    let signature = Signature::from_bytes(signature_bytes);
+    let transcript = receipt
+        .signing_transcript()
+        .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+    provisioning
+        .response_signer()
+        .verifying_key()
+        .verify_strict(transcript.as_bytes(), &signature)
+        .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+    Ok(facts.clone())
+}
+
+fn map_restricted_inner_apply_error(
+    error: RuntimeControlRequestError,
+) -> RuntimeRestrictedRemoteApplyErrorV1 {
+    match error {
+        RuntimeControlRequestError::Rejected => RuntimeRestrictedRemoteApplyErrorV1::Rejected,
+        RuntimeControlRequestError::Unavailable => RuntimeRestrictedRemoteApplyErrorV1::Unavailable,
+        RuntimeControlRequestError::Internal(_) => RuntimeRestrictedRemoteApplyErrorV1::Internal,
+    }
+}
+
+fn authenticate_managed_serving_request(
+    provisioning: &RuntimeProvisioningV1,
+    request: &ManagedServingBootstrapRequestV1,
+    channel: ReferenceChannelBindingV1,
+) -> Result<(), RuntimeControlRequestError> {
+    let claim = request.authentication().claim();
+    if request.target() != provisioning.target()
+        || request.source_scope() != provisioning.source_scope()
+        || request.channel() != channel
+        || channel.target() != provisioning.target()
+        || channel.runtime_peer() != provisioning.runtime_principal()
+        || claim.principal() != provisioning.controller_principal()
+        || claim.key() != provisioning.controller_request_key_ref()
+        || claim.algorithm().value() != ED25519_ALGORITHM
+        || claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+        || claim.nonce().iter().all(|byte| *byte == 0)
+    {
+        return Err(RuntimeControlRequestError::Rejected);
+    }
+    let bytes: &[u8; ED25519_SIGNATURE_BYTES] = request
+        .authentication()
+        .signature()
+        .try_into()
+        .map_err(|_| RuntimeControlRequestError::Rejected)?;
+    let signature = Signature::from_bytes(bytes);
+    let transcript = request
+        .signing_transcript()
+        .map_err(|_| RuntimeControlRequestError::Rejected)?;
+    provisioning
+        .controller_key()
+        .verify_strict(transcript.as_bytes(), &signature)
+        .map_err(|_| RuntimeControlRequestError::Rejected)
+}
+
+fn managed_terminal_response_wire(
+    receipt: &paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricApplyTerminalReceiptV1,
+) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    let wire = receipt.canonical_wire();
+    if wire.is_empty() || wire.len() > MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES {
+        return Err(RuntimeControlRequestError::Internal(
+            RuntimeBootstrapEndpointError::InvalidStartedState,
+        ));
+    }
+    Ok(wire.into())
+}
+
+fn managed_agent_stack_terminal_response_wire(
+    receipt: &paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentStackTerminalReceiptV1,
+) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    let wire = receipt.canonical_wire();
+    if wire.is_empty() || wire.len() > MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES {
+        return Err(RuntimeControlRequestError::Internal(
+            RuntimeBootstrapEndpointError::InvalidStartedState,
+        ));
+    }
+    Ok(wire.into())
+}
+
+fn managed_model_agent_stack_terminal_response_wire(
+    receipt: &paraegox_runtime_contracts::managed_model_agent_stack_plan::ManagedModelAgentStackTerminalReceiptV1,
+) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    let wire = receipt.canonical_wire();
+    if wire.is_empty() || wire.len() > MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES {
+        return Err(RuntimeControlRequestError::Internal(
+            RuntimeBootstrapEndpointError::InvalidStartedState,
+        ));
+    }
+    Ok(wire.into())
+}
+
+fn distributed_agent_stack_terminal_response_wire(
+    receipt: &paraegox_runtime_contracts::distributed_agent_stack_plan::DistributedAgentStackTerminalReceiptV1,
+) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    let wire = receipt.canonical_wire();
+    if wire.is_empty() || wire.len() > MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_BYTES {
+        return Err(RuntimeControlRequestError::Internal(
+            RuntimeBootstrapEndpointError::InvalidStartedState,
+        ));
+    }
+    Ok(wire.into())
+}
+
+fn distributed_agent_stack_apply_response_wire(
+    outcome: DistributedAgentStackApplyOutcome,
+) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    match outcome {
+        DistributedAgentStackApplyOutcome::Committed(receipt)
+        | DistributedAgentStackApplyOutcome::Replayed(receipt) => {
+            distributed_agent_stack_terminal_response_wire(&receipt)
+        }
+        DistributedAgentStackApplyOutcome::CommittedHandleUnavailable(_) => {
+            // The caller retains the durable Ready owner before classifying
+            // this outcome. Do not encode terminal success; an exact
+            // authenticated replay owns the bounded publication retry.
+            Err(RuntimeControlRequestError::Unavailable)
+        }
+        DistributedAgentStackApplyOutcome::CommittedOwnerRestartRequired => {
+            // The cutover owner is durable and must remain installed for
+            // ordered shutdown, but it cannot serve another request in this
+            // process. Exit the service loop so restart recovery owns it.
+            Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::DistributedAgentStackRestartRequired,
+            ))
+        }
+    }
+}
+
+fn map_managed_fabric_error(error: ManagedFabricRuntimeError) -> RuntimeControlRequestError {
+    if error.is_request_rejection() {
+        RuntimeControlRequestError::Rejected
+    } else {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedFabric(error))
+    }
+}
+
+fn map_managed_agent_stack_error(
+    error: ManagedAgentStackRuntimeError,
+) -> RuntimeControlRequestError {
+    if error.is_request_rejection() {
+        RuntimeControlRequestError::Rejected
+    } else {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedAgentStack(
+            error,
+        ))
+    }
+}
+
+fn map_managed_model_agent_stack_error(
+    error: ManagedModelAgentStackRuntimeError,
+) -> RuntimeControlRequestError {
+    if error.is_request_rejection() {
+        RuntimeControlRequestError::Rejected
+    } else {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedModelAgentStack(
+            error,
+        ))
+    }
+}
+
+fn map_distributed_agent_stack_error(
+    error: DistributedAgentStackRuntimeError,
+) -> RuntimeControlRequestError {
+    if matches!(
+        &error,
+        DistributedAgentStackRuntimeError::HandlePublicationPending
+    ) {
+        RuntimeControlRequestError::Unavailable
+    } else if error.is_request_rejection() {
+        RuntimeControlRequestError::Rejected
+    } else {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::DistributedAgentStack(
+            error,
+        ))
+    }
 }
 
 impl<Store> StartedRuntimeBootstrapService<Store>
@@ -1080,81 +2421,649 @@ pub(crate) fn run_runtime_bootstrap_process(
     expected_store_instance_id: [u8; 32],
     compiled: RuntimeCompiledInstallationFactsV1,
     provisioning: RuntimeProvisioningV1,
+    dependencies: RuntimeManagedFabricServiceDependenciesV1,
 ) -> Result<(), RuntimeBootstrapEndpointError> {
+    if ManagedFabricStore::cutover_present(state_directory)? {
+        // Build the executor before constructing any managed owner so an
+        // executor startup failure cannot strand an owner that would require
+        // asynchronous shutdown.
+        let runtime = build_managed_fabric_owner_runtime()?;
+        let started = StartedManagedFabricService::try_start(
+            state_directory,
+            expected_store_instance_id,
+            compiled,
+            provisioning,
+            dependencies,
+        )?;
+        let service_result = runtime.block_on(serve_managed_fabric_until(
+            started,
+            runtime_shutdown_signal(),
+        ));
+        drop(runtime);
+        return service_result;
+    }
     let store = RuntimeStore::open(
         state_directory,
         expected_store_instance_id,
         provisioning.owner_target_fingerprint(),
     )?;
     let started = StartedRuntimeBootstrapService::try_start(store, compiled, provisioning)?;
-    let bound = started.bind()?;
+    // The local listener is the last startup resource: if the executor cannot
+    // be built there is no socket guard whose cleanup would otherwise occur
+    // only through Drop.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
         .build()
         .map_err(|_| RuntimeBootstrapEndpointError::Runtime)?;
+    let bound = started.bind()?;
     let service_result = runtime.block_on(bound.serve_until(runtime_shutdown_signal()));
     drop(runtime);
     service_result
 }
 
+/// Runs the explicit DeveloperLocal endpoint.  A fresh store is served in
+/// legacy read-only mode first so Deployment can obtain a real authenticated
+/// PXBR.  Only a fully decoded, authenticated, channel-bound, and manifest-pin
+/// exact PXFB can consume that legacy owner and publish the one-way PXMS
+/// marker; the listener and socket identity remain unchanged across cutover.
+pub(crate) async fn serve_runtime_developer_local_until<F, R>(
+    state_directory: &Path,
+    expected_store_instance_id: [u8; 32],
+    compiled: RuntimeCompiledInstallationFactsV1,
+    provisioning: RuntimeProvisioningV1,
+    dependencies: RuntimeManagedFabricServiceDependenciesV1,
+    shutdown: F,
+    ready: R,
+) -> Result<(), RuntimeBootstrapEndpointError>
+where
+    F: Future<Output = io::Result<()>>,
+    R: FnOnce(
+        ReferenceChannelBindingV1,
+        RuntimeAgentHandleBroker,
+    ) -> Result<(), RuntimeBootstrapEndpointError>,
+{
+    if ManagedFabricStore::cutover_present_developer_local(state_directory)? {
+        let started = StartedManagedFabricService::try_start_developer_local(
+            state_directory,
+            expected_store_instance_id,
+            compiled,
+            provisioning,
+            dependencies,
+        )?;
+        return serve_managed_fabric_until_with_ready(started, shutdown, ready).await;
+    }
+    let store = RuntimeStore::open_developer_local(
+        state_directory,
+        expected_store_instance_id,
+        provisioning.owner_target_fingerprint(),
+    )?;
+    let started = StartedRuntimeBootstrapService::try_start(store, compiled, provisioning)?;
+    serve_developer_legacy_cutover_until(
+        started,
+        state_directory,
+        expected_store_instance_id,
+        dependencies,
+        shutdown,
+        ready,
+    )
+    .await
+}
+
+enum DeveloperLocalControlState {
+    Legacy(Option<Box<RuntimeControlService<RuntimeStore>>>),
+    Managed(Box<ManagedFabricControlService>),
+}
+
+async fn serve_developer_legacy_cutover_until<F, R>(
+    started: StartedRuntimeBootstrapService<RuntimeStore>,
+    state_directory: &Path,
+    expected_store_instance_id: [u8; 32],
+    dependencies: RuntimeManagedFabricServiceDependenciesV1,
+    shutdown: F,
+    ready: R,
+) -> Result<(), RuntimeBootstrapEndpointError>
+where
+    F: Future<Output = io::Result<()>>,
+    R: FnOnce(
+        ReferenceChannelBindingV1,
+        RuntimeAgentHandleBroker,
+    ) -> Result<(), RuntimeBootstrapEndpointError>,
+{
+    let (standard, guard) = bind_control_socket(&started.provisioning)?;
+    let channel = match live_runtime_channel(&started.provisioning, &guard) {
+        Ok(channel) => channel,
+        Err(error) => {
+            drop(standard);
+            let cleanup_result = guard.cleanup();
+            return aggregate_runtime_service_failures(Err(error), Ok(()), Ok(()), cleanup_result);
+        }
+    };
+    let legacy = match started.into_control_service(channel) {
+        Ok(legacy) => legacy,
+        Err(error) => {
+            drop(standard);
+            let cleanup_result = guard.cleanup();
+            return aggregate_runtime_service_failures(Err(error), Ok(()), Ok(()), cleanup_result);
+        }
+    };
+    let handle_broker = RuntimeAgentHandleBroker::default();
+    let listener = match UnixListener::from_std(standard) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let primary = RuntimeBootstrapEndpointError::Socket(error.kind());
+            let cleanup_result = guard.cleanup();
+            return aggregate_runtime_service_failures(
+                Err(primary),
+                Ok(()),
+                Ok(()),
+                cleanup_result,
+            );
+        }
+    };
+    // A configured restricted transport listener is part of DeveloperLocal
+    // endpoint readiness, even while the UDS owner is still in legacy PXBR
+    // mode. Until authenticated PXFB cutover completes, every remote request
+    // receives only Fabric's fixed generic rejection and cannot reach a
+    // mutation owner. The same listener/session and receiver are retained
+    // across cutover; no endpoint generation is reopened or substituted.
+    let mut restricted = match dependencies.restricted_runtime_apply_endpoint.clone() {
+        Some(endpoint_dependencies) => {
+            match RunningRestrictedRuntimeApplyEndpointV1::start(
+                endpoint_dependencies,
+                &legacy.provisioning,
+            )
+            .await
+            {
+                Ok(endpoint) => Some(endpoint),
+                Err(error) => {
+                    drop(listener);
+                    let cleanup_result = guard.cleanup();
+                    return aggregate_runtime_service_failures(
+                        Err(error),
+                        Ok(()),
+                        Ok(()),
+                        cleanup_result,
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    if let Err(error) = ready(channel, handle_broker.clone()) {
+        drop(listener);
+        let cleanup_result = guard.cleanup();
+        let restricted_shutdown_result = match restricted.take() {
+            Some(endpoint) => endpoint.shutdown().await,
+            None => Ok(()),
+        };
+        return aggregate_runtime_service_failures(
+            Err(error),
+            Ok(()),
+            restricted_shutdown_result,
+            cleanup_result,
+        );
+    }
+    let mut control = DeveloperLocalControlState::Legacy(Some(Box::new(legacy)));
+    let mut shutdown = Box::pin(shutdown);
+    let service_result = 'service: loop {
+        let accepted = if let Some(restricted) = restricted.as_mut() {
+            tokio::select! {
+                biased;
+                result = &mut shutdown => break result
+                    .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind())),
+                result = listener.accept() => result,
+                inbound = restricted.receiver.recv() => {
+                    let Some(inbound) = inbound else {
+                        break Err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply(
+                            RestrictedRuntimeApplyErrorV1::EndpointWorkerFailed,
+                        ));
+                    };
+                    let response = match &mut control {
+                        DeveloperLocalControlState::Managed(managed) => managed
+                            .handle_restricted_distributed_agent_stack_apply_v1(
+                                inbound.canonical_request(),
+                                &restricted.expected_carrier,
+                            )
+                            .await,
+                        DeveloperLocalControlState::Legacy(_) => {
+                            Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)
+                        }
+                    };
+                    match response {
+                        Ok(response) => {
+                            if let Err(error) = inbound.respond(response.into_vec()) {
+                                break Err(
+                                    RuntimeBootstrapEndpointError::
+                                        RestrictedRuntimeApplyResponseHandoff(error),
+                                );
+                            }
+                        }
+                        Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected) => {
+                            // Before PXFB cutover this is the only possible
+                            // outcome. Dropping the unanswered request exposes
+                            // no legacy state and produces Fabric's fixed body.
+                            drop(inbound);
+                        }
+                        Err(RuntimeRestrictedRemoteApplyErrorV1::Unavailable) => {
+                            // Keep the committed live owner installed so the
+                            // same authenticated request can retry publication.
+                            drop(inbound);
+                        }
+                        Err(error @ RuntimeRestrictedRemoteApplyErrorV1::Internal) => {
+                            drop(inbound);
+                            break Err(
+                                RuntimeBootstrapEndpointError::RestrictedRuntimeApplyOwner(error),
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                result = &mut shutdown => break result
+                    .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind())),
+                result = listener.accept() => result,
+            }
+        };
+        let (mut stream, _) = match accepted {
+            Ok(value) => value,
+            Err(error) => break Err(RuntimeBootstrapEndpointError::Socket(error.kind())),
+        };
+        let (expected_uid, expected_gid, expected_channel) = match &control {
+            DeveloperLocalControlState::Legacy(Some(legacy)) => (
+                legacy.provisioning.controller_uid(),
+                legacy.provisioning.controller_gid(),
+                legacy.channel,
+            ),
+            DeveloperLocalControlState::Managed(managed) => (
+                managed.provisioning.controller_uid(),
+                managed.provisioning.controller_gid(),
+                managed.channel,
+            ),
+            DeveloperLocalControlState::Legacy(None) => {
+                break Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+            }
+        };
+        if !peer_is_authorized(&stream, expected_uid, expected_gid) {
+            continue;
+        }
+        let live_channel = match live_runtime_channel_from_state(&control, &guard) {
+            Ok(live) if live == expected_channel => live,
+            Ok(_) => break Err(RuntimeBootstrapEndpointError::SocketIdentityChanged),
+            Err(error) => break Err(error),
+        };
+        let request =
+            match read_bounded_frame(&mut stream, MAX_CONTROL_REQUEST_BYTES, DEFAULT_IO_TIMEOUT)
+                .await
+            {
+                Ok(request) => request,
+                Err(()) => continue,
+            };
+
+        let response = match &mut control {
+            DeveloperLocalControlState::Legacy(slot) => {
+                let legacy = match slot.as_mut() {
+                    Some(legacy) => legacy,
+                    None => {
+                        break 'service Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+                    }
+                };
+                if request.starts_with(MANAGED_BOOTSTRAP_REQUEST_MAGIC) {
+                    if prevalidate_developer_managed_cutover_request(legacy, &request, live_channel)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let legacy = match slot.take() {
+                        Some(legacy) => legacy,
+                        None => {
+                            break 'service Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+                        }
+                    };
+                    let RuntimeControlService {
+                        apply,
+                        compiled,
+                        provisioning,
+                        channel,
+                        ..
+                    } = *legacy;
+                    let legacy_store = match apply.into_developer_managed_cutover_store() {
+                        Ok(store) => store,
+                        Err(error) => {
+                            break 'service Err(RuntimeBootstrapEndpointError::Apply(error));
+                        }
+                    };
+                    let started =
+                        match StartedManagedFabricService::try_cutover_developer_local_from_store(
+                            state_directory,
+                            expected_store_instance_id,
+                            compiled,
+                            provisioning,
+                            legacy_store,
+                            handle_broker.clone(),
+                            dependencies.clone(),
+                        ) {
+                            Ok(started) => started,
+                            Err(error) => break 'service Err(error),
+                        };
+                    let mut managed = match recover_managed_control_for_existing_channel(
+                        started, channel,
+                    )
+                    .await
+                    {
+                        Ok(managed) => managed,
+                        Err(error) => break 'service Err(error),
+                    };
+                    let response = managed.handle_request(&request, live_channel).await;
+                    control = DeveloperLocalControlState::Managed(Box::new(managed));
+                    response
+                } else if request.starts_with(APPLY_REQUEST_MAGIC) {
+                    // DeveloperLocal admits no legacy PXAR-v5 mutation: the
+                    // sole fresh transition is authenticated PXFB→PXMS.
+                    Err(RuntimeControlRequestError::Rejected)
+                } else {
+                    legacy
+                        .handle_request(&request, live_channel)
+                        .and_then(|response| response.ok_or(RuntimeControlRequestError::Rejected))
+                }
+            }
+            DeveloperLocalControlState::Managed(managed) => {
+                managed.handle_request(&request, live_channel).await
+            }
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(RuntimeControlRequestError::Rejected)
+            | Err(RuntimeControlRequestError::Unavailable) => {
+                continue;
+            }
+            Err(RuntimeControlRequestError::Internal(error)) => break Err(error),
+        };
+        let _ = write_bounded_frame(
+            &mut stream,
+            &response,
+            MAX_CONTROL_RESPONSE_BYTES,
+            DEFAULT_IO_TIMEOUT,
+        )
+        .await;
+    };
+    drop(listener);
+    let cleanup_result = guard.cleanup();
+    let restricted_shutdown_result = match restricted.take() {
+        Some(endpoint) => endpoint.shutdown().await,
+        None => Ok(()),
+    };
+    let managed_shutdown = match &mut control {
+        DeveloperLocalControlState::Managed(managed) => {
+            shutdown_managed_successor_chain(
+                &mut managed.distributed,
+                &mut managed.model_stack,
+                &mut managed.stack,
+                &mut managed.core,
+            )
+            .await
+        }
+        DeveloperLocalControlState::Legacy(_) => Ok(()),
+    };
+    aggregate_runtime_service_failures(
+        service_result,
+        managed_shutdown,
+        restricted_shutdown_result,
+        cleanup_result,
+    )
+}
+
+fn live_runtime_channel_from_state(
+    control: &DeveloperLocalControlState,
+    guard: &SocketGuard,
+) -> Result<ReferenceChannelBindingV1, RuntimeBootstrapEndpointError> {
+    match control {
+        DeveloperLocalControlState::Legacy(Some(legacy)) => {
+            live_runtime_channel(&legacy.provisioning, guard)
+        }
+        DeveloperLocalControlState::Managed(managed) => {
+            live_runtime_channel(&managed.provisioning, guard)
+        }
+        DeveloperLocalControlState::Legacy(None) => {
+            Err(RuntimeBootstrapEndpointError::InvalidStartedState)
+        }
+    }
+}
+
+fn prevalidate_developer_managed_cutover_request(
+    legacy: &RuntimeControlService<RuntimeStore>,
+    frame: &[u8],
+    live_channel: ReferenceChannelBindingV1,
+) -> Result<(), RuntimeControlRequestError> {
+    if live_channel != legacy.channel
+        || frame.is_empty()
+        || frame.len() > MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES
+    {
+        return Err(RuntimeControlRequestError::Rejected);
+    }
+    let request = ManagedServingBootstrapRequestV1::decode(frame)
+        .map_err(|_| RuntimeControlRequestError::Rejected)?;
+    authenticate_managed_serving_request(&legacy.provisioning, &request, legacy.channel)?;
+    let snapshot = legacy.apply.snapshot();
+    let installation =
+        verify_startup_installation(snapshot, legacy.provisioning.target(), legacy.compiled)
+            .map_err(RuntimeControlRequestError::Internal)?;
+    validate_snapshot_pins(&legacy.provisioning, snapshot)
+        .map_err(RuntimeControlRequestError::Internal)?;
+    let manifest = installation.immutable_manifest_ingress().map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::Installation(error))
+    })?;
+    validate_startup_durable_control_state(
+        snapshot,
+        &manifest,
+        legacy.compiled,
+        &legacy.provisioning,
+    )
+    .map_err(RuntimeControlRequestError::Internal)?;
+    let projection = ManagedFabricManifestProjectionV1::try_from_verified_legacy_manifest(
+        &manifest,
+    )
+    .map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedFabricContract(
+            error,
+        ))
+    })?;
+    if request.target() != legacy.provisioning.target()
+        || request.expected_runtime_store_instance_id() != *snapshot.store_instance_id()
+        || request.projection() != &projection
+        || request.channel() != legacy.channel
+    {
+        return Err(RuntimeControlRequestError::Rejected);
+    }
+    Ok(())
+}
+
+async fn recover_managed_control_for_existing_channel(
+    started: StartedManagedFabricService,
+    channel: ReferenceChannelBindingV1,
+) -> Result<ManagedFabricControlService, RuntimeBootstrapEndpointError> {
+    let StartedManagedFabricService {
+        mut core,
+        mut stack,
+        stack_projection,
+        mut model_stack,
+        model_stack_projection,
+        mut distributed,
+        distributed_projection,
+        handle_broker,
+        state_directory,
+        provisioning,
+        dependencies,
+    } = started;
+    let recovery_result = async {
+        if let Some(distributed) = distributed.as_mut() {
+            distributed
+                .recover(&mut core)
+                .await
+                .map_err(RuntimeBootstrapEndpointError::DistributedAgentStack)?;
+        } else if let Some(model_stack) = model_stack.as_mut() {
+            if model_stack.requires_predecessor_recovery() {
+                core.recover().await?;
+            }
+            model_stack
+                .recover(&mut core)
+                .await
+                .map_err(RuntimeBootstrapEndpointError::ManagedModelAgentStack)?;
+        } else {
+            if stack
+                .as_ref()
+                .is_none_or(ManagedAgentStackRuntimeCore::requires_predecessor_recovery)
+            {
+                core.recover().await?;
+            }
+            if let Some(stack) = stack.as_mut() {
+                stack
+                    .recover(&mut core)
+                    .await
+                    .map_err(RuntimeBootstrapEndpointError::ManagedAgentStack)?;
+            }
+        }
+        Ok::<(), RuntimeBootstrapEndpointError>(())
+    }
+    .await;
+    if let Err(error) = recovery_result {
+        let owner_shutdown = shutdown_managed_successor_chain(
+            &mut distributed,
+            &mut model_stack,
+            &mut stack,
+            &mut core,
+        )
+        .await;
+        let failure =
+            aggregate_runtime_service_failures(Err(error), owner_shutdown, Ok(()), Ok(()))
+                .expect_err("the primary recovery failure cannot aggregate to success");
+        return Err(failure);
+    }
+    Ok(ManagedFabricControlService {
+        core,
+        stack,
+        stack_projection,
+        model_stack,
+        model_stack_projection,
+        distributed,
+        distributed_projection,
+        handle_broker,
+        state_directory,
+        provisioning,
+        channel,
+        dependencies,
+    })
+}
+
+async fn shutdown_managed_successor_chain(
+    distributed: &mut Option<DistributedAgentStackRuntimeCore>,
+    model_stack: &mut Option<ManagedModelAgentStackRuntimeCore>,
+    stack: &mut Option<ManagedAgentStackRuntimeCore>,
+    core: &mut ManagedFabricRuntimeCore,
+) -> Result<(), RuntimeBootstrapEndpointError> {
+    if let Some(model_stack) = model_stack.as_mut() {
+        // The A2 owner is the dependency-order authority. In particular, an
+        // uncertain Agent retirement forbids touching either Model or Fabric.
+        // Do not let the outer generic cleanup path stop Fabric after that
+        // fail-closed decision.
+        model_stack
+            .shutdown(core)
+            .await
+            .map_err(RuntimeBootstrapEndpointError::ManagedModelAgentStack)?;
+        return core
+            .shutdown()
+            .await
+            .map_err(RuntimeBootstrapEndpointError::ManagedFabric);
+    }
+    if let Some(distributed) = distributed.as_mut() {
+        distributed
+            .shutdown()
+            .await
+            .map_err(RuntimeBootstrapEndpointError::DistributedAgentStack)?;
+    }
+    if let Some(stack) = stack.as_mut() {
+        stack
+            .shutdown(core)
+            .await
+            .map_err(RuntimeBootstrapEndpointError::ManagedAgentStack)?;
+    }
+    core.shutdown()
+        .await
+        .map_err(RuntimeBootstrapEndpointError::ManagedFabric)
+}
+
+#[derive(Default)]
+struct RuntimeBootstrapFailureReducerV1 {
+    failures: Vec<RuntimeBootstrapFailureV1>,
+}
+
+impl RuntimeBootstrapFailureReducerV1 {
+    fn record_result(
+        &mut self,
+        stage: RuntimeBootstrapFailureStageV1,
+        result: Result<(), RuntimeBootstrapEndpointError>,
+    ) {
+        if let Err(error) = result {
+            self.record_error(stage, error);
+        }
+    }
+
+    fn record_error(
+        &mut self,
+        stage: RuntimeBootstrapFailureStageV1,
+        error: RuntimeBootstrapEndpointError,
+    ) {
+        match error {
+            RuntimeBootstrapEndpointError::StagedFailures(failures) => {
+                self.failures.extend(failures.into_failures().into_vec());
+            }
+            error => self.failures.push(RuntimeBootstrapFailureV1 {
+                stage,
+                error: Box::new(error),
+            }),
+        }
+    }
+
+    fn finish(mut self) -> Result<(), RuntimeBootstrapEndpointError> {
+        if self.failures.is_empty() {
+            Ok(())
+        } else {
+            self.failures.sort_by_key(|failure| failure.stage.order());
+            Err(RuntimeBootstrapEndpointError::StagedFailures(
+                RuntimeBootstrapFailureSetV1 {
+                    failures: self.failures.into_boxed_slice(),
+                },
+            ))
+        }
+    }
+}
+
+fn aggregate_runtime_service_failures(
+    service_result: Result<(), RuntimeBootstrapEndpointError>,
+    owner_shutdown: Result<(), RuntimeBootstrapEndpointError>,
+    restricted_shutdown: Result<(), RuntimeBootstrapEndpointError>,
+    local_cleanup: Result<(), RuntimeBootstrapEndpointError>,
+) -> Result<(), RuntimeBootstrapEndpointError> {
+    let mut failures = RuntimeBootstrapFailureReducerV1::default();
+    failures.record_result(RuntimeBootstrapFailureStageV1::Primary, service_result);
+    failures.record_result(RuntimeBootstrapFailureStageV1::Successor, owner_shutdown);
+    failures.record_result(
+        RuntimeBootstrapFailureStageV1::RestrictedEndpoint,
+        restricted_shutdown,
+    );
+    failures.record_result(
+        RuntimeBootstrapFailureStageV1::LocalSocketCleanup,
+        local_cleanup,
+    );
+    failures.finish()
+}
+
 impl<Store: RuntimeBootstrapStore> StartedRuntimeBootstrapService<Store> {
     fn bind(self) -> Result<BoundRuntimeBootstrapService<Store>, RuntimeBootstrapEndpointError> {
-        self.provisioning.validate_runtime_credentials()?;
-        let directory = open_socket_directory(
-            self.provisioning
-                .socket_path()
-                .parent()
-                .ok_or(RuntimeBootstrapEndpointError::InvalidProvisioning)?,
-            self.provisioning.runtime_uid(),
-            self.provisioning.controller_gid(),
-        )?;
-        remove_stale_socket_if_present(&directory, self.provisioning.socket_path())?;
-        let standard = StdUnixListener::bind(self.provisioning.socket_path())
-            .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
-        let identity = socket_identity(self.provisioning.socket_path())?;
-        let guard = SocketGuard {
-            path: self.provisioning.socket_path().to_path_buf(),
-            directory,
-            identity,
-        };
-        let setup = (|| {
-            chown(
-                self.provisioning.socket_path(),
-                None,
-                Some(Gid::from_raw(self.provisioning.controller_gid())),
-            )
-            .map_err(nix_socket_error)?;
-            fs::set_permissions(
-                self.provisioning.socket_path(),
-                fs::Permissions::from_mode(CONTROL_SOCKET_MODE),
-            )
-            .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
-            let metadata = fs::symlink_metadata(self.provisioning.socket_path())
-                .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
-            validate_socket_metadata(
-                &metadata,
-                self.provisioning.runtime_uid(),
-                self.provisioning.controller_gid(),
-            )?;
-            if !identity.matches(&metadata) {
-                return Err(RuntimeBootstrapEndpointError::SocketIdentityChanged);
-            }
-            guard.validate_directory_identity()?;
-            guard
-                .directory
-                .file
-                .sync_all()
-                .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
-            standard
-                .set_nonblocking(true)
-                .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))
-        })();
-        if let Err(error) = setup {
-            drop(standard);
-            let _ = guard.cleanup();
-            return Err(error);
-        }
+        let (standard, guard) = bind_control_socket(&self.provisioning)?;
 
         Ok(BoundRuntimeBootstrapService {
             started: self,
@@ -1163,6 +3072,73 @@ impl<Store: RuntimeBootstrapStore> StartedRuntimeBootstrapService<Store> {
             io_timeout: DEFAULT_IO_TIMEOUT,
         })
     }
+}
+
+fn bind_control_socket(
+    provisioning: &RuntimeProvisioningV1,
+) -> Result<(StdUnixListener, SocketGuard), RuntimeBootstrapEndpointError> {
+    provisioning.validate_runtime_credentials()?;
+    let directory = open_socket_directory(
+        provisioning
+            .socket_path()
+            .parent()
+            .ok_or(RuntimeBootstrapEndpointError::InvalidProvisioning)?,
+        provisioning.runtime_uid(),
+        provisioning.controller_gid(),
+        provisioning.socket_directory_mode(),
+        provisioning.socket_mode(),
+    )?;
+    remove_stale_socket_if_present(&directory, provisioning.socket_path())?;
+    let standard = StdUnixListener::bind(provisioning.socket_path())
+        .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
+    let identity = socket_identity(provisioning.socket_path())?;
+    let guard = SocketGuard {
+        path: provisioning.socket_path().to_path_buf(),
+        directory,
+        identity,
+    };
+    let setup = (|| {
+        chown(
+            provisioning.socket_path(),
+            None,
+            Some(Gid::from_raw(provisioning.controller_gid())),
+        )
+        .map_err(nix_socket_error)?;
+        fs::set_permissions(
+            provisioning.socket_path(),
+            fs::Permissions::from_mode(provisioning.socket_mode()),
+        )
+        .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
+        let metadata = fs::symlink_metadata(provisioning.socket_path())
+            .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
+        validate_socket_metadata(
+            &metadata,
+            provisioning.runtime_uid(),
+            provisioning.controller_gid(),
+            provisioning.socket_mode(),
+        )?;
+        if !identity.matches(&metadata) {
+            return Err(RuntimeBootstrapEndpointError::SocketIdentityChanged);
+        }
+        guard.validate_directory_identity()?;
+        guard
+            .directory
+            .file
+            .sync_all()
+            .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
+        standard
+            .set_nonblocking(true)
+            .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))
+    })();
+    if let Err(error) = setup {
+        drop(standard);
+        let cleanup_result = guard.cleanup();
+        let failure =
+            aggregate_runtime_service_failures(Err(error), Ok(()), Ok(()), cleanup_result)
+                .expect_err("the primary socket setup failure cannot aggregate to success");
+        return Err(failure);
+    }
+    Ok((standard, guard))
 }
 
 struct BoundRuntimeBootstrapService<Store> {
@@ -1186,10 +3162,45 @@ where
             guard,
             io_timeout,
         } = self;
-        let channel = live_runtime_channel(&started.provisioning, &guard)?;
-        let mut control = started.into_control_service(channel)?;
-        let listener = UnixListener::from_std(standard)
-            .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
+        let channel = match live_runtime_channel(&started.provisioning, &guard) {
+            Ok(channel) => channel,
+            Err(error) => {
+                drop(standard);
+                let cleanup_result = guard.cleanup();
+                return aggregate_runtime_service_failures(
+                    Err(error),
+                    Ok(()),
+                    Ok(()),
+                    cleanup_result,
+                );
+            }
+        };
+        let mut control = match started.into_control_service(channel) {
+            Ok(control) => control,
+            Err(error) => {
+                drop(standard);
+                let cleanup_result = guard.cleanup();
+                return aggregate_runtime_service_failures(
+                    Err(error),
+                    Ok(()),
+                    Ok(()),
+                    cleanup_result,
+                );
+            }
+        };
+        let listener = match UnixListener::from_std(standard) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let primary = RuntimeBootstrapEndpointError::Socket(error.kind());
+                let cleanup_result = guard.cleanup();
+                return aggregate_runtime_service_failures(
+                    Err(primary),
+                    Ok(()),
+                    Ok(()),
+                    cleanup_result,
+                );
+            }
+        };
         let mut shutdown = Box::pin(shutdown);
         let service_result =
             loop {
@@ -1226,7 +3237,9 @@ where
                     };
                 let response = match control.handle_request(&request, live_channel) {
                     Ok(Some(response)) => response,
-                    Ok(None) | Err(RuntimeControlRequestError::Rejected) => continue,
+                    Ok(None)
+                    | Err(RuntimeControlRequestError::Rejected)
+                    | Err(RuntimeControlRequestError::Unavailable) => continue,
                     Err(RuntimeControlRequestError::Internal(error)) => break Err(error),
                 };
                 let _ = write_bounded_frame(
@@ -1239,12 +3252,382 @@ where
             };
         drop(listener);
         let cleanup_result = guard.cleanup();
-        match (service_result, cleanup_result) {
-            (_, Err(error)) => Err(error),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
-        }
+        aggregate_runtime_service_failures(service_result, Ok(()), Ok(()), cleanup_result)
     }
+}
+
+async fn serve_managed_fabric_until<F>(
+    started: StartedManagedFabricService,
+    shutdown: F,
+) -> Result<(), RuntimeBootstrapEndpointError>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    serve_managed_fabric_until_with_ready(started, shutdown, |_, _| Ok(())).await
+}
+
+struct RunningRestrictedRuntimeApplyEndpointV1 {
+    endpoint: RestrictedRuntimeApplyEndpointV1,
+    receiver: RestrictedRuntimeApplyReceiverV1,
+    expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+}
+
+fn validate_restricted_runtime_apply_endpoint_dependencies(
+    dependencies: &RuntimeRestrictedApplyEndpointDependenciesV1,
+    provisioning: &RuntimeProvisioningV1,
+) -> Result<(), RuntimeBootstrapEndpointError> {
+    if !dependencies
+        .endpoint_config
+        .matches_restricted_carrier(&dependencies.expected_carrier)
+    {
+        return Err(RuntimeBootstrapEndpointError::InvalidProvisioning);
+    }
+    validate_restricted_runtime_apply_carrier_pins(provisioning, &dependencies.expected_carrier)
+        .map(|_| ())
+        .map_err(|_| RuntimeBootstrapEndpointError::InvalidProvisioning)
+}
+
+impl RunningRestrictedRuntimeApplyEndpointV1 {
+    async fn start(
+        dependencies: RuntimeRestrictedApplyEndpointDependenciesV1,
+        provisioning: &RuntimeProvisioningV1,
+    ) -> Result<Self, RuntimeBootstrapEndpointError> {
+        validate_restricted_runtime_apply_endpoint_dependencies(&dependencies, provisioning)?;
+        let (endpoint, receiver) =
+            RestrictedRuntimeApplyEndpointV1::start(dependencies.endpoint_config)
+                .await
+                .map_err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply)?;
+        Ok(Self {
+            endpoint,
+            receiver,
+            expected_carrier: dependencies.expected_carrier,
+        })
+    }
+
+    async fn shutdown(self) -> Result<(), RuntimeBootstrapEndpointError> {
+        let Self {
+            endpoint,
+            receiver,
+            expected_carrier: _,
+        } = self;
+        // Closing the sole consumer drops queued responders before endpoint
+        // undeclaration/join, so shutdown cannot leave the worker waiting for
+        // a Runtime owner that has already stopped selecting this receiver.
+        drop(receiver);
+        endpoint
+            .shutdown()
+            .await
+            .map_err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply)
+    }
+}
+
+pub(crate) async fn serve_managed_fabric_until_with_ready<F, R>(
+    started: StartedManagedFabricService,
+    shutdown: F,
+    ready: R,
+) -> Result<(), RuntimeBootstrapEndpointError>
+where
+    F: Future<Output = io::Result<()>>,
+    R: FnOnce(
+        ReferenceChannelBindingV1,
+        RuntimeAgentHandleBroker,
+    ) -> Result<(), RuntimeBootstrapEndpointError>,
+{
+    let StartedManagedFabricService {
+        mut core,
+        mut stack,
+        stack_projection,
+        mut model_stack,
+        model_stack_projection,
+        mut distributed,
+        distributed_projection,
+        handle_broker,
+        state_directory,
+        provisioning,
+        dependencies,
+    } = started;
+
+    // Recovery is the readiness gate. No filesystem entry for the control
+    // listener exists until the durable successor state and any required real
+    // Fabric session have been reconciled successfully.
+    let recovery = async {
+        if let Some(distributed) = distributed.as_mut() {
+            distributed
+                .recover(&mut core)
+                .await
+                .map_err(RuntimeBootstrapEndpointError::DistributedAgentStack)?;
+        } else if let Some(model_stack) = model_stack.as_mut() {
+            if model_stack.requires_predecessor_recovery() {
+                core.recover().await?;
+            }
+            model_stack
+                .recover(&mut core)
+                .await
+                .map_err(RuntimeBootstrapEndpointError::ManagedModelAgentStack)?;
+        } else {
+            if stack
+                .as_ref()
+                .is_none_or(ManagedAgentStackRuntimeCore::requires_predecessor_recovery)
+            {
+                core.recover().await?;
+            }
+            if let Some(stack) = stack.as_mut() {
+                stack
+                    .recover(&mut core)
+                    .await
+                    .map_err(RuntimeBootstrapEndpointError::ManagedAgentStack)?;
+            }
+        }
+        Ok::<(), RuntimeBootstrapEndpointError>(())
+    }
+    .await;
+    if let Err(error) = recovery {
+        let owner_shutdown = shutdown_managed_successor_chain(
+            &mut distributed,
+            &mut model_stack,
+            &mut stack,
+            &mut core,
+        )
+        .await;
+        return aggregate_runtime_service_failures(Err(error), owner_shutdown, Ok(()), Ok(()));
+    }
+    let (standard, guard) = match bind_control_socket(&provisioning) {
+        Ok(bound) => bound,
+        Err(error) => {
+            let owner_shutdown = shutdown_managed_successor_chain(
+                &mut distributed,
+                &mut model_stack,
+                &mut stack,
+                &mut core,
+            )
+            .await;
+            return aggregate_runtime_service_failures(Err(error), owner_shutdown, Ok(()), Ok(()));
+        }
+    };
+    let channel = match live_runtime_channel(&provisioning, &guard) {
+        Ok(channel) => channel,
+        Err(error) => {
+            drop(standard);
+            let cleanup_result = guard.cleanup();
+            let shutdown_result = shutdown_managed_successor_chain(
+                &mut distributed,
+                &mut model_stack,
+                &mut stack,
+                &mut core,
+            )
+            .await;
+            return aggregate_runtime_service_failures(
+                Err(error),
+                shutdown_result,
+                Ok(()),
+                cleanup_result,
+            );
+        }
+    };
+    let mut control = ManagedFabricControlService {
+        core,
+        stack,
+        stack_projection,
+        model_stack,
+        model_stack_projection,
+        distributed,
+        distributed_projection,
+        handle_broker,
+        state_directory,
+        provisioning,
+        channel,
+        dependencies,
+    };
+    let listener = match UnixListener::from_std(standard) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let primary = RuntimeBootstrapEndpointError::Socket(error.kind());
+            let cleanup_result = guard.cleanup();
+            let shutdown_result = shutdown_managed_successor_chain(
+                &mut control.distributed,
+                &mut control.model_stack,
+                &mut control.stack,
+                &mut control.core,
+            )
+            .await;
+            return aggregate_runtime_service_failures(
+                Err(primary),
+                shutdown_result,
+                Ok(()),
+                cleanup_result,
+            );
+        }
+    };
+    let mut restricted = match control
+        .dependencies
+        .restricted_runtime_apply_endpoint
+        .clone()
+    {
+        Some(dependencies) => {
+            match RunningRestrictedRuntimeApplyEndpointV1::start(
+                dependencies,
+                &control.provisioning,
+            )
+            .await
+            {
+                Ok(endpoint) => Some(endpoint),
+                Err(error) => {
+                    drop(listener);
+                    let cleanup_result = guard.cleanup();
+                    let shutdown_result = shutdown_managed_successor_chain(
+                        &mut control.distributed,
+                        &mut control.model_stack,
+                        &mut control.stack,
+                        &mut control.core,
+                    )
+                    .await;
+                    return aggregate_runtime_service_failures(
+                        Err(error),
+                        shutdown_result,
+                        Ok(()),
+                        cleanup_result,
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    if let Err(error) = ready(control.channel, control.handle_broker.clone()) {
+        drop(listener);
+        let cleanup_result = guard.cleanup();
+        let restricted_shutdown_result = match restricted.take() {
+            Some(endpoint) => endpoint.shutdown().await,
+            None => Ok(()),
+        };
+        let shutdown_result = shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await;
+        return aggregate_runtime_service_failures(
+            Err(error),
+            shutdown_result,
+            restricted_shutdown_result,
+            cleanup_result,
+        );
+    }
+    let mut shutdown = Box::pin(shutdown);
+    let service_result = loop {
+        let accepted = if let Some(restricted) = restricted.as_mut() {
+            tokio::select! {
+                biased;
+                result = &mut shutdown => break result
+                    .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind())),
+                result = listener.accept() => result,
+                inbound = restricted.receiver.recv() => {
+                    let Some(inbound) = inbound else {
+                        break Err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply(
+                            RestrictedRuntimeApplyErrorV1::EndpointWorkerFailed,
+                        ));
+                    };
+                    let response = control
+                        .handle_restricted_distributed_agent_stack_apply_v1(
+                            inbound.canonical_request(),
+                            &restricted.expected_carrier,
+                        )
+                        .await;
+                    match response {
+                        Ok(response) => {
+                            if let Err(error) = inbound.respond(response.into_vec()) {
+                                break Err(
+                                    RuntimeBootstrapEndpointError::
+                                        RestrictedRuntimeApplyResponseHandoff(error),
+                                );
+                            }
+                        }
+                        Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected) => {
+                            // Dropping the unanswered request makes Fabric emit
+                            // only its fixed generic remote rejection.
+                            drop(inbound);
+                        }
+                        Err(RuntimeRestrictedRemoteApplyErrorV1::Unavailable) => {
+                            // Preserve the committed live owner for exact
+                            // authenticated replay of the same request.
+                            drop(inbound);
+                        }
+                        Err(error @ RuntimeRestrictedRemoteApplyErrorV1::Internal) => {
+                            drop(inbound);
+                            break Err(
+                                RuntimeBootstrapEndpointError::RestrictedRuntimeApplyOwner(error),
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                result = &mut shutdown => break result
+                    .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind())),
+                result = listener.accept() => result,
+            }
+        };
+        let (mut stream, _) = match accepted {
+            Ok(value) => value,
+            Err(error) => break Err(RuntimeBootstrapEndpointError::Socket(error.kind())),
+        };
+        if !peer_is_authorized(
+            &stream,
+            control.provisioning.controller_uid(),
+            control.provisioning.controller_gid(),
+        ) {
+            continue;
+        }
+        let live_channel = match live_runtime_channel(&control.provisioning, &guard) {
+            Ok(channel) if channel == control.channel => channel,
+            Ok(_) => break Err(RuntimeBootstrapEndpointError::SocketIdentityChanged),
+            Err(error) => break Err(error),
+        };
+        let request =
+            match read_bounded_frame(&mut stream, MAX_CONTROL_REQUEST_BYTES, DEFAULT_IO_TIMEOUT)
+                .await
+            {
+                Ok(request) => request,
+                Err(()) => continue,
+            };
+        let response = match control.handle_request(&request, live_channel).await {
+            Ok(response) => response,
+            Err(RuntimeControlRequestError::Rejected)
+            | Err(RuntimeControlRequestError::Unavailable) => {
+                continue;
+            }
+            Err(RuntimeControlRequestError::Internal(error)) => break Err(error),
+        };
+        let _ = write_bounded_frame(
+            &mut stream,
+            &response,
+            MAX_CONTROL_RESPONSE_BYTES,
+            DEFAULT_IO_TIMEOUT,
+        )
+        .await;
+    };
+    drop(listener);
+    let cleanup_result = guard.cleanup();
+    let restricted_shutdown_result = match restricted.take() {
+        Some(endpoint) => endpoint.shutdown().await,
+        None => Ok(()),
+    };
+    let shutdown_result = shutdown_managed_successor_chain(
+        &mut control.distributed,
+        &mut control.model_stack,
+        &mut control.stack,
+        &mut control.core,
+    )
+    .await;
+    aggregate_runtime_service_failures(
+        service_result,
+        shutdown_result,
+        restricted_shutdown_result,
+        cleanup_result,
+    )
 }
 
 async fn runtime_shutdown_signal() -> io::Result<()> {
@@ -1305,11 +3688,18 @@ fn open_socket_directory(
     path: &Path,
     expected_uid: u32,
     expected_gid: u32,
+    expected_directory_mode: u32,
+    expected_socket_mode: u32,
 ) -> Result<OpenedSocketDirectory, RuntimeBootstrapEndpointError> {
     validate_absolute_directory_path(path)?;
     let before = fs::symlink_metadata(path)
         .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
-    validate_socket_directory_metadata(&before, expected_uid, expected_gid)?;
+    validate_socket_directory_metadata(
+        &before,
+        expected_uid,
+        expected_gid,
+        expected_directory_mode,
+    )?;
     let owned = open(
         path,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
@@ -1320,7 +3710,12 @@ fn open_socket_directory(
     let after = file
         .metadata()
         .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
-    validate_socket_directory_metadata(&after, expected_uid, expected_gid)?;
+    validate_socket_directory_metadata(
+        &after,
+        expected_uid,
+        expected_gid,
+        expected_directory_mode,
+    )?;
     let identity = SocketIdentity::from_metadata(&after);
     if !identity.matches(&before) {
         return Err(RuntimeBootstrapEndpointError::SocketIdentityChanged);
@@ -1331,6 +3726,8 @@ fn open_socket_directory(
         identity,
         expected_uid,
         expected_gid,
+        expected_directory_mode,
+        expected_socket_mode,
     })
 }
 
@@ -1343,11 +3740,12 @@ fn validate_socket_directory_metadata(
     metadata: &Metadata,
     expected_uid: u32,
     expected_gid: u32,
+    expected_mode: u32,
 ) -> Result<(), RuntimeBootstrapEndpointError> {
     if !metadata.is_dir()
         || metadata.uid() != expected_uid
         || metadata.gid() != expected_gid
-        || metadata.mode() & MODE_MASK != CONTROL_SOCKET_DIRECTORY_MODE
+        || metadata.mode() & MODE_MASK != expected_mode
     {
         return Err(RuntimeBootstrapEndpointError::UnsafeSocketDirectory);
     }
@@ -1358,12 +3756,13 @@ fn validate_socket_metadata(
     metadata: &Metadata,
     expected_uid: u32,
     expected_gid: u32,
+    expected_mode: u32,
 ) -> Result<(), RuntimeBootstrapEndpointError> {
     if !metadata.file_type().is_socket()
         || metadata.nlink() != 1
         || metadata.uid() != expected_uid
         || metadata.gid() != expected_gid
-        || metadata.mode() & MODE_MASK != CONTROL_SOCKET_MODE
+        || metadata.mode() & MODE_MASK != expected_mode
     {
         return Err(RuntimeBootstrapEndpointError::UnsafeSocket);
     }
@@ -1401,6 +3800,8 @@ struct OpenedSocketDirectory {
     identity: SocketIdentity,
     expected_uid: u32,
     expected_gid: u32,
+    expected_directory_mode: u32,
+    expected_socket_mode: u32,
 }
 
 struct SocketGuard {
@@ -1422,6 +3823,7 @@ impl SocketGuard {
             &opened,
             self.directory.expected_uid,
             self.directory.expected_gid,
+            self.directory.expected_directory_mode,
         )?;
         if !self.directory.identity.matches(&opened) || !self.directory.identity.matches(&named) {
             return Err(RuntimeBootstrapEndpointError::SocketIdentityChanged);
@@ -1437,6 +3839,7 @@ impl SocketGuard {
             &metadata,
             self.directory.expected_uid,
             self.directory.expected_gid,
+            self.directory.expected_socket_mode,
         )?;
         if !self.identity.matches(&metadata) {
             return Err(RuntimeBootstrapEndpointError::SocketIdentityChanged);
@@ -1472,7 +3875,12 @@ fn remove_stale_socket_if_present(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(RuntimeBootstrapEndpointError::Socket(error.kind())),
     };
-    validate_socket_metadata(&metadata, directory.expected_uid, directory.expected_gid)?;
+    validate_socket_metadata(
+        &metadata,
+        directory.expected_uid,
+        directory.expected_gid,
+        directory.expected_socket_mode,
+    )?;
     match StdUnixStream::connect(path) {
         Ok(stream) => {
             drop(stream);
@@ -1503,7 +3911,12 @@ fn remove_exact_socket(
     }
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| RuntimeBootstrapEndpointError::Socket(error.kind()))?;
-    validate_socket_metadata(&metadata, directory.expected_uid, directory.expected_gid)?;
+    validate_socket_metadata(
+        &metadata,
+        directory.expected_uid,
+        directory.expected_gid,
+        directory.expected_socket_mode,
+    )?;
     if !expected.matches(&metadata) {
         return Err(RuntimeBootstrapEndpointError::SocketIdentityChanged);
     }
@@ -1980,9 +4393,65 @@ enum RuntimeQueryRequestError {
     InvalidSignature,
 }
 
+/// Lifecycle stage attached to every Runtime service failure retained across
+/// startup rollback or shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeBootstrapFailureStageV1 {
+    Primary,
+    Successor,
+    RestrictedEndpoint,
+    LocalSocketCleanup,
+}
+
+impl RuntimeBootstrapFailureStageV1 {
+    const fn order(self) -> u8 {
+        match self {
+            Self::Primary => 0,
+            Self::Successor => 1,
+            Self::RestrictedEndpoint => 2,
+            Self::LocalSocketCleanup => 3,
+        }
+    }
+}
+
+/// One typed lifecycle failure. The boxed error is the explicit recursion
+/// boundary that keeps the endpoint error enum finite and compact even when an
+/// aggregation is itself passed through another cleanup boundary.
+pub(crate) struct RuntimeBootstrapFailureV1 {
+    stage: RuntimeBootstrapFailureStageV1,
+    error: Box<RuntimeBootstrapEndpointError>,
+}
+
+impl fmt::Debug for RuntimeBootstrapFailureV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeBootstrapFailureV1")
+            .field("stage", &self.stage)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+/// Ordered, lossless lifecycle failure set.
+#[derive(Debug)]
+pub(crate) struct RuntimeBootstrapFailureSetV1 {
+    failures: Box<[RuntimeBootstrapFailureV1]>,
+}
+
+impl RuntimeBootstrapFailureSetV1 {
+    pub(crate) fn len(&self) -> usize {
+        self.failures.len()
+    }
+
+    fn into_failures(self) -> Box<[RuntimeBootstrapFailureV1]> {
+        self.failures
+    }
+}
+
 /// Fail-closed Runtime bootstrap startup/service error.
 #[derive(Debug)]
 pub(crate) enum RuntimeBootstrapEndpointError {
+    StagedFailures(RuntimeBootstrapFailureSetV1),
     InvalidProvisioning,
     ProvisioningPinMismatch,
     BuildPinMismatch,
@@ -1999,6 +4468,21 @@ pub(crate) enum RuntimeBootstrapEndpointError {
     ControlContract(ReferenceControlError),
     ControlState(RuntimeControlStateError),
     Apply(RuntimeReferenceApplyError),
+    ManagedFabricContract(ManagedFabricPlanError),
+    ManagedAgentStackContract(ManagedAgentStackPlanError),
+    ManagedModelAgentStackContract(ManagedModelAgentStackPlanError),
+    DistributedAgentStackContract(DistributedAgentStackPlanError),
+    ManagedServingContract(ManagedServingBootstrapError),
+    ManagedFabricState(ManagedFabricStateError),
+    ManagedFabricStore(ManagedFabricStoreError),
+    ManagedFabric(ManagedFabricRuntimeError),
+    ManagedAgentStack(ManagedAgentStackRuntimeError),
+    ManagedModelAgentStack(ManagedModelAgentStackRuntimeError),
+    DistributedAgentStack(DistributedAgentStackRuntimeError),
+    DistributedAgentStackRestartRequired,
+    RestrictedRuntimeApply(RestrictedRuntimeApplyErrorV1),
+    RestrictedRuntimeApplyOwner(RuntimeRestrictedRemoteApplyErrorV1),
+    RestrictedRuntimeApplyResponseHandoff(RestrictedRuntimeApplyRespondErrorV1),
     RestartReassembly(RuntimeRestartReassemblyError),
     StoreOpen(RuntimeStoreOpenError),
     Store(RuntimeStoreError),
@@ -2041,6 +4525,78 @@ impl From<RuntimeStoreError> for RuntimeBootstrapEndpointError {
     }
 }
 
+impl From<ManagedFabricPlanError> for RuntimeBootstrapEndpointError {
+    fn from(error: ManagedFabricPlanError) -> Self {
+        Self::ManagedFabricContract(error)
+    }
+}
+
+impl From<ManagedAgentStackPlanError> for RuntimeBootstrapEndpointError {
+    fn from(error: ManagedAgentStackPlanError) -> Self {
+        Self::ManagedAgentStackContract(error)
+    }
+}
+
+impl From<ManagedModelAgentStackPlanError> for RuntimeBootstrapEndpointError {
+    fn from(error: ManagedModelAgentStackPlanError) -> Self {
+        Self::ManagedModelAgentStackContract(error)
+    }
+}
+
+impl From<DistributedAgentStackPlanError> for RuntimeBootstrapEndpointError {
+    fn from(error: DistributedAgentStackPlanError) -> Self {
+        Self::DistributedAgentStackContract(error)
+    }
+}
+
+impl From<ManagedServingBootstrapError> for RuntimeBootstrapEndpointError {
+    fn from(error: ManagedServingBootstrapError) -> Self {
+        Self::ManagedServingContract(error)
+    }
+}
+
+impl From<ManagedFabricStateError> for RuntimeBootstrapEndpointError {
+    fn from(error: ManagedFabricStateError) -> Self {
+        Self::ManagedFabricState(error)
+    }
+}
+
+impl From<ManagedFabricStoreError> for RuntimeBootstrapEndpointError {
+    fn from(error: ManagedFabricStoreError) -> Self {
+        Self::ManagedFabricStore(error)
+    }
+}
+
+impl From<ManagedFabricRuntimeError> for RuntimeBootstrapEndpointError {
+    fn from(error: ManagedFabricRuntimeError) -> Self {
+        Self::ManagedFabric(error)
+    }
+}
+
+impl From<ManagedAgentStackRuntimeError> for RuntimeBootstrapEndpointError {
+    fn from(error: ManagedAgentStackRuntimeError) -> Self {
+        Self::ManagedAgentStack(error)
+    }
+}
+
+impl From<ManagedModelAgentStackRuntimeError> for RuntimeBootstrapEndpointError {
+    fn from(error: ManagedModelAgentStackRuntimeError) -> Self {
+        Self::ManagedModelAgentStack(error)
+    }
+}
+
+impl From<DistributedAgentStackRuntimeError> for RuntimeBootstrapEndpointError {
+    fn from(error: DistributedAgentStackRuntimeError) -> Self {
+        Self::DistributedAgentStack(error)
+    }
+}
+
+impl From<RestrictedRuntimeApplyErrorV1> for RuntimeBootstrapEndpointError {
+    fn from(error: RestrictedRuntimeApplyErrorV1) -> Self {
+        Self::RestrictedRuntimeApply(error)
+    }
+}
+
 impl From<RuntimeRestartReassemblyError> for RuntimeBootstrapEndpointError {
     fn from(error: RuntimeRestartReassemblyError) -> Self {
         Self::RestartReassembly(error)
@@ -2050,6 +4606,11 @@ impl From<RuntimeRestartReassemblyError> for RuntimeBootstrapEndpointError {
 impl fmt::Display for RuntimeBootstrapEndpointError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StagedFailures(failures) => write!(
+                formatter,
+                "Runtime lifecycle reported {} staged failure(s)",
+                failures.len()
+            ),
             Self::InvalidProvisioning => formatter.write_str("invalid bootstrap provisioning"),
             Self::ProvisioningPinMismatch => {
                 formatter.write_str("bootstrap provisioning does not match journal pins")
@@ -2072,6 +4633,52 @@ impl fmt::Display for RuntimeBootstrapEndpointError {
             Self::ControlContract(error) => write!(formatter, "bootstrap contract: {error}"),
             Self::ControlState(error) => write!(formatter, "Runtime control state: {error:?}"),
             Self::Apply(error) => write!(formatter, "Runtime reference apply: {error:?}"),
+            Self::ManagedFabricContract(error) => {
+                write!(formatter, "managed Fabric contract: {error}")
+            }
+            Self::ManagedAgentStackContract(error) => {
+                write!(formatter, "managed Agent-stack contract: {error}")
+            }
+            Self::ManagedModelAgentStackContract(error) => {
+                write!(formatter, "managed Model+Agent-stack contract: {error}")
+            }
+            Self::DistributedAgentStackContract(error) => {
+                write!(formatter, "distributed Agent-stack contract: {error:?}")
+            }
+            Self::ManagedServingContract(error) => {
+                write!(formatter, "managed serving contract: {error}")
+            }
+            Self::ManagedFabricState(error) => {
+                write!(formatter, "managed Fabric durable state: {error}")
+            }
+            Self::ManagedFabricStore(error) => {
+                write!(formatter, "managed Fabric store: {error}")
+            }
+            Self::ManagedFabric(error) => write!(formatter, "managed Fabric Runtime: {error}"),
+            Self::ManagedAgentStack(error) => {
+                write!(formatter, "managed Agent-stack Runtime: {error}")
+            }
+            Self::ManagedModelAgentStack(error) => {
+                write!(formatter, "managed Model+Agent-stack Runtime: {error}")
+            }
+            Self::DistributedAgentStack(error) => {
+                write!(formatter, "distributed Agent-stack Runtime: {error}")
+            }
+            Self::DistributedAgentStackRestartRequired => {
+                formatter.write_str("distributed Agent-stack owner requires restart recovery")
+            }
+            Self::RestrictedRuntimeApply(error) => {
+                write!(formatter, "restricted Runtime apply transport: {error}")
+            }
+            Self::RestrictedRuntimeApplyOwner(error) => {
+                write!(formatter, "restricted Runtime apply owner: {error}")
+            }
+            Self::RestrictedRuntimeApplyResponseHandoff(error) => {
+                write!(
+                    formatter,
+                    "restricted Runtime apply response handoff: {error}"
+                )
+            }
             Self::RestartReassembly(error) => {
                 write!(formatter, "Runtime restart reassembly: {error:?}")
             }
@@ -2087,20 +4694,90 @@ impl std::error::Error for RuntimeBootstrapEndpointError {}
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::rc::Rc;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
+    fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_offset = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing section start: {start}"));
+        let tail = &source[start_offset..];
+        let end_offset = tail
+            .find(end)
+            .unwrap_or_else(|| panic!("missing section end: {end}"));
+        &tail[..end_offset]
+    }
+
+    use paraegox_agent_contracts::{
+        AgentConversationDeckRunId, AgentConversationRequestId, AgentConversationRequestV1,
+        AgentConversationSessionId, AgentConversationTerminalResultV1, AgentConversationTurnId,
+    };
+    use paraegox_agent_service::DeterministicEchoModelProvider;
+    use paraegox_evidence::{EvidenceOwnerRefV1, EvidenceRetentionPolicyV1, EvidenceStoreEpochV1};
+    use paraegox_fabric::ResolvedRemoteMtlsIdentityFiles;
     use paraegox_kernel::time::BoundedDuration;
+    use paraegox_model::{
+        ModelBackendFuture, ModelBackendIdentityV1, ModelBackendV1, ModelCancellationViewV1,
+        ModelInvocationOutcomeV1, ModelInvocationRequestV1,
+    };
     use paraegox_runtime_contracts::{
         apply::{
             ApplyOperationId, PlanWriterContext, PlanWriterEpoch, PlanWriterRef,
             RuntimeApplyControl, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm,
             TenureProofAuthority, WriterTenureClaim, WriterTenureProof,
         },
-        assignment::InstanceRef,
+        assignment::{BindingId, InstanceRef},
+        distributed_agent_stack_plan::{
+            DistributedAgentStackApplyRequestDraftV1,
+            DistributedAgentStackLocalBindingEvidenceFieldsV1,
+            DistributedAgentStackRestrictedApplyRequestDraftV1,
+            DistributedAgentStackTargetExecutionV1, DistributedAgentStackTerminalAuthClaimV1,
+            DistributedAgentStackTerminalEvidenceFieldsV1,
+            DistributedAgentStackTerminalObservationsV1, DistributedAgentStackTerminalOutcomeV1,
+            DistributedAgentStackTerminalReceiptDraftV1, DistributedAgentStackTerminalReceiptV2,
+            DistributedFabricCredentialRefV1, DistributedFabricObservedTransportProofFieldsV1,
+            DistributedFabricObservedTransportProofV1,
+            DistributedFabricPeerAuthenticationRequirementV1, DistributedFabricPeerIdentityRefV1,
+            DistributedFabricPeerPlanV1, DistributedFabricSessionEpochV1,
+            DistributedFabricTlsEndpointV1, DistributedFabricTopologyV1,
+            DistributedFabricTransportEvidenceRefV1, DistributedFabricTrustAnchorRefV1,
+            DistributedFabricTrustDomainRefV1, RestrictedRuntimeApplyCarrierBindingFieldsV1,
+            RestrictedRuntimeApplyTransportProfileFieldsV1,
+            RestrictedRuntimeApplyTransportProfileV1,
+            distributed_agent_stack_installed_binding_set_digest_v1,
+        },
         execution::{CardDefinitionRef, CardImplementationRef, DomainRef},
         installation::{
             InstalledRuntimeArtifactObservationV1, generate_build_descriptor, generate_manifest,
+        },
+        managed_agent_stack_plan::{
+            ManagedAgentIngressLimitsV1, ManagedAgentPortPlanV1, ManagedAgentProviderProfileV1,
+            ManagedAgentProviderRefV1, ManagedAgentProviderSelectionV1,
+            ManagedAgentSemanticLimitsV1, ManagedAgentServicePlanV1,
+            ManagedAgentStackApplyRequestDraftV1, ManagedAgentStackTargetExecutionV1,
+            ManagedAgentStackTerminalOutcomeV1, ManagedAgentStackTerminalReceiptV1,
+        },
+        managed_fabric_plan::{
+            ManagedFabricApplyRequestDraftV1, ManagedFabricApplyRequestV1,
+            ManagedFabricApplyTerminalOutcomeV1, ManagedFabricApplyTerminalReceiptV1,
+            ManagedFabricListenEndpointV1, ManagedFabricTargetExecutionV1,
+        },
+        managed_model_agent_stack_plan::{
+            ManagedModelAdapterBindingV1, ManagedModelAdapterVersionV1,
+            ManagedModelAgentStackApplyRequestDraftV1, ManagedModelAgentStackTargetExecutionV1,
+            ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptV1,
+            ManagedModelCapabilityIdV1, ManagedModelServicePlanV1,
+        },
+        managed_service::{
+            ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleBudgetsV1,
+            ManagedServiceSpecV1,
+        },
+        managed_serving_bootstrap::{
+            ManagedServingBootstrapRequestDraftV1, ManagedServingBootstrapRequestIdV1,
+            ManagedServingBootstrapResponseV1, ManagedServingReadinessV1,
         },
         provenance::{PlanProvenance, SourcePlanDigest, SourcePlanRef, SourcePlanRevision},
         reference_control::{
@@ -2115,6 +4792,16 @@ mod tests {
     };
 
     use super::*;
+    use crate::distributed_fabric_runtime::{
+        RuntimeFabricCredentialRequirementV1, RuntimeFabricCredentialResolveErrorV2,
+        RuntimeResolvedFabricPeerCredentialV2,
+    };
+    use crate::managed_model_runtime::{
+        RuntimeModelBackendResolveError, RuntimeResolvedModelBackendV1,
+    };
+    use crate::runtime_agent_provider::{
+        RuntimeAgentProviderResolveError, RuntimeResolvedAgentProviderV1,
+    };
     use crate::runtime_control_state::runtime_reference_apply::{
         RuntimeEmptyRetireOwnerPlan, RuntimeOneSourceOwnerPlan, RuntimeReferenceApplyStoreError,
         RuntimeReferenceMaterializationOwnerError,
@@ -2130,6 +4817,10 @@ mod tests {
         StorePinnedBuildIdentity, TerminalOutcome,
     };
     use crate::runtime_provisioning::RuntimeProvisioningInputV1;
+    use crate::runtime_store::{
+        ManagedFabricStore,
+        tests::{TestDirectory, managed_fabric_store_fixture_from_snapshot},
+    };
 
     const TARGET: RuntimeHostId = RuntimeHostId::from_bytes([0x11; 16]);
     const SOURCE_SCOPE: SourceScopeRef = SourceScopeRef::from_bytes([0x21; 16]);
@@ -2147,8 +4838,998 @@ mod tests {
     const STORE_INSTANCE_ID: [u8; 32] = [0x51; 32];
     const CLOCK_DOMAIN: [u8; 16] = [0x52; 16];
 
+    struct DeterministicFixtureResolver;
+
+    impl RuntimeAgentProviderResolverV1 for DeterministicFixtureResolver {
+        fn resolve(
+            &self,
+            selection: ManagedAgentProviderSelectionV1,
+        ) -> Result<RuntimeResolvedAgentProviderV1, RuntimeAgentProviderResolveError> {
+            if selection.profile() != ManagedAgentProviderProfileV1::DeterministicFixture {
+                return Err(RuntimeAgentProviderResolveError::ResolutionFailed);
+            }
+            Ok(RuntimeResolvedAgentProviderV1::new(
+                selection,
+                DeterministicEchoModelProvider::new(),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct EndpointModelBackend {
+        identity: ModelBackendIdentityV1,
+    }
+
+    impl ModelBackendV1 for EndpointModelBackend {
+        fn identity(&self) -> ModelBackendIdentityV1 {
+            self.identity
+        }
+
+        fn invoke(
+            &self,
+            request: ModelInvocationRequestV1,
+            _cancellation: ModelCancellationViewV1,
+        ) -> ModelBackendFuture {
+            let output = format!("endpoint-model: {}", request.prompt()).into_boxed_str();
+            Box::pin(async move { ModelInvocationOutcomeV1::Success(output) })
+        }
+    }
+
+    struct DeterministicModelBackendResolver;
+
+    impl RuntimeModelBackendResolverV1 for DeterministicModelBackendResolver {
+        fn resolve(
+            &self,
+            plan: &ManagedModelServicePlanV1,
+        ) -> Result<RuntimeResolvedModelBackendV1, RuntimeModelBackendResolveError> {
+            let identity = ModelBackendIdentityV1::try_new(
+                *plan.provider().provider_ref().as_bytes(),
+                plan.provider().config_digest(),
+            )
+            .map_err(|_| RuntimeModelBackendResolveError::ResolutionFailed)?;
+            Ok(RuntimeResolvedModelBackendV1::new(
+                *plan,
+                EndpointModelBackend { identity },
+            ))
+        }
+    }
+
+    fn deterministic_fixture_service_dependencies() -> RuntimeManagedFabricServiceDependenciesV1 {
+        RuntimeManagedFabricServiceDependenciesV1::new(
+            Arc::new(DeterministicFixtureResolver),
+            unavailable_model_backend_resolver(),
+            None,
+            None,
+        )
+    }
+
+    fn model_fixture_service_dependencies() -> RuntimeManagedFabricServiceDependenciesV1 {
+        RuntimeManagedFabricServiceDependenciesV1::new(
+            Arc::new(DeterministicFixtureResolver),
+            Arc::new(DeterministicModelBackendResolver),
+            None,
+            None,
+        )
+    }
+
     fn digest(byte: u8) -> Digest32 {
         Digest32::from_bytes([byte; 32])
+    }
+
+    const RESTRICTED_APPLY_ROUTE: &str = "paraegox/runtime/endpoint-stack/restricted/apply";
+    const RESTRICTED_TLS_LISTENER: &str = "tls/192.0.2.10:7447";
+    const RESTRICTED_PROFILE_REF: [u8; 16] = [0xd7; 16];
+    const RESTRICTED_ENDPOINT_REF: [u8; 16] = [0xd6; 16];
+    const RESTRICTED_ENDPOINT_GENERATION: u64 = 1;
+    const RESTRICTED_OPERATION_TIMEOUT_NANOS: u64 = 5_000_000_000;
+
+    fn restricted_transport_profile(
+        route: &str,
+        tls_listener_locator: &str,
+        endpoint_generation: u64,
+        operation_timeout_nanos: u64,
+    ) -> RestrictedRuntimeApplyTransportProfileV1 {
+        RestrictedRuntimeApplyTransportProfileV1::try_new(
+            RestrictedRuntimeApplyTransportProfileFieldsV1 {
+                target: TARGET,
+                endpoint_ref: RESTRICTED_ENDPOINT_REF,
+                endpoint_generation,
+                tls_listener_locator,
+                route,
+                trust_domain_ref: DistributedFabricTrustDomainRefV1::try_from_bytes([0xd9; 16])
+                    .unwrap_or_else(|error| panic!("restricted trust domain rejected: {error}")),
+                trust_anchor_ref: DistributedFabricTrustAnchorRefV1::try_from_bytes([0xda; 16])
+                    .unwrap_or_else(|error| panic!("restricted trust anchor rejected: {error}")),
+                controller_connector_credential_ref:
+                    DistributedFabricCredentialRefV1::try_from_bytes([0xdb; 16]).unwrap_or_else(
+                        |error| panic!("restricted Controller credential rejected: {error}"),
+                    ),
+                runtime_listener_credential_ref: DistributedFabricCredentialRefV1::try_from_bytes(
+                    [0xdc; 16],
+                )
+                .unwrap_or_else(|error| panic!("restricted Runtime credential rejected: {error}")),
+                controller_principal: CONTROLLER_PRINCIPAL,
+                runtime_principal: RUNTIME_PRINCIPAL,
+                operation_timeout_nanos,
+            },
+        )
+        .unwrap_or_else(|error| panic!("restricted transport profile rejected: {error}"))
+    }
+
+    fn restricted_endpoint_config(
+        profile: &RestrictedRuntimeApplyTransportProfileV1,
+        profile_ref: [u8; 16],
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> RestrictedRuntimeApplyEndpointConfigV1 {
+        RestrictedRuntimeApplyEndpointConfigV1::try_from_transport_profile(
+            profile,
+            profile_ref,
+            carrier,
+            PathBuf::from("/tmp/paraegox-restricted-root-ca.pem"),
+            ResolvedRemoteMtlsIdentityFiles::try_new(
+                PathBuf::from("/tmp/paraegox-restricted-runtime.pem"),
+                PathBuf::from("/tmp/paraegox-restricted-runtime.key"),
+            )
+            .unwrap_or_else(|error| panic!("restricted identity files rejected: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("restricted endpoint config rejected: {error}"))
+    }
+
+    fn restricted_carrier_with_profile_digest(
+        profile: &RestrictedRuntimeApplyTransportProfileV1,
+        profile_ref: [u8; 16],
+        profile_digest: Digest32,
+    ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+        let controller_key_fingerprint = ed25519_control_key_fingerprint(
+            SigningKey::from_bytes(&CONTROLLER_SEED)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("restricted Controller fingerprint failed: {error}"));
+        let runtime_response_key_fingerprint = ed25519_control_key_fingerprint(
+            SigningKey::from_bytes(&RESPONSE_SEED)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("restricted Runtime fingerprint failed: {error}"));
+        RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: profile.target(),
+                runtime_principal: profile.runtime_principal(),
+                controller_principal: profile.controller_principal(),
+                endpoint_ref: profile.endpoint_ref(),
+                endpoint_generation: profile.endpoint_generation(),
+                route: profile.route(),
+                controller_request_key: CONTROLLER_KEY_REF,
+                controller_request_key_fingerprint: controller_key_fingerprint,
+                runtime_response_key: RESPONSE_KEY_REF,
+                runtime_response_key_fingerprint,
+                control_transport_profile_ref: profile_ref,
+                control_transport_profile_digest: profile_digest,
+            },
+        )
+        .unwrap_or_else(|error| panic!("restricted expected carrier rejected: {error}"))
+    }
+
+    fn restricted_carrier_for_profile(
+        profile: &RestrictedRuntimeApplyTransportProfileV1,
+        profile_ref: [u8; 16],
+    ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+        restricted_carrier_with_profile_digest(profile, profile_ref, profile.profile_digest())
+    }
+
+    fn restricted_endpoint_dependencies_from_profile(
+        profile: &RestrictedRuntimeApplyTransportProfileV1,
+        profile_ref: [u8; 16],
+    ) -> RuntimeRestrictedApplyEndpointDependenciesV1 {
+        let carrier = restricted_carrier_for_profile(profile, profile_ref);
+        let endpoint_config = restricted_endpoint_config(profile, profile_ref, &carrier);
+        RuntimeRestrictedApplyEndpointDependenciesV1::new(endpoint_config, carrier)
+    }
+
+    fn restricted_endpoint_dependencies(
+        route: &str,
+    ) -> RuntimeRestrictedApplyEndpointDependenciesV1 {
+        let profile = restricted_transport_profile(
+            route,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        restricted_endpoint_dependencies_from_profile(&profile, RESTRICTED_PROFILE_REF)
+    }
+
+    struct FailClosedFabricCredentialResolver;
+
+    impl RuntimeFabricCredentialResolverV2 for FailClosedFabricCredentialResolver {
+        fn resolve(
+            &self,
+            _requirement: &RuntimeFabricCredentialRequirementV1,
+        ) -> Result<RuntimeResolvedFabricPeerCredentialV2, RuntimeFabricCredentialResolveErrorV2>
+        {
+            Err(RuntimeFabricCredentialResolveErrorV2::ResolutionFailed)
+        }
+    }
+
+    fn evidence_store_config(root: PathBuf) -> DistributedAgentStackEvidenceStoreConfigV1 {
+        DistributedAgentStackEvidenceStoreConfigV1::try_new(
+            root,
+            EvidenceStoreEpochV1::try_from_bytes([0xe1; 16])
+                .unwrap_or_else(|error| panic!("Evidence store epoch rejected: {error:?}")),
+            EvidenceRetentionPolicyV1::try_new(64, 1024 * 1024)
+                .unwrap_or_else(|error| panic!("Evidence retention rejected: {error:?}")),
+            EvidenceOwnerRefV1::try_from_bytes([0xe2; 16])
+                .unwrap_or_else(|error| panic!("Evidence owner rejected: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("Evidence store config rejected: {error:?}"))
+    }
+
+    fn distributed_service_dependencies(
+        evidence_store_config: DistributedAgentStackEvidenceStoreConfigV1,
+    ) -> (
+        RuntimeManagedFabricServiceDependenciesV1,
+        Arc<dyn RuntimeFabricCredentialResolverV2>,
+        Arc<dyn RuntimeAgentProviderResolverV1>,
+    ) {
+        let fabric_credential_resolver: Arc<dyn RuntimeFabricCredentialResolverV2> =
+            Arc::new(FailClosedFabricCredentialResolver);
+        let agent_provider_resolver = unavailable_provider_resolver();
+        let dependencies = RuntimeManagedFabricServiceDependenciesV1::new(
+            Arc::clone(&agent_provider_resolver),
+            unavailable_model_backend_resolver(),
+            Some(RuntimeDistributedAgentStackDependenciesV1::new(
+                Arc::clone(&fabric_credential_resolver),
+                evidence_store_config,
+            )),
+            None,
+        );
+        (
+            dependencies,
+            fabric_credential_resolver,
+            agent_provider_resolver,
+        )
+    }
+
+    #[test]
+    fn distributed_v2_dependency_is_repeatable_and_debug_redacted() {
+        let evidence_directory = TestSocketDirectory::create();
+        let evidence_root = evidence_directory.path.join("evidence-store");
+        let expected_evidence = evidence_store_config(evidence_root.clone());
+        let expected_epoch = expected_evidence.store_epoch();
+        let expected_retention = expected_evidence.retention_policy();
+        let expected_owner = expected_evidence.owner_ref();
+        let (dependencies, expected_resolver, expected_agent_provider) =
+            distributed_service_dependencies(expected_evidence);
+        let first_cutover = dependencies
+            .distributed_agent_stack_owner_dependencies()
+            .unwrap_or_else(|| panic!("first cutover lost distributed dependencies"));
+        let restart = dependencies
+            .distributed_agent_stack_owner_dependencies()
+            .unwrap_or_else(|| panic!("restart lost distributed dependencies"));
+
+        assert!(Arc::ptr_eq(
+            &expected_resolver,
+            &first_cutover.fabric_credential_resolver
+        ));
+        assert!(Arc::ptr_eq(
+            &first_cutover.fabric_credential_resolver,
+            &restart.fabric_credential_resolver
+        ));
+        assert!(Arc::ptr_eq(
+            &expected_agent_provider,
+            &dependencies.agent_provider_resolver()
+        ));
+        assert_eq!(
+            first_cutover.evidence_store_config.root(),
+            evidence_root.as_path()
+        );
+        assert_eq!(
+            first_cutover.evidence_store_config.store_epoch(),
+            expected_epoch
+        );
+        assert_eq!(
+            first_cutover.evidence_store_config.retention_policy(),
+            expected_retention
+        );
+        assert_eq!(
+            first_cutover.evidence_store_config.owner_ref(),
+            expected_owner
+        );
+
+        let debug = format!("{dependencies:?}");
+        assert!(debug.contains("distributed_agent_stack: true"));
+        assert!(!debug.contains("FailClosedFabricCredentialResolver"));
+        let distributed_debug = format!(
+            "{:?}",
+            dependencies
+                .distributed_agent_stack
+                .as_ref()
+                .unwrap_or_else(|| panic!("configured V2 dependency disappeared"))
+        );
+        assert!(distributed_debug.contains("<injected>"));
+        assert!(distributed_debug.contains("<composition-pinned>"));
+        assert!(!distributed_debug.contains("FailClosedFabricCredentialResolver"));
+        assert!(
+            !distributed_debug.contains(
+                evidence_root
+                    .to_str()
+                    .unwrap_or_else(|| panic!("Evidence fixture root is not UTF-8"))
+            )
+        );
+        assert!(!distributed_debug.contains(&format!("{expected_epoch:?}")));
+        assert!(!distributed_debug.contains(&format!("{expected_retention:?}")));
+        assert!(!distributed_debug.contains(&format!("{expected_owner:?}")));
+        let evidence_debug = format!("{:?}", first_cutover.evidence_store_config);
+        assert!(
+            !evidence_debug.contains(
+                evidence_root
+                    .to_str()
+                    .unwrap_or_else(|| panic!("Evidence fixture root is not UTF-8"))
+            )
+        );
+        assert!(!evidence_debug.contains(&format!("{expected_epoch:?}")));
+        assert!(!evidence_debug.contains(&format!("{expected_owner:?}")));
+
+        let unavailable = RuntimeManagedFabricServiceDependenciesV1::unavailable();
+        let unavailable_distributed = unavailable.distributed_agent_stack_owner_dependencies();
+        let unavailable_resolver = unavailable_distributed
+            .map(|dependencies| Arc::clone(&dependencies.fabric_credential_resolver));
+        let unavailable_evidence =
+            unavailable_distributed.map(|dependencies| dependencies.evidence_store_config.clone());
+        assert!(unavailable_resolver.is_none());
+        assert!(unavailable_evidence.is_none());
+        assert!(unavailable.restricted_runtime_apply_endpoint.is_none());
+        let unresolved_model = managed_model_plan(managed_agent_plan().provider());
+        assert!(matches!(
+            unavailable
+                .model_backend_resolver()
+                .resolve(&unresolved_model),
+            Err(RuntimeModelBackendResolveError::ResolutionFailed)
+        ));
+        let unavailable_debug = format!("{unavailable:?}");
+        assert!(unavailable_debug.contains("model_backend_resolver: \"<injected>\""));
+        assert!(unavailable_debug.contains("restricted_runtime_apply_endpoint: false"));
+    }
+
+    #[test]
+    fn restricted_endpoint_dependency_pins_exact_pair_and_redacts_composition_values() {
+        let socket_directory = TestSocketDirectory::create();
+        let provisioning = provisioning(socket_directory.socket_path.clone());
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let restricted = restricted_endpoint_dependencies(RESTRICTED_APPLY_ROUTE);
+        validate_restricted_runtime_apply_endpoint_dependencies(&restricted, &provisioning)
+            .unwrap_or_else(|error| panic!("restricted dependency validation failed: {error}"));
+        assert_eq!(restricted.endpoint_config.route(), RESTRICTED_APPLY_ROUTE);
+        assert_eq!(restricted.expected_carrier.route(), RESTRICTED_APPLY_ROUTE);
+        assert!(
+            restricted
+                .endpoint_config
+                .matches_restricted_carrier(&restricted.expected_carrier)
+        );
+        assert_eq!(
+            restricted.expected_carrier.control_transport_profile_ref(),
+            RESTRICTED_PROFILE_REF
+        );
+        assert_eq!(
+            restricted
+                .expected_carrier
+                .control_transport_profile_digest(),
+            profile.profile_digest()
+        );
+
+        let dependencies = RuntimeManagedFabricServiceDependenciesV1::new(
+            unavailable_provider_resolver(),
+            unavailable_model_backend_resolver(),
+            None,
+            Some(restricted.clone()),
+        );
+        let cloned = dependencies.clone();
+        let preserved = cloned
+            .restricted_runtime_apply_endpoint
+            .as_ref()
+            .unwrap_or_else(|| panic!("restricted dependency disappeared during clone"));
+        assert_eq!(preserved.endpoint_config, restricted.endpoint_config);
+        assert_eq!(preserved.expected_carrier, restricted.expected_carrier);
+        let debug = format!("{dependencies:?} {restricted:?}");
+        assert!(debug.contains("restricted_runtime_apply_endpoint: true"));
+        assert!(debug.contains("<composition-pinned>"));
+        assert!(!debug.contains(RESTRICTED_APPLY_ROUTE));
+        assert!(!debug.contains("paraegox-restricted-runtime.key"));
+
+        let mismatched_profile = restricted_transport_profile(
+            "paraegox/runtime/endpoint-stack/other-route/apply",
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let mismatched_config = restricted_endpoint_dependencies_from_profile(
+            &mismatched_profile,
+            RESTRICTED_PROFILE_REF,
+        )
+        .endpoint_config;
+        let mismatched = RuntimeRestrictedApplyEndpointDependenciesV1::new(
+            mismatched_config,
+            restricted.expected_carrier,
+        );
+        assert!(matches!(
+            validate_restricted_runtime_apply_endpoint_dependencies(&mismatched, &provisioning),
+            Err(RuntimeBootstrapEndpointError::InvalidProvisioning)
+        ));
+    }
+
+    #[tokio::test]
+    async fn restricted_endpoint_rejects_every_non_exact_profile_carrier_pair_before_start() {
+        let socket_directory = TestSocketDirectory::create();
+        let provisioning = provisioning(socket_directory.socket_path.clone());
+        let base_profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let base =
+            restricted_endpoint_dependencies_from_profile(&base_profile, RESTRICTED_PROFILE_REF);
+
+        let locator_profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            "tls/192.0.2.11:7447",
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let locator_dependencies =
+            restricted_endpoint_dependencies_from_profile(&locator_profile, RESTRICTED_PROFILE_REF);
+        let profile_ref_dependencies =
+            restricted_endpoint_dependencies_from_profile(&base_profile, [0xe7; 16]);
+        let generation_profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION + 1,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let generation_config = restricted_endpoint_dependencies_from_profile(
+            &generation_profile,
+            RESTRICTED_PROFILE_REF,
+        )
+        .endpoint_config;
+        let timeout_profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS + 1,
+        );
+        let timeout_config =
+            restricted_endpoint_dependencies_from_profile(&timeout_profile, RESTRICTED_PROFILE_REF)
+                .endpoint_config;
+        let mismatched_profile_digest = if base_profile.profile_digest() != digest(0xe8) {
+            digest(0xe8)
+        } else {
+            digest(0xe9)
+        };
+        let digest_carrier = restricted_carrier_with_profile_digest(
+            &base_profile,
+            RESTRICTED_PROFILE_REF,
+            mismatched_profile_digest,
+        );
+
+        assert_ne!(
+            locator_profile.tls_listener_locator(),
+            base_profile.tls_listener_locator()
+        );
+        assert_ne!(
+            locator_profile.profile_digest(),
+            base_profile.profile_digest()
+        );
+        assert_ne!(
+            profile_ref_dependencies
+                .expected_carrier
+                .control_transport_profile_ref(),
+            base.expected_carrier.control_transport_profile_ref()
+        );
+        assert_ne!(
+            generation_profile.endpoint_generation(),
+            base_profile.endpoint_generation()
+        );
+        assert_ne!(
+            generation_profile.profile_digest(),
+            base_profile.profile_digest()
+        );
+        assert_ne!(
+            timeout_profile.operation_timeout_nanos(),
+            base_profile.operation_timeout_nanos()
+        );
+        assert_ne!(
+            timeout_profile.profile_digest(),
+            base_profile.profile_digest()
+        );
+        assert_ne!(
+            digest_carrier.control_transport_profile_digest(),
+            base.expected_carrier.control_transport_profile_digest()
+        );
+        for profile in [&locator_profile, &generation_profile, &timeout_profile] {
+            assert_eq!(profile.route(), base_profile.route());
+            assert_eq!(
+                profile.controller_principal(),
+                base_profile.controller_principal()
+            );
+            assert_eq!(
+                profile.runtime_principal(),
+                base_profile.runtime_principal()
+            );
+        }
+
+        let mismatches = [
+            (
+                "locator",
+                RuntimeRestrictedApplyEndpointDependenciesV1::new(
+                    locator_dependencies.endpoint_config,
+                    base.expected_carrier.clone(),
+                ),
+            ),
+            (
+                "profile-ref",
+                RuntimeRestrictedApplyEndpointDependenciesV1::new(
+                    profile_ref_dependencies.endpoint_config,
+                    base.expected_carrier.clone(),
+                ),
+            ),
+            (
+                "profile-digest",
+                RuntimeRestrictedApplyEndpointDependenciesV1::new(
+                    base.endpoint_config.clone(),
+                    digest_carrier,
+                ),
+            ),
+            (
+                "endpoint-generation",
+                RuntimeRestrictedApplyEndpointDependenciesV1::new(
+                    generation_config,
+                    base.expected_carrier.clone(),
+                ),
+            ),
+            (
+                "timeout",
+                RuntimeRestrictedApplyEndpointDependenciesV1::new(
+                    timeout_config,
+                    base.expected_carrier.clone(),
+                ),
+            ),
+        ];
+
+        for (field, mismatch) in &mismatches {
+            assert_eq!(
+                mismatch.endpoint_config.route(),
+                base.endpoint_config.route()
+            );
+            assert_eq!(
+                mismatch.expected_carrier.route(),
+                base.expected_carrier.route()
+            );
+            assert_eq!(
+                mismatch.expected_carrier.controller_principal(),
+                base.expected_carrier.controller_principal()
+            );
+            assert_eq!(
+                mismatch.expected_carrier.runtime_principal(),
+                base.expected_carrier.runtime_principal()
+            );
+            assert!(
+                !mismatch
+                    .endpoint_config
+                    .matches_restricted_carrier(&mismatch.expected_carrier),
+                "{field} mismatch unexpectedly paired"
+            );
+        }
+
+        for (field, mismatch) in mismatches {
+            assert!(
+                matches!(
+                    RunningRestrictedRuntimeApplyEndpointV1::start(mismatch, &provisioning).await,
+                    Err(RuntimeBootstrapEndpointError::InvalidProvisioning)
+                ),
+                "{field} mismatch reached the Fabric listener"
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_composition_orders_verification_select_handoff_and_cleanup() {
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let start = source
+                .find(start)
+                .unwrap_or_else(|| panic!("missing {start}"));
+            let tail = &source[start..];
+            let end = tail.find(end).unwrap_or_else(|| panic!("missing {end}"));
+            &tail[..end]
+        }
+
+        let source = include_str!("runtime_control_endpoint.rs");
+        let dependency_validation = section(
+            source,
+            "fn validate_restricted_runtime_apply_endpoint_dependencies",
+            "impl RunningRestrictedRuntimeApplyEndpointV1",
+        );
+        assert!(
+            dependency_validation
+                .find(".matches_restricted_carrier")
+                .unwrap_or_else(|| panic!("missing exact endpoint/carrier matcher"))
+                < dependency_validation
+                    .find("validate_restricted_runtime_apply_carrier_pins")
+                    .unwrap_or_else(|| panic!("missing provisioning pin validation"))
+        );
+        let seam = section(
+            source,
+            "pub(crate) async fn handle_restricted_distributed_agent_stack_apply_v1",
+            "    fn handle_serving_bootstrap",
+        );
+        assert!(
+            seam.find("authenticate_restricted_distributed_agent_stack_apply")
+                .unwrap_or_else(|| panic!("missing authenticated marker"))
+                < seam
+                    .find(".handle_distributed_agent_stack_apply")
+                    .unwrap_or_else(|| panic!("missing sole PXAR v8 owner"))
+        );
+        assert!(
+            seam.find("validate_restricted_inner_terminal")
+                .unwrap_or_else(|| panic!("missing PXDS1 validation"))
+                < seam
+                    .find("DistributedAgentStackTerminalReceiptDraftV2::try_new")
+                    .unwrap_or_else(|| panic!("missing PXDS2 draft"))
+        );
+        assert!(
+            seam.find(".finalize(&signature)")
+                .unwrap_or_else(|| panic!("missing signed PXDS2 finalization"))
+                < seam
+                    .find(".register_restricted_distributed_alias")
+                    .unwrap_or_else(|| panic!("missing exact PXDS2 alias registration"))
+        );
+        assert!(
+            seam.find(".register_restricted_distributed_alias")
+                .unwrap_or_else(|| panic!("missing exact PXDS2 alias registration"))
+                < seam
+                    .find("Ok(wire.into())")
+                    .unwrap_or_else(|| panic!("missing restricted response return"))
+        );
+
+        let outer_authentication = section(
+            source,
+            "fn authenticate_restricted_distributed_agent_stack_apply",
+            "fn validate_restricted_inner_terminal",
+        );
+        assert!(outer_authentication.contains("verify_controller_carrier_before_mutation"));
+        let inner_terminal = section(
+            source,
+            "fn validate_restricted_inner_terminal",
+            "fn map_restricted_inner_apply_error",
+        );
+        assert!(
+            inner_terminal
+                .find(".verify_strict")
+                .unwrap_or_else(|| panic!("missing PXDS1 signature verification"))
+                < inner_terminal
+                    .find("Ok(facts.clone())")
+                    .unwrap_or_else(|| panic!("missing verified facts return"))
+        );
+
+        let running_endpoint = section(
+            source,
+            "impl RunningRestrictedRuntimeApplyEndpointV1",
+            "pub(crate) async fn serve_managed_fabric_until_with_ready",
+        );
+        assert!(
+            running_endpoint
+                .find("validate_restricted_runtime_apply_endpoint_dependencies")
+                .unwrap_or_else(|| panic!("missing restricted dependency validation"))
+                < running_endpoint
+                    .find("RestrictedRuntimeApplyEndpointV1::start")
+                    .unwrap_or_else(|| panic!("listener opened before dependency validation"))
+        );
+        assert!(
+            running_endpoint
+                .find("drop(receiver)")
+                .unwrap_or_else(|| panic!("receiver must close before endpoint shutdown"))
+                < running_endpoint
+                    .find(".shutdown()")
+                    .unwrap_or_else(|| panic!("missing endpoint shutdown"))
+        );
+
+        let serve = section(
+            source,
+            "pub(crate) async fn serve_managed_fabric_until_with_ready",
+            "async fn runtime_shutdown_signal",
+        );
+        assert!(
+            serve
+                .find("RunningRestrictedRuntimeApplyEndpointV1::start")
+                .unwrap_or_else(|| panic!("missing restricted endpoint startup"))
+                < serve
+                    .find("if let Err(error) = ready")
+                    .unwrap_or_else(|| panic!("missing readiness callback"))
+        );
+        assert!(serve.contains("result = &mut shutdown"));
+        assert!(serve.contains("result = listener.accept()"));
+        assert!(serve.contains("inbound = restricted.receiver.recv()"));
+        assert_eq!(
+            serve
+                .match_indices(".handle_restricted_distributed_agent_stack_apply_v1")
+                .count(),
+            1
+        );
+        assert!(serve.contains("if let Err(error) = inbound.respond(response.into_vec())"));
+        assert!(serve.contains("RestrictedRuntimeApplyResponseHandoff(error)"));
+        let rejection = serve
+            .find("Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)")
+            .unwrap_or_else(|| panic!("missing generic rejection branch"));
+        assert!(serve[rejection..].contains("drop(inbound)"));
+
+        let restricted_shutdowns = serve
+            .match_indices("let restricted_shutdown_result")
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        assert_eq!(restricted_shutdowns.len(), 2);
+        for shutdown in restricted_shutdowns {
+            let tail = &serve[shutdown..];
+            assert!(
+                tail.find("endpoint.shutdown().await")
+                    .unwrap_or_else(|| panic!("missing restricted shutdown"))
+                    < tail
+                        .find("shutdown_managed_successor_chain")
+                        .unwrap_or_else(|| panic!("missing managed owner cleanup"))
+            );
+        }
+        assert_eq!(
+            serve
+                .match_indices("aggregate_runtime_service_failures(")
+                .count(),
+            7
+        );
+        assert!(source.contains("control_transport_profile_ref` and"));
+        assert!(source.contains("opaque composition assertions"));
+        assert!(
+            source.contains("RestrictedRuntimeApplyEndpointConfigV1::try_from_transport_profile")
+        );
+        // Split the forbidden spelling so this source-scanning assertion does
+        // not find its own string literal and fail unconditionally.
+        let raw_constructor = ["RestrictedRuntimeApplyEndpointConfigV1::try_", "new"].concat();
+        assert!(!source.contains(&raw_constructor));
+    }
+
+    #[test]
+    fn lifecycle_failure_reducer_preserves_every_stage_and_nested_owner_failure() {
+        let mut owner_failures = RuntimeBootstrapFailureReducerV1::default();
+        owner_failures.record_result(
+            RuntimeBootstrapFailureStageV1::Successor,
+            Err(RuntimeBootstrapEndpointError::InvalidStartedState),
+        );
+        owner_failures.record_result(
+            RuntimeBootstrapFailureStageV1::Successor,
+            Err(RuntimeBootstrapEndpointError::Runtime),
+        );
+
+        let failure = aggregate_runtime_service_failures(
+            Err(RuntimeBootstrapEndpointError::BuildPinMismatch),
+            owner_failures.finish(),
+            Err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply(
+                RestrictedRuntimeApplyErrorV1::SessionCloseFailed,
+            )),
+            Err(RuntimeBootstrapEndpointError::Socket(
+                io::ErrorKind::PermissionDenied,
+            )),
+        )
+        .expect_err("five staged failures must not reduce to success");
+        let RuntimeBootstrapEndpointError::StagedFailures(failures) = failure else {
+            panic!("reducer must return the typed failure set");
+        };
+
+        assert_eq!(failures.len(), 5);
+        assert!(!failures.failures.is_empty());
+        assert_eq!(
+            failures
+                .failures
+                .iter()
+                .map(|failure| failure.stage)
+                .collect::<Vec<_>>(),
+            vec![
+                RuntimeBootstrapFailureStageV1::Primary,
+                RuntimeBootstrapFailureStageV1::Successor,
+                RuntimeBootstrapFailureStageV1::Successor,
+                RuntimeBootstrapFailureStageV1::RestrictedEndpoint,
+                RuntimeBootstrapFailureStageV1::LocalSocketCleanup,
+            ]
+        );
+        assert!(
+            failures
+                .failures
+                .iter()
+                .find(|failure| failure.stage == RuntimeBootstrapFailureStageV1::Primary)
+                .is_some_and(|failure| matches!(
+                    failure.error.as_ref(),
+                    RuntimeBootstrapEndpointError::BuildPinMismatch
+                ))
+        );
+        assert!(
+            failures
+                .failures
+                .iter()
+                .find(|failure| {
+                    failure.stage == RuntimeBootstrapFailureStageV1::RestrictedEndpoint
+                })
+                .is_some_and(|failure| matches!(
+                    failure.error.as_ref(),
+                    RuntimeBootstrapEndpointError::RestrictedRuntimeApply(
+                        RestrictedRuntimeApplyErrorV1::SessionCloseFailed
+                    )
+                ))
+        );
+        assert!(matches!(
+            failures.failures[4].error.as_ref(),
+            RuntimeBootstrapEndpointError::Socket(io::ErrorKind::PermissionDenied)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_cleanup_source_uses_lossless_staged_reducer() {
+        let source = include_str!("runtime_control_endpoint.rs");
+        assert!(source.contains("error: Box<RuntimeBootstrapEndpointError>"));
+        assert!(source.contains("failures: Box<[RuntimeBootstrapFailureV1]>"));
+
+        let shutdown = section(
+            source,
+            "async fn shutdown_managed_successor_chain",
+            "#[derive(Default)]\nstruct RuntimeBootstrapFailureReducerV1",
+        );
+        // Dependency teardown is deliberately fail-fast rather than lossless:
+        // after an uncertain Agent retirement, touching its Model/Fabric
+        // dependencies would violate the owner safety boundary. Independent
+        // endpoint/socket cleanup remains covered by the staged reducer below.
+        let compact_shutdown = shutdown.split_whitespace().collect::<String>();
+        let model = compact_shutdown
+            .find("ifletSome(model_stack)=model_stack.as_mut()")
+            .unwrap_or_else(|| panic!("Model+Agent shutdown branch disappeared"));
+        let model_shutdown = compact_shutdown
+            .find(
+                "model_stack.shutdown(core).await.map_err(RuntimeBootstrapEndpointError::ManagedModelAgentStack)?",
+            )
+            .unwrap_or_else(|| panic!("fail-fast Model+Agent shutdown disappeared"));
+        let model_fabric = compact_shutdown
+            .find(
+                "returncore.shutdown().await.map_err(RuntimeBootstrapEndpointError::ManagedFabric)",
+            )
+            .unwrap_or_else(|| panic!("Model branch Fabric shutdown disappeared"));
+        let distributed = compact_shutdown
+            .find("ifletSome(distributed)=distributed.as_mut()")
+            .unwrap_or_else(|| panic!("distributed Agent shutdown disappeared"));
+        let distributed_shutdown = compact_shutdown
+            .find(
+                "distributed.shutdown().await.map_err(RuntimeBootstrapEndpointError::DistributedAgentStack)?",
+            )
+            .unwrap_or_else(|| panic!("fail-fast distributed Agent shutdown disappeared"));
+        let stack = compact_shutdown
+            .find("ifletSome(stack)=stack.as_mut()")
+            .unwrap_or_else(|| panic!("predecessor Agent shutdown disappeared"));
+        let stack_shutdown = compact_shutdown
+            .find(
+                "stack.shutdown(core).await.map_err(RuntimeBootstrapEndpointError::ManagedAgentStack)?",
+            )
+            .unwrap_or_else(|| panic!("fail-fast predecessor Agent shutdown disappeared"));
+        let fabric = compact_shutdown
+            .rfind("core.shutdown().await.map_err(RuntimeBootstrapEndpointError::ManagedFabric)")
+            .unwrap_or_else(|| panic!("managed Fabric shutdown disappeared"));
+        assert!(model < model_shutdown && model_shutdown < model_fabric);
+        assert!(
+            model_fabric < distributed
+                && distributed < distributed_shutdown
+                && distributed_shutdown < stack
+                && stack < stack_shutdown
+                && stack_shutdown < fabric
+        );
+        assert!(!shutdown.contains("RuntimeBootstrapFailureReducerV1"));
+
+        let reducer = section(
+            source,
+            "#[derive(Default)]\nstruct RuntimeBootstrapFailureReducerV1",
+            "impl<Store: RuntimeBootstrapStore> StartedRuntimeBootstrapService<Store>",
+        );
+        assert!(reducer.contains("RuntimeBootstrapEndpointError::StagedFailures"));
+        assert!(reducer.contains("RuntimeBootstrapFailureStageV1::Primary"));
+        assert!(reducer.contains("RuntimeBootstrapFailureStageV1::RestrictedEndpoint"));
+        assert!(reducer.contains("RuntimeBootstrapFailureStageV1::LocalSocketCleanup"));
+        assert!(!reducer.contains(".and("));
+
+        let bind = section(
+            source,
+            "fn bind_control_socket",
+            "struct BoundRuntimeBootstrapService",
+        );
+        assert!(bind.contains("let cleanup_result = guard.cleanup();"));
+        assert!(bind.contains("aggregate_runtime_service_failures("));
+        assert!(!bind.contains("let _ = guard.cleanup()"));
+
+        let legacy = section(
+            source,
+            "async fn serve_developer_legacy_cutover_until",
+            "fn live_runtime_channel_from_state",
+        );
+        assert!(legacy.contains("let service_result = 'service: loop"));
+        assert_eq!(
+            legacy
+                .match_indices("aggregate_runtime_service_failures(")
+                .count(),
+            6
+        );
+        assert_eq!(
+            legacy
+                .match_indices("RunningRestrictedRuntimeApplyEndpointV1::start")
+                .count(),
+            1
+        );
+        assert!(
+            legacy
+                .find("RunningRestrictedRuntimeApplyEndpointV1::start")
+                .unwrap_or_else(|| panic!("missing restricted listener startup"))
+                < legacy
+                    .find("if let Err(error) = ready")
+                    .unwrap_or_else(|| panic!("restricted listener starts after readiness"))
+        );
+        assert!(legacy.contains("DeveloperLocalControlState::Legacy(_)"));
+        assert!(legacy.contains("Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)"));
+        assert!(!legacy.contains("cleanup.and("));
+
+        let recovery = section(
+            source,
+            "async fn recover_managed_control_for_existing_channel",
+            "async fn shutdown_managed_successor_chain",
+        );
+        assert!(recovery.contains("let recovery_result = async"));
+        assert!(recovery.contains("shutdown_managed_successor_chain"));
+        assert!(recovery.contains("aggregate_runtime_service_failures("));
+
+        let bound = section(
+            source,
+            "impl<Store> BoundRuntimeBootstrapService<Store>",
+            "async fn serve_managed_fabric_until",
+        );
+        assert_eq!(
+            bound
+                .match_indices("aggregate_runtime_service_failures(")
+                .count(),
+            4
+        );
+        assert!(!bound.contains("(_, Err(error))"));
+
+        let managed = section(
+            source,
+            "pub(crate) async fn serve_managed_fabric_until_with_ready",
+            "async fn runtime_shutdown_signal",
+        );
+        assert_eq!(
+            managed
+                .match_indices("aggregate_runtime_service_failures(")
+                .count(),
+            7
+        );
+        assert_eq!(
+            managed
+                .match_indices("shutdown_managed_successor_chain")
+                .count(),
+            7
+        );
+        assert!(!managed.contains(".and("));
+    }
+
+    #[test]
+    fn production_managed_fabric_owner_uses_zenoh_compatible_scheduler() {
+        let runtime = build_managed_fabric_owner_runtime()
+            .unwrap_or_else(|error| panic!("managed Runtime build failed: {error}"));
+        assert!(matches!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ));
+        runtime.block_on(async { tokio::task::yield_now().await });
     }
 
     fn distinct_controller_uid(runtime_uid: u32) -> u32 {
@@ -2313,6 +5994,829 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("sequence one rejected: {error:?}"));
         (snapshot, compiled)
+    }
+
+    fn managed_started_service(
+        socket_path: PathBuf,
+    ) -> (TestDirectory, StartedManagedFabricService) {
+        managed_started_service_with_dependencies(
+            socket_path,
+            deterministic_fixture_service_dependencies(),
+        )
+    }
+
+    fn managed_started_service_with_dependencies(
+        socket_path: PathBuf,
+        dependencies: RuntimeManagedFabricServiceDependenciesV1,
+    ) -> (TestDirectory, StartedManagedFabricService) {
+        let provisioning = provisioning(socket_path);
+        let (snapshot, compiled) = installed_snapshot(&provisioning);
+        let installation = verify_startup_installation(&snapshot, provisioning.target(), compiled)
+            .unwrap_or_else(|error| panic!("managed fixture installation rejected: {error}"));
+        let manifest = installation
+            .immutable_manifest_ingress()
+            .unwrap_or_else(|error| panic!("managed fixture manifest rejected: {error}"));
+        let projection =
+            ManagedFabricManifestProjectionV1::try_from_verified_legacy_manifest(&manifest)
+                .unwrap_or_else(|error| panic!("managed fixture projection rejected: {error}"));
+        let projection_digest = transition_projection_digest(&projection)
+            .unwrap_or_else(|error| panic!("managed fixture projection digest failed: {error}"));
+        let (state_directory, store) =
+            managed_fabric_store_fixture_from_snapshot(&snapshot, projection_digest);
+        let started = StartedManagedFabricService::try_start_from_store(
+            state_directory.path(),
+            STORE_INSTANCE_ID,
+            compiled,
+            provisioning,
+            store,
+            dependencies,
+        )
+        .unwrap_or_else(|error| panic!("managed startup rejected: {error}"));
+        (state_directory, started)
+    }
+
+    #[tokio::test]
+    async fn distributed_dependencies_survive_reopen_and_control_cutover_without_reallocation() {
+        let socket_directory = TestSocketDirectory::create();
+        let evidence_directory = TestSocketDirectory::create();
+        let evidence_root = evidence_directory.path.join("evidence-store");
+        let expected_evidence = evidence_store_config(evidence_root.clone());
+        let expected_epoch = expected_evidence.store_epoch();
+        let expected_retention = expected_evidence.retention_policy();
+        let expected_owner = expected_evidence.owner_ref();
+        let (mut dependencies, expected_resolver, expected_agent_provider) =
+            distributed_service_dependencies(expected_evidence);
+        let expected_restricted = restricted_endpoint_dependencies(RESTRICTED_APPLY_ROUTE);
+        dependencies.restricted_runtime_apply_endpoint = Some(expected_restricted.clone());
+        let (_state_directory, mut started) = managed_started_service_with_dependencies(
+            socket_directory.socket_path.clone(),
+            dependencies,
+        );
+        started
+            .core
+            .recover()
+            .await
+            .unwrap_or_else(|error| panic!("managed dependency fixture recovery failed: {error}"));
+
+        let reopened_distributed = started
+            .dependencies
+            .distributed_agent_stack_owner_dependencies()
+            .unwrap_or_else(|| panic!("durable reopen lost distributed dependencies"));
+        let reopen_resolver = Arc::clone(&reopened_distributed.fabric_credential_resolver);
+        let reopen_evidence = reopened_distributed.evidence_store_config.clone();
+        let reopen_agent_provider = started.dependencies.agent_provider_resolver();
+        assert!(Arc::ptr_eq(&expected_resolver, &reopen_resolver));
+        assert!(Arc::ptr_eq(
+            &expected_agent_provider,
+            &reopen_agent_provider
+        ));
+        assert_eq!(reopen_evidence.root(), evidence_root.as_path());
+        assert_eq!(reopen_evidence.store_epoch(), expected_epoch);
+        assert_eq!(reopen_evidence.retention_policy(), expected_retention);
+        assert_eq!(reopen_evidence.owner_ref(), expected_owner);
+        let reopened_restricted = started
+            .dependencies
+            .restricted_runtime_apply_endpoint
+            .as_ref()
+            .unwrap_or_else(|| panic!("durable reopen lost restricted endpoint dependencies"));
+        assert_eq!(
+            reopened_restricted.endpoint_config,
+            expected_restricted.endpoint_config
+        );
+        assert_eq!(
+            reopened_restricted.expected_carrier,
+            expected_restricted.expected_carrier
+        );
+        validate_restricted_runtime_apply_endpoint_dependencies(
+            reopened_restricted,
+            &started.provisioning,
+        )
+        .unwrap_or_else(|error| panic!("reopened restricted dependencies failed: {error}"));
+
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0x91),
+            digest(0x92),
+        )
+        .unwrap_or_else(|error| panic!("dependency fixture channel rejected: {error}"));
+        let mut control = ManagedFabricControlService {
+            core: started.core,
+            stack: started.stack,
+            stack_projection: started.stack_projection,
+            model_stack: started.model_stack,
+            model_stack_projection: started.model_stack_projection,
+            distributed: started.distributed,
+            distributed_projection: started.distributed_projection,
+            handle_broker: started.handle_broker,
+            state_directory: started.state_directory,
+            provisioning: started.provisioning,
+            channel,
+            dependencies: started.dependencies,
+        };
+        let cutover_distributed = control
+            .dependencies
+            .distributed_agent_stack_owner_dependencies()
+            .unwrap_or_else(|| panic!("first cutover lost distributed dependencies"));
+        let cutover_resolver = Arc::clone(&cutover_distributed.fabric_credential_resolver);
+        let cutover_agent_provider = control.dependencies.agent_provider_resolver();
+        assert!(Arc::ptr_eq(&reopen_resolver, &cutover_resolver));
+        assert!(Arc::ptr_eq(&reopen_agent_provider, &cutover_agent_provider));
+        assert_eq!(
+            cutover_distributed.evidence_store_config.root(),
+            evidence_root.as_path()
+        );
+        assert_eq!(
+            cutover_distributed.evidence_store_config.store_epoch(),
+            expected_epoch
+        );
+        assert_eq!(
+            cutover_distributed.evidence_store_config.retention_policy(),
+            expected_retention
+        );
+        assert_eq!(
+            cutover_distributed.evidence_store_config.owner_ref(),
+            expected_owner
+        );
+        let cutover_restricted = control
+            .dependencies
+            .restricted_runtime_apply_endpoint
+            .as_ref()
+            .unwrap_or_else(|| panic!("control cutover lost restricted endpoint dependencies"));
+        assert_eq!(
+            cutover_restricted.endpoint_config,
+            expected_restricted.endpoint_config
+        );
+        assert_eq!(
+            cutover_restricted.expected_carrier,
+            expected_restricted.expected_carrier
+        );
+        let source = include_str!("runtime_control_endpoint.rs");
+        let reopen_owner = section(
+            source,
+            "    fn try_start_from_store(",
+            "pub(crate) struct ManagedFabricControlService",
+        );
+        assert!(reopen_owner.contains("fabric_credential_resolver,"));
+        assert!(reopen_owner.contains("evidence_store_config,"));
+        assert!(
+            reopen_owner
+                .contains("agent_provider_resolver: dependencies.agent_provider_resolver(),")
+        );
+        assert!(!reopen_owner.contains("agent_provider_resolver: unavailable_provider_resolver"));
+        let cutover_owner = section(
+            source,
+            "    async fn handle_distributed_agent_stack_apply(",
+            "pub(crate) fn validate_restricted_runtime_apply_carrier_pins",
+        );
+        assert!(cutover_owner.contains("fabric_credential_resolver,"));
+        assert!(cutover_owner.contains("evidence_store_config,"));
+        assert!(
+            cutover_owner
+                .contains("agent_provider_resolver: self.dependencies.agent_provider_resolver(),")
+        );
+        assert!(!cutover_owner.contains("agent_provider_resolver: unavailable_provider_resolver"));
+
+        control
+            .core
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("managed dependency fixture shutdown failed: {error}"));
+    }
+
+    fn managed_available_port() -> u16 {
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .unwrap_or_else(|error| panic!("ephemeral bind failed: {error}"))
+            .local_addr()
+            .unwrap_or_else(|error| panic!("ephemeral address failed: {error}"))
+            .port()
+    }
+
+    fn managed_lifecycle_budgets() -> ManagedServiceLifecycleBudgetsV1 {
+        let budget = BoundedDuration::from_nanos(3_000_000_000);
+        ManagedServiceLifecycleBudgetsV1::try_new(budget, budget, budget, budget, budget)
+            .unwrap_or_else(|error| panic!("managed lifecycle budgets rejected: {error}"))
+    }
+
+    fn managed_writer_context(
+        epoch_value: u64,
+        supersedes_value: u64,
+        nonce: &[u8],
+    ) -> PlanWriterContext {
+        let authority = TenureProofAuthority::try_new(
+            TENURE_AUTHORITY_REF,
+            TENURE_KEY_REF,
+            TenureProofAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("managed tenure algorithm failed: {error}")),
+            ED25519_ALGORITHM_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("managed tenure authority failed: {error}"));
+        let epoch = PlanWriterEpoch::new(epoch_value);
+        let claim = WriterTenureClaim::try_new(
+            SOURCE_SCOPE,
+            WRITER,
+            epoch,
+            PlanWriterEpoch::new(supersedes_value),
+        )
+        .unwrap_or_else(|error| panic!("managed tenure claim failed: {error}"));
+        let unsigned =
+            WriterTenureProof::try_new(authority, claim, nonce, &[1; ED25519_SIGNATURE_BYTES])
+                .unwrap_or_else(|error| panic!("managed unsigned tenure failed: {error}"));
+        let signature = SigningKey::from_bytes(&TENURE_SEED)
+            .sign(
+                unsigned
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("managed tenure transcript failed: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        let proof = WriterTenureProof::try_new(authority, claim, nonce, &signature)
+            .unwrap_or_else(|error| panic!("managed tenure proof failed: {error}"));
+        PlanWriterContext::try_new(WRITER, epoch, proof)
+            .unwrap_or_else(|error| panic!("managed writer context failed: {error}"))
+    }
+
+    fn managed_temporal(clock_generation: ClockGeneration, seed: u8) -> ApplyTemporalConstraint {
+        ApplyTemporalConstraint::try_new(
+            TemporalConstraintId::from_bytes([seed; 16]),
+            ClockDomainRef::from_bytes(CLOCK_DOMAIN),
+            clock_generation,
+            BoundedDuration::from_nanos(12_000_000_000),
+            BoundedDuration::from_nanos(12_000_000_000),
+        )
+        .unwrap_or_else(|error| panic!("managed temporal constraint rejected: {error}"))
+    }
+
+    fn managed_auth(nonce: &[u8]) -> ApplyRequestAuthClaim {
+        ApplyRequestAuthClaim::try_new(
+            CONTROLLER_PRINCIPAL,
+            CONTROLLER_KEY_REF,
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("managed auth algorithm failed: {error}")),
+            ED25519_ALGORITHM_VERSION,
+            nonce,
+        )
+        .unwrap_or_else(|error| panic!("managed auth claim rejected: {error}"))
+    }
+
+    fn managed_fabric_active_request(
+        projection: ManagedFabricManifestProjectionV1,
+        port: u16,
+        clock_generation: ClockGeneration,
+    ) -> ManagedFabricApplyRequestV1 {
+        let service = ManagedServiceSpecV1::new(
+            ManagedServiceId::from_bytes([0xa0; 16]),
+            managed_lifecycle_budgets(),
+        );
+        let endpoint = ManagedFabricListenEndpointV1::try_new(&format!("tcp/127.0.0.1:{port}"))
+            .unwrap_or_else(|error| panic!("managed Fabric endpoint rejected: {error}"));
+        let execution = ManagedFabricTargetExecutionV1::try_one_managed_fabric_service(
+            projection, service, endpoint,
+        )
+        .unwrap_or_else(|error| panic!("managed Fabric execution rejected: {error}"));
+        let provenance = PlanProvenance::new(
+            SOURCE_SCOPE,
+            SourcePlanRef::from_bytes([0xa1; 16]),
+            SourcePlanRevision::new(1),
+            SourcePlanDigest::new(digest(0xa2)),
+        );
+        let control = RuntimeApplyControl::new(
+            managed_writer_context(1, 0, b"managed-fabric-tenure-nonce"),
+            ExpectedActive::None,
+            ApplyOperationId::from_bytes([0xa3; 16]),
+        );
+        let draft = ManagedFabricApplyRequestDraftV1::try_new(
+            execution,
+            provenance,
+            control,
+            managed_temporal(clock_generation, 0xa4),
+            STORE_INSTANCE_ID,
+            managed_auth(b"managed-fabric-request-nonce"),
+        )
+        .unwrap_or_else(|error| panic!("managed Fabric request draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("managed Fabric transcript failed: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("managed Fabric request rejected: {error}"))
+    }
+
+    fn managed_agent_plan() -> ManagedAgentServicePlanV1 {
+        let service = ManagedServiceSpecV1::new(
+            ManagedServiceId::from_bytes([0xb0; 16]),
+            managed_lifecycle_budgets(),
+        );
+        let semantic = ManagedAgentSemanticLimitsV1::try_new(8, 16, 16, 32)
+            .unwrap_or_else(|error| panic!("managed Agent semantics rejected: {error}"));
+        let ingress = ManagedAgentIngressLimitsV1::try_new(
+            8,
+            512 * 1024,
+            64 * 1024,
+            64 * 1024,
+            2_000_000_000,
+        )
+        .unwrap_or_else(|error| panic!("managed Agent ingress rejected: {error}"));
+        let port = ManagedAgentPortPlanV1::try_new(
+            BindingId::from_bytes([0xb1; 16]),
+            BindingId::from_bytes([0xb2; 16]),
+            "paraegox/runtime/endpoint-stack/submit",
+            "paraegox/runtime/endpoint-stack/control",
+            ingress,
+        )
+        .unwrap_or_else(|error| panic!("managed Agent port rejected: {error}"));
+        let provider = ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+            ManagedAgentProviderRefV1::try_from_bytes([0xb3; 16])
+                .unwrap_or_else(|error| panic!("managed provider ref rejected: {error}")),
+            digest(0xb4),
+        )
+        .unwrap_or_else(|error| panic!("managed fixture provider rejected: {error}"));
+        ManagedAgentServicePlanV1::try_new(service, semantic, port, provider)
+            .unwrap_or_else(|error| panic!("managed Agent plan rejected: {error}"))
+    }
+
+    fn managed_model_plan(provider: ManagedAgentProviderSelectionV1) -> ManagedModelServicePlanV1 {
+        let service = ManagedServiceSpecV1::new(
+            ManagedServiceId::from_bytes([0xc1; 16]),
+            managed_lifecycle_budgets(),
+        );
+        let adapter = ManagedModelAdapterBindingV1::try_new(
+            [0xc2; 16],
+            ManagedModelAdapterVersionV1::try_new(1)
+                .unwrap_or_else(|error| panic!("managed Model adapter version rejected: {error}")),
+            ManagedModelCapabilityIdV1::bounded_text_v1(),
+        )
+        .unwrap_or_else(|error| panic!("managed Model adapter binding rejected: {error}"));
+        ManagedModelServicePlanV1::try_new(service, 2, provider, adapter)
+            .unwrap_or_else(|error| panic!("managed Model plan rejected: {error}"))
+    }
+
+    fn managed_model_stack_active_request(
+        fabric_request: &ManagedFabricApplyRequestV1,
+        projection: ManagedModelAgentStackProjectionV1,
+        clock_generation: ClockGeneration,
+    ) -> ManagedModelAgentStackApplyRequestV1 {
+        let agent = managed_agent_plan();
+        let model = managed_model_plan(agent.provider());
+        let embedded = ManagedAgentStackTargetExecutionV1::try_fabric_and_agent(
+            projection.managed_agent_stack_projection().clone(),
+            fabric_request.target_execution().clone(),
+            agent,
+        )
+        .unwrap_or_else(|error| panic!("managed Model+Agent embedded stack rejected: {error}"));
+        let execution = ManagedModelAgentStackTargetExecutionV1::try_fabric_model_and_agent(
+            projection, embedded, model,
+        )
+        .unwrap_or_else(|error| panic!("managed Model+Agent execution rejected: {error}"));
+        let provenance = PlanProvenance::new(
+            SOURCE_SCOPE,
+            SourcePlanRef::from_bytes([0xa1; 16]),
+            SourcePlanRevision::new(2),
+            SourcePlanDigest::new(digest(0xc3)),
+        );
+        let control = RuntimeApplyControl::new(
+            fabric_request
+                .control_commitment()
+                .control()
+                .writer_context()
+                .clone(),
+            ExpectedActive::Exact(fabric_request.target_slice_digest()),
+            ApplyOperationId::from_bytes([0xc4; 16]),
+        );
+        let draft = ManagedModelAgentStackApplyRequestDraftV1::try_new(
+            execution,
+            provenance,
+            control,
+            managed_temporal(clock_generation, 0xc5),
+            STORE_INSTANCE_ID,
+            managed_auth(b"managed-model-agent-request-nonce"),
+        )
+        .unwrap_or_else(|error| panic!("managed Model+Agent request draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| {
+                        panic!("managed Model+Agent transcript failed: {error}")
+                    })
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("managed Model+Agent request rejected: {error}"))
+    }
+
+    fn managed_stack_active_request(
+        fabric_request: &ManagedFabricApplyRequestV1,
+        projection: ManagedAgentStackProjectionV1,
+        clock_generation: ClockGeneration,
+    ) -> ManagedAgentStackApplyRequestV1 {
+        let execution = ManagedAgentStackTargetExecutionV1::try_fabric_and_agent(
+            projection,
+            fabric_request.target_execution().clone(),
+            managed_agent_plan(),
+        )
+        .unwrap_or_else(|error| panic!("managed stack execution rejected: {error}"));
+        let provenance = PlanProvenance::new(
+            SOURCE_SCOPE,
+            SourcePlanRef::from_bytes([0xa1; 16]),
+            SourcePlanRevision::new(2),
+            SourcePlanDigest::new(digest(0xb5)),
+        );
+        let control = RuntimeApplyControl::new(
+            fabric_request
+                .control_commitment()
+                .control()
+                .writer_context()
+                .clone(),
+            ExpectedActive::Exact(fabric_request.target_slice_digest()),
+            ApplyOperationId::from_bytes([0xb6; 16]),
+        );
+        let draft = ManagedAgentStackApplyRequestDraftV1::try_new(
+            execution,
+            provenance,
+            control,
+            managed_temporal(clock_generation, 0xb7),
+            STORE_INSTANCE_ID,
+            managed_auth(b"managed-stack-active-request-nonce"),
+        )
+        .unwrap_or_else(|error| panic!("managed stack request draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("managed stack transcript failed: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("managed stack request rejected: {error}"))
+    }
+
+    fn managed_stack_empty_request(
+        active: &ManagedAgentStackApplyRequestV1,
+        clock_generation: ClockGeneration,
+    ) -> ManagedAgentStackApplyRequestV1 {
+        let execution = ManagedAgentStackTargetExecutionV1::try_empty_deactivate(
+            active.target_execution().projection().clone(),
+        )
+        .unwrap_or_else(|error| panic!("managed empty stack execution rejected: {error}"));
+        let provenance = PlanProvenance::new(
+            SOURCE_SCOPE,
+            SourcePlanRef::from_bytes([0xa1; 16]),
+            SourcePlanRevision::new(3),
+            SourcePlanDigest::new(digest(0xb8)),
+        );
+        let control = RuntimeApplyControl::new(
+            active
+                .control_commitment()
+                .control()
+                .writer_context()
+                .clone(),
+            ExpectedActive::Exact(active.target_slice_digest()),
+            ApplyOperationId::from_bytes([0xb9; 16]),
+        );
+        let draft = ManagedAgentStackApplyRequestDraftV1::try_new(
+            execution,
+            provenance,
+            control,
+            managed_temporal(clock_generation, 0xba),
+            STORE_INSTANCE_ID,
+            managed_auth(b"managed-stack-empty-request-nonce"),
+        )
+        .unwrap_or_else(|error| panic!("managed empty stack draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("managed empty transcript failed: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("managed empty request rejected: {error}"))
+    }
+
+    fn distributed_stack_active_request(
+        active: &ManagedAgentStackApplyRequestV1,
+        projection: DistributedAgentStackProjectionV1,
+        clock_generation: ClockGeneration,
+    ) -> DistributedAgentStackApplyRequestV1 {
+        // This is desired topology only. The fixture keeps distributed owner
+        // dependencies explicitly unavailable, so no transport or TLS proof is
+        // fabricated and the legal first-cutover request fails closed to zero.
+        let authentication = DistributedFabricPeerAuthenticationRequirementV1::try_mutual_tls(
+            DistributedFabricTrustDomainRefV1::try_from_bytes([0xd1; 16])
+                .unwrap_or_else(|error| panic!("distributed trust-domain ref rejected: {error}")),
+            DistributedFabricCredentialRefV1::try_from_bytes([0xd2; 16])
+                .unwrap_or_else(|error| panic!("distributed credential ref rejected: {error}")),
+            DistributedFabricTrustAnchorRefV1::try_from_bytes([0xd3; 16])
+                .unwrap_or_else(|error| panic!("distributed trust-anchor ref rejected: {error}")),
+            DistributedFabricPeerIdentityRefV1::try_from_bytes([0xd4; 16])
+                .unwrap_or_else(|error| panic!("distributed peer-identity ref rejected: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("distributed authentication rejected: {error}"));
+        let peer = DistributedFabricPeerPlanV1::try_new(
+            RuntimeHostId::from_bytes([0xd5; 16]),
+            DistributedFabricTlsEndpointV1::try_new("tls/192.0.2.11:7447")
+                .unwrap_or_else(|error| panic!("distributed peer endpoint rejected: {error}")),
+            authentication,
+        )
+        .unwrap_or_else(|error| panic!("distributed peer rejected: {error}"));
+        let topology = DistributedFabricTopologyV1::try_new(
+            projection.target(),
+            active
+                .target_execution()
+                .fabric()
+                .listen_endpoint()
+                .unwrap_or_else(|| panic!("active predecessor lost its loopback listener"))
+                .clone(),
+            DistributedFabricTlsEndpointV1::try_new("tls/192.0.2.10:7447")
+                .unwrap_or_else(|error| panic!("distributed listen endpoint rejected: {error}")),
+            vec![peer],
+        )
+        .unwrap_or_else(|error| panic!("distributed topology rejected: {error}"));
+        let execution = DistributedAgentStackTargetExecutionV1::try_distributed_fabric_and_agent(
+            projection,
+            active.target_execution().clone(),
+            topology,
+        )
+        .unwrap_or_else(|error| panic!("distributed active execution rejected: {error}"));
+        let provenance = PlanProvenance::new(
+            SOURCE_SCOPE,
+            SourcePlanRef::from_bytes([0xa1; 16]),
+            SourcePlanRevision::new(3),
+            SourcePlanDigest::new(digest(0xc0)),
+        );
+        let control = RuntimeApplyControl::new(
+            active
+                .control_commitment()
+                .control()
+                .writer_context()
+                .clone(),
+            ExpectedActive::Exact(active.target_slice_digest()),
+            ApplyOperationId::from_bytes([0xc1; 16]),
+        );
+        let draft = DistributedAgentStackApplyRequestDraftV1::try_new(
+            execution,
+            provenance,
+            control,
+            managed_temporal(clock_generation, 0xc2),
+            STORE_INSTANCE_ID,
+            managed_auth(b"distributed-stack-active-request-nonce"),
+        )
+        .unwrap_or_else(|error| panic!("distributed active draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("distributed active transcript failed: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("distributed active request rejected: {error}"))
+    }
+
+    fn distributed_active_terminal_receipt(
+        request: &DistributedAgentStackApplyRequestV1,
+        channel: ReferenceChannelBindingV1,
+        selection_observed_at_nanos: u64,
+    ) -> DistributedAgentStackTerminalReceiptV1 {
+        let peer = request
+            .target_execution()
+            .topology()
+            .and_then(|topology| topology.peers().first())
+            .unwrap_or_else(|| panic!("distributed ActiveReady fixture lost its peer"));
+        let proof = DistributedFabricObservedTransportProofV1::try_new(
+            request.target(),
+            peer,
+            DistributedFabricObservedTransportProofFieldsV1 {
+                local_runtime_host: request.target(),
+                peer_runtime_host: peer.peer_runtime_host(),
+                session_epoch: DistributedFabricSessionEpochV1::try_from_bytes([0xe3; 16])
+                    .unwrap_or_else(|error| panic!("fixture session epoch rejected: {error}")),
+                authenticated_peer_identity_ref: peer.authentication().expected_peer_identity_ref(),
+                selected_local_credential_ref: peer.authentication().local_credential_ref(),
+                transport_evidence_ref: DistributedFabricTransportEvidenceRefV1::try_from_bytes(
+                    [0xe4; 16],
+                )
+                .unwrap_or_else(|error| panic!("fixture transport Evidence ref rejected: {error}")),
+                observation_sequence: 41,
+            },
+        )
+        .unwrap_or_else(|error| panic!("fixture transport proof rejected: {error}"));
+        let observations =
+            DistributedAgentStackTerminalObservationsV1::try_new(request, vec![proof])
+                .unwrap_or_else(|error| panic!("fixture terminal observations rejected: {error}"));
+        let installed_binding_set_digest =
+            distributed_agent_stack_installed_binding_set_digest_v1(digest(0xf1), digest(0xf2))
+                .unwrap_or_else(|error| panic!("fixture binding-set digest rejected: {error}"));
+        let facts =
+            DistributedAgentStackTerminalFactsV1::try_new(
+                request,
+                DistributedAgentStackTerminalOutcomeV1::ActiveReady,
+                DistributedAgentStackTerminalEvidenceFieldsV1 {
+                    runtime_host_epoch: 2,
+                    completion_snapshot_sequence: 17,
+                    selection_clock_generation: request.temporal().target_clock_generation(),
+                    selection_observed_at_nanos,
+                    fabric_generation: Some(ManagedServiceGeneration::try_new(2).unwrap_or_else(
+                        |error| panic!("fixture Fabric generation rejected: {error}"),
+                    )),
+                    agent_generation: Some(ManagedServiceGeneration::try_new(3).unwrap_or_else(
+                        |error| panic!("fixture Agent generation rejected: {error}"),
+                    )),
+                    local_bindings: DistributedAgentStackLocalBindingEvidenceFieldsV1 {
+                        physical_binding_census: 2,
+                        census_complete: true,
+                        fabric_ready: true,
+                        agent_ready: true,
+                        dependency_satisfied: true,
+                        exact_zero: false,
+                        quarantined: false,
+                        installed_binding_set_digest,
+                        raw_outcome_digest: digest(0xf3),
+                    },
+                },
+                observations,
+            )
+            .unwrap_or_else(|error| panic!("fixture ActiveReady facts rejected: {error}"));
+        let auth = DistributedAgentStackTerminalAuthClaimV1::try_new(
+            channel,
+            RESPONSE_KEY_REF,
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("fixture terminal algorithm rejected: {error}")),
+            ED25519_ALGORITHM_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("fixture terminal auth rejected: {error}"));
+        let draft =
+            DistributedAgentStackTerminalReceiptDraftV1::try_new(request, facts, channel, auth)
+                .unwrap_or_else(|error| {
+                    panic!("fixture ActiveReady PXDS1 draft rejected: {error}")
+                });
+        let signature = SigningKey::from_bytes(&RESPONSE_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| {
+                        panic!("fixture ActiveReady PXDS1 transcript rejected: {error}")
+                    })
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("fixture ActiveReady PXDS1 rejected: {error}"))
+    }
+
+    fn restricted_carrier(
+        provisioning: &RuntimeProvisioningV1,
+        request: &DistributedAgentStackApplyRequestV1,
+        route: &str,
+        controller_key_fingerprint: Digest32,
+        runtime_response_key_fingerprint: Digest32,
+    ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+        RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: request.target(),
+                runtime_principal: provisioning.runtime_principal(),
+                controller_principal: provisioning.controller_principal(),
+                endpoint_ref: [0xc3; 16],
+                endpoint_generation: 1,
+                route,
+                controller_request_key: provisioning.controller_request_key_ref(),
+                controller_request_key_fingerprint: controller_key_fingerprint,
+                runtime_response_key: provisioning.runtime_response_key_ref(),
+                runtime_response_key_fingerprint,
+                control_transport_profile_ref: [0xc4; 16],
+                control_transport_profile_digest: digest(0xc5),
+            },
+        )
+        .unwrap_or_else(|error| panic!("restricted carrier rejected: {error}"))
+    }
+
+    fn pinned_restricted_carrier(
+        provisioning: &RuntimeProvisioningV1,
+        request: &DistributedAgentStackApplyRequestV1,
+        route: &str,
+    ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+        let runtime_response_key_fingerprint = ed25519_control_key_fingerprint(
+            provisioning.response_signer().verifying_key().as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("Runtime response fingerprint failed: {error}"));
+        restricted_carrier(
+            provisioning,
+            request,
+            route,
+            provisioning.controller_key_fingerprint(),
+            runtime_response_key_fingerprint,
+        )
+    }
+
+    fn restricted_apply_request(
+        request: DistributedAgentStackApplyRequestV1,
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> DistributedAgentStackRestrictedApplyRequestV1 {
+        let draft = DistributedAgentStackRestrictedApplyRequestDraftV1::try_new(request, carrier)
+            .unwrap_or_else(|error| panic!("restricted request draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("restricted transcript failed: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("restricted request rejected: {error}"))
+    }
+
+    async fn managed_control_with_active_stack(
+        socket_path: PathBuf,
+    ) -> (
+        TestDirectory,
+        ManagedFabricControlService,
+        ManagedAgentStackApplyRequestV1,
+    ) {
+        let (state_directory, mut started) = managed_started_service(socket_path);
+        started
+            .core
+            .recover()
+            .await
+            .unwrap_or_else(|error| panic!("restricted predecessor recovery failed: {error}"));
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xe5),
+            digest(0xe6),
+        )
+        .unwrap_or_else(|error| panic!("restricted channel rejected: {error}"));
+        let fabric_request = managed_fabric_active_request(
+            started.stack_projection.managed_fabric_projection().clone(),
+            managed_available_port(),
+            started
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("restricted predecessor clock failed: {error}"))
+                .generation(),
+        );
+        let mut control = ManagedFabricControlService {
+            core: started.core,
+            stack: started.stack,
+            stack_projection: started.stack_projection,
+            model_stack: started.model_stack,
+            model_stack_projection: started.model_stack_projection,
+            distributed: started.distributed,
+            distributed_projection: started.distributed_projection,
+            handle_broker: started.handle_broker,
+            state_directory: started.state_directory,
+            provisioning: started.provisioning,
+            channel,
+            dependencies: started.dependencies,
+        };
+        let fabric_wire = control
+            .handle_request(fabric_request.canonical_wire(), channel)
+            .await
+            .unwrap_or_else(|error| panic!("restricted predecessor PXAR-v6 failed: {error:?}"));
+        let fabric_receipt = ManagedFabricApplyTerminalReceiptV1::decode(&fabric_wire)
+            .unwrap_or_else(|error| panic!("restricted predecessor PXFT failed: {error}"));
+        assert_eq!(
+            fabric_receipt.facts().outcome(),
+            ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+        );
+        let stack_request = managed_stack_active_request(
+            &fabric_request,
+            control.stack_projection.clone(),
+            control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("restricted stack clock failed: {error}"))
+                .generation(),
+        );
+        let stack_wire = control
+            .handle_request(stack_request.canonical_wire(), channel)
+            .await
+            .unwrap_or_else(|error| panic!("restricted predecessor PXAR-v7 failed: {error:?}"));
+        let stack_receipt = ManagedAgentStackTerminalReceiptV1::decode(&stack_wire)
+            .unwrap_or_else(|error| panic!("restricted predecessor PXST failed: {error}"));
+        assert_eq!(
+            stack_receipt.facts().state().outcome(),
+            ManagedAgentStackTerminalOutcomeV1::ActiveReady
+        );
+        assert!(control.stack.is_some());
+        assert!(control.distributed.is_none());
+        (state_directory, control, stack_request)
     }
 
     struct MockStore {
@@ -5210,6 +9714,1391 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_listener_is_published_only_after_successor_recovery() {
+        let socket_directory = TestSocketDirectory::create();
+        let (_state_directory, started) =
+            managed_started_service(socket_directory.socket_path.clone());
+        assert!(matches!(
+            started.core.recovered_observation(),
+            Err(ManagedFabricRuntimeError::RecoveryNotCompleted)
+        ));
+        assert!(
+            !socket_directory.socket_path.exists(),
+            "managed socket must be absent before async recovery"
+        );
+        assert_eq!(
+            started
+                .core
+                .clock_reading()
+                .expect("managed clock must read")
+                .generation()
+                .value(),
+            1
+        );
+        serve_managed_fabric_until(started, async {
+            assert!(
+                socket_directory.socket_path.exists(),
+                "shutdown future must not be polled until recovery and bind complete"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|error| panic!("managed service shutdown failed: {error}"));
+        assert!(
+            !socket_directory.socket_path.exists(),
+            "managed socket must be removed after exact shutdown"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_pxar9_routes_only_to_model_agent_owner_and_returns_exact_pxmt() {
+        let socket_directory = TestSocketDirectory::create();
+        let (_state_directory, mut started) = managed_started_service_with_dependencies(
+            socket_directory.socket_path.clone(),
+            model_fixture_service_dependencies(),
+        );
+        started
+            .core
+            .recover()
+            .await
+            .unwrap_or_else(|error| panic!("PXAR9 predecessor recovery rejected: {error}"));
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xe7),
+            digest(0xe8),
+        )
+        .unwrap_or_else(|error| panic!("PXAR9 channel rejected: {error}"));
+        let fabric_request = managed_fabric_active_request(
+            started.stack_projection.managed_fabric_projection().clone(),
+            managed_available_port(),
+            started
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("PXAR9 predecessor clock failed: {error}"))
+                .generation(),
+        );
+        let mut control = ManagedFabricControlService {
+            core: started.core,
+            stack: started.stack,
+            stack_projection: started.stack_projection,
+            model_stack: started.model_stack,
+            model_stack_projection: started.model_stack_projection,
+            distributed: started.distributed,
+            distributed_projection: started.distributed_projection,
+            handle_broker: started.handle_broker,
+            state_directory: started.state_directory,
+            provisioning: started.provisioning,
+            channel,
+            dependencies: started.dependencies,
+        };
+        let fabric_wire = control
+            .handle_request(fabric_request.canonical_wire(), channel)
+            .await
+            .unwrap_or_else(|error| panic!("PXAR9 predecessor apply rejected: {error:?}"));
+        let fabric_receipt = ManagedFabricApplyTerminalReceiptV1::decode(&fabric_wire)
+            .unwrap_or_else(|error| panic!("PXAR9 predecessor terminal rejected: {error}"));
+        assert_eq!(
+            fabric_receipt.facts().outcome(),
+            ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+        );
+
+        let request = managed_model_stack_active_request(
+            &fabric_request,
+            control.model_stack_projection.clone(),
+            control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("PXAR9 owner clock failed: {error}"))
+                .generation(),
+        );
+        assert_eq!(
+            u16::from_be_bytes([request.canonical_wire()[4], request.canonical_wire()[5]]),
+            MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION
+        );
+        let terminal_wire = control
+            .handle_request(request.canonical_wire(), channel)
+            .await
+            .unwrap_or_else(|error| panic!("valid PXAR9 rejected: {error:?}"));
+        let terminal = ManagedModelAgentStackTerminalReceiptV1::decode(&terminal_wire)
+            .unwrap_or_else(|error| panic!("valid PXMT rejected: {error}"));
+        let facts = terminal
+            .validate_against_request(&request, channel)
+            .unwrap_or_else(|error| panic!("PXMT correlation failed: {error}"));
+        assert_eq!(
+            facts.state().outcome(),
+            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady
+        );
+        assert_eq!(terminal.canonical_wire(), terminal_wire.as_ref());
+        assert!(control.model_stack.is_some());
+        assert!(control.stack.is_none());
+        assert!(control.distributed.is_none());
+        assert_eq!(
+            control
+                .handle_request(request.canonical_wire(), channel)
+                .await
+                .unwrap_or_else(|error| panic!("PXAR9 replay rejected: {error:?}")),
+            terminal_wire,
+            "owner terminal replay must preserve the exact legal PXMT bytes",
+        );
+
+        let sibling_v7 = managed_stack_active_request(
+            &fabric_request,
+            control.stack_projection.clone(),
+            control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("PXAR7 sibling clock failed: {error}"))
+                .generation(),
+        );
+        assert!(matches!(
+            control
+                .handle_request(sibling_v7.canonical_wire(), channel)
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        assert!(matches!(
+            control
+                .handle_request(fabric_request.canonical_wire(), channel)
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("PXAR9 successor shutdown failed: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_pxar7_active_conversation_empty_and_restart_replay_are_one_vertical() {
+        let socket_directory = TestSocketDirectory::create();
+        let (state_directory, mut started) =
+            managed_started_service(socket_directory.socket_path.clone());
+        started
+            .core
+            .recover()
+            .await
+            .unwrap_or_else(|error| panic!("managed predecessor recovery rejected: {error}"));
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xe1),
+            digest(0xe2),
+        )
+        .unwrap_or_else(|error| panic!("managed stack channel rejected: {error}"));
+        let fabric_projection = started.stack_projection.managed_fabric_projection().clone();
+        let fabric_port = managed_available_port();
+        let fabric_request = managed_fabric_active_request(
+            fabric_projection.clone(),
+            fabric_port,
+            started
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("managed predecessor clock failed: {error}"))
+                .generation(),
+        );
+        let mut control = ManagedFabricControlService {
+            core: started.core,
+            stack: started.stack,
+            stack_projection: started.stack_projection,
+            model_stack: started.model_stack,
+            model_stack_projection: started.model_stack_projection,
+            distributed: started.distributed,
+            distributed_projection: started.distributed_projection,
+            handle_broker: started.handle_broker,
+            state_directory: started.state_directory,
+            provisioning: started.provisioning,
+            channel,
+            dependencies: started.dependencies,
+        };
+        let fabric_wire = control
+            .handle_request(fabric_request.canonical_wire(), channel)
+            .await
+            .unwrap_or_else(|error| panic!("managed PXAR-v6 rejected: {error:?}"));
+        let fabric_receipt = ManagedFabricApplyTerminalReceiptV1::decode(&fabric_wire)
+            .unwrap_or_else(|error| panic!("managed PXFT decode failed: {error}"));
+        assert_eq!(
+            fabric_receipt.facts().outcome(),
+            ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+        );
+
+        let stack_request = managed_stack_active_request(
+            &fabric_request,
+            control.stack_projection.clone(),
+            control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("managed stack clock failed: {error}"))
+                .generation(),
+        );
+        let active_wire = control
+            .handle_request(stack_request.canonical_wire(), channel)
+            .await
+            .unwrap_or_else(|error| panic!("managed PXAR-v7 rejected: {error:?}"));
+        let active_receipt = ManagedAgentStackTerminalReceiptV1::decode(&active_wire)
+            .unwrap_or_else(|error| panic!("managed PXST decode failed: {error}"));
+        assert_eq!(
+            active_receipt.facts().state().outcome(),
+            ManagedAgentStackTerminalOutcomeV1::ActiveReady
+        );
+        assert!(control.stack.is_some());
+        let handle = control
+            .handle_broker
+            .try_acquire()
+            .unwrap_or_else(|| panic!("ActiveReady must publish one opaque Agent handle"));
+        let deck_run_id = AgentConversationDeckRunId::try_from_bytes([0xc1; 16])
+            .unwrap_or_else(|error| panic!("DeckRun id rejected: {error}"));
+        let session_id = AgentConversationSessionId::try_from_bytes([0xc2; 16])
+            .unwrap_or_else(|error| panic!("Session id rejected: {error}"));
+        handle
+            .open_session(deck_run_id, session_id, Duration::from_secs(2))
+            .await
+            .unwrap_or_else(|error| panic!("managed Agent session failed: {error}"));
+        let turn = AgentConversationRequestV1::try_new(
+            deck_run_id,
+            session_id,
+            AgentConversationTurnId::try_from_bytes([0xc3; 16])
+                .unwrap_or_else(|error| panic!("Turn id rejected: {error}")),
+            AgentConversationRequestId::try_from_bytes([0xc4; 16])
+                .unwrap_or_else(|error| panic!("Request id rejected: {error}")),
+            2_000_000_000,
+            "endpoint vertical",
+        )
+        .unwrap_or_else(|error| panic!("managed Agent request rejected: {error}"));
+        let terminal = handle
+            .submit(turn, Duration::from_secs(2))
+            .await
+            .unwrap_or_else(|error| panic!("managed Agent turn failed: {error}"));
+        assert_eq!(
+            terminal.result(),
+            &AgentConversationTerminalResultV1::Success("echo: endpoint vertical".into())
+        );
+        assert_eq!(
+            control
+                .handle_request(stack_request.canonical_wire(), channel)
+                .await
+                .unwrap_or_else(|error| panic!("managed active replay failed: {error:?}")),
+            active_wire,
+            "PXST replay must be byte-identical"
+        );
+        let mut predecessor_v6 = fabric_request.canonical_wire().to_vec();
+        predecessor_v6.shrink_to_fit();
+        assert!(matches!(
+            control.handle_request(&predecessor_v6, channel).await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+
+        let empty_request = managed_stack_empty_request(
+            &stack_request,
+            control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("managed empty clock failed: {error}"))
+                .generation(),
+        );
+        let empty_wire = control
+            .handle_request(empty_request.canonical_wire(), channel)
+            .await
+            .unwrap_or_else(|error| panic!("managed empty PXAR-v7 rejected: {error:?}"));
+        let empty_receipt = ManagedAgentStackTerminalReceiptV1::decode(&empty_wire)
+            .unwrap_or_else(|error| panic!("managed empty PXST decode failed: {error}"));
+        assert_eq!(
+            empty_receipt.facts().state().outcome(),
+            ManagedAgentStackTerminalOutcomeV1::EmptyExactZero
+        );
+        assert!(control.handle_broker.try_acquire().is_none());
+        assert_eq!(
+            control
+                .handle_request(empty_request.canonical_wire(), channel)
+                .await
+                .unwrap_or_else(|error| panic!("managed empty replay failed: {error:?}")),
+            empty_wire
+        );
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, fabric_port))
+            .unwrap_or_else(|error| panic!("exact-zero did not release Fabric port: {error}"));
+
+        if let Some(stack) = control.stack.as_mut() {
+            stack
+                .shutdown(&mut control.core)
+                .await
+                .unwrap_or_else(|error| panic!("managed stack shutdown failed: {error}"));
+        }
+        control
+            .core
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("managed predecessor shutdown failed: {error}"));
+        drop(control);
+
+        let projection_digest = transition_projection_digest(&fabric_projection)
+            .unwrap_or_else(|error| panic!("restart projection digest failed: {error}"));
+        let reopened_store = ManagedFabricStore::open_fixture(
+            state_directory.path(),
+            STORE_INSTANCE_ID,
+            provisioning(socket_directory.socket_path.clone()).owner_target_fingerprint(),
+            projection_digest,
+        )
+        .unwrap_or_else(|error| panic!("managed successor store reopen failed: {error}"));
+        let restarted = StartedManagedFabricService::try_start_from_store(
+            state_directory.path(),
+            STORE_INSTANCE_ID,
+            compiled_facts(),
+            provisioning(socket_directory.socket_path.clone()),
+            reopened_store,
+            RuntimeManagedFabricServiceDependenciesV1::unavailable(),
+        )
+        .unwrap_or_else(|error| panic!("managed exact-zero restart failed: {error}"));
+        let StartedManagedFabricService {
+            mut core,
+            mut stack,
+            stack_projection,
+            model_stack,
+            model_stack_projection,
+            distributed,
+            distributed_projection,
+            handle_broker,
+            state_directory,
+            provisioning,
+            dependencies,
+        } = restarted;
+        {
+            let recovered_stack = stack
+                .as_mut()
+                .unwrap_or_else(|| panic!("managed stack cutover disappeared on restart"));
+            assert!(!recovered_stack.requires_predecessor_recovery());
+            recovered_stack
+                .recover(&mut core)
+                .await
+                .unwrap_or_else(|error| panic!("managed exact-zero recovery failed: {error}"));
+        }
+        let mut restarted_control = ManagedFabricControlService {
+            core,
+            stack,
+            stack_projection,
+            model_stack,
+            model_stack_projection,
+            distributed,
+            distributed_projection,
+            handle_broker,
+            state_directory,
+            provisioning,
+            channel,
+            dependencies,
+        };
+        assert_eq!(
+            restarted_control
+                .handle_request(empty_request.canonical_wire(), channel)
+                .await
+                .unwrap_or_else(|error| panic!("restart PXST replay failed: {error:?}")),
+            empty_wire
+        );
+        assert!(restarted_control.handle_broker.try_acquire().is_none());
+        if let Some(stack) = restarted_control.stack.as_mut() {
+            stack
+                .shutdown(&mut restarted_control.core)
+                .await
+                .unwrap_or_else(|error| panic!("restart stack shutdown failed: {error}"));
+        }
+        restarted_control
+            .core
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("restart predecessor shutdown failed: {error}"));
+    }
+
+    #[test]
+    fn distributed_owner_commits_active_v1_before_publishing_any_handle() {
+        let source = include_str!("distributed_agent_stack_runtime.rs");
+        let evidence_commit = section(
+            source,
+            "    async fn commit_snapshot_evidence_and_activate(",
+            "    async fn start_agent_after_verified_evidence(",
+        );
+        let begin = evidence_commit
+            .find("self.begin_evidence_commit(owner, batch.clone())")
+            .unwrap_or_else(|| panic!("durable Evidence intent disappeared"));
+        let append = evidence_commit
+            .find("self.append_evidence_batch_with_one_reopen(&batch)")
+            .unwrap_or_else(|| panic!("Evidence append/readback disappeared"));
+        let committed = evidence_commit
+            .find("self.mark_evidence_committed(owner, &verified)")
+            .unwrap_or_else(|| panic!("durable Evidence commit disappeared"));
+        let agent_start = evidence_commit
+            .find("self.start_agent_after_verified_evidence(")
+            .unwrap_or_else(|| panic!("post-Evidence Agent start disappeared"));
+        assert!(begin < append && append < committed && committed < agent_start);
+        assert!(!evidence_commit.contains(".publish_distributed("));
+
+        let activation = section(
+            source,
+            "    async fn start_agent_after_verified_evidence(",
+            "    async fn complete_agent_activation_failure(",
+        );
+        let assembly_start = activation
+            .find("ManagedAgentAssembly::start_from_execution(")
+            .unwrap_or_else(|| panic!("distributed Agent start disappeared"));
+        let ready_shape = activation
+            .find("ready.phase = DistributedAgentStackDurablePhase::ActiveReady")
+            .unwrap_or_else(|| panic!("ActiveReady state construction disappeared"));
+        let clear_handoff = activation
+            .find("self.snapshot.evidence_state().try_clear_committed()")
+            .unwrap_or_else(|| panic!("committed Evidence clear disappeared"));
+        let durable_commit = activation
+            .find("self.commit_v2_transition(owner, ready, cleared_evidence)")
+            .unwrap_or_else(|| panic!("durable ActiveReady commit disappeared"));
+        let retain_handle = activation
+            .find("self.handle = Some(handle.clone())")
+            .unwrap_or_else(|| panic!("Runtime handle retention disappeared"));
+        let pending_publish = activation
+            .find("self.handle_publication_pending = self")
+            .unwrap_or_else(|| panic!("handle publication retry marker disappeared"));
+        let publish = activation
+            .find(".publish_distributed(handle, &receipt)")
+            .unwrap_or_else(|| panic!("distributed handle publication disappeared"));
+        assert!(
+            assembly_start < ready_shape
+                && ready_shape < clear_handoff
+                && clear_handoff < durable_commit
+                && durable_commit < retain_handle
+                && retain_handle < pending_publish
+                && pending_publish < publish
+        );
+        assert_eq!(activation.match_indices(".publish_distributed(").count(), 1);
+        let activation_failures = activation
+            .match_indices(".complete_agent_activation_failure(")
+            .map(|(failure, _)| failure)
+            .collect::<Vec<_>>();
+        assert!(!activation_failures.is_empty());
+        assert!(
+            activation_failures
+                .into_iter()
+                .all(|failure| failure < publish),
+            "Agent start/census failures must return before broker publication"
+        );
+        let commit_failure = &activation[durable_commit..retain_handle];
+        assert!(commit_failure.contains("drop(handle)"));
+        assert!(
+            commit_failure
+                .contains("self.cleanup_unpublished_agent_after_commit_failure(assembly)")
+        );
+        assert!(commit_failure.contains("self.recovery_completed = false"));
+        assert!(commit_failure.contains("return Err(error)"));
+        let activation_cleanup = section(
+            source,
+            "    async fn complete_agent_activation_failure(",
+            "    async fn cleanup_unpublished_agent_after_commit_failure(",
+        );
+        assert!(activation_cleanup.contains("self.handle = None"));
+        assert!(activation_cleanup.contains("self.handle_publication_pending = false"));
+        assert!(activation_cleanup.contains("assembly.shutdown().await"));
+        assert!(!activation_cleanup.contains(".publish_distributed("));
+        let commit_cleanup = section(
+            source,
+            "    async fn cleanup_unpublished_agent_after_commit_failure(",
+            "    fn commit_agent_activation_quarantine(",
+        );
+        assert!(commit_cleanup.contains("self.handle = None"));
+        assert!(commit_cleanup.contains("self.handle_publication_pending = false"));
+        assert!(commit_cleanup.contains("assembly.shutdown().await"));
+        assert!(commit_cleanup.contains("self.cleanup_live().await"));
+        assert!(!commit_cleanup.contains(".publish_distributed("));
+        let apply_outcome = section(
+            source,
+            "    fn activation_apply_outcome(",
+            "    async fn complete_agent_activation_failure(",
+        );
+        assert!(apply_outcome.contains("if self.handle_publication_pending"));
+        assert!(
+            apply_outcome
+                .contains("DistributedAgentStackApplyOutcome::CommittedHandleUnavailable(receipt)")
+        );
+        assert!(apply_outcome.contains("DistributedAgentStackApplyOutcome::Committed(receipt)"));
+
+        let replay = section(
+            source,
+            "    pub(crate) fn authenticated_terminal_replay(",
+            "    #[cfg(test)]\n    pub(crate) fn durable_current_is_exact_zero_for_test(",
+        );
+        let validate = replay
+            .find("validate_request(owner, &self.projection, request, response_channel)")
+            .unwrap_or_else(|| panic!("authenticated replay validation disappeared"));
+        let lookup = replay
+            .find("self.lookup_terminal(request, response_channel)")
+            .unwrap_or_else(|| panic!("durable terminal lookup disappeared"));
+        let pending = replay
+            .find("if self.handle_publication_pending")
+            .unwrap_or_else(|| panic!("pending publication retry disappeared"));
+        let active = replay
+            .find("DistributedAgentStackTerminalOutcomeV1::ActiveReady")
+            .unwrap_or_else(|| panic!("pending replay ActiveReady gate disappeared"));
+        let retained = replay
+            .find("let handle = self")
+            .unwrap_or_else(|| panic!("pending replay retained-handle gate disappeared"));
+        let retry = replay
+            .find(".publish_distributed(handle.clone(), active)")
+            .unwrap_or_else(|| panic!("exact PXDS1 publication retry disappeared"));
+        let clear_pending = replay
+            .find("self.handle_publication_pending = false")
+            .unwrap_or_else(|| panic!("publication retry marker clear disappeared"));
+        assert!(
+            validate < lookup
+                && lookup < pending
+                && pending < active
+                && active < retained
+                && retained < retry
+                && retry < clear_pending
+        );
+        assert_eq!(replay.match_indices(".publish_distributed(").count(), 1);
+
+        let endpoint_source = include_str!("runtime_control_endpoint.rs");
+        let endpoint = section(
+            endpoint_source,
+            "    async fn handle_distributed_agent_stack_apply(",
+            "pub(crate) fn validate_restricted_runtime_apply_carrier_pins",
+        );
+        let mutable_owner = endpoint
+            .find("if let Some(distributed) = self.distributed.as_mut()")
+            .unwrap_or_else(|| panic!("mutation-capable distributed replay owner disappeared"));
+        let authenticated_replay = endpoint
+            .find("distributed.authenticated_terminal_replay")
+            .unwrap_or_else(|| panic!("authenticated distributed replay disappeared"));
+        let exact_return = endpoint
+            .find("return distributed_agent_stack_terminal_response_wire(&receipt)")
+            .unwrap_or_else(|| panic!("exact PXDS1 replay return disappeared"));
+        let fresh_reading = endpoint
+            .find("let reading = self")
+            .unwrap_or_else(|| panic!("fresh distributed admission clock disappeared"));
+        assert!(
+            mutable_owner < authenticated_replay
+                && authenticated_replay < exact_return
+                && exact_return < fresh_reading
+        );
+        let installed_core = endpoint
+            .find("self.distributed = Some(distributed)")
+            .unwrap_or_else(|| panic!("cutover core installation disappeared"));
+        let classify = endpoint
+            .find("distributed_agent_stack_apply_response_wire(outcome)")
+            .unwrap_or_else(|| panic!("distributed outcome classification disappeared"));
+        assert!(installed_core < classify);
+        let response_mapping = section(
+            endpoint_source,
+            "fn distributed_agent_stack_apply_response_wire(",
+            "fn map_managed_fabric_error(",
+        );
+        let handle_unavailable = response_mapping
+            .find("DistributedAgentStackApplyOutcome::CommittedHandleUnavailable(_)")
+            .unwrap_or_else(|| panic!("handle-unavailable outcome mapping disappeared"));
+        let restart_required = response_mapping
+            .find("DistributedAgentStackApplyOutcome::CommittedOwnerRestartRequired")
+            .unwrap_or_else(|| panic!("retained-owner restart mapping disappeared"));
+        let pending_error = response_mapping
+            .find("Err(RuntimeControlRequestError::Unavailable)")
+            .unwrap_or_else(|| panic!("handle-unavailable endpoint error disappeared"));
+        let restart_error = response_mapping
+            .find("RuntimeBootstrapEndpointError::DistributedAgentStackRestartRequired")
+            .unwrap_or_else(|| panic!("restart-required endpoint error disappeared"));
+        assert!(handle_unavailable < pending_error && restart_required < restart_error);
+        assert!(
+            !response_mapping[handle_unavailable.min(restart_required)..]
+                .contains("distributed_agent_stack_terminal_response_wire(&receipt)")
+        );
+    }
+
+    #[test]
+    fn unavailable_is_nonfatal_in_every_endpoint_service_loop() {
+        let source = include_str!("runtime_control_endpoint.rs");
+        let developer = section(
+            source,
+            "async fn serve_developer_legacy_cutover_until<F, R>(",
+            "fn prevalidate_developer_managed_cutover_request(",
+        );
+        let legacy = section(
+            source,
+            "impl<Store> BoundRuntimeBootstrapService<Store>",
+            "async fn serve_managed_fabric_until<F>(",
+        );
+        let managed = section(
+            source,
+            "pub(crate) async fn serve_managed_fabric_until_with_ready<F, R>(",
+            "async fn runtime_shutdown_signal()",
+        );
+        let assert_local_unavailable_continues = |service: &str| {
+            let unavailable = service
+                .find("Err(RuntimeControlRequestError::Unavailable)")
+                .unwrap_or_else(|| panic!("local Unavailable classification disappeared"));
+            let internal = service[unavailable..]
+                .find("Err(RuntimeControlRequestError::Internal(error))")
+                .map(|offset| unavailable + offset)
+                .unwrap_or_else(|| panic!("local Internal classification disappeared"));
+            let nonfatal = &service[unavailable..internal];
+            assert!(nonfatal.contains("continue"));
+            assert!(!nonfatal.contains("break"));
+        };
+        assert_local_unavailable_continues(developer);
+        assert_local_unavailable_continues(legacy);
+        assert_local_unavailable_continues(managed);
+
+        let assert_restricted_unavailable_continues = |service: &str| {
+            let unavailable = service
+                .find("Err(RuntimeRestrictedRemoteApplyErrorV1::Unavailable)")
+                .unwrap_or_else(|| panic!("restricted Unavailable classification disappeared"));
+            let internal = service[unavailable..]
+                .find("Err(error @ RuntimeRestrictedRemoteApplyErrorV1::Internal)")
+                .map(|offset| unavailable + offset)
+                .unwrap_or_else(|| panic!("restricted Internal classification disappeared"));
+            let nonfatal = &service[unavailable..internal];
+            assert!(nonfatal.contains("drop(inbound)"));
+            assert!(!nonfatal.contains("break"));
+            assert!(service[internal..].contains("continue;"));
+        };
+        assert_restricted_unavailable_continues(developer);
+        assert_restricted_unavailable_continues(managed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_pxds_bridge_claims_only_exact_published_inner_and_registered_outer() {
+        // The endpoint's remote-mTLS fixture remains intentionally fail-closed,
+        // so this test begins at the signed PXDS1 terminal boundary. It proves
+        // endpoint correlation and handle gating, not a live two-host session.
+        let socket_directory = TestSocketDirectory::create();
+        let (_state_directory, mut control, stack_request) =
+            managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
+        let request = distributed_stack_active_request(
+            &stack_request,
+            control.distributed_projection.clone(),
+            control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("ActiveReady PXDS fixture clock failed: {error}"))
+                .generation(),
+        );
+        let carrier =
+            pinned_restricted_carrier(&control.provisioning, &request, RESTRICTED_APPLY_ROUTE);
+        let restricted = restricted_apply_request(request.clone(), carrier.clone());
+        let authenticated = authenticate_restricted_distributed_agent_stack_apply(
+            &control.provisioning,
+            &restricted,
+            &carrier,
+        )
+        .unwrap_or_else(|error| panic!("ActiveReady PXRC authentication failed: {error}"));
+        let pxds1 = distributed_active_terminal_receipt(&request, control.channel, 101);
+        let pxds1_wire = distributed_agent_stack_terminal_response_wire(&pxds1)
+            .unwrap_or_else(|error| panic!("ActiveReady PXDS1 response rejected: {error:?}"));
+        assert_eq!(pxds1_wire.as_ref(), pxds1.canonical_wire());
+        assert_eq!(
+            distributed_agent_stack_apply_response_wire(
+                DistributedAgentStackApplyOutcome::Committed(pxds1.clone()),
+            )
+            .unwrap_or_else(|error| panic!("committed PXDS1 classification failed: {error:?}")),
+            pxds1_wire
+        );
+        assert_eq!(
+            distributed_agent_stack_apply_response_wire(
+                DistributedAgentStackApplyOutcome::Replayed(pxds1.clone()),
+            )
+            .unwrap_or_else(|error| panic!("replayed PXDS1 classification failed: {error:?}")),
+            pxds1_wire
+        );
+        assert!(matches!(
+            distributed_agent_stack_apply_response_wire(
+                DistributedAgentStackApplyOutcome::CommittedHandleUnavailable(pxds1.clone()),
+            ),
+            Err(RuntimeControlRequestError::Unavailable)
+        ));
+        assert!(matches!(
+            distributed_agent_stack_apply_response_wire(
+                DistributedAgentStackApplyOutcome::CommittedOwnerRestartRequired,
+            ),
+            Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::DistributedAgentStackRestartRequired,
+            ))
+        ));
+        assert_eq!(
+            map_restricted_inner_apply_error(RuntimeControlRequestError::Unavailable),
+            RuntimeRestrictedRemoteApplyErrorV1::Unavailable
+        );
+        assert!(matches!(
+            map_distributed_agent_stack_error(
+                DistributedAgentStackRuntimeError::HandlePublicationPending,
+            ),
+            RuntimeControlRequestError::Unavailable
+        ));
+
+        let bridged_facts = validate_restricted_inner_terminal(
+            &control.provisioning,
+            authenticated,
+            control.channel,
+            &pxds1_wire,
+        )
+        .unwrap_or_else(|error| panic!("ActiveReady PXDS1 validation failed: {error}"));
+        assert_eq!(&bridged_facts, pxds1.facts());
+        assert_eq!(
+            bridged_facts.outcome(),
+            DistributedAgentStackTerminalOutcomeV1::ActiveReady
+        );
+        assert_eq!(bridged_facts.target(), request.target());
+        assert_eq!(bridged_facts.operation_id(), request.operation_id());
+        assert_eq!(
+            bridged_facts.request_digest(),
+            request.envelope_request_digest()
+        );
+        assert_eq!(
+            bridged_facts.target_slice_digest(),
+            request.target_slice_digest()
+        );
+
+        let draft =
+            DistributedAgentStackTerminalReceiptDraftV2::try_new(authenticated, bridged_facts)
+                .unwrap_or_else(|error| panic!("ActiveReady PXDS2 draft rejected: {error}"));
+        let signature = control
+            .provisioning
+            .response_signer()
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| {
+                        panic!("ActiveReady PXDS2 transcript rejected: {error}")
+                    })
+                    .as_bytes(),
+            )
+            .to_bytes();
+        let pxds2 = draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("ActiveReady PXDS2 rejected: {error}"));
+        let expected_runtime_fingerprint = ed25519_control_key_fingerprint(
+            control
+                .provisioning
+                .response_signer()
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("Runtime response fingerprint failed: {error}"));
+        let verified_v2 = pxds2
+            .verify_runtime_response(
+                authenticated,
+                |principal, key, fingerprint, transcript, signature| {
+                    let Ok(signature) = Signature::from_slice(signature) else {
+                        return false;
+                    };
+                    principal == control.provisioning.runtime_principal()
+                        && key == control.provisioning.runtime_response_key_ref()
+                        && fingerprint == expected_runtime_fingerprint
+                        && control
+                            .provisioning
+                            .response_signer()
+                            .verifying_key()
+                            .verify_strict(transcript, &signature)
+                            .is_ok()
+                },
+            )
+            .unwrap_or_else(|error| panic!("ActiveReady PXDS2 verification failed: {error}"));
+        assert_eq!(verified_v2, pxds1.facts());
+        assert_eq!(pxds2.carrier(), &carrier);
+        assert_eq!(
+            pxds2.restricted_request_digest(),
+            restricted.restricted_request_digest()
+        );
+
+        // This fixture isolates the broker's exact-receipt gate. The separate
+        // owner-ordering test proves that production publication happens only
+        // after the same ActiveReady transition is durably committed.
+        let live_handle = control
+            .handle_broker
+            .try_acquire()
+            .unwrap_or_else(|| panic!("managed predecessor lost its live Agent handle"));
+        assert!(
+            control
+                .handle_broker
+                .try_claim_restricted_distributed(pxds2.canonical_wire())
+                .unwrap_or_else(|error| panic!("unpublished PXDS2 claim failed: {error}"))
+                .is_none(),
+            "an unregistered ActiveReady PXDS2 must not claim a handle"
+        );
+        assert!(
+            control
+                .handle_broker
+                .register_restricted_distributed_alias(&pxds1_wire, pxds2.canonical_wire())
+                .is_err(),
+            "an outer alias must not register before its exact inner PXDS1 is published"
+        );
+        assert!(
+            control
+                .handle_broker
+                .try_claim_distributed(&pxds1_wire)
+                .unwrap_or_else(|error| panic!("unpublished PXDS1 claim failed: {error}"))
+                .is_none(),
+            "an ActiveReady receipt that was not published must not claim a handle"
+        );
+        control
+            .handle_broker
+            .publish_distributed(live_handle, &pxds1)
+            .unwrap_or_else(|error| panic!("fixture distributed publish failed: {error}"));
+        assert!(
+            control
+                .handle_broker
+                .try_claim_distributed(&pxds1_wire)
+                .unwrap_or_else(|error| panic!("published PXDS1 claim failed: {error}"))
+                .is_some(),
+            "the byte-identical published ActiveReady PXDS1 must claim its handle"
+        );
+        assert!(
+            control
+                .handle_broker
+                .try_claim_restricted_distributed(pxds2.canonical_wire())
+                .unwrap_or_else(|error| panic!("unregistered PXDS2 claim failed: {error}"))
+                .is_none(),
+            "publishing inner PXDS1 alone must not make the outer PXDS2 claimable"
+        );
+        control
+            .handle_broker
+            .register_restricted_distributed_alias(&pxds1_wire, pxds2.canonical_wire())
+            .unwrap_or_else(|error| panic!("exact restricted alias registration failed: {error}"));
+        control
+            .handle_broker
+            .register_restricted_distributed_alias(&pxds1_wire, pxds2.canonical_wire())
+            .unwrap_or_else(|error| panic!("exact restricted alias replay failed: {error}"));
+        assert!(
+            control
+                .handle_broker
+                .try_claim_restricted_distributed(pxds2.canonical_wire())
+                .unwrap_or_else(|error| panic!("registered PXDS2 claim failed: {error}"))
+                .is_some(),
+            "the byte-identical registered ActiveReady PXDS2 must claim its inner handle"
+        );
+        let different_facts_inner =
+            distributed_active_terminal_receipt(&request, control.channel, 102);
+        assert_ne!(different_facts_inner.facts(), pxds1.facts());
+        let different_facts_draft = DistributedAgentStackTerminalReceiptDraftV2::try_new(
+            authenticated,
+            different_facts_inner.facts().clone(),
+        )
+        .unwrap_or_else(|error| panic!("different-facts PXDS2 draft rejected: {error}"));
+        let different_facts_signature = control
+            .provisioning
+            .response_signer()
+            .sign(
+                different_facts_draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| {
+                        panic!("different-facts PXDS2 transcript rejected: {error}")
+                    })
+                    .as_bytes(),
+            )
+            .to_bytes();
+        let different_facts_pxds2 = different_facts_draft
+            .finalize(&different_facts_signature)
+            .unwrap_or_else(|error| panic!("different-facts PXDS2 rejected: {error}"));
+        assert!(
+            control
+                .handle_broker
+                .register_restricted_distributed_alias(
+                    pxds1.canonical_wire(),
+                    different_facts_pxds2.canonical_wire(),
+                )
+                .is_err(),
+            "a canonical PXDS2 with different typed/fact bytes must not alias the inner PXDS1"
+        );
+        let mut different_pxds1 = pxds1_wire.into_vec();
+        *different_pxds1
+            .last_mut()
+            .unwrap_or_else(|| panic!("PXDS1 fixture must contain a signature")) ^= 1;
+        assert!(
+            control
+                .handle_broker
+                .try_claim_distributed(&different_pxds1)
+                .unwrap_or_else(|error| panic!("different PXDS1 claim failed: {error}"))
+                .is_none(),
+            "a different canonical PXDS1 must not claim the published handle"
+        );
+        assert!(
+            control
+                .handle_broker
+                .register_restricted_distributed_alias(&different_pxds1, pxds2.canonical_wire())
+                .is_err(),
+            "an alias must not attach to a different inner PXDS1"
+        );
+        let mut different_pxds2 = pxds2.canonical_wire().to_vec();
+        *different_pxds2
+            .last_mut()
+            .unwrap_or_else(|| panic!("PXDS2 fixture must contain a signature")) ^= 1;
+        assert!(
+            control
+                .handle_broker
+                .try_claim_restricted_distributed(&different_pxds2)
+                .unwrap_or_else(|error| panic!("different PXDS2 claim failed: {error}"))
+                .is_none(),
+            "a different canonical PXDS2 must not claim the registered alias"
+        );
+        assert!(
+            control
+                .handle_broker
+                .register_restricted_distributed_alias(pxds1.canonical_wire(), &different_pxds2)
+                .is_err(),
+            "a different outer alias must not replace the registered PXDS2"
+        );
+        assert!(matches!(
+            control
+                .handle_broker
+                .try_claim_distributed(pxds2.canonical_wire()),
+            Err(ManagedAgentStackRuntimeError::RequestRejected)
+        ));
+        assert!(matches!(
+            control
+                .handle_broker
+                .try_claim_restricted_distributed(pxds1.canonical_wire()),
+            Err(ManagedAgentStackRuntimeError::RequestRejected)
+        ));
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("ActiveReady PXDS fixture shutdown failed: {error}"));
+        assert!(
+            control
+                .handle_broker
+                .try_claim_restricted_distributed(pxds2.canonical_wire())
+                .unwrap_or_else(|error| panic!("revoked PXDS2 claim failed: {error}"))
+                .is_none(),
+            "ordered shutdown must revoke the inner handle and every registered alias"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restricted_pxrc_verifies_before_mutation_and_returns_exact_pinned_pxds2() {
+        const ROUTE: &str = "paraegox/runtime/endpoint-stack/restricted/apply";
+
+        let socket_directory = TestSocketDirectory::create();
+        let (_state_directory, mut control, stack_request) =
+            managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
+        let distributed_request = distributed_stack_active_request(
+            &stack_request,
+            control.distributed_projection.clone(),
+            control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("restricted apply clock failed: {error}"))
+                .generation(),
+        );
+        let carrier = pinned_restricted_carrier(&control.provisioning, &distributed_request, ROUTE);
+        let restricted = restricted_apply_request(distributed_request.clone(), carrier.clone());
+        let before_sequence = control
+            .core
+            .recovered_observation()
+            .unwrap_or_else(|error| panic!("restricted preflight observation failed: {error}"))
+            .successor_snapshot_sequence;
+
+        let mut bad_signature = restricted.canonical_wire().to_vec();
+        *bad_signature
+            .last_mut()
+            .unwrap_or_else(|| panic!("PXRC must contain a signature")) ^= 1;
+        assert!(matches!(
+            control
+                .handle_restricted_distributed_agent_stack_apply_v1(&bad_signature, &carrier)
+                .await,
+            Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)
+        ));
+        assert!(control.distributed.is_none());
+
+        let wrong_expected = pinned_restricted_carrier(
+            &control.provisioning,
+            &distributed_request,
+            "paraegox/runtime/endpoint-stack/other-route/apply",
+        );
+        assert!(matches!(
+            control
+                .handle_restricted_distributed_agent_stack_apply_v1(
+                    restricted.canonical_wire(),
+                    &wrong_expected,
+                )
+                .await,
+            Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)
+        ));
+        assert!(control.distributed.is_none());
+
+        let runtime_response_fingerprint = ed25519_control_key_fingerprint(
+            control
+                .provisioning
+                .response_signer()
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("restricted Runtime fingerprint failed: {error}"));
+        let unpinned_carrier = restricted_carrier(
+            &control.provisioning,
+            &distributed_request,
+            ROUTE,
+            digest(0xee),
+            runtime_response_fingerprint,
+        );
+        let unpinned =
+            restricted_apply_request(distributed_request.clone(), unpinned_carrier.clone());
+        assert!(matches!(
+            control
+                .handle_restricted_distributed_agent_stack_apply_v1(
+                    unpinned.canonical_wire(),
+                    &unpinned_carrier,
+                )
+                .await,
+            Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)
+        ));
+        assert!(control.distributed.is_none());
+
+        let unpinned_runtime_carrier = restricted_carrier(
+            &control.provisioning,
+            &distributed_request,
+            ROUTE,
+            control.provisioning.controller_key_fingerprint(),
+            digest(0xef),
+        );
+        let unpinned_runtime = restricted_apply_request(
+            distributed_request.clone(),
+            unpinned_runtime_carrier.clone(),
+        );
+        assert!(matches!(
+            control
+                .handle_restricted_distributed_agent_stack_apply_v1(
+                    unpinned_runtime.canonical_wire(),
+                    &unpinned_runtime_carrier,
+                )
+                .await,
+            Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)
+        ));
+        assert!(control.distributed.is_none());
+
+        let mut bad_inner_signature = distributed_request.authentication().signature().to_vec();
+        *bad_inner_signature
+            .last_mut()
+            .unwrap_or_else(|| panic!("PXAR v8 must contain a signature")) ^= 1;
+        let bad_inner = DistributedAgentStackApplyRequestDraftV1::try_new(
+            distributed_request.target_execution().clone(),
+            distributed_request.provenance(),
+            distributed_request.control_commitment().control().clone(),
+            distributed_request.temporal(),
+            distributed_request.expected_runtime_store_instance_id(),
+            distributed_request.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("bad inner PXAR draft rejected: {error}"))
+        .finalize(&bad_inner_signature)
+        .unwrap_or_else(|error| panic!("structurally valid bad inner PXAR rejected: {error}"));
+        let authenticated_outer = restricted_apply_request(bad_inner, carrier.clone());
+        let _authenticated_outer = authenticate_restricted_distributed_agent_stack_apply(
+            &control.provisioning,
+            &authenticated_outer,
+            &carrier,
+        )
+        .unwrap_or_else(|error| panic!("valid outer PXRC authentication failed: {error}"));
+        assert!(matches!(
+            control
+                .handle_restricted_distributed_agent_stack_apply_v1(
+                    authenticated_outer.canonical_wire(),
+                    &carrier,
+                )
+                .await,
+            Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)
+        ));
+        assert!(control.distributed.is_none());
+        assert_eq!(
+            control
+                .core
+                .recovered_observation()
+                .unwrap_or_else(|error| panic!("restricted rejection observation failed: {error}"))
+                .successor_snapshot_sequence,
+            before_sequence,
+            "rejected PXRC/PXAR authentication must not mutate the PXAR v8 owner"
+        );
+
+        let response = control
+            .handle_restricted_distributed_agent_stack_apply_v1(
+                restricted.canonical_wire(),
+                &carrier,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("valid restricted apply failed: {error}"));
+        assert!(control.distributed.is_some());
+        let receipt = DistributedAgentStackTerminalReceiptV2::decode(&response)
+            .unwrap_or_else(|error| panic!("restricted PXDS2 decode failed: {error}"));
+        assert!(matches!(
+            control
+                .handle_broker
+                .try_claim_restricted_distributed(&response),
+            Err(ManagedAgentStackRuntimeError::RequestRejected)
+        ));
+        assert_eq!(receipt.carrier(), &carrier);
+        assert_eq!(
+            receipt.restricted_request_digest(),
+            restricted.restricted_request_digest()
+        );
+        let authenticated = authenticate_restricted_distributed_agent_stack_apply(
+            &control.provisioning,
+            &restricted,
+            &carrier,
+        )
+        .unwrap_or_else(|error| panic!("restricted marker reconstruction failed: {error}"));
+        let facts = receipt
+            .verify_runtime_response(
+                authenticated,
+                |principal, key, fingerprint, transcript, signature| {
+                    let Ok(signature) = Signature::from_slice(signature) else {
+                        return false;
+                    };
+                    principal == control.provisioning.runtime_principal()
+                        && key == control.provisioning.runtime_response_key_ref()
+                        && fingerprint == runtime_response_fingerprint
+                        && control
+                            .provisioning
+                            .response_signer()
+                            .verifying_key()
+                            .verify_strict(transcript, &signature)
+                            .is_ok()
+                },
+            )
+            .unwrap_or_else(|error| panic!("restricted Runtime signature failed: {error}"));
+        assert_eq!(
+            facts.outcome(),
+            DistributedAgentStackTerminalOutcomeV1::TerminalNonReady
+        );
+        let evidence = facts.evidence();
+        assert!(evidence.fabric_generation.is_none());
+        assert!(evidence.agent_generation.is_none());
+        assert_eq!(evidence.local_bindings.physical_binding_census, 0);
+        assert!(!evidence.local_bindings.census_complete);
+        assert!(!evidence.local_bindings.fabric_ready);
+        assert!(!evidence.local_bindings.agent_ready);
+        assert!(!evidence.local_bindings.dependency_satisfied);
+        assert!(!evidence.local_bindings.exact_zero);
+        assert!(!evidence.local_bindings.quarantined);
+        assert!(
+            facts
+                .observations()
+                .unwrap_or_else(|| panic!("non-ready terminal lost its empty observation set"))
+                .proofs()
+                .is_empty()
+        );
+        assert!(
+            control.handle_broker.try_acquire().is_none(),
+            "non-ready distributed owner must not publish an Agent handle"
+        );
+        assert!(
+            control
+                .distributed
+                .as_ref()
+                .is_some_and(|distributed| distributed.durable_current_is_exact_zero_for_test()),
+            "conservative PXDS evidence must not weaken the independently durable exact-zero state"
+        );
+
+        let replay = control
+            .handle_restricted_distributed_agent_stack_apply_v1(
+                restricted.canonical_wire(),
+                &carrier,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("restricted replay failed: {error}"));
+        assert_eq!(replay, response, "restricted replay must be byte-identical");
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("restricted successor shutdown failed: {error}"));
+    }
+
+    #[tokio::test]
+    async fn managed_serving_bootstrap_is_signed_correlated_and_read_only() {
+        let socket_directory = TestSocketDirectory::create();
+        let (_state_directory, mut started) =
+            managed_started_service(socket_directory.socket_path.clone());
+        started
+            .core
+            .recover()
+            .await
+            .unwrap_or_else(|error| panic!("managed recovery rejected: {error}"));
+        let observed = started
+            .core
+            .recovered_observation()
+            .unwrap_or_else(|error| panic!("managed observation rejected: {error}"));
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xc1),
+            digest(0xc2),
+        )
+        .unwrap_or_else(|error| panic!("managed channel rejected: {error}"));
+        let claim = ApplyRequestAuthClaim::try_new(
+            CONTROLLER_PRINCIPAL,
+            CONTROLLER_KEY_REF,
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("managed algorithm rejected: {error}")),
+            ED25519_ALGORITHM_VERSION,
+            b"managed-serving-fresh-nonce",
+        )
+        .unwrap_or_else(|error| panic!("managed bootstrap claim rejected: {error}"));
+        let draft = ManagedServingBootstrapRequestDraftV1::try_new(
+            ManagedServingBootstrapRequestIdV1::try_from_bytes([0xc3; 16])
+                .unwrap_or_else(|error| panic!("managed request id rejected: {error}")),
+            TARGET,
+            SOURCE_SCOPE,
+            STORE_INSTANCE_ID,
+            observed.projection.clone(),
+            channel,
+            claim,
+        )
+        .unwrap_or_else(|error| panic!("managed bootstrap draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("managed request transcript failed: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        let request = draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("managed request finalization failed: {error}"));
+        let mut control = ManagedFabricControlService {
+            core: started.core,
+            stack: started.stack,
+            stack_projection: started.stack_projection,
+            model_stack: started.model_stack,
+            model_stack_projection: started.model_stack_projection,
+            distributed: started.distributed,
+            distributed_projection: started.distributed_projection,
+            handle_broker: started.handle_broker,
+            state_directory: started.state_directory,
+            provisioning: started.provisioning,
+            channel,
+            dependencies: started.dependencies,
+        };
+
+        let mut bad_signature = request.canonical_wire().to_vec();
+        let last = bad_signature
+            .last_mut()
+            .unwrap_or_else(|| panic!("managed request must be nonempty"));
+        *last ^= 0x01;
+        assert!(matches!(
+            control.handle_request(&bad_signature, channel).await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+
+        let response_wire = control
+            .handle_request(request.canonical_wire(), channel)
+            .await
+            .unwrap_or_else(|error| panic!("managed bootstrap rejected: {error:?}"));
+        let response = ManagedServingBootstrapResponseV1::decode(&response_wire)
+            .unwrap_or_else(|error| panic!("managed response decode failed: {error}"));
+        let facts = response
+            .validate_against_request(&request, channel)
+            .unwrap_or_else(|error| panic!("managed response correlation failed: {error}"));
+        assert_eq!(facts.readiness(), ManagedServingReadinessV1::RecoveredReady);
+        assert_eq!(facts.target(), TARGET);
+        assert_eq!(facts.runtime_store_instance_id(), STORE_INSTANCE_ID);
+        assert_eq!(facts.projection(), &observed.projection);
+        assert_eq!(facts.runtime_host_epoch(), observed.runtime_host_epoch);
+        assert_eq!(
+            facts.snapshot_sequence(),
+            observed.successor_snapshot_sequence
+        );
+        assert_eq!(facts.clock_domain(), observed.clock.domain());
+        assert_eq!(facts.clock_generation(), observed.clock.generation());
+        assert_ne!(facts.observed_at_nanos(), 0);
+        assert_eq!(response.authentication_runtime_peer(), RUNTIME_PRINCIPAL);
+        assert_eq!(response.authentication_key(), RESPONSE_KEY_REF);
+        let response_signature: &[u8; ED25519_SIGNATURE_BYTES] = response
+            .authentication_signature()
+            .try_into()
+            .unwrap_or_else(|_| panic!("managed response signature length changed"));
+        SigningKey::from_bytes(&RESPONSE_SEED)
+            .verifying_key()
+            .verify_strict(
+                response
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("managed response transcript failed: {error}"))
+                    .as_bytes(),
+                &Signature::from_bytes(response_signature),
+            )
+            .unwrap_or_else(|error| panic!("managed response signature failed: {error}"));
+        let after = control
+            .core
+            .recovered_observation()
+            .unwrap_or_else(|error| panic!("post-response observation failed: {error}"));
+        assert_eq!(
+            after.successor_snapshot_sequence, observed.successor_snapshot_sequence,
+            "PXFB/PXFR read-only observation must not write the successor journal"
+        );
+        control
+            .core
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("managed cleanup failed: {error}"));
+    }
+
+    #[tokio::test]
+    async fn managed_dispatch_strictly_rejects_pxar_v5_without_legacy_fallback() {
+        let socket_directory = TestSocketDirectory::create();
+        let (_state_directory, mut started) =
+            managed_started_service(socket_directory.socket_path.clone());
+        started
+            .core
+            .recover()
+            .await
+            .unwrap_or_else(|error| panic!("managed recovery rejected: {error}"));
+        let observation = started
+            .core
+            .recovered_observation()
+            .unwrap_or_else(|error| panic!("managed observation rejected: {error}"));
+        assert_eq!(observation.target, TARGET);
+        assert_eq!(observation.store_instance_id, STORE_INSTANCE_ID);
+        assert_eq!(observation.runtime_host_epoch, 1);
+        assert_eq!(observation.clock.generation().value(), 1);
+        assert_ne!(observation.transition_projection_digest, digest(0));
+        assert_ne!(observation.successor_snapshot_sequence, 0);
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xd1),
+            digest(0xd2),
+        )
+        .unwrap_or_else(|error| panic!("managed channel rejected: {error}"));
+        let mut control = ManagedFabricControlService {
+            core: started.core,
+            stack: started.stack,
+            stack_projection: started.stack_projection,
+            model_stack: started.model_stack,
+            model_stack_projection: started.model_stack_projection,
+            distributed: started.distributed,
+            distributed_projection: started.distributed_projection,
+            handle_broker: started.handle_broker,
+            state_directory: started.state_directory,
+            provisioning: started.provisioning,
+            channel,
+            dependencies: started.dependencies,
+        };
+        let mut legacy_version = [0_u8; 18];
+        legacy_version[..4].copy_from_slice(APPLY_REQUEST_MAGIC);
+        legacy_version[4..6].copy_from_slice(&5_u16.to_be_bytes());
+        assert!(matches!(
+            control.handle_request(&legacy_version, channel).await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        control
+            .core
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("managed cleanup failed: {error}"));
+    }
+
+    #[tokio::test]
     async fn bound_service_checks_peer_credentials_and_cleans_up_on_shutdown() {
         let directory = TestSocketDirectory::create();
         let bound = started_service(directory.socket_path.clone())
@@ -5243,6 +11132,7 @@ mod tests {
             STORE_INSTANCE_ID,
             compiled_facts(),
             provisioning(directory.socket_path.clone()),
+            RuntimeManagedFabricServiceDependenciesV1::unavailable(),
         );
         assert!(matches!(
             result,

@@ -19,6 +19,7 @@ use paraegox_runtime_contracts::reference_control::{
     ReferenceBootstrapRequestIdV1, ReferenceBootstrapResponseV1, ReferenceChannelBindingV1,
     ReferenceControlError, ReferenceControllerBootstrapExpectationV1,
     ed25519_control_key_fingerprint, reference_bootstrap_channel_policy_fingerprint_v1,
+    reference_developer_local_bootstrap_channel_policy_fingerprint_v1,
 };
 use paraegox_runtime_contracts::wire::ApplyRequestAuthClaim;
 
@@ -76,6 +77,7 @@ pub(crate) struct ControllerBootstrapProvisioningV1 {
     controller_gid: u32,
     admission_policy: ReferenceAdmissionPolicyFingerprintV1,
     exchange_timeout: Duration,
+    developer_local: bool,
 }
 
 impl ControllerBootstrapProvisioningV1 {
@@ -118,6 +120,51 @@ impl ControllerBootstrapProvisioningV1 {
             controller_gid,
             admission_policy,
             exchange_timeout,
+            developer_local: false,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // GOV-WAIVER-0011
+    pub(crate) fn try_new_developer_local(
+        socket_path: PathBuf,
+        controller_principal: PrincipalRef,
+        runtime_principal: PrincipalRef,
+        response_key_ref: paraegox_runtime_contracts::wire::ApplyAuthKeyRef,
+        response_public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+        runtime_uid: u32,
+        runtime_gid: u32,
+        controller_uid: u32,
+        controller_gid: u32,
+        admission_policy: ReferenceAdmissionPolicyFingerprintV1,
+        exchange_timeout: Duration,
+    ) -> Result<Self, ControllerBootstrapError> {
+        if bytes_are_zero(controller_principal.as_bytes())
+            || bytes_are_zero(runtime_principal.as_bytes())
+            || bytes_are_zero(response_key_ref.as_bytes())
+            || bytes_are_zero(&response_public_key)
+            || runtime_uid == 0
+            || runtime_gid == 0
+            || controller_uid == 0
+            || controller_gid == 0
+            || runtime_uid != controller_uid
+            || runtime_gid != controller_gid
+            || exchange_timeout.is_zero()
+        {
+            return Err(ControllerBootstrapError::InvalidProvisioning);
+        }
+        Ok(Self {
+            socket_path,
+            controller_principal,
+            runtime_principal,
+            response_key_ref,
+            response_public_key,
+            runtime_uid,
+            runtime_gid,
+            controller_uid,
+            controller_gid,
+            admission_policy,
+            exchange_timeout,
+            developer_local: true,
         })
     }
 }
@@ -206,23 +253,28 @@ pub(crate) async fn bootstrap_runtime_v1(
         provisioning.admission_policy,
     )
     .map_err(ControllerBootstrapError::ControlContract)?;
-    let stable_channel_policy =
-        reference_bootstrap_channel_policy_fingerprint_v1(ReferenceBootstrapChannelPolicyInputV1 {
-            canonical_socket_path: unix_path_bytes(&provisioning.socket_path),
-            target,
-            source_scope,
-            controller_principal: provisioning.controller_principal,
-            controller_key_ref: request_auth.key(),
-            controller_public_key: controller_signer.verifying_key().as_bytes(),
-            runtime_uid: provisioning.runtime_uid,
-            runtime_gid: provisioning.runtime_gid,
-            controller_uid: provisioning.controller_uid,
-            controller_gid: provisioning.controller_gid,
-            runtime_principal: provisioning.runtime_principal,
-            response_key_ref: provisioning.response_key_ref,
-            response_public_key: &provisioning.response_public_key,
-        })
-        .map_err(ControllerBootstrapError::ControlContract)?;
+    let controller_verification_key = controller_signer.verifying_key();
+    let channel_policy_input = ReferenceBootstrapChannelPolicyInputV1 {
+        canonical_socket_path: unix_path_bytes(&provisioning.socket_path),
+        target,
+        source_scope,
+        controller_principal: provisioning.controller_principal,
+        controller_key_ref: request_auth.key(),
+        controller_public_key: controller_verification_key.as_bytes(),
+        runtime_uid: provisioning.runtime_uid,
+        runtime_gid: provisioning.runtime_gid,
+        controller_uid: provisioning.controller_uid,
+        controller_gid: provisioning.controller_gid,
+        runtime_principal: provisioning.runtime_principal,
+        response_key_ref: provisioning.response_key_ref,
+        response_public_key: &provisioning.response_public_key,
+    };
+    let stable_channel_policy = if provisioning.developer_local {
+        reference_developer_local_bootstrap_channel_policy_fingerprint_v1(channel_policy_input)
+    } else {
+        reference_bootstrap_channel_policy_fingerprint_v1(channel_policy_input)
+    }
+    .map_err(ControllerBootstrapError::ControlContract)?;
 
     let prepared = prepare_request(
         state,

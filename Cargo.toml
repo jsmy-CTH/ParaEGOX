@@ -1,10 +1,20 @@
 [workspace]
 members = [
+  "crates/paraegox-agent-contracts",
+  "crates/paraegox-agent-service",
   "crates/paraegox-deployment",
+  "crates/paraegox-evidence",
+  "crates/paraegox-fabric",
+  "crates/paraegox-inspection",
   "crates/paraegox-kernel",
+  "crates/paraegox-local",
+  "crates/paraegox-model",
+  "crates/paraegox-model-adapters",
+  "crates/paraegox-node",
   "crates/paraegox-runtime",
   "crates/paraegox-runtime-contracts",
   "crates/paraegox-runtime-host",
+  "crates/paraegox-tui",
 ]
 resolver = "3"
 
@@ -16,13 +26,33 @@ license = "Apache-2.0"
 repository = "https://github.com/jsmy-CTH/ParaEGOX"
 
 [workspace.dependencies]
+crossterm = "=0.29.0"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
+getrandom = { version = "=0.4.3", default-features = false }
 nix = { version = "=0.31.3", default-features = false, features = ["dir", "fs", "process", "signal", "user"] }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"] }
+rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
 sha2 = { version = "0.11.0", default-features = false }
 tokio = { version = "=1.53.1", default-features = false, features = ["io-util", "net", "rt", "signal", "sync", "time"] }
+toml = "=0.9.12"
 zeroize = { version = "=1.8.2", default-features = false, features = ["alloc"] }
+zenoh = { version = "=1.9.0", default-features = false, features = ["transport_tcp", "transport_tls"] }
+paraegox-agent-contracts = { path = "crates/paraegox-agent-contracts" }
+paraegox-agent-service = { path = "crates/paraegox-agent-service" }
+paraegox-deployment = { path = "crates/paraegox-deployment" }
+paraegox-evidence = { path = "crates/paraegox-evidence" }
+paraegox-fabric = { path = "crates/paraegox-fabric" }
+paraegox-inspection = { path = "crates/paraegox-inspection" }
 paraegox-kernel = { path = "crates/paraegox-kernel" }
+paraegox-model = { path = "crates/paraegox-model" }
+paraegox-model-adapters = { path = "crates/paraegox-model-adapters" }
+paraegox-node = { path = "crates/paraegox-node" }
+paraegox-runtime = { path = "crates/paraegox-runtime" }
 paraegox-runtime-contracts = { path = "crates/paraegox-runtime-contracts" }
+paraegox-tui = { path = "crates/paraegox-tui" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

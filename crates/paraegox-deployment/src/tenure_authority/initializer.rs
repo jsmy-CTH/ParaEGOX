@@ -38,6 +38,23 @@ pub(super) fn initialize(
     )
 }
 
+/// Initializes the explicitly selected same-user developer store with the
+/// same CSPRNG, lock, codec, checksum, atomic publish, and read-back path as
+/// production. Only the target-filesystem evidence gate differs.
+pub(super) fn initialize_developer_local(
+    directory: &Path,
+    provisioning: AuthorityProvisioning,
+) -> Result<InitializationReceipt, InitializationError> {
+    let mut entropy = SystemInitializationEntropy;
+    initialize_with(
+        directory,
+        provisioning,
+        &mut entropy,
+        FilesystemPolicy::DeveloperLocal,
+        CommitFailpoint::None,
+    )
+}
+
 fn initialize_with(
     directory: &Path,
     provisioning: AuthorityProvisioning,

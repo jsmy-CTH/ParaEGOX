@@ -1,0 +1,45 @@
+[package]
+name = "paraegox-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+paraegox-agent-contracts.workspace = true
+paraegox-agent-service.workspace = true
+paraegox-deployment.workspace = true
+paraegox-evidence.workspace = true
+paraegox-fabric.workspace = true
+paraegox-inspection.workspace = true
+paraegox-kernel.workspace = true
+paraegox-model.workspace = true
+paraegox-model-adapters.workspace = true
+paraegox-node.workspace = true
+paraegox-runtime.workspace = true
+paraegox-runtime-contracts.workspace = true
+paraegox-tui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+rustix.workspace = true
+
+[target.'cfg(unix)'.dependencies.tokio]
+workspace = true
+features = ["rt", "time"]
+
+[[bin]]
+name = "paraegox"
+path = "src/main.rs"
+
+[lints]
+workspace = true
