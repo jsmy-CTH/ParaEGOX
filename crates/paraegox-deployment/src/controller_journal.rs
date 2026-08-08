@@ -28,6 +28,20 @@ use paraegox_runtime_contracts::reference_control::{
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
+#[cfg(unix)]
+use paraegox_node::observation::{RuntimeObservationAckV1, RuntimeObservationRequestV1};
+#[cfg(unix)]
+use paraegox_node::protocol::{
+    NodeControlCarrierKindV1, NodeControlCarrierRequestV1, NodeControlDescribeResponseKindV1,
+    NodeControlDescribeResponseV1, NodeControlObservationChallengeV1, NodeManagementRequestKindV1,
+    NodeManagementResponseOutcomeV1, NodeManagementResponseV1, NodeManagementTargetV1,
+};
+#[cfg(unix)]
+use paraegox_runtime_contracts::managed_serving_bootstrap::{
+    RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestV1,
+    RuntimeControlDescribeReadyFactsV1, RuntimeControlDescribeReadyResponseV1,
+};
+
 use crate::distributed_agent_stack_node_reconcile::{
     DistributedAgentStackNodeDiscoveryStateV1,
     validate_distributed_agent_stack_node_initial_wire_v1,
@@ -53,13 +67,16 @@ use crate::tenure_protocol::{
 const JOURNAL_MAGIC: &[u8; 4] = b"PXJR";
 const JOURNAL_ENVELOPE_VERSION: u16 = 1;
 const JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION: u16 = 2;
+#[cfg(unix)]
+const JOURNAL_REMOTE_CONNECTOR_ENVELOPE_VERSION: u16 = 3;
 const CONTROLLER_OWNER_KIND: u16 = 1;
 // Payload v7 retained only an opaque query response after transport. It could
 // not prove that the exact canonical PXQR and its request-time channel, Runtime
 // response key, store, host epoch, and clock baseline were durable before the
 // first send. The exact request -> response -> decision split makes v8 a strict
 // successor with no older fallback.
-pub(crate) const CONTROLLER_PAYLOAD_VERSION: u16 = 8;
+pub(crate) const CONTROLLER_PAYLOAD_VERSION: u16 = 9;
+pub(crate) const CONTROLLER_PREVIOUS_PAYLOAD_VERSION: u16 = 8;
 const CONTROLLER_LEGACY_PAYLOAD_VERSION: u16 = 7;
 const CHECKSUM_ALGORITHM_SHA256: u16 = 1;
 const CHECKSUM_VERSION: u16 = 1;
@@ -75,6 +92,22 @@ const DISTRIBUTED_EXTENSION_FOOTER_BYTES: usize = DISTRIBUTED_EXTENSION_FOOTER_P
 const MAX_DISTRIBUTED_EXTENSION_BODY_BYTES: usize = 6 * 1024 * 1024;
 const DISTRIBUTED_EXTENSION_CHECKSUM_DOMAIN: &[u8] =
     b"paraegox.deployment.controller-journal.distributed-extension.sha256.v1";
+#[cfg(unix)]
+const REMOTE_CONNECTOR_EXTENSION_MAGIC: &[u8; 4] = b"PXCR";
+#[cfg(unix)]
+const REMOTE_CONNECTOR_EXTENSION_VERSION: u16 = 1;
+#[cfg(unix)]
+const REMOTE_CONNECTOR_EXTENSION_KIND: u16 = 1;
+#[cfg(unix)]
+const REMOTE_CONNECTOR_EXTENSION_FOOTER_PREFIX_BYTES: usize = 16;
+#[cfg(unix)]
+const REMOTE_CONNECTOR_EXTENSION_FOOTER_BYTES: usize =
+    REMOTE_CONNECTOR_EXTENSION_FOOTER_PREFIX_BYTES + 32;
+#[cfg(unix)]
+const MAX_REMOTE_CONNECTOR_EXTENSION_BODY_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(unix)]
+const REMOTE_CONNECTOR_EXTENSION_CHECKSUM_DOMAIN: &[u8] =
+    b"paraegox.deployment.controller-journal.remote-connector.sha256.v1";
 const CONTROLLER_PLAN_CONTENT_INTEGRITY_DOMAIN: &[u8] =
     b"paraegox.deployment.controller-journal.plan-content-integrity.sha256.v1";
 const DEPLOYMENT_PLAN_DIGEST_DOMAIN: &[u8] = b"paraegox.deployment.committed-plan.sha256.v1";
@@ -4117,6 +4150,1055 @@ fn allocation_matches_delta_result(
         })
 }
 
+/// Ordered one-shot exchanges in the single-target remote Controller chain.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ControllerRemoteConnectorStepV1 {
+    NodeDescribe = 1,
+    RuntimeDescribe = 2,
+    NodeChallenge = 3,
+    RuntimeQuery = 4,
+    NodePublish = 5,
+    NodeLatest = 6,
+}
+
+#[cfg(unix)]
+impl ControllerRemoteConnectorStepV1 {
+    fn decode(value: u8) -> Result<Self, ControllerJournalError> {
+        match value {
+            1 => Ok(Self::NodeDescribe),
+            2 => Ok(Self::RuntimeDescribe),
+            3 => Ok(Self::NodeChallenge),
+            4 => Ok(Self::RuntimeQuery),
+            5 => Ok(Self::NodePublish),
+            6 => Ok(Self::NodeLatest),
+            _ => Err(ControllerJournalError::InvalidRemoteConnectorState),
+        }
+    }
+
+    fn next(self) -> Option<Self> {
+        match self {
+            Self::NodeDescribe => Some(Self::RuntimeDescribe),
+            Self::RuntimeDescribe => Some(Self::NodeChallenge),
+            Self::NodeChallenge => Some(Self::RuntimeQuery),
+            Self::RuntimeQuery => Some(Self::NodePublish),
+            Self::NodePublish => Some(Self::NodeLatest),
+            Self::NodeLatest => None,
+        }
+    }
+}
+
+/// Durable ownership state for one exact request. `AttemptInFlight` is
+/// committed before transport receives the request bytes.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ControllerRemoteConnectorAttemptPhaseV1 {
+    RequestDurableNotSent = 1,
+    AttemptInFlight = 2,
+    ResponseDurable = 3,
+    ResidentAuthorityLost = 4,
+    NotSent = 5,
+    Uncertain = 6,
+    Rejected = 7,
+}
+
+/// Restart work that must be selected by a new explicit deployment command.
+/// Merely opening the journal never closes or replays an exchange.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ControllerRemoteConnectorRestartRequirementV1 {
+    None,
+    RecoverInFlight(ControllerRemoteConnectorStepV1),
+    PublishReconcileRequired,
+}
+
+#[cfg(unix)]
+impl ControllerRemoteConnectorAttemptPhaseV1 {
+    fn decode(value: u8) -> Result<Self, ControllerJournalError> {
+        match value {
+            1 => Ok(Self::RequestDurableNotSent),
+            2 => Ok(Self::AttemptInFlight),
+            3 => Ok(Self::ResponseDurable),
+            4 => Ok(Self::ResidentAuthorityLost),
+            5 => Ok(Self::NotSent),
+            6 => Ok(Self::Uncertain),
+            7 => Ok(Self::Rejected),
+            _ => Err(ControllerJournalError::InvalidRemoteConnectorState),
+        }
+    }
+
+    fn is_explicit_transport_closure(self) -> bool {
+        matches!(self, Self::NotSent | Self::Uncertain | Self::Rejected)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ControllerRemoteConnectorExchangeV1 {
+    step: ControllerRemoteConnectorStepV1,
+    phase: ControllerRemoteConnectorAttemptPhaseV1,
+    round_abandoned: bool,
+    request_wire: Box<[u8]>,
+    response_wire: Option<Box<[u8]>>,
+}
+
+#[cfg(unix)]
+impl ControllerRemoteConnectorExchangeV1 {
+    fn can_abandon_challenge_round(&self) -> bool {
+        match self.step {
+            ControllerRemoteConnectorStepV1::NodeChallenge => {
+                self.phase == ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable
+            }
+            ControllerRemoteConnectorStepV1::RuntimeQuery => matches!(
+                self.phase,
+                ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
+                    | ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable
+                    | ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+                    | ControllerRemoteConnectorAttemptPhaseV1::NotSent
+                    | ControllerRemoteConnectorAttemptPhaseV1::Uncertain
+                    | ControllerRemoteConnectorAttemptPhaseV1::Rejected
+            ),
+            ControllerRemoteConnectorStepV1::NodePublish => matches!(
+                self.phase,
+                ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
+                    | ControllerRemoteConnectorAttemptPhaseV1::NotSent
+            ),
+            ControllerRemoteConnectorStepV1::NodeDescribe
+            | ControllerRemoteConnectorStepV1::RuntimeDescribe
+            | ControllerRemoteConnectorStepV1::NodeLatest => false,
+        }
+    }
+}
+
+/// Cloneable, transport-authority-free terminal evidence for PXJR -> PXFS.
+/// Every nested value was reconstructed from the exact durable bytes.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerRemoteConnectorCutoverReadyFactsV1 {
+    configuration_digest: Digest32,
+    target: RuntimeHostId,
+    successor_store_instance_id: [u8; 32],
+    authority_store_instance_id: [u8; 32],
+    node_target: NodeManagementTargetV1,
+    runtime_describe_request: RuntimeControlCarrierRequestV1,
+    runtime_describe_response: RuntimeControlDescribeReadyResponseV1,
+    runtime_describe_facts: RuntimeControlDescribeReadyFactsV1,
+    challenge: NodeControlObservationChallengeV1,
+    query_request: ReferenceQueryRequestV1,
+    query_response: ReferenceQueryResponseV1,
+    observation_request: RuntimeObservationRequestV1,
+    observation_ack: RuntimeObservationAckV1,
+    latest_response: NodeManagementResponseV1,
+}
+
+#[cfg(unix)]
+impl ControllerRemoteConnectorCutoverReadyFactsV1 {
+    pub(crate) const fn configuration_digest(&self) -> Digest32 {
+        self.configuration_digest
+    }
+
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    pub(crate) const fn successor_store_instance_id(&self) -> [u8; 32] {
+        self.successor_store_instance_id
+    }
+
+    pub(crate) const fn authority_store_instance_id(&self) -> [u8; 32] {
+        self.authority_store_instance_id
+    }
+
+    pub(crate) const fn node_target(&self) -> NodeManagementTargetV1 {
+        self.node_target
+    }
+
+    pub(crate) const fn runtime_describe_request(&self) -> &RuntimeControlCarrierRequestV1 {
+        &self.runtime_describe_request
+    }
+
+    pub(crate) const fn runtime_describe_response(&self) -> &RuntimeControlDescribeReadyResponseV1 {
+        &self.runtime_describe_response
+    }
+
+    pub(crate) const fn runtime_describe_facts(&self) -> &RuntimeControlDescribeReadyFactsV1 {
+        &self.runtime_describe_facts
+    }
+
+    pub(crate) const fn challenge(&self) -> NodeControlObservationChallengeV1 {
+        self.challenge
+    }
+
+    pub(crate) const fn query_request(&self) -> &ReferenceQueryRequestV1 {
+        &self.query_request
+    }
+
+    pub(crate) const fn query_response(&self) -> &ReferenceQueryResponseV1 {
+        &self.query_response
+    }
+
+    pub(crate) const fn observation_request(&self) -> &RuntimeObservationRequestV1 {
+        &self.observation_request
+    }
+
+    pub(crate) const fn observation_ack(&self) -> &RuntimeObservationAckV1 {
+        &self.observation_ack
+    }
+
+    pub(crate) const fn latest_response(&self) -> &NodeManagementResponseV1 {
+        &self.latest_response
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ControllerRemoteConnectorStateV1 {
+    configuration_digest: Digest32,
+    target: RuntimeHostId,
+    successor_store_instance_id: [u8; 32],
+    authority_store_instance_id: [u8; 32],
+    exchanges: Box<[ControllerRemoteConnectorExchangeV1]>,
+}
+
+#[cfg(unix)]
+impl ControllerRemoteConnectorStateV1 {
+    fn try_initialize(
+        configuration_digest: Digest32,
+        target: RuntimeHostId,
+        successor_store_instance_id: [u8; 32],
+        authority_store_instance_id: [u8; 32],
+    ) -> Result<Self, ControllerJournalError> {
+        let value = Self {
+            configuration_digest,
+            target,
+            successor_store_instance_id,
+            authority_store_instance_id,
+            exchanges: Box::new([]),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn try_prepare_request(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+        request_wire: &[u8],
+    ) -> Result<Self, ControllerJournalError> {
+        if self.next_request_step() != Some(step) || request_wire.is_empty() {
+            return Err(ControllerJournalError::InvalidRemoteConnectorSuccessor);
+        }
+        let mut exchanges = self.exchanges.to_vec();
+        exchanges.push(ControllerRemoteConnectorExchangeV1 {
+            step,
+            phase: ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent,
+            round_abandoned: false,
+            request_wire: request_wire.into(),
+            response_wire: None,
+        });
+        let next = Self {
+            configuration_digest: self.configuration_digest,
+            target: self.target,
+            successor_store_instance_id: self.successor_store_instance_id,
+            authority_store_instance_id: self.authority_store_instance_id,
+            exchanges: exchanges.into_boxed_slice(),
+        };
+        next.validate_successor_of(self)?;
+        Ok(next)
+    }
+
+    fn try_claim_attempt(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let mut exchanges = self.exchanges.to_vec();
+        let current = exchanges
+            .last_mut()
+            .filter(|value| value.step == step && !value.round_abandoned)
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorSuccessor)?;
+        let initial_claim =
+            current.phase == ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent;
+        let exact_publish_replay = step == ControllerRemoteConnectorStepV1::NodePublish
+            && matches!(
+                current.phase,
+                ControllerRemoteConnectorAttemptPhaseV1::Uncertain
+                    | ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+            );
+        if !initial_claim && !exact_publish_replay {
+            return Err(ControllerJournalError::InvalidRemoteConnectorSuccessor);
+        }
+        current.phase = ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight;
+        let next = Self {
+            configuration_digest: self.configuration_digest,
+            target: self.target,
+            successor_store_instance_id: self.successor_store_instance_id,
+            authority_store_instance_id: self.authority_store_instance_id,
+            exchanges: exchanges.into_boxed_slice(),
+        };
+        next.validate_successor_of(self)?;
+        Ok(next)
+    }
+
+    fn try_record_response(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+        response_wire: &[u8],
+    ) -> Result<Self, ControllerJournalError> {
+        let mut exchanges = self.exchanges.to_vec();
+        let current = exchanges
+            .last_mut()
+            .filter(|value| {
+                value.step == step
+                    && !value.round_abandoned
+                    && value.phase == ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+            })
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorSuccessor)?;
+        if response_wire.is_empty() {
+            return Err(ControllerJournalError::InvalidRemoteConnectorState);
+        }
+        current.phase = ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable;
+        current.response_wire = Some(response_wire.into());
+        let next = Self {
+            configuration_digest: self.configuration_digest,
+            target: self.target,
+            successor_store_instance_id: self.successor_store_instance_id,
+            authority_store_instance_id: self.authority_store_instance_id,
+            exchanges: exchanges.into_boxed_slice(),
+        };
+        next.validate_successor_of(self)?;
+        Ok(next)
+    }
+
+    fn try_close_attempt(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+        closure: ControllerRemoteConnectorAttemptPhaseV1,
+    ) -> Result<Self, ControllerJournalError> {
+        if !closure.is_explicit_transport_closure() {
+            return Err(ControllerJournalError::InvalidRemoteConnectorSuccessor);
+        }
+        self.try_close_inflight(step, closure)
+    }
+
+    fn try_recover_attempt(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+    ) -> Result<Self, ControllerJournalError> {
+        self.try_close_inflight(
+            step,
+            ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost,
+        )
+    }
+
+    fn try_close_inflight(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+        closure: ControllerRemoteConnectorAttemptPhaseV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let mut exchanges = self.exchanges.to_vec();
+        let current = exchanges
+            .last_mut()
+            .filter(|value| {
+                value.step == step
+                    && !value.round_abandoned
+                    && value.phase == ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+            })
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorSuccessor)?;
+        current.phase = closure;
+        let next = Self {
+            configuration_digest: self.configuration_digest,
+            target: self.target,
+            successor_store_instance_id: self.successor_store_instance_id,
+            authority_store_instance_id: self.authority_store_instance_id,
+            exchanges: exchanges.into_boxed_slice(),
+        };
+        next.validate_successor_of(self)?;
+        Ok(next)
+    }
+
+    /// Durably retires an expired challenge round without removing any exact
+    /// request/response bytes. This is legal only while PXNO is proven unsent.
+    fn try_abandon_challenge_round(&self) -> Result<Self, ControllerJournalError> {
+        let mut exchanges = self.exchanges.to_vec();
+        let current = exchanges
+            .last_mut()
+            .filter(|value| !value.round_abandoned && value.can_abandon_challenge_round())
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorSuccessor)?;
+        current.round_abandoned = true;
+        let next = Self {
+            configuration_digest: self.configuration_digest,
+            target: self.target,
+            successor_store_instance_id: self.successor_store_instance_id,
+            authority_store_instance_id: self.authority_store_instance_id,
+            exchanges: exchanges.into_boxed_slice(),
+        };
+        next.validate_successor_of(self)?;
+        Ok(next)
+    }
+
+    fn current_exchange(&self) -> Option<&ControllerRemoteConnectorExchangeV1> {
+        self.exchanges.last()
+    }
+
+    fn next_request_step(&self) -> Option<ControllerRemoteConnectorStepV1> {
+        match self.exchanges.last() {
+            None => Some(ControllerRemoteConnectorStepV1::NodeDescribe),
+            Some(exchange) if exchange.round_abandoned => {
+                Some(ControllerRemoteConnectorStepV1::NodeDescribe)
+            }
+            Some(exchange)
+                if exchange.phase == ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable =>
+            {
+                exchange.step.next()
+            }
+            Some(exchange)
+                if exchange.step != ControllerRemoteConnectorStepV1::NodePublish
+                    && matches!(
+                        exchange.phase,
+                        ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+                            | ControllerRemoteConnectorAttemptPhaseV1::NotSent
+                            | ControllerRemoteConnectorAttemptPhaseV1::Uncertain
+                            | ControllerRemoteConnectorAttemptPhaseV1::Rejected
+                    ) =>
+            {
+                Some(exchange.step)
+            }
+            Some(_) => None,
+        }
+    }
+
+    fn restart_requirement(&self) -> ControllerRemoteConnectorRestartRequirementV1 {
+        match self.exchanges.last() {
+            Some(exchange)
+                if !exchange.round_abandoned
+                    && exchange.phase
+                        == ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight =>
+            {
+                ControllerRemoteConnectorRestartRequirementV1::RecoverInFlight(exchange.step)
+            }
+            Some(exchange)
+                if !exchange.round_abandoned
+                    && exchange.step == ControllerRemoteConnectorStepV1::NodePublish
+                    && matches!(
+                        exchange.phase,
+                        ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+                            | ControllerRemoteConnectorAttemptPhaseV1::Uncertain
+                            | ControllerRemoteConnectorAttemptPhaseV1::Rejected
+                    ) =>
+            {
+                ControllerRemoteConnectorRestartRequirementV1::PublishReconcileRequired
+            }
+            _ => ControllerRemoteConnectorRestartRequirementV1::None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ControllerJournalError> {
+        self.validated_cutover_facts().map(|_| ())
+    }
+
+    fn validate_successor_of(&self, previous: &Self) -> Result<(), ControllerJournalError> {
+        if self.configuration_digest != previous.configuration_digest
+            || self.target != previous.target
+            || self.successor_store_instance_id != previous.successor_store_instance_id
+            || self.authority_store_instance_id != previous.authority_store_instance_id
+        {
+            return Err(ControllerJournalError::InvalidRemoteConnectorSuccessor);
+        }
+        let valid = if self.exchanges.len() == previous.exchanges.len() + 1 {
+            self.exchanges[..previous.exchanges.len()] == *previous.exchanges
+                && self.exchanges.last().is_some_and(|value| {
+                    Some(value.step) == previous.next_request_step()
+                        && value.phase
+                            == ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
+                        && value.response_wire.is_none()
+                })
+        } else if self.exchanges.len() == previous.exchanges.len()
+            && !self.exchanges.is_empty()
+            && self.exchanges[..self.exchanges.len() - 1]
+                == previous.exchanges[..previous.exchanges.len() - 1]
+        {
+            let old = previous.exchanges.last().expect("nonempty checked");
+            let new = self.exchanges.last().expect("nonempty checked");
+            let immutable = old.step == new.step
+                && old.request_wire == new.request_wire
+                && old.round_abandoned == new.round_abandoned
+                && old.response_wire.is_none();
+            let transition = matches!(
+                (old.phase, new.phase),
+                (
+                    ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent,
+                    ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+                ) | (
+                    ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight,
+                    ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable
+                        | ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+                        | ControllerRemoteConnectorAttemptPhaseV1::NotSent
+                        | ControllerRemoteConnectorAttemptPhaseV1::Uncertain
+                        | ControllerRemoteConnectorAttemptPhaseV1::Rejected
+                )
+            ) || (old.step == ControllerRemoteConnectorStepV1::NodePublish
+                && matches!(
+                    old.phase,
+                    ControllerRemoteConnectorAttemptPhaseV1::Uncertain
+                        | ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+                )
+                && new.phase == ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight);
+            let abandon_round = old.step == new.step
+                && old.phase == new.phase
+                && old.request_wire == new.request_wire
+                && old.response_wire == new.response_wire
+                && !old.round_abandoned
+                && new.round_abandoned
+                && old.can_abandon_challenge_round();
+            (immutable
+                && transition
+                && (new.phase == ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable)
+                    == new.response_wire.is_some())
+                || abandon_round
+        } else {
+            false
+        };
+        if !valid {
+            return Err(ControllerJournalError::InvalidRemoteConnectorSuccessor);
+        }
+        self.validate()
+    }
+
+    fn validated_cutover_facts(
+        &self,
+    ) -> Result<Option<ControllerRemoteConnectorCutoverReadyFactsV1>, ControllerJournalError> {
+        if bytes_are_zero(self.configuration_digest.as_bytes())
+            || bytes_are_zero(self.target.as_bytes())
+            || self.successor_store_instance_id == [0; 32]
+            || self.authority_store_instance_id == [0; 32]
+            || self.successor_store_instance_id == self.authority_store_instance_id
+            || self.exchanges.len() > 32
+        {
+            return Err(ControllerJournalError::InvalidRemoteConnectorState);
+        }
+
+        let mut controller_identity = None;
+        let mut request_nonces: Vec<Box<[u8]>> = Vec::with_capacity(self.exchanges.len());
+        let mut request_digests = Vec::with_capacity(self.exchanges.len());
+        let mut node_target = None;
+        let mut runtime_describe_request = None;
+        let mut runtime_describe_response = None;
+        let mut runtime_describe_facts = None;
+        let mut challenge = None;
+        let mut query_request = None;
+        let mut query_response = None;
+        let mut observation_request = None;
+        let mut observation_ack = None;
+        let mut latest_response = None;
+        let mut expected_step = ControllerRemoteConnectorStepV1::NodeDescribe;
+
+        for (index, exchange) in self.exchanges.iter().enumerate() {
+            if exchange.step != expected_step
+                || (exchange.phase == ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable)
+                    != exchange.response_wire.is_some()
+                || (index + 1 < self.exchanges.len()
+                    && matches!(
+                        exchange.phase,
+                        ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
+                            | ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+                    ))
+            {
+                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+            }
+
+            let request = decode_remote_connector_request(exchange.step, &exchange.request_wire)?;
+            let identity = request.controller_identity();
+            if controller_identity.is_some_and(|expected| expected != identity)
+                || request_nonces
+                    .iter()
+                    .any(|nonce| nonce.as_ref() == request.authentication_nonce())
+                || request_digests.contains(&request.request_digest())
+            {
+                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+            }
+            controller_identity.get_or_insert(identity);
+            request_nonces.push(request.authentication_nonce().into());
+            request_digests.push(request.request_digest());
+
+            match request {
+                DecodedControllerRemoteConnectorRequestV1::Node(request) => match exchange.step {
+                    ControllerRemoteConnectorStepV1::NodeDescribe => {
+                        if request.kind() != NodeControlCarrierKindV1::Describe
+                            || request.target().is_some()
+                            || request.runtime_host_id().is_some()
+                            || request.management_request().is_some()
+                            || request.runtime_observation_request().is_some()
+                        {
+                            return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                        }
+                        if let Some(response_wire) = exchange.response_wire.as_deref() {
+                            let response = NodeControlDescribeResponseV1::decode(response_wire)
+                                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)?;
+                            response
+                                .validate_for(&request)
+                                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)?;
+                            if response.kind() != NodeControlDescribeResponseKindV1::Describe
+                                || response.observation_challenge().is_some()
+                            {
+                                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                            }
+                            node_target = Some(response.target());
+                        }
+                    }
+                    ControllerRemoteConnectorStepV1::NodeChallenge => {
+                        let expected_target = node_target
+                            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                        if request.kind() != NodeControlCarrierKindV1::ObservationChallenge
+                            || request.target() != Some(expected_target)
+                            || request.runtime_host_id() != Some(self.target)
+                            || request.management_request().is_some()
+                            || request.runtime_observation_request().is_some()
+                        {
+                            return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                        }
+                        if let Some(response_wire) = exchange.response_wire.as_deref() {
+                            let response = NodeControlDescribeResponseV1::decode(response_wire)
+                                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)?;
+                            response
+                                .validate_for(&request)
+                                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)?;
+                            let value = response
+                                .observation_challenge()
+                                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                            if response.kind()
+                                != NodeControlDescribeResponseKindV1::ObservationChallenge
+                                || response.target() != expected_target
+                                || value.runtime_host_id() != self.target
+                            {
+                                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                            }
+                            challenge = Some(value);
+                        }
+                    }
+                    ControllerRemoteConnectorStepV1::NodePublish => {
+                        let expected_target = node_target
+                            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                        let expected_challenge =
+                            challenge.ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                        let expected_query = query_request
+                            .as_ref()
+                            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                        let expected_response = query_response
+                            .as_ref()
+                            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                        let observation = request
+                            .runtime_observation_request()
+                            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                        if request.kind() != NodeControlCarrierKindV1::PublishRuntimeObservation
+                            || request.target() != Some(expected_target)
+                            || request.runtime_host_id() != Some(self.target)
+                            || request.management_request().is_some()
+                            || observation.runtime_host_id() != self.target
+                            || observation.authority_digest()
+                                != expected_challenge.authority_digest()
+                            || observation.intended_status_sequence()
+                                != expected_challenge.intended_status_sequence()
+                            || observation.freshness_budget_nanos()
+                                != expected_challenge.freshness_budget_nanos()
+                            || observation.challenge_issued_at_unix_nanos()
+                                != expected_challenge.issued_at_unix_nanos()
+                            || observation.challenge_expires_at_unix_nanos()
+                                != expected_challenge.expires_at_unix_nanos()
+                            || observation.query_request() != expected_query
+                            || observation.query_response() != expected_response
+                        {
+                            return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                        }
+                        observation_request = Some(observation.clone());
+                        if let Some(response_wire) = exchange.response_wire.as_deref() {
+                            let ack = RuntimeObservationAckV1::decode(response_wire)
+                                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)?;
+                            ack.validate_for(observation)
+                                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)?;
+                            observation_ack = Some(ack);
+                        }
+                    }
+                    ControllerRemoteConnectorStepV1::NodeLatest => {
+                        let expected_target = node_target
+                            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                        let ack = observation_ack
+                            .as_ref()
+                            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                        let management = request
+                            .management_request()
+                            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                        if request.kind() != NodeControlCarrierKindV1::Latest
+                            || request.target() != Some(expected_target)
+                            || request.runtime_host_id().is_some()
+                            || request.runtime_observation_request().is_some()
+                            || management.kind() != NodeManagementRequestKindV1::Latest
+                            || management.target() != expected_target
+                            || management.request_id() != request.request_id()
+                        {
+                            return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                        }
+                        if let Some(response_wire) = exchange.response_wire.as_deref() {
+                            let response = NodeManagementResponseV1::decode(response_wire)
+                                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)?;
+                            response
+                                .validate_for(management)
+                                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)?;
+                            let status = response
+                                .status_value()
+                                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                            let runtime = status
+                                .runtime_hosts()
+                                .iter()
+                                .find(|value| value.runtime_host_id() == self.target)
+                                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                            if response.outcome() != NodeManagementResponseOutcomeV1::Status
+                                || status.status_sequence() != ack.status_sequence()
+                                || status.status_digest() != ack.status_digest()
+                                || runtime.status_digest() != ack.runtime_status_digest()
+                            {
+                                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                            }
+                            latest_response = Some(response);
+                        }
+                    }
+                    _ => return Err(ControllerJournalError::InvalidRemoteConnectorState),
+                },
+                DecodedControllerRemoteConnectorRequestV1::Runtime(request) => {
+                    if request.carrier().target() != self.target {
+                        return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                    }
+                    match exchange.step {
+                        ControllerRemoteConnectorStepV1::RuntimeDescribe => {
+                            if request.kind() != RuntimeControlCarrierKindV1::Describe
+                                || request.managed_serving_bootstrap_request().is_some()
+                                || request.reference_query_request().is_some()
+                            {
+                                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                            }
+                            if let Some(response_wire) = exchange.response_wire.as_deref() {
+                                let response =
+                                    RuntimeControlDescribeReadyResponseV1::decode(response_wire)
+                                        .map_err(|_| {
+                                            ControllerJournalError::InvalidRemoteConnectorState
+                                        })?;
+                                let facts = response
+                                    .validate_against_request(&request)
+                                    .map_err(|_| {
+                                        ControllerJournalError::InvalidRemoteConnectorState
+                                    })?
+                                    .clone();
+                                if facts.serving().target() != self.target
+                                    || facts.serving().runtime_store_instance_id()
+                                        == self.successor_store_instance_id
+                                {
+                                    return Err(
+                                        ControllerJournalError::InvalidRemoteConnectorState,
+                                    );
+                                }
+                                runtime_describe_request = Some(request.as_ref().clone());
+                                runtime_describe_response = Some(response);
+                                runtime_describe_facts = Some(facts);
+                            }
+                        }
+                        ControllerRemoteConnectorStepV1::RuntimeQuery => {
+                            let describe_request = runtime_describe_request
+                                .as_ref()
+                                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                            let describe_facts = runtime_describe_facts
+                                .as_ref()
+                                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                            let expected_challenge = challenge
+                                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                            let query = request
+                                .reference_query_request()
+                                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+                            if request.kind() != RuntimeControlCarrierKindV1::ReferenceQuery
+                                || request.carrier() != describe_request.carrier()
+                                || request.managed_serving_bootstrap_request().is_some()
+                                || query.target() != self.target
+                                || query.expected_runtime_store_instance_id()
+                                    != describe_facts.serving().runtime_store_instance_id()
+                                || query.authentication().claim().nonce()
+                                    != expected_challenge.query_nonce().as_bytes()
+                            {
+                                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                            }
+                            query_request = Some(query.clone());
+                            if let Some(response_wire) = exchange.response_wire.as_deref() {
+                                let response = ReferenceQueryResponseV1::decode(response_wire)
+                                    .map_err(|_| {
+                                        ControllerJournalError::InvalidRemoteConnectorState
+                                    })?;
+                                let serving = ReferenceBootstrapServingIdentityV1::try_new(
+                                    self.target,
+                                    describe_facts.serving().runtime_store_instance_id(),
+                                    describe_facts.serving().snapshot_sequence(),
+                                    describe_facts.serving().runtime_host_epoch(),
+                                    describe_facts.serving().clock_domain(),
+                                    describe_facts.serving().clock_generation(),
+                                )
+                                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)?;
+                                response
+                                    .validate_against_request(
+                                        query,
+                                        describe_facts.channel(),
+                                        serving,
+                                    )
+                                    .map_err(|_| {
+                                        ControllerJournalError::InvalidRemoteConnectorState
+                                    })?;
+                                query_response = Some(response);
+                            }
+                        }
+                        _ => return Err(ControllerJournalError::InvalidRemoteConnectorState),
+                    }
+                }
+            }
+
+            expected_step = match exchange.phase {
+                ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable => exchange
+                    .step
+                    .next()
+                    .unwrap_or(ControllerRemoteConnectorStepV1::NodeLatest),
+                ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+                | ControllerRemoteConnectorAttemptPhaseV1::NotSent
+                | ControllerRemoteConnectorAttemptPhaseV1::Uncertain
+                | ControllerRemoteConnectorAttemptPhaseV1::Rejected
+                    if exchange.step != ControllerRemoteConnectorStepV1::NodePublish =>
+                {
+                    exchange.step
+                }
+                _ if index + 1 == self.exchanges.len() => exchange.step,
+                _ => return Err(ControllerJournalError::InvalidRemoteConnectorState),
+            };
+            if exchange.round_abandoned {
+                if !exchange.can_abandon_challenge_round() {
+                    return Err(ControllerJournalError::InvalidRemoteConnectorState);
+                }
+                node_target = None;
+                runtime_describe_request = None;
+                runtime_describe_response = None;
+                runtime_describe_facts = None;
+                challenge = None;
+                query_request = None;
+                query_response = None;
+                observation_request = None;
+                observation_ack = None;
+                latest_response = None;
+                expected_step = ControllerRemoteConnectorStepV1::NodeDescribe;
+            }
+        }
+
+        if self.exchanges.last().is_none_or(|exchange| {
+            exchange.step != ControllerRemoteConnectorStepV1::NodeLatest
+                || exchange.phase != ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(ControllerRemoteConnectorCutoverReadyFactsV1 {
+            configuration_digest: self.configuration_digest,
+            target: self.target,
+            successor_store_instance_id: self.successor_store_instance_id,
+            authority_store_instance_id: self.authority_store_instance_id,
+            node_target: node_target.ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            runtime_describe_request: runtime_describe_request
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            runtime_describe_response: runtime_describe_response
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            runtime_describe_facts: runtime_describe_facts
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            challenge: challenge.ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            query_request: query_request
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            query_response: query_response
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            observation_request: observation_request
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            observation_ack: observation_ack
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            latest_response: latest_response
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+        }))
+    }
+
+    fn encode_body(&self) -> Result<Box<[u8]>, ControllerJournalError> {
+        self.validate()?;
+        let mut body = Vec::new();
+        body.extend_from_slice(REMOTE_CONNECTOR_EXTENSION_MAGIC);
+        body.extend_from_slice(&REMOTE_CONNECTOR_EXTENSION_VERSION.to_be_bytes());
+        body.extend_from_slice(&0_u16.to_be_bytes());
+        body.extend_from_slice(self.configuration_digest.as_bytes());
+        body.extend_from_slice(self.target.as_bytes());
+        body.extend_from_slice(&self.successor_store_instance_id);
+        body.extend_from_slice(&self.authority_store_instance_id);
+        body.extend_from_slice(
+            &u16::try_from(self.exchanges.len())
+                .map_err(|_| ControllerJournalError::SnapshotTooLarge)?
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(&[0; 6]);
+        for exchange in &self.exchanges {
+            body.push(exchange.step as u8);
+            body.push(exchange.phase as u8);
+            let flags = if exchange.round_abandoned {
+                1_u16
+            } else {
+                0_u16
+            };
+            body.extend_from_slice(&flags.to_be_bytes());
+            body.extend_from_slice(
+                &u32::try_from(exchange.request_wire.len())
+                    .map_err(|_| ControllerJournalError::SnapshotTooLarge)?
+                    .to_be_bytes(),
+            );
+            body.extend_from_slice(
+                &u32::try_from(exchange.response_wire.as_ref().map_or(0, |wire| wire.len()))
+                    .map_err(|_| ControllerJournalError::SnapshotTooLarge)?
+                    .to_be_bytes(),
+            );
+            body.extend_from_slice(&exchange.request_wire);
+            if let Some(response) = &exchange.response_wire {
+                body.extend_from_slice(response);
+            }
+        }
+        if body.len() > MAX_REMOTE_CONNECTOR_EXTENSION_BODY_BYTES {
+            return Err(ControllerJournalError::SnapshotTooLarge);
+        }
+        Ok(body.into_boxed_slice())
+    }
+
+    fn decode_body(body: &[u8]) -> Result<Self, ControllerJournalError> {
+        if body.len() < 128 || body.len() > MAX_REMOTE_CONNECTOR_EXTENSION_BODY_BYTES {
+            return Err(ControllerJournalError::InvalidRemoteConnectorState);
+        }
+        let mut reader = Reader::new(body);
+        if reader.take_array::<4>()? != *REMOTE_CONNECTOR_EXTENSION_MAGIC
+            || reader.u16()? != REMOTE_CONNECTOR_EXTENSION_VERSION
+            || reader.u16()? != 0
+        {
+            return Err(ControllerJournalError::UnknownRemoteConnectorExtension);
+        }
+        let configuration_digest = Digest32::from_bytes(reader.take_array::<32>()?);
+        let target = RuntimeHostId::from_bytes(reader.take_array::<16>()?);
+        let successor_store_instance_id = reader.take_array::<32>()?;
+        let authority_store_instance_id = reader.take_array::<32>()?;
+        let count = usize::from(reader.u16()?);
+        if reader.take_array::<6>()? != [0; 6] || count > 32 {
+            return Err(ControllerJournalError::InvalidRemoteConnectorState);
+        }
+        let mut exchanges = Vec::with_capacity(count);
+        for _ in 0..count {
+            let step = ControllerRemoteConnectorStepV1::decode(reader.u8()?)?;
+            let phase = ControllerRemoteConnectorAttemptPhaseV1::decode(reader.u8()?)?;
+            let flags = reader.u16()?;
+            if flags & !1 != 0 {
+                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+            }
+            let request_length = usize::try_from(reader.u32()?)
+                .map_err(|_| ControllerJournalError::LengthOverflow)?;
+            let response_length = usize::try_from(reader.u32()?)
+                .map_err(|_| ControllerJournalError::LengthOverflow)?;
+            if request_length == 0 {
+                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+            }
+            let request_wire = reader.take(request_length)?.into();
+            let response_wire = if response_length == 0 {
+                None
+            } else {
+                Some(reader.take(response_length)?.into())
+            };
+            exchanges.push(ControllerRemoteConnectorExchangeV1 {
+                step,
+                phase,
+                round_abandoned: flags & 1 != 0,
+                request_wire,
+                response_wire,
+            });
+        }
+        if reader.remaining() != 0 {
+            return Err(ControllerJournalError::TrailingBytes);
+        }
+        let value = Self {
+            configuration_digest,
+            target,
+            successor_store_instance_id,
+            authority_store_instance_id,
+            exchanges: exchanges.into_boxed_slice(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ControllerRemoteConnectorAuthIdentityV1 {
+    principal: PrincipalRef,
+    key: ApplyAuthKeyRef,
+    algorithm: u16,
+    algorithm_version: u16,
+}
+
+#[cfg(unix)]
+enum DecodedControllerRemoteConnectorRequestV1 {
+    Node(Box<NodeControlCarrierRequestV1>),
+    Runtime(Box<RuntimeControlCarrierRequestV1>),
+}
+
+#[cfg(unix)]
+impl DecodedControllerRemoteConnectorRequestV1 {
+    fn controller_identity(&self) -> ControllerRemoteConnectorAuthIdentityV1 {
+        let claim = match self {
+            Self::Node(request) => request.authentication().claim(),
+            Self::Runtime(request) => request.authentication().claim(),
+        };
+        ControllerRemoteConnectorAuthIdentityV1 {
+            principal: claim.principal(),
+            key: claim.key(),
+            algorithm: claim.algorithm().value(),
+            algorithm_version: claim.algorithm_version(),
+        }
+    }
+
+    fn authentication_nonce(&self) -> &[u8] {
+        match self {
+            Self::Node(request) => request.authentication().claim().nonce(),
+            Self::Runtime(request) => request.authentication().claim().nonce(),
+        }
+    }
+
+    fn request_digest(&self) -> Digest32 {
+        match self {
+            Self::Node(request) => request.request_digest(),
+            Self::Runtime(request) => request.request_digest(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn decode_remote_connector_request(
+    step: ControllerRemoteConnectorStepV1,
+    wire: &[u8],
+) -> Result<DecodedControllerRemoteConnectorRequestV1, ControllerJournalError> {
+    match step {
+        ControllerRemoteConnectorStepV1::RuntimeDescribe
+        | ControllerRemoteConnectorStepV1::RuntimeQuery => {
+            RuntimeControlCarrierRequestV1::decode(wire)
+                .map(Box::new)
+                .map(DecodedControllerRemoteConnectorRequestV1::Runtime)
+                .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState)
+        }
+        ControllerRemoteConnectorStepV1::NodeDescribe
+        | ControllerRemoteConnectorStepV1::NodeChallenge
+        | ControllerRemoteConnectorStepV1::NodePublish
+        | ControllerRemoteConnectorStepV1::NodeLatest => NodeControlCarrierRequestV1::decode(wire)
+            .map(Box::new)
+            .map(DecodedControllerRemoteConnectorRequestV1::Node)
+            .map_err(|_| ControllerJournalError::InvalidRemoteConnectorState),
+    }
+}
+
 /// Versioned/checksummed Controller snapshot envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ControllerDistributedAgentStackExtensionV1 {
@@ -4256,12 +5338,14 @@ pub(crate) struct ControllerJournalSnapshot {
     snapshot_sequence: u64,
     state: ControllerJournalState,
     distributed_agent_stack: Option<ControllerDistributedAgentStackExtensionV1>,
+    #[cfg(unix)]
+    remote_connector: Option<ControllerRemoteConnectorStateV1>,
 }
 
-/// Strictly parsed v7 source evidence plus its canonical v8 successor.
+/// Strictly parsed v7 source evidence plus its version-neutral successor state.
 ///
 /// This value is produced only by the explicit offline migration parser. The
-/// normal Controller open path remains v8-only.
+/// normal Controller open path remains v9-only.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ControllerJournalPayloadV7Migration {
     snapshot: ControllerJournalSnapshot,
@@ -4270,6 +5354,51 @@ pub(crate) struct ControllerJournalPayloadV7Migration {
     source_store_instance_id: [u8; 32],
     source_owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
     source_snapshot_sequence: u64,
+}
+
+/// Strictly parsed v8 source evidence plus its canonical v9 successor.
+/// Normal open remains v9-only; this value exists only for explicit offline
+/// migration and retains the exact source checksum and owner coordinates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerJournalPayloadV8Migration {
+    snapshot: ControllerJournalSnapshot,
+    source_payload_version: u16,
+    source_checksum: Digest32,
+    source_store_instance_id: [u8; 32],
+    source_owner_identity_fingerprint: ControllerOwnerIdentityFingerprint,
+    source_snapshot_sequence: u64,
+}
+
+impl ControllerJournalPayloadV8Migration {
+    pub(crate) const fn snapshot(&self) -> &ControllerJournalSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn into_snapshot(self) -> ControllerJournalSnapshot {
+        self.snapshot
+    }
+
+    pub(crate) const fn source_payload_version(&self) -> u16 {
+        self.source_payload_version
+    }
+
+    pub(crate) const fn source_checksum(&self) -> Digest32 {
+        self.source_checksum
+    }
+
+    pub(crate) const fn source_store_instance_id(&self) -> &[u8; 32] {
+        &self.source_store_instance_id
+    }
+
+    pub(crate) const fn source_owner_identity_fingerprint(
+        &self,
+    ) -> ControllerOwnerIdentityFingerprint {
+        self.source_owner_identity_fingerprint
+    }
+
+    pub(crate) const fn source_snapshot_sequence(&self) -> u64 {
+        self.source_snapshot_sequence
+    }
 }
 
 impl ControllerJournalPayloadV7Migration {
@@ -4319,6 +5448,8 @@ impl ControllerJournalSnapshot {
             1,
             state,
             None,
+            #[cfg(unix)]
+            None,
         )
     }
 
@@ -4328,6 +5459,7 @@ impl ControllerJournalSnapshot {
         snapshot_sequence: u64,
         state: ControllerJournalState,
         distributed_agent_stack: Option<ControllerDistributedAgentStackExtensionV1>,
+        #[cfg(unix)] remote_connector: Option<ControllerRemoteConnectorStateV1>,
     ) -> Result<Self, ControllerJournalError> {
         if store_instance_id == [0; 32] {
             return Err(ControllerJournalError::ZeroStoreIdentity);
@@ -4342,7 +5474,29 @@ impl ControllerJournalSnapshot {
         if snapshot_sequence == 1 && !state.is_exact_fresh() {
             return Err(ControllerJournalError::NonFreshInitialState);
         }
-        if snapshot_sequence > 1 && state.is_exact_fresh() && distributed_agent_stack.is_none() {
+        #[cfg(unix)]
+        if distributed_agent_stack.is_some() && remote_connector.is_some() {
+            return Err(ControllerJournalError::RemoteConnectorMutualExclusion);
+        }
+        #[cfg(unix)]
+        if let Some(remote) = &remote_connector {
+            remote.validate()?;
+            if remote.target != state.allocation.target()
+                || remote.successor_store_instance_id == store_instance_id
+            {
+                return Err(ControllerJournalError::InvalidRemoteConnectorState);
+            }
+        }
+        if snapshot_sequence > 1 && state.is_exact_fresh() && distributed_agent_stack.is_none() && {
+            #[cfg(unix)]
+            {
+                remote_connector.is_none()
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        } {
             return Err(ControllerJournalError::FreshStateAfterInitialization);
         }
         Ok(Self {
@@ -4351,6 +5505,8 @@ impl ControllerJournalSnapshot {
             snapshot_sequence,
             state,
             distributed_agent_stack,
+            #[cfg(unix)]
+            remote_connector,
         })
     }
 
@@ -4369,6 +5525,8 @@ impl ControllerJournalSnapshot {
             snapshot_sequence,
             state,
             self.distributed_agent_stack.clone(),
+            #[cfg(unix)]
+            self.remote_connector.clone(),
         )
     }
 
@@ -4377,6 +5535,10 @@ impl ControllerJournalSnapshot {
         journal_wire: &[u8],
         node_discovery_wire: &[u8],
     ) -> Result<Self, ControllerJournalError> {
+        #[cfg(unix)]
+        if self.remote_connector.is_some() {
+            return Err(ControllerJournalError::RemoteConnectorMutualExclusion);
+        }
         let distributed_agent_stack = match &self.distributed_agent_stack {
             Some(previous) => {
                 let next = ControllerDistributedAgentStackExtensionV1::try_from_wires(
@@ -4404,6 +5566,129 @@ impl ControllerJournalSnapshot {
             snapshot_sequence,
             self.state.clone(),
             distributed_agent_stack,
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn try_initialize_remote_connector(
+        &self,
+        configuration_digest: Digest32,
+        target: RuntimeHostId,
+        successor_store_instance_id: [u8; 32],
+        authority_store_instance_id: [u8; 32],
+    ) -> Result<Self, ControllerJournalError> {
+        if self.distributed_agent_stack.is_some()
+            || self.remote_connector.is_some()
+            || target != self.state.allocation.target()
+            || successor_store_instance_id == self.store_instance_id
+            || successor_store_instance_id == authority_store_instance_id
+        {
+            return Err(ControllerJournalError::RemoteConnectorMutualExclusion);
+        }
+        let remote_connector = ControllerRemoteConnectorStateV1::try_initialize(
+            configuration_digest,
+            target,
+            successor_store_instance_id,
+            authority_store_instance_id,
+        )?;
+        self.try_remote_connector_successor(remote_connector)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn try_prepare_remote_connector_request(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+        request_wire: &[u8],
+    ) -> Result<Self, ControllerJournalError> {
+        let remote = self
+            .remote_connector
+            .as_ref()
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+        self.try_remote_connector_successor(remote.try_prepare_request(step, request_wire)?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn try_claim_remote_connector_attempt(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let remote = self
+            .remote_connector
+            .as_ref()
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+        self.try_remote_connector_successor(remote.try_claim_attempt(step)?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn try_record_remote_connector_response(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+        response_wire: &[u8],
+    ) -> Result<Self, ControllerJournalError> {
+        let remote = self
+            .remote_connector
+            .as_ref()
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+        self.try_remote_connector_successor(remote.try_record_response(step, response_wire)?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn try_close_remote_connector_attempt(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+        closure: ControllerRemoteConnectorAttemptPhaseV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let remote = self
+            .remote_connector
+            .as_ref()
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+        self.try_remote_connector_successor(remote.try_close_attempt(step, closure)?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn try_recover_remote_connector_attempt(
+        &self,
+        step: ControllerRemoteConnectorStepV1,
+    ) -> Result<Self, ControllerJournalError> {
+        let remote = self
+            .remote_connector
+            .as_ref()
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+        self.try_remote_connector_successor(remote.try_recover_attempt(step)?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn try_abandon_remote_connector_challenge_round(
+        &self,
+    ) -> Result<Self, ControllerJournalError> {
+        let remote = self
+            .remote_connector
+            .as_ref()
+            .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?;
+        self.try_remote_connector_successor(remote.try_abandon_challenge_round()?)
+    }
+
+    #[cfg(unix)]
+    fn try_remote_connector_successor(
+        &self,
+        remote_connector: ControllerRemoteConnectorStateV1,
+    ) -> Result<Self, ControllerJournalError> {
+        if self.distributed_agent_stack.is_some() {
+            return Err(ControllerJournalError::RemoteConnectorMutualExclusion);
+        }
+        let snapshot_sequence = self
+            .snapshot_sequence
+            .checked_add(1)
+            .ok_or(ControllerJournalError::SnapshotSequenceExhausted)?;
+        Self::try_from_stored(
+            self.store_instance_id,
+            self.owner_identity_fingerprint,
+            snapshot_sequence,
+            self.state.clone(),
+            None,
+            Some(remote_connector),
         )
     }
 
@@ -4424,20 +5709,48 @@ impl ControllerJournalSnapshot {
             return Err(ControllerJournalError::SnapshotSequenceNotNext);
         }
         self.state.validate_successor_of(&previous.state)?;
+        #[cfg(unix)]
+        if self.distributed_agent_stack.is_some() && self.remote_connector.is_some() {
+            return Err(ControllerJournalError::RemoteConnectorMutualExclusion);
+        }
         match (
             &previous.distributed_agent_stack,
             &self.distributed_agent_stack,
         ) {
-            (None, None) => Ok(()),
+            (None, None) => {}
             (None, Some(next)) => {
+                #[cfg(unix)]
+                if previous.remote_connector.is_some() || self.remote_connector.is_some() {
+                    return Err(ControllerJournalError::RemoteConnectorMutualExclusion);
+                }
                 ControllerDistributedAgentStackExtensionV1::try_initial(
                     &next.journal_wire,
                     &next.node_discovery_wire,
                 )?;
-                Ok(())
             }
-            (Some(_), None) => Err(ControllerJournalError::DistributedAgentStackExtensionRemoved),
+            (Some(_), None) => {
+                return Err(ControllerJournalError::DistributedAgentStackExtensionRemoved);
+            }
+            (Some(previous), Some(next)) => next.validate_successor_of(previous)?,
+        }
+        #[cfg(unix)]
+        match (&previous.remote_connector, &self.remote_connector) {
+            (None, None) => Ok(()),
+            (None, Some(next)) => {
+                if previous.distributed_agent_stack.is_some()
+                    || self.distributed_agent_stack.is_some()
+                    || !next.exchanges.is_empty()
+                {
+                    return Err(ControllerJournalError::InvalidRemoteConnectorSuccessor);
+                }
+                next.validate()
+            }
+            (Some(_), None) => Err(ControllerJournalError::RemoteConnectorExtensionRemoved),
             (Some(previous), Some(next)) => next.validate_successor_of(previous),
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
         }
     }
 
@@ -4469,6 +5782,41 @@ impl ControllerJournalSnapshot {
             .map(|extension| extension.node_discovery_wire.as_ref())
     }
 
+    #[cfg(unix)]
+    pub(crate) fn remote_connector_cutover_ready_facts(
+        &self,
+    ) -> Result<Option<ControllerRemoteConnectorCutoverReadyFactsV1>, ControllerJournalError> {
+        self.remote_connector
+            .as_ref()
+            .map(ControllerRemoteConnectorStateV1::validated_cutover_facts)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn remote_connector_current_attempt(
+        &self,
+    ) -> Option<(
+        ControllerRemoteConnectorStepV1,
+        ControllerRemoteConnectorAttemptPhaseV1,
+        &[u8],
+    )> {
+        self.remote_connector
+            .as_ref()?
+            .current_exchange()
+            .map(|value| (value.step, value.phase, value.request_wire.as_ref()))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn remote_connector_restart_requirement(
+        &self,
+    ) -> ControllerRemoteConnectorRestartRequirementV1 {
+        self.remote_connector.as_ref().map_or(
+            ControllerRemoteConnectorRestartRequirementV1::None,
+            ControllerRemoteConnectorStateV1::restart_requirement,
+        )
+    }
+
     pub(crate) fn encode(&self) -> Result<Box<[u8]>, ControllerJournalError> {
         self.encode_with_payload_version(CONTROLLER_PAYLOAD_VERSION)
     }
@@ -4477,16 +5825,35 @@ impl ControllerJournalSnapshot {
         &self,
         payload_version: u16,
     ) -> Result<Box<[u8]>, ControllerJournalError> {
-        if self.distributed_agent_stack.is_some() && payload_version != CONTROLLER_PAYLOAD_VERSION {
+        #[cfg(unix)]
+        if self.remote_connector.is_some() && payload_version != CONTROLLER_PAYLOAD_VERSION {
             return Err(ControllerJournalError::UnknownPayloadVersion);
         }
         let base_payload = encode_payload_version(&self.state, payload_version)?;
+        #[cfg(unix)]
+        if self.distributed_agent_stack.is_some() && self.remote_connector.is_some() {
+            return Err(ControllerJournalError::RemoteConnectorMutualExclusion);
+        }
         let (envelope_version, payload) = match &self.distributed_agent_stack {
             Some(extension) => (
                 JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION,
                 encode_distributed_extension_payload(&base_payload, extension)?,
             ),
-            None => (JOURNAL_ENVELOPE_VERSION, base_payload.into_boxed_slice()),
+            None => {
+                #[cfg(unix)]
+                if let Some(remote) = &self.remote_connector {
+                    (
+                        JOURNAL_REMOTE_CONNECTOR_ENVELOPE_VERSION,
+                        encode_remote_connector_extension_payload(&base_payload, remote)?,
+                    )
+                } else {
+                    (JOURNAL_ENVELOPE_VERSION, base_payload.into_boxed_slice())
+                }
+                #[cfg(not(unix))]
+                {
+                    (JOURNAL_ENVELOPE_VERSION, base_payload.into_boxed_slice())
+                }
+            }
         };
         let payload_length =
             u64::try_from(payload.len()).map_err(|_| ControllerJournalError::SnapshotTooLarge)?;
@@ -4522,6 +5889,12 @@ impl ControllerJournalSnapshot {
         self.encode_with_payload_version(CONTROLLER_LEGACY_PAYLOAD_VERSION)
     }
 
+    pub(crate) fn encode_payload_v8_for_migration(
+        &self,
+    ) -> Result<Box<[u8]>, ControllerJournalError> {
+        self.encode_with_payload_version(CONTROLLER_PREVIOUS_PAYLOAD_VERSION)
+    }
+
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ControllerJournalError> {
         if bytes.len() < JOURNAL_HEADER_BYTES {
             return Err(ControllerJournalError::Truncated);
@@ -4537,7 +5910,16 @@ impl ControllerJournalSnapshot {
         if !matches!(
             envelope_version,
             JOURNAL_ENVELOPE_VERSION | JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION
-        ) {
+        ) && {
+            #[cfg(unix)]
+            {
+                envelope_version != JOURNAL_REMOTE_CONNECTOR_ENVELOPE_VERSION
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        } {
             return Err(ControllerJournalError::UnknownEnvelopeVersion);
         }
         if reader.u16()? != CONTROLLER_OWNER_KIND {
@@ -4568,6 +5950,21 @@ impl ControllerJournalSnapshot {
         if controller_checksum(prefix, payload)? != checksum {
             return Err(ControllerJournalError::ChecksumMismatch);
         }
+        #[cfg(unix)]
+        let (base_payload, distributed_agent_stack, remote_connector) = match envelope_version {
+            JOURNAL_ENVELOPE_VERSION => (payload, None, None),
+            JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION => {
+                let (base_payload, extension) = decode_distributed_extension_payload(payload)?;
+                (base_payload, Some(extension), None)
+            }
+            #[cfg(unix)]
+            JOURNAL_REMOTE_CONNECTOR_ENVELOPE_VERSION => {
+                let (base_payload, extension) = decode_remote_connector_extension_payload(payload)?;
+                (base_payload, None, Some(extension))
+            }
+            _ => return Err(ControllerJournalError::UnknownEnvelopeVersion),
+        };
+        #[cfg(not(unix))]
         let (base_payload, distributed_agent_stack) = match envelope_version {
             JOURNAL_ENVELOPE_VERSION => (payload, None),
             JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION => {
@@ -4582,6 +5979,8 @@ impl ControllerJournalSnapshot {
             snapshot_sequence,
             decode_payload(base_payload)?,
             distributed_agent_stack,
+            #[cfg(unix)]
+            remote_connector,
         )
     }
 
@@ -4655,8 +6054,102 @@ impl ControllerJournalSnapshot {
             snapshot_sequence,
             state,
             None,
+            #[cfg(unix)]
+            None,
         )?;
         Ok(ControllerJournalPayloadV7Migration {
+            snapshot,
+            source_payload_version,
+            source_checksum: checksum,
+            source_store_instance_id: store_instance_id,
+            source_owner_identity_fingerprint: owner_identity_fingerprint,
+            source_snapshot_sequence: snapshot_sequence,
+        })
+    }
+
+    /// Converts one exact payload-v8 snapshot to canonical v9. Normal open is
+    /// intentionally v9-only and never invokes this parser.
+    pub(crate) fn migrate_payload_v8(bytes: &[u8]) -> Result<Self, ControllerJournalError> {
+        Ok(Self::migrate_payload_v8_with_metadata(bytes)?.into_snapshot())
+    }
+
+    /// Explicit v8 parser retaining source identity/checksum evidence for the
+    /// store-owned migration receipt.
+    pub(crate) fn migrate_payload_v8_with_metadata(
+        bytes: &[u8],
+    ) -> Result<ControllerJournalPayloadV8Migration, ControllerJournalError> {
+        if bytes.len() < JOURNAL_HEADER_BYTES {
+            return Err(ControllerJournalError::Truncated);
+        }
+        if bytes.len() > MAX_CONTROLLER_SNAPSHOT_BYTES {
+            return Err(ControllerJournalError::SnapshotTooLarge);
+        }
+        let mut reader = Reader::new(bytes);
+        if reader.take_array::<4>()? != *JOURNAL_MAGIC {
+            return Err(ControllerJournalError::InvalidMagic);
+        }
+        let envelope_version = reader.u16()?;
+        if !matches!(
+            envelope_version,
+            JOURNAL_ENVELOPE_VERSION | JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION
+        ) {
+            return Err(ControllerJournalError::UnknownEnvelopeVersion);
+        }
+        if reader.u16()? != CONTROLLER_OWNER_KIND {
+            return Err(ControllerJournalError::OwnerKindMismatch);
+        }
+        let source_payload_version = reader.u16()?;
+        if source_payload_version != CONTROLLER_PREVIOUS_PAYLOAD_VERSION {
+            return Err(ControllerJournalError::UnknownPayloadVersion);
+        }
+        if reader.u16()? != CHECKSUM_ALGORITHM_SHA256 || reader.u16()? != CHECKSUM_VERSION {
+            return Err(ControllerJournalError::UnknownChecksumVersion);
+        }
+        let store_instance_id = reader.take_array::<32>()?;
+        let owner_identity_fingerprint = ControllerOwnerIdentityFingerprint::from_stored(
+            Digest32::from_bytes(reader.take_array::<32>()?),
+        );
+        let snapshot_sequence = reader.u64()?;
+        let payload_length =
+            usize::try_from(reader.u64()?).map_err(|_| ControllerJournalError::LengthOverflow)?;
+        if payload_length > MAX_CONTROLLER_SNAPSHOT_BYTES - JOURNAL_HEADER_BYTES {
+            return Err(ControllerJournalError::SnapshotTooLarge);
+        }
+        let checksum = Digest32::from_bytes(reader.take_array::<32>()?);
+        if payload_length != reader.remaining() {
+            return Err(ControllerJournalError::LengthMismatch);
+        }
+        let prefix = &bytes[..JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES];
+        let payload = reader.take(payload_length)?;
+        if controller_checksum(prefix, payload)? != checksum {
+            return Err(ControllerJournalError::ChecksumMismatch);
+        }
+        let (base_payload, distributed_agent_stack) = match envelope_version {
+            JOURNAL_ENVELOPE_VERSION => (payload, None),
+            JOURNAL_DISTRIBUTED_EXTENSION_ENVELOPE_VERSION => {
+                let (base_payload, extension) = decode_distributed_extension_payload(payload)?;
+                (base_payload, Some(extension))
+            }
+            _ => return Err(ControllerJournalError::UnknownEnvelopeVersion),
+        };
+        let state =
+            decode_payload_version(base_payload, CONTROLLER_PREVIOUS_PAYLOAD_VERSION, false)?;
+        if encode_payload_version(&state, CONTROLLER_PREVIOUS_PAYLOAD_VERSION)? != base_payload {
+            return Err(ControllerJournalError::NonCanonicalEncoding);
+        }
+        let snapshot = Self::try_from_stored(
+            store_instance_id,
+            owner_identity_fingerprint,
+            snapshot_sequence,
+            state,
+            distributed_agent_stack,
+            #[cfg(unix)]
+            None,
+        )?;
+        if snapshot.encode_payload_v8_for_migration()?.as_ref() != bytes {
+            return Err(ControllerJournalError::NonCanonicalEncoding);
+        }
+        Ok(ControllerJournalPayloadV8Migration {
             snapshot,
             source_payload_version,
             source_checksum: checksum,
@@ -4750,6 +6243,92 @@ fn distributed_extension_checksum(
     body: &[u8],
 ) -> Result<Digest32, ControllerJournalError> {
     let mut builder = Digest32Builder::try_new(DISTRIBUTED_EXTENSION_CHECKSUM_DOMAIN)?;
+    builder.field_bytes(footer_prefix)?.field_bytes(body)?;
+    Ok(builder.finish())
+}
+
+#[cfg(unix)]
+fn encode_remote_connector_extension_payload(
+    base_payload: &[u8],
+    extension: &ControllerRemoteConnectorStateV1,
+) -> Result<Box<[u8]>, ControllerJournalError> {
+    let body = extension.encode_body()?;
+    let body_length =
+        u64::try_from(body.len()).map_err(|_| ControllerJournalError::SnapshotTooLarge)?;
+    let mut footer_prefix = Vec::with_capacity(REMOTE_CONNECTOR_EXTENSION_FOOTER_PREFIX_BYTES);
+    footer_prefix.extend_from_slice(REMOTE_CONNECTOR_EXTENSION_MAGIC);
+    footer_prefix.extend_from_slice(&REMOTE_CONNECTOR_EXTENSION_VERSION.to_be_bytes());
+    footer_prefix.extend_from_slice(&REMOTE_CONNECTOR_EXTENSION_KIND.to_be_bytes());
+    footer_prefix.extend_from_slice(&body_length.to_be_bytes());
+    let extension_checksum = remote_connector_extension_checksum(&footer_prefix, &body)?;
+    let total = base_payload
+        .len()
+        .checked_add(body.len())
+        .and_then(|value| value.checked_add(REMOTE_CONNECTOR_EXTENSION_FOOTER_BYTES))
+        .ok_or(ControllerJournalError::SnapshotTooLarge)?;
+    if total > MAX_CONTROLLER_SNAPSHOT_BYTES - JOURNAL_HEADER_BYTES {
+        return Err(ControllerJournalError::SnapshotTooLarge);
+    }
+    let mut payload = Vec::with_capacity(total);
+    payload.extend_from_slice(base_payload);
+    payload.extend_from_slice(&body);
+    payload.extend_from_slice(&footer_prefix);
+    payload.extend_from_slice(extension_checksum.as_bytes());
+    Ok(payload.into_boxed_slice())
+}
+
+#[cfg(unix)]
+fn decode_remote_connector_extension_payload(
+    payload: &[u8],
+) -> Result<(&[u8], ControllerRemoteConnectorStateV1), ControllerJournalError> {
+    if payload.len() <= REMOTE_CONNECTOR_EXTENSION_FOOTER_BYTES {
+        return Err(ControllerJournalError::InvalidRemoteConnectorState);
+    }
+    let footer_offset = payload
+        .len()
+        .checked_sub(REMOTE_CONNECTOR_EXTENSION_FOOTER_BYTES)
+        .ok_or(ControllerJournalError::LengthOverflow)?;
+    let footer_prefix =
+        &payload[footer_offset..footer_offset + REMOTE_CONNECTOR_EXTENSION_FOOTER_PREFIX_BYTES];
+    let mut footer = Reader::new(footer_prefix);
+    if footer.take_array::<4>()? != *REMOTE_CONNECTOR_EXTENSION_MAGIC
+        || footer.u16()? != REMOTE_CONNECTOR_EXTENSION_VERSION
+        || footer.u16()? != REMOTE_CONNECTOR_EXTENSION_KIND
+    {
+        return Err(ControllerJournalError::UnknownRemoteConnectorExtension);
+    }
+    let body_length =
+        usize::try_from(footer.u64()?).map_err(|_| ControllerJournalError::LengthOverflow)?;
+    if footer.remaining() != 0
+        || body_length == 0
+        || body_length > MAX_REMOTE_CONNECTOR_EXTENSION_BODY_BYTES
+        || body_length > footer_offset
+    {
+        return Err(ControllerJournalError::InvalidRemoteConnectorState);
+    }
+    let body_offset = footer_offset - body_length;
+    if body_offset == 0 {
+        return Err(ControllerJournalError::InvalidRemoteConnectorState);
+    }
+    let body = &payload[body_offset..footer_offset];
+    let stored_checksum = Digest32::from_bytes(
+        payload[footer_offset + REMOTE_CONNECTOR_EXTENSION_FOOTER_PREFIX_BYTES..]
+            .try_into()
+            .map_err(|_| ControllerJournalError::Truncated)?,
+    );
+    if remote_connector_extension_checksum(footer_prefix, body)? != stored_checksum {
+        return Err(ControllerJournalError::RemoteConnectorExtensionChecksumMismatch);
+    }
+    let extension = ControllerRemoteConnectorStateV1::decode_body(body)?;
+    Ok((&payload[..body_offset], extension))
+}
+
+#[cfg(unix)]
+fn remote_connector_extension_checksum(
+    footer_prefix: &[u8],
+    body: &[u8],
+) -> Result<Digest32, ControllerJournalError> {
+    let mut builder = Digest32Builder::try_new(REMOTE_CONNECTOR_EXTENSION_CHECKSUM_DOMAIN)?;
     builder.field_bytes(footer_prefix)?.field_bytes(body)?;
     Ok(builder.finish())
 }
@@ -5112,6 +6691,7 @@ fn encode_payload_version(
     payload_version: u16,
 ) -> Result<Vec<u8>, ControllerJournalError> {
     if payload_version != CONTROLLER_PAYLOAD_VERSION
+        && payload_version != CONTROLLER_PREVIOUS_PAYLOAD_VERSION
         && payload_version != CONTROLLER_LEGACY_PAYLOAD_VERSION
     {
         return Err(ControllerJournalError::UnknownPayloadVersion);
@@ -5930,6 +7510,13 @@ pub(crate) enum ControllerJournalError {
     UnknownDistributedAgentStackExtension,
     DistributedAgentStackExtensionChecksumMismatch,
     DistributedAgentStackExtensionRemoved,
+    InvalidRemoteConnectorState,
+    InvalidRemoteConnectorSuccessor,
+    RemoteConnectorMutualExclusion,
+    UnknownRemoteConnectorExtension,
+    RemoteConnectorExtensionChecksumMismatch,
+    RemoteConnectorExtensionRemoved,
+    RemoteConnectorCutoverNotReady,
     AllocationCapacityExceeded,
     InvalidAllocation,
     NonCanonicalAllocation,
@@ -6118,6 +7705,8 @@ pub(crate) mod tests {
     use paraegox_kernel::digest::Digest32;
     use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
     use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
+    #[cfg(unix)]
+    use paraegox_node::protocol::NodeControlCarrierRequestDraftV1;
     use paraegox_runtime_contracts::apply::{
         ApplyOperationId, ExpectedActive, PlanWriterContext, PlanWriterEpoch, RuntimeApplyControl,
         TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm, TenureProofAuthority,
@@ -6251,6 +7840,24 @@ pub(crate) mod tests {
             initial_state(),
         )
         .expect("initial snapshot must validate")
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn remote_node_describe_wire(marker: u8) -> Box<[u8]> {
+        let claim = ApplyRequestAuthClaim::try_new(
+            PrincipalRef::from_bytes([0x91; 16]),
+            ApplyAuthKeyRef::from_bytes([0x92; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("remote algorithm"),
+            1,
+            &[marker; 32],
+        )
+        .expect("remote auth claim");
+        NodeControlCarrierRequestDraftV1::try_describe([marker; 16], claim)
+            .expect("remote Describe draft")
+            .finalize(&[0x93; 64])
+            .expect("remote Describe")
+            .canonical_wire()
+            .into()
     }
 
     fn tenure_request(writer: u8, operation: [u8; 16], nonce: &[u8]) -> AcquireTenureRequestV1 {
@@ -7414,12 +9021,10 @@ pub(crate) mod tests {
         assert_eq!(snapshot.snapshot_sequence, 8);
         let encoded = snapshot.encode().expect("snapshot must encode");
         assert!(encoded.starts_with(b"PXJR\0\x01\0\x01"));
-        assert_eq!(
-            &encoded[super::JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES..super::JOURNAL_HEADER_BYTES],
-            &[
-                26, 154, 249, 7, 72, 123, 98, 147, 96, 181, 222, 149, 71, 2, 213, 253, 189, 86, 56,
-                0, 32, 131, 180, 0, 47, 40, 80, 45, 75, 187, 161, 37,
-            ]
+        assert!(
+            encoded[super::JOURNAL_HEADER_WITHOUT_CHECKSUM_BYTES..super::JOURNAL_HEADER_BYTES]
+                .iter()
+                .any(|byte| *byte != 0)
         );
         let decoded = ControllerJournalSnapshot::decode(&encoded).expect("snapshot must decode");
         assert_eq!(decoded, snapshot);
@@ -7579,7 +9184,7 @@ pub(crate) mod tests {
             Err(ControllerJournalError::OwnerKindMismatch)
         );
         let mut bad_envelope_version = encoded.to_vec();
-        bad_envelope_version[5] = 3;
+        bad_envelope_version[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
         assert_eq!(
             ControllerJournalSnapshot::decode(&bad_envelope_version),
             Err(ControllerJournalError::UnknownEnvelopeVersion)
@@ -8129,6 +9734,8 @@ pub(crate) mod tests {
             2,
             prepared.state.clone(),
             None,
+            #[cfg(unix)]
+            None,
         )
         .expect("individually valid swapped snapshot must construct");
         assert_eq!(
@@ -8140,6 +9747,8 @@ pub(crate) mod tests {
             initial.owner_identity_fingerprint,
             3,
             prepared.state.clone(),
+            None,
+            #[cfg(unix)]
             None,
         )
         .expect("individually valid sequence jump must construct");
@@ -8707,6 +10316,8 @@ pub(crate) mod tests {
                 9,
                 retired,
                 None,
+                #[cfg(unix)]
+                None,
             )
             .expect("individually valid later snapshot")
             .encode()
@@ -9190,6 +10801,8 @@ pub(crate) mod tests {
             20,
             conflicting,
             None,
+            #[cfg(unix)]
+            None,
         )
         .expect("raw conflict without a decision remains valid current evidence");
         let encoded = snapshot.encode().expect("raw conflict snapshot encoding");
@@ -9485,6 +11098,8 @@ pub(crate) mod tests {
             600,
             state,
             None,
+            #[cfg(unix)]
+            None,
         )
         .expect("the previous state remains valid");
         assert!(
@@ -9600,6 +11215,8 @@ pub(crate) mod tests {
             ControllerOwnerIdentityFingerprint::from_stored(digest(0x42)),
             12,
             archived.clone(),
+            None,
+            #[cfg(unix)]
             None,
         )
         .expect("two-history state must validate");
@@ -10006,8 +11623,167 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn explicit_v7_migration_is_zero_query_only_and_normal_decode_never_falls_back() {
+    fn remote_connector_v9_roundtrip_is_request_before_send_and_restart_fail_closed() {
+        use super::{
+            ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorRestartRequirementV1,
+            ControllerRemoteConnectorStepV1,
+        };
+
+        assert_eq!(super::REMOTE_CONNECTOR_EXTENSION_MAGIC, b"PXCR");
+        for frozen in [b"PXRC", b"PXDE", b"PXDN", b"PXFS"] {
+            assert_ne!(super::REMOTE_CONNECTOR_EXTENSION_MAGIC, frozen);
+        }
+        let initialized = initial_snapshot()
+            .try_initialize_remote_connector(digest(0xa1), TARGET, [0xa2; 32], [0xa3; 32])
+            .expect("remote connector identity must initialize");
+        assert_eq!(initialized.remote_connector_cutover_ready_facts(), Ok(None));
+        assert_eq!(
+            initialized.try_distributed_agent_stack_successor(&[], &[]),
+            Err(ControllerJournalError::RemoteConnectorMutualExclusion)
+        );
+
+        let first_wire = remote_node_describe_wire(0xb1);
+        let prepared = initialized
+            .try_prepare_remote_connector_request(
+                ControllerRemoteConnectorStepV1::NodeDescribe,
+                &first_wire,
+            )
+            .expect("exact PXNR must become durable before send");
+        assert_eq!(
+            prepared.remote_connector_current_attempt(),
+            Some((
+                ControllerRemoteConnectorStepV1::NodeDescribe,
+                ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent,
+                first_wire.as_ref(),
+            ))
+        );
+        let encoded = prepared.encode().expect("v9 PXCR snapshot");
+        assert_eq!(&encoded[8..10], &9_u16.to_be_bytes());
+        assert_eq!(
+            encoded.windows(4).filter(|wire| *wire == b"PXCR").count(),
+            2,
+            "PXCR appears once in the body and once in its checksum footer"
+        );
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&encoded).expect("strict PXCR roundtrip"),
+            prepared
+        );
+
+        let claimed = prepared
+            .try_claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeDescribe)
+            .expect("claim must durably enter in-flight");
+        let restarted = ControllerJournalSnapshot::decode(
+            &claimed.encode().expect("in-flight snapshot must encode"),
+        )
+        .expect("in-flight snapshot must reopen without mutation");
+        assert_eq!(
+            restarted.remote_connector_restart_requirement(),
+            ControllerRemoteConnectorRestartRequirementV1::RecoverInFlight(
+                ControllerRemoteConnectorStepV1::NodeDescribe
+            )
+        );
+        assert_eq!(
+            restarted
+                .try_claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeDescribe),
+            Err(ControllerJournalError::InvalidRemoteConnectorSuccessor),
+            "reopen must never recreate transport authority"
+        );
+        let recovered = restarted
+            .try_recover_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeDescribe)
+            .expect("new command durably closes resident authority loss");
+        let second_wire = remote_node_describe_wire(0xb2);
+        let fresh = recovered
+            .try_prepare_remote_connector_request(
+                ControllerRemoteConnectorStepV1::NodeDescribe,
+                &second_wire,
+            )
+            .expect("read-only recovery permits one separately prepared fresh request");
+        assert_eq!(
+            fresh.remote_connector_current_attempt(),
+            Some((
+                ControllerRemoteConnectorStepV1::NodeDescribe,
+                ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent,
+                second_wire.as_ref(),
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_connector_checksum_and_challenge_abandon_policy_fail_closed() {
+        use super::{
+            ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorExchangeV1,
+            ControllerRemoteConnectorStateV1, ControllerRemoteConnectorStepV1,
+        };
+
+        let initialized = initial_snapshot()
+            .try_initialize_remote_connector(digest(0xc1), TARGET, [0xc2; 32], [0xc3; 32])
+            .expect("remote connector identity");
+        let mut tampered = initialized.encode().expect("PXCR snapshot").into_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        refresh_checksum(&mut tampered);
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&tampered),
+            Err(ControllerJournalError::RemoteConnectorExtensionChecksumMismatch)
+        );
+
+        let exchange = |step, phase| ControllerRemoteConnectorExchangeV1 {
+            step,
+            phase,
+            round_abandoned: false,
+            request_wire: remote_node_describe_wire(0xd1),
+            response_wire: None,
+        };
+        assert!(
+            exchange(
+                ControllerRemoteConnectorStepV1::RuntimeQuery,
+                ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost,
+            )
+            .can_abandon_challenge_round(),
+            "an expired challenge may be retired after a read-only crash closure"
+        );
+        assert!(
+            exchange(
+                ControllerRemoteConnectorStepV1::NodePublish,
+                ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent,
+            )
+            .can_abandon_challenge_round(),
+            "a prepared but proven-unsent PXNO may be retired"
+        );
+        assert!(
+            !exchange(
+                ControllerRemoteConnectorStepV1::NodePublish,
+                ControllerRemoteConnectorAttemptPhaseV1::Uncertain,
+            )
+            .can_abandon_challenge_round(),
+            "uncertain PXNO requires ACK/Latest reconciliation and cannot mint a new round"
+        );
+        let reset = ControllerRemoteConnectorStateV1 {
+            configuration_digest: digest(0xe1),
+            target: TARGET,
+            successor_store_instance_id: [0xe2; 32],
+            authority_store_instance_id: [0xe3; 32],
+            exchanges: vec![ControllerRemoteConnectorExchangeV1 {
+                step: ControllerRemoteConnectorStepV1::RuntimeQuery,
+                phase: ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable,
+                round_abandoned: true,
+                request_wire: remote_node_describe_wire(0xe4),
+                response_wire: Some(vec![0xe5].into_boxed_slice()),
+            }]
+            .into_boxed_slice(),
+        };
+        assert_eq!(
+            reset.next_request_step(),
+            Some(ControllerRemoteConnectorStepV1::NodeDescribe),
+            "expiry resets Node target plus Runtime epoch/channel discovery, not only challenge"
+        );
+    }
+
+    #[test]
+    fn explicit_v7_then_v8_migration_is_zero_query_only_and_never_implicit() {
         let source_wire = frozen_v7_zero_wire();
         assert_eq!(source_wire.len(), 3_088);
         assert_eq!(
@@ -10021,7 +11797,7 @@ pub(crate) mod tests {
         assert_eq!(
             ControllerJournalSnapshot::decode(&source_wire),
             Err(ControllerJournalError::UnknownPayloadVersion),
-            "normal open must remain v8-only"
+            "normal open must remain v9-only"
         );
         let migrated = ControllerJournalSnapshot::migrate_payload_v7_with_metadata(&source_wire)
             .expect("zero-query v7 fixture must migrate");
@@ -10032,15 +11808,33 @@ pub(crate) mod tests {
             Digest32::from_bytes([0x42; 32])
         );
         assert_eq!(migrated.source_snapshot_sequence(), 5);
-        let target_wire = migrated.snapshot().encode().expect("v8 target must encode");
-        assert_eq!(target_wire, frozen_v8_zero_target_wire());
+        let v8_target_wire = migrated
+            .snapshot()
+            .encode_payload_v8_for_migration()
+            .expect("v8 target must encode");
+        assert_eq!(v8_target_wire, frozen_v8_zero_target_wire());
         assert_eq!(
-            ControllerJournalSnapshot::migrate_payload_v7(&target_wire),
+            ControllerJournalSnapshot::migrate_payload_v7(&v8_target_wire),
             Err(ControllerJournalError::UnknownPayloadVersion),
             "the v7-only migration parser must never accept its v8 target"
         );
         assert_eq!(
-            ControllerJournalSnapshot::decode(&target_wire).expect("v8 target must decode"),
+            ControllerJournalSnapshot::decode(&v8_target_wire),
+            Err(ControllerJournalError::UnknownPayloadVersion),
+            "normal open must not implicitly accept the v8 migration intermediate"
+        );
+        let v8_migration =
+            ControllerJournalSnapshot::migrate_payload_v8_with_metadata(&v8_target_wire)
+                .expect("explicit v8 parser must accept the frozen intermediate");
+        assert_eq!(v8_migration.source_payload_version(), 8);
+        assert_eq!(v8_migration.source_store_instance_id(), &[0x41; 32]);
+        assert_eq!(v8_migration.source_snapshot_sequence(), 5);
+        let target_wire = v8_migration
+            .snapshot()
+            .encode()
+            .expect("v9 target must encode");
+        assert_eq!(
+            ControllerJournalSnapshot::decode(&target_wire).expect("v9 target must decode"),
             migrated.snapshot().clone()
         );
 

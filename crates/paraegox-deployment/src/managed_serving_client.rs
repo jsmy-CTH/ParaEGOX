@@ -1,10 +1,11 @@
 //! Durable Controller owner for the successor Runtime serving observation.
 //!
-//! PXFB is read-only at Runtime, but its Controller-side delivery state is not
-//! ephemeral. The exact request is committed before transport, the attempt is
-//! committed in-flight before a move-only send action exists, and a timeout or
-//! EOF is durably closed without claiming any Runtime effect. A later explicit
-//! invocation must provide a fresh request identity and nonce.
+//! PXFB may perform Runtime's one-way managed-owner cutover, so its
+//! Controller-side delivery state is never ephemeral. The exact request is
+//! committed before transport, the attempt is committed in-flight before a
+//! move-only send action exists, and a timeout or EOF is durably closed without
+//! claiming whether Runtime changed. The remote path cannot issue another PXFB
+//! until a later tranche admits a fresh Describe reconciliation transition.
 
 use core::fmt;
 use core::future::Future;
@@ -121,6 +122,21 @@ impl ManagedServingDescribeVerifierV1 {
         &self.carrier
     }
 
+    #[must_use]
+    pub(crate) const fn controller_public_key(&self) -> [u8; 32] {
+        self.controller_public_key
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_response_public_key(&self) -> [u8; 32] {
+        self.runtime_response_public_key
+    }
+
+    #[must_use]
+    pub(crate) const fn manifest_digest(&self) -> Digest32 {
+        self.manifest_digest
+    }
+
     /// Builds and self-verifies one exact fresh Controller-signed PXCC
     /// Describe. Local composition never has to hand-assemble the C1 carrier.
     pub(crate) fn try_build_request(
@@ -232,6 +248,17 @@ impl ManagedServingDescribeIngressV1 {
         self.response.canonical_wire()
     }
 
+    /// Repeats signature, carrier, manifest and correlation checks before a
+    /// persisted Describe observation is used to authorize another operation.
+    pub(crate) fn revalidate(
+        &self,
+        verifier: &ManagedServingDescribeVerifierV1,
+    ) -> Result<(), ManagedServingControllerError> {
+        verify_describe_request(verifier, &self.request)?;
+        verify_describe_response(verifier, &self.request, &self.response)?;
+        self.validate_pins(verifier)
+    }
+
     fn validate_pins(
         &self,
         verifier: &ManagedServingDescribeVerifierV1,
@@ -297,6 +324,78 @@ pub(crate) struct RuntimeReferenceQueryMtlsExchangeSuccessV1 {
     observed_runtime_certificate_principal: PrincipalRef,
     observed_carrier_binding_digest: Digest32,
     response_wire: Box<[u8]>,
+}
+
+/// Raw PXFR bytes returned by one concrete remote Runtime-control exchange.
+///
+/// The TLS peer and complete PXCB digest are transport observations. They are
+/// checked independently from the Runtime-local [`ReferenceChannelBindingV1`]
+/// carried by PXDR/PXFB/PXFR.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeManagedServingMtlsExchangeSuccessV1 {
+    observed_runtime_certificate_principal: PrincipalRef,
+    observed_carrier_binding_digest: Digest32,
+    response_wire: Box<[u8]>,
+}
+
+impl RuntimeManagedServingMtlsExchangeSuccessV1 {
+    pub(crate) fn try_new(
+        observed_runtime_certificate_principal: PrincipalRef,
+        observed_carrier_binding_digest: Digest32,
+        response_wire: Box<[u8]>,
+    ) -> Result<Self, ManagedServingControllerError> {
+        if bytes_are_zero(observed_runtime_certificate_principal.as_bytes())
+            || digest_is_zero(observed_carrier_binding_digest)
+            || response_wire.is_empty()
+        {
+            return Err(ManagedServingControllerError::ManagedServingUnauthenticatedTransport);
+        }
+        Ok(Self {
+            observed_runtime_certificate_principal,
+            observed_carrier_binding_digest,
+            response_wire,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn observed_runtime_certificate_principal(&self) -> PrincipalRef {
+        self.observed_runtime_certificate_principal
+    }
+
+    #[must_use]
+    pub(crate) const fn observed_carrier_binding_digest(&self) -> Digest32 {
+        self.observed_carrier_binding_digest
+    }
+
+    #[must_use]
+    pub(crate) fn response_wire(&self) -> &[u8] {
+        &self.response_wire
+    }
+}
+
+/// Authenticated PXFR retained with both outer and inner request correlation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedRuntimeManagedServingResponseV1 {
+    carrier_request_digest: Digest32,
+    inner_request_digest: Digest32,
+    response: ManagedServingBootstrapResponseV1,
+}
+
+impl VerifiedRuntimeManagedServingResponseV1 {
+    #[must_use]
+    pub(crate) const fn carrier_request_digest(&self) -> Digest32 {
+        self.carrier_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn inner_request_digest(&self) -> Digest32 {
+        self.inner_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn response(&self) -> &ManagedServingBootstrapResponseV1 {
+        &self.response
+    }
 }
 
 impl RuntimeReferenceQueryMtlsExchangeSuccessV1 {
@@ -371,6 +470,122 @@ impl VerifiedRuntimeReferenceQueryResponseV1 {
 }
 
 impl ManagedServingDescribeVerifierV1 {
+    pub(crate) fn revalidate_managed_serving_carrier(
+        &self,
+        ingress: &ManagedServingDescribeIngressV1,
+        base: &VerifiedManagedFabricProducerContextV1,
+        carrier_request: &RuntimeControlCarrierRequestV1,
+    ) -> Result<(), ManagedServingControllerError> {
+        self.validate_managed_serving_context(ingress, base)?;
+        let inner = carrier_request
+            .managed_serving_bootstrap_request()
+            .ok_or(ManagedServingControllerError::ManagedServingCarrierRequestMismatch)?;
+        validate_request(base, inner)?;
+        verify_remote_carrier(self, carrier_request, inner)
+    }
+
+    /// Wraps one already-durable, independently signed PXFB in a fresh signed
+    /// PXCC ManagedServingBootstrap carrier. The complete PXCB and byte-exact
+    /// inner PXFB are self-verified before the value may cross persistence.
+    pub(crate) fn try_build_managed_serving_bootstrap_carrier(
+        &self,
+        ingress: &ManagedServingDescribeIngressV1,
+        base: &VerifiedManagedFabricProducerContextV1,
+        fresh: FreshManagedServingBootstrapV1,
+        controller_signer: &SigningKey,
+        inner: &ManagedServingBootstrapRequestV1,
+    ) -> Result<RuntimeControlCarrierRequestV1, ManagedServingControllerError> {
+        self.validate_managed_serving_context(ingress, base)?;
+        validate_request(base, inner)?;
+        if controller_signer.verifying_key().to_bytes() != self.controller_public_key {
+            return Err(ManagedServingControllerError::ControllerKeyMismatch);
+        }
+        if inner.request_id().as_bytes() != &fresh.request_id {
+            return Err(ManagedServingControllerError::ManagedServingCarrierRequestMismatch);
+        }
+        if ingress.request.request_id() == inner.request_id()
+            || ingress.request.authentication().claim().nonce() == fresh.authentication_nonce
+            || inner.authentication().claim().nonce() == fresh.authentication_nonce
+        {
+            return Err(ManagedServingControllerError::FreshIdentityReused);
+        }
+        let claim = ApplyRequestAuthClaim::try_new(
+            self.carrier.controller_principal(),
+            self.carrier.controller_request_key(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)?,
+            ED25519_ALGORITHM_VERSION,
+            &fresh.authentication_nonce,
+        )?;
+        let draft = RuntimeControlCarrierRequestDraftV1::try_managed_serving_bootstrap(
+            inner.request_id(),
+            self.carrier.clone(),
+            inner.clone(),
+            claim,
+        )?;
+        let signature = controller_signer.sign(draft.signing_transcript()?.as_bytes());
+        let carrier_request = draft.finalize(&signature.to_bytes())?;
+        verify_runtime_control_request(
+            self,
+            &carrier_request,
+            RuntimeControlCarrierKindV1::ManagedServingBootstrap,
+            ManagedServingControllerError::ManagedServingCarrierRequestMismatch,
+        )?;
+        if carrier_request.managed_serving_bootstrap_request() != Some(inner) {
+            return Err(ManagedServingControllerError::ManagedServingCarrierRequestMismatch);
+        }
+        Ok(carrier_request)
+    }
+
+    /// Verifies one raw PXFR only after the concrete TLS peer, complete PXCB,
+    /// outer PXCC signature and byte-exact inner PXFB all match durable state.
+    pub(crate) fn try_accept_managed_serving_response(
+        &self,
+        ingress: &ManagedServingDescribeIngressV1,
+        base: &VerifiedManagedFabricProducerContextV1,
+        carrier_request: &RuntimeControlCarrierRequestV1,
+        transport: &RuntimeManagedServingMtlsExchangeSuccessV1,
+    ) -> Result<VerifiedRuntimeManagedServingResponseV1, ManagedServingControllerError> {
+        self.revalidate_managed_serving_carrier(ingress, base, carrier_request)?;
+        let inner = carrier_request
+            .managed_serving_bootstrap_request()
+            .ok_or(ManagedServingControllerError::ManagedServingCarrierRequestMismatch)?;
+        if transport.observed_runtime_certificate_principal != self.carrier.runtime_principal()
+            || transport.observed_carrier_binding_digest != self.carrier.binding_digest()
+        {
+            return Err(ManagedServingControllerError::ManagedServingTransportPinMismatch);
+        }
+        let response = ManagedServingBootstrapResponseV1::decode(&transport.response_wire)?;
+        let _ = VerifiedManagedServingPinV1::try_new(base, inner, &response)?;
+        Ok(VerifiedRuntimeManagedServingResponseV1 {
+            carrier_request_digest: carrier_request.request_digest(),
+            inner_request_digest: inner.request_digest(),
+            response,
+        })
+    }
+
+    fn validate_managed_serving_context(
+        &self,
+        ingress: &ManagedServingDescribeIngressV1,
+        base: &VerifiedManagedFabricProducerContextV1,
+    ) -> Result<(), ManagedServingControllerError> {
+        ingress.revalidate(self)?;
+        let facts = ingress.serving_facts();
+        if base.target() != self.target
+            || base.target() != facts.target()
+            || base.runtime_store_instance_id() != facts.runtime_store_instance_id()
+            || base.projection() != facts.projection()
+            || base.channel() != ingress.channel()
+            || base.controller_principal() != self.carrier.controller_principal()
+            || base.request_key() != self.carrier.controller_request_key()
+            || base.controller_verifying_key() != self.controller_public_key
+            || base.runtime_response_key() != self.carrier.runtime_response_key()
+            || base.runtime_response_public_key().to_bytes() != self.runtime_response_public_key
+        {
+            return Err(ManagedServingControllerError::ManagedServingRemoteContextMismatch);
+        }
+        Ok(())
+    }
+
     /// Wraps one ControllerStore-issued, already-durable PXQR in an exact
     /// fresh signed PXCC ReferenceQuery carrier and self-verifies both layers.
     pub(crate) fn try_build_reference_query(
@@ -411,6 +626,7 @@ impl ManagedServingDescribeVerifierV1 {
             self,
             &carrier_request,
             RuntimeControlCarrierKindV1::ReferenceQuery,
+            ManagedServingControllerError::ReferenceQueryRequestMismatch,
         )?;
         if carrier_request.reference_query_request() != Some(inner) {
             return Err(ManagedServingControllerError::ReferenceQueryRequestMismatch);
@@ -443,6 +659,7 @@ impl ManagedServingDescribeVerifierV1 {
             self,
             &action.carrier_request,
             RuntimeControlCarrierKindV1::ReferenceQuery,
+            ManagedServingControllerError::ReferenceQueryRequestMismatch,
         )?;
         if action.carrier_request.reference_query_request() != Some(action.prepared.request()) {
             return Err(ManagedServingControllerError::ReferenceQueryRequestMismatch);
@@ -475,6 +692,7 @@ impl ManagedServingDescribeVerifierV1 {
             self,
             carrier_request,
             RuntimeControlCarrierKindV1::ReferenceQuery,
+            ManagedServingControllerError::ReferenceQueryRequestMismatch,
         )?;
         if carrier_request.reference_query_request() != Some(prepared.request()) {
             return Err(ManagedServingControllerError::ReferenceQueryRequestMismatch);
@@ -589,13 +807,14 @@ fn verify_runtime_control_request(
     verifier: &ManagedServingDescribeVerifierV1,
     request: &RuntimeControlCarrierRequestV1,
     expected_kind: RuntimeControlCarrierKindV1,
+    mismatch: ManagedServingControllerError,
 ) -> Result<(), ManagedServingControllerError> {
     if request.kind() != expected_kind
         || request.authentication().claim().algorithm().value() != ED25519_ALGORITHM
         || request.authentication().claim().algorithm_version() != ED25519_ALGORITHM_VERSION
         || request.authentication().signature().len() != ED25519_SIGNATURE_BYTES
     {
-        return Err(ManagedServingControllerError::ReferenceQueryRequestMismatch);
+        return Err(mismatch);
     }
     let key = VerifyingKey::from_bytes(&verifier.controller_public_key)
         .map_err(|_| ManagedServingControllerError::InvalidDescribePin)?;
@@ -609,7 +828,7 @@ fn verify_runtime_control_request(
                     && verify_ed25519(&key, transcript, signature)
             },
         )
-        .map_err(|_| ManagedServingControllerError::ReferenceQueryRequestMismatch)?;
+        .map_err(|_| mismatch)?;
     Ok(())
 }
 
@@ -717,6 +936,7 @@ impl ManagedServingBootstrapPhaseV1 {
 pub(crate) struct ManagedServingBootstrapStateV1 {
     phase: ManagedServingBootstrapPhaseV1,
     request: Option<ManagedServingBootstrapRequestV1>,
+    carrier_request: Option<RuntimeControlCarrierRequestV1>,
     response: Option<ManagedServingBootstrapResponseV1>,
 }
 
@@ -726,6 +946,7 @@ impl ManagedServingBootstrapStateV1 {
         Self {
             phase: ManagedServingBootstrapPhaseV1::ReadyForRequest,
             request: None,
+            carrier_request: None,
             response: None,
         }
     }
@@ -750,8 +971,34 @@ impl ManagedServingBootstrapStateV1 {
     }
 
     #[must_use]
+    pub(crate) fn carrier_request_wire(&self) -> &[u8] {
+        self.carrier_request
+            .as_ref()
+            .map_or(&[], RuntimeControlCarrierRequestV1::canonical_wire)
+    }
+
+    #[must_use]
     pub(crate) const fn request(&self) -> Option<&ManagedServingBootstrapRequestV1> {
         self.request.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) const fn carrier_request(&self) -> Option<&RuntimeControlCarrierRequestV1> {
+        self.carrier_request.as_ref()
+    }
+
+    /// The current remote tranche begins only from a pristine PXFJ serving
+    /// state. In particular, a closed in-flight PXCC may already have changed
+    /// Runtime and must be reconciled through a new Describe before any new
+    /// PXFB can be authorized.
+    pub(crate) fn require_remote_prepare_ready(&self) -> Result<(), ManagedServingControllerError> {
+        match self.phase {
+            ManagedServingBootstrapPhaseV1::ReadyForRequest => Ok(()),
+            ManagedServingBootstrapPhaseV1::AttemptClosedNoResponse => {
+                Err(ManagedServingControllerError::RemoteDescribeReconcileRequired)
+            }
+            _ => Err(ManagedServingControllerError::InvalidPhase),
+        }
     }
 
     pub(crate) fn decode(
@@ -760,17 +1007,32 @@ impl ManagedServingBootstrapStateV1 {
         response_wire: &[u8],
         base: &VerifiedManagedFabricProducerContextV1,
     ) -> Result<Self, ManagedServingControllerError> {
+        Self::decode_with_remote_carrier(phase, request_wire, response_wire, &[], base, None)
+    }
+
+    pub(crate) fn decode_with_remote_carrier(
+        phase: ManagedServingBootstrapPhaseV1,
+        request_wire: &[u8],
+        response_wire: &[u8],
+        carrier_request_wire: &[u8],
+        base: &VerifiedManagedFabricProducerContextV1,
+        verifier: Option<&ManagedServingDescribeVerifierV1>,
+    ) -> Result<Self, ManagedServingControllerError> {
         let state = match phase {
             ManagedServingBootstrapPhaseV1::ReadyForRequest => {
-                if !request_wire.is_empty() || !response_wire.is_empty() {
+                if !request_wire.is_empty()
+                    || !response_wire.is_empty()
+                    || !carrier_request_wire.is_empty()
+                {
                     return Err(ManagedServingControllerError::InvalidStateEncoding);
                 }
                 Self::initial()
             }
-            ManagedServingBootstrapPhaseV1::RequestDurable
-            | ManagedServingBootstrapPhaseV1::AttemptInFlight
-            | ManagedServingBootstrapPhaseV1::AttemptClosedNoResponse => {
+            ManagedServingBootstrapPhaseV1::RequestDurable => {
                 if request_wire.is_empty() || !response_wire.is_empty() {
+                    return Err(ManagedServingControllerError::InvalidStateEncoding);
+                }
+                if !carrier_request_wire.is_empty() {
                     return Err(ManagedServingControllerError::InvalidStateEncoding);
                 }
                 let request = ManagedServingBootstrapRequestV1::decode(request_wire)?;
@@ -778,6 +1040,23 @@ impl ManagedServingBootstrapStateV1 {
                 Self {
                     phase,
                     request: Some(request),
+                    carrier_request: None,
+                    response: None,
+                }
+            }
+            ManagedServingBootstrapPhaseV1::AttemptInFlight
+            | ManagedServingBootstrapPhaseV1::AttemptClosedNoResponse => {
+                if request_wire.is_empty() || !response_wire.is_empty() {
+                    return Err(ManagedServingControllerError::InvalidStateEncoding);
+                }
+                let request = ManagedServingBootstrapRequestV1::decode(request_wire)?;
+                validate_request(base, &request)?;
+                let carrier_request =
+                    decode_optional_remote_carrier(carrier_request_wire, &request, verifier)?;
+                Self {
+                    phase,
+                    request: Some(request),
+                    carrier_request,
                     response: None,
                 }
             }
@@ -787,11 +1066,14 @@ impl ManagedServingBootstrapStateV1 {
                 }
                 let request = ManagedServingBootstrapRequestV1::decode(request_wire)?;
                 validate_request(base, &request)?;
+                let carrier_request =
+                    decode_optional_remote_carrier(carrier_request_wire, &request, verifier)?;
                 let response = ManagedServingBootstrapResponseV1::decode(response_wire)?;
                 let _ = VerifiedManagedServingPinV1::try_new(base, &request, &response)?;
                 Self {
                     phase,
                     request: Some(request),
+                    carrier_request,
                     response: Some(response),
                 }
             }
@@ -844,6 +1126,7 @@ impl ManagedServingBootstrapStateV1 {
         Ok(Self {
             phase: ManagedServingBootstrapPhaseV1::RequestDurable,
             request: Some(request),
+            carrier_request: None,
             response: None,
         })
     }
@@ -862,6 +1145,34 @@ impl ManagedServingBootstrapStateV1 {
             Self {
                 phase: ManagedServingBootstrapPhaseV1::AttemptInFlight,
                 request: Some(request.clone()),
+                carrier_request: None,
+                response: None,
+            },
+            request,
+        ))
+    }
+
+    pub(crate) fn try_claim_remote(
+        &self,
+        verifier: &ManagedServingDescribeVerifierV1,
+        carrier_request: RuntimeControlCarrierRequestV1,
+    ) -> Result<(Self, ManagedServingBootstrapRequestV1), ManagedServingControllerError> {
+        if self.phase != ManagedServingBootstrapPhaseV1::RequestDurable
+            || self.response.is_some()
+            || self.carrier_request.is_some()
+        {
+            return Err(ManagedServingControllerError::InvalidPhase);
+        }
+        let request = self
+            .request
+            .clone()
+            .ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
+        verify_remote_carrier(verifier, &carrier_request, &request)?;
+        Ok((
+            Self {
+                phase: ManagedServingBootstrapPhaseV1::AttemptInFlight,
+                request: Some(request.clone()),
+                carrier_request: Some(carrier_request),
                 response: None,
             },
             request,
@@ -878,6 +1189,7 @@ impl ManagedServingBootstrapStateV1 {
         Ok(Self {
             phase: ManagedServingBootstrapPhaseV1::AttemptClosedNoResponse,
             request: self.request.clone(),
+            carrier_request: self.carrier_request.clone(),
             response: None,
         })
     }
@@ -901,6 +1213,7 @@ impl ManagedServingBootstrapStateV1 {
             Self {
                 phase: ManagedServingBootstrapPhaseV1::ResponseDurable,
                 request: Some(request.clone()),
+                carrier_request: self.carrier_request.clone(),
                 response: Some(response),
             },
             pin,
@@ -992,6 +1305,40 @@ impl VerifiedManagedServingPinV1 {
     }
 }
 
+fn decode_optional_remote_carrier(
+    carrier_request_wire: &[u8],
+    inner: &ManagedServingBootstrapRequestV1,
+    verifier: Option<&ManagedServingDescribeVerifierV1>,
+) -> Result<Option<RuntimeControlCarrierRequestV1>, ManagedServingControllerError> {
+    if carrier_request_wire.is_empty() {
+        if verifier.is_some() {
+            return Err(ManagedServingControllerError::InvalidStateEncoding);
+        }
+        return Ok(None);
+    }
+    let verifier = verifier.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
+    let carrier_request = RuntimeControlCarrierRequestV1::decode(carrier_request_wire)?;
+    verify_remote_carrier(verifier, &carrier_request, inner)?;
+    Ok(Some(carrier_request))
+}
+
+fn verify_remote_carrier(
+    verifier: &ManagedServingDescribeVerifierV1,
+    carrier_request: &RuntimeControlCarrierRequestV1,
+    inner: &ManagedServingBootstrapRequestV1,
+) -> Result<(), ManagedServingControllerError> {
+    verify_runtime_control_request(
+        verifier,
+        carrier_request,
+        RuntimeControlCarrierKindV1::ManagedServingBootstrap,
+        ManagedServingControllerError::ManagedServingCarrierRequestMismatch,
+    )?;
+    if carrier_request.managed_serving_bootstrap_request() != Some(inner) {
+        return Err(ManagedServingControllerError::ManagedServingCarrierRequestMismatch);
+    }
+    Ok(())
+}
+
 fn validate_request(
     base: &VerifiedManagedFabricProducerContextV1,
     request: &ManagedServingBootstrapRequestV1,
@@ -1048,6 +1395,15 @@ pub(crate) enum RuntimeReferenceQueryTransportErrorV1 {
     Rejected,
 }
 
+/// Classification returned by exactly one remote PXCC/PXFR exchange. No
+/// variant grants replay authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeManagedServingTransportErrorV1 {
+    NotSent,
+    Uncertain,
+    Rejected,
+}
+
 /// Fail-closed Controller errors for PXFB/PXFR durable ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedServingControllerError {
@@ -1073,6 +1429,13 @@ pub(crate) enum ManagedServingControllerError {
     DescribeEpochRegression,
     DescribeChannelRebindWithoutRestart,
     DescribePhaseRegression,
+    ManagedServingRemoteContextMismatch,
+    ManagedServingCarrierRequestMismatch,
+    ManagedServingUnauthenticatedTransport,
+    ManagedServingTransportPinMismatch,
+    ManagedServingTransport(RuntimeManagedServingTransportErrorV1),
+    ManagedServingTransportAuthoritySpent,
+    RemoteDescribeReconcileRequired,
     ReferenceQueryRequiresLegacyReady,
     ReferenceQueryRequestMismatch,
     ReferenceQueryUnauthenticatedTransport,
@@ -1111,6 +1474,12 @@ impl From<RuntimeReferenceQueryTransportErrorV1> for ManagedServingControllerErr
     }
 }
 
+impl From<RuntimeManagedServingTransportErrorV1> for ManagedServingControllerError {
+    fn from(value: RuntimeManagedServingTransportErrorV1) -> Self {
+        Self::ManagedServingTransport(value)
+    }
+}
+
 impl fmt::Display for ManagedServingControllerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "managed serving Controller failed: {self:?}")
@@ -1133,11 +1502,11 @@ mod tests {
     };
     use paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricManifestProjectionV1;
     use paraegox_runtime_contracts::managed_serving_bootstrap::{
-        ManagedServingBootstrapFactsV1, ManagedServingBootstrapRequestIdV1,
-        ManagedServingBootstrapResponseAuthClaimV1, RuntimeControlCarrierKindV1,
-        RuntimeControlCarrierRequestDraftV1, RuntimeControlCarrierRequestV1,
-        RuntimeControlDescribeReadyFactsV1, RuntimeControlDescribeReadyPhaseV1,
-        RuntimeControlDescribeReadyResponseDraftV1,
+        ManagedServingBootstrapError, ManagedServingBootstrapFactsV1,
+        ManagedServingBootstrapRequestIdV1, ManagedServingBootstrapResponseAuthClaimV1,
+        RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestDraftV1,
+        RuntimeControlCarrierRequestV1, RuntimeControlDescribeReadyFactsV1,
+        RuntimeControlDescribeReadyPhaseV1, RuntimeControlDescribeReadyResponseDraftV1,
     };
     use paraegox_runtime_contracts::provenance::{SourcePlanRevision, SourceScopeRef};
     use paraegox_runtime_contracts::reference_control::{
@@ -1154,7 +1523,8 @@ mod tests {
     };
 
     use super::{
-        FreshManagedServingBootstrapV1, ManagedServingControllerError,
+        FreshManagedServingBootstrapV1, ManagedServingBootstrapPhaseV1,
+        ManagedServingBootstrapStateV1, ManagedServingControllerError,
         ManagedServingDescribeIngressV1, ManagedServingDescribeVerifierV1,
         RuntimeReferenceQueryMtlsExchangeSuccessV1, RuntimeReferenceQueryTransportErrorV1,
         ingress_reference_serving_identity,
@@ -1166,6 +1536,24 @@ mod tests {
     const CONTROLLER_SEED: [u8; 32] = [0x41; 32];
     const RUNTIME_SEED: [u8; 32] = [0x51; 32];
     const STORE: [u8; 32] = [0x61; 32];
+
+    #[test]
+    fn remote_closed_attempt_requires_describe_reconciliation_before_another_px_f_b() {
+        let closed = ManagedServingBootstrapStateV1 {
+            phase: ManagedServingBootstrapPhaseV1::AttemptClosedNoResponse,
+            request: None,
+            carrier_request: None,
+            response: None,
+        };
+        assert_eq!(
+            closed.require_remote_prepare_ready(),
+            Err(ManagedServingControllerError::RemoteDescribeReconcileRequired)
+        );
+        assert_eq!(
+            ManagedServingBootstrapStateV1::initial().require_remote_prepare_ready(),
+            Ok(())
+        );
+    }
 
     fn hex_nibble(byte: u8) -> u8 {
         match byte {
@@ -1560,6 +1948,49 @@ mod tests {
         assert!(matches!(
             ManagedServingDescribeIngressV1::try_accept(&wrong_manifest, None, request, &response,),
             Err(ManagedServingControllerError::DescribeManifestMismatch)
+        ));
+
+        let channel_mismatch_request = describe_request(verifier.carrier(), &controller, 0x85);
+        let channel_mismatch = ReferenceChannelBindingV1::try_new(
+            projection.target(),
+            PrincipalRef::from_bytes([0xfe; 16]),
+            Digest32::from_bytes([0xed; 32]),
+            Digest32::from_bytes([0xec; 32]),
+        )
+        .expect("well-shaped mismatched Runtime-local channel");
+        let channel_mismatch_serving = ManagedServingBootstrapFactsV1::try_recovered_ready(
+            projection.target(),
+            STORE,
+            projection,
+            3,
+            5,
+            ClockReading::new(
+                ClockDomainRef::from_bytes([0x71; 16]),
+                ClockGeneration::try_new(3).expect("clock generation"),
+                MonotonicInstant::from_ticks(5),
+            ),
+        )
+        .expect("serving facts");
+        let channel_mismatch_ready = RuntimeControlDescribeReadyFactsV1::try_new(
+            RuntimeControlDescribeReadyPhaseV1::LegacyReady,
+            channel_mismatch_serving,
+            channel_mismatch,
+        )
+        .expect("ready facts remain structurally valid");
+        let channel_mismatch_auth = ManagedServingBootstrapResponseAuthClaimV1::try_new(
+            channel_mismatch,
+            verifier.carrier().runtime_response_key(),
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+        )
+        .expect("response claim");
+        assert!(matches!(
+            RuntimeControlDescribeReadyResponseDraftV1::try_new(
+                &channel_mismatch_request,
+                channel_mismatch_ready,
+                channel_mismatch_auth,
+            ),
+            Err(ManagedServingBootstrapError::InvalidControlReadyFacts)
         ));
     }
 

@@ -31,8 +31,12 @@ use paraegox_runtime_contracts::reference_control::ReferenceQueryResponseV1;
 use paraegox_runtime_contracts::wire::ApplyAuthAlgorithm;
 
 use crate::controller_journal::{
-    CONTROLLER_PAYLOAD_VERSION, ControllerJournalError, ControllerJournalPayloadV7Migration,
-    ControllerJournalSnapshot, ControllerOwnerIdentityFingerprint, MAX_CONTROLLER_SNAPSHOT_BYTES,
+    CONTROLLER_PAYLOAD_VERSION, CONTROLLER_PREVIOUS_PAYLOAD_VERSION, ControllerJournalError,
+    ControllerJournalPayloadV7Migration, ControllerJournalPayloadV8Migration,
+    ControllerJournalSnapshot, ControllerOwnerIdentityFingerprint,
+    ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorCutoverReadyFactsV1,
+    ControllerRemoteConnectorRestartRequirementV1, ControllerRemoteConnectorStepV1,
+    MAX_CONTROLLER_SNAPSHOT_BYTES,
 };
 use crate::distributed_agent_stack_apply::{
     DistributedAgentStackApplyError, DistributedAgentStackApplyJournalV1,
@@ -53,10 +57,16 @@ const MIGRATION_SOURCE_FILE_PREFIX: &str = "controller.snapshot.source-v7-";
 const MIGRATION_SOURCE_FILE_SUFFIX: &str = ".evidence";
 const MIGRATION_RECEIPT_FILE_PREFIX: &str = "controller.snapshot.migration-v1-";
 const MIGRATION_RECEIPT_FILE_SUFFIX: &str = ".receipt";
+const PAYLOAD_V8_MIGRATION_SOURCE_FILE_PREFIX: &str = "controller.snapshot.source-v8-";
+const PAYLOAD_V8_MIGRATION_RECEIPT_FILE_PREFIX: &str = "controller.snapshot.migration-v2-";
 const MIGRATION_EVIDENCE_TEMP_PREFIX: &str = ".controller.snapshot.migration.tmp-";
 const CONTROLLER_MIGRATION_RECEIPT_MAGIC: &[u8; 4] = b"PXCM";
 const CONTROLLER_MIGRATION_RECEIPT_VERSION: u16 = 1;
 const CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION: u16 = 7;
+const CONTROLLER_MIGRATION_TARGET_PAYLOAD_VERSION: u16 = 8;
+const CONTROLLER_PAYLOAD_V8_MIGRATION_RECEIPT_VERSION: u16 = 2;
+const CONTROLLER_PAYLOAD_V8_MIGRATION_SOURCE_VERSION: u16 = 8;
+const CONTROLLER_PAYLOAD_V8_MIGRATION_TARGET_VERSION: u16 = 9;
 const CONTROLLER_MIGRATION_EVIDENCE_DOMAIN: &[u8] =
     b"paraegox.deployment.controller-journal.migration-evidence.sha256.v1";
 const CONTROLLER_MIGRATION_RECEIPT_DOMAIN: &[u8] =
@@ -145,6 +155,7 @@ impl fmt::Debug for ControllerDirectoryHandle {
 /// Fixed-width receipt binding exact v7 source bytes to exact v8 target bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ControllerStoreMigrationReceipt {
+    receipt_version: u16,
     migration_id: [u8; 32],
     source_payload_version: u16,
     source_checksum: Digest32,
@@ -157,6 +168,19 @@ pub(crate) struct ControllerStoreMigrationReceipt {
     target_snapshot_length: u64,
     target_snapshot_digest: Digest32,
     canonical_wire: [u8; MIGRATION_RECEIPT_BYTES],
+}
+
+struct ControllerMigrationReceiptInput<'a> {
+    receipt_version: u16,
+    migration_id: [u8; 32],
+    source_payload_version: u16,
+    source_checksum: Digest32,
+    source_store_instance_id: [u8; 32],
+    source_owner_identity_fingerprint: Digest32,
+    source_snapshot_sequence: u64,
+    source_wire: &'a [u8],
+    target_payload_version: u16,
+    target_wire: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,6 +205,7 @@ impl ControllerStoreMigrationReceipt {
     ) -> Result<Self, ControllerStoreMigrationError> {
         if migration_id.iter().all(|byte| *byte == 0)
             || source.source_payload_version() != CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION
+            || CONTROLLER_PREVIOUS_PAYLOAD_VERSION != CONTROLLER_MIGRATION_TARGET_PAYLOAD_VERSION
             || source.source_store_instance_id() != target.store_instance_id()
             || source.source_owner_identity_fingerprint() != target.owner_identity_fingerprint()
             || source.source_snapshot_sequence() != target.snapshot_sequence()
@@ -192,29 +217,76 @@ impl ControllerStoreMigrationReceipt {
         {
             return Err(ControllerStoreMigrationError::InvalidReceipt);
         }
-        let source_snapshot_length = u64::try_from(source_wire.len())
+        Self::try_new_from_parts(ControllerMigrationReceiptInput {
+            receipt_version: CONTROLLER_MIGRATION_RECEIPT_VERSION,
+            migration_id,
+            source_payload_version: source.source_payload_version(),
+            source_checksum: source.source_checksum(),
+            source_store_instance_id: *source.source_store_instance_id(),
+            source_owner_identity_fingerprint: source.source_owner_identity_fingerprint().value(),
+            source_snapshot_sequence: source.source_snapshot_sequence(),
+            source_wire,
+            target_payload_version: CONTROLLER_MIGRATION_TARGET_PAYLOAD_VERSION,
+            target_wire,
+        })
+    }
+
+    fn try_new_payload_v8(
+        migration_id: [u8; 32],
+        source: &ControllerJournalPayloadV8Migration,
+        source_wire: &[u8],
+        target: &ControllerJournalSnapshot,
+        target_wire: &[u8],
+    ) -> Result<Self, ControllerStoreMigrationError> {
+        if migration_id.iter().all(|byte| *byte == 0)
+            || source.source_payload_version() != CONTROLLER_PAYLOAD_V8_MIGRATION_SOURCE_VERSION
+            || CONTROLLER_PAYLOAD_VERSION != CONTROLLER_PAYLOAD_V8_MIGRATION_TARGET_VERSION
+            || source.source_store_instance_id() != target.store_instance_id()
+            || source.source_owner_identity_fingerprint() != target.owner_identity_fingerprint()
+            || source.source_snapshot_sequence() != target.snapshot_sequence()
+            || source.snapshot() != target
+            || source_wire.is_empty()
+            || source_wire.len() > MAX_CONTROLLER_SNAPSHOT_BYTES
+            || target_wire.is_empty()
+            || target_wire.len() > MAX_CONTROLLER_SNAPSHOT_BYTES
+        {
+            return Err(ControllerStoreMigrationError::InvalidReceipt);
+        }
+        Self::try_new_from_parts(ControllerMigrationReceiptInput {
+            receipt_version: CONTROLLER_PAYLOAD_V8_MIGRATION_RECEIPT_VERSION,
+            migration_id,
+            source_payload_version: source.source_payload_version(),
+            source_checksum: source.source_checksum(),
+            source_store_instance_id: *source.source_store_instance_id(),
+            source_owner_identity_fingerprint: source.source_owner_identity_fingerprint().value(),
+            source_snapshot_sequence: source.source_snapshot_sequence(),
+            source_wire,
+            target_payload_version: CONTROLLER_PAYLOAD_V8_MIGRATION_TARGET_VERSION,
+            target_wire,
+        })
+    }
+
+    fn try_new_from_parts(
+        input: ControllerMigrationReceiptInput<'_>,
+    ) -> Result<Self, ControllerStoreMigrationError> {
+        let source_snapshot_length = u64::try_from(input.source_wire.len())
             .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
-        let target_snapshot_length = u64::try_from(target_wire.len())
+        let target_snapshot_length = u64::try_from(input.target_wire.len())
             .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
-        let source_snapshot_digest = migration_evidence_digest(source_wire)?;
-        let target_snapshot_digest = migration_evidence_digest(target_wire)?;
+        let source_snapshot_digest = migration_evidence_digest(input.source_wire)?;
+        let target_snapshot_digest = migration_evidence_digest(input.target_wire)?;
         let mut prefix = Vec::with_capacity(MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES);
         prefix.extend_from_slice(CONTROLLER_MIGRATION_RECEIPT_MAGIC);
-        prefix.extend_from_slice(&CONTROLLER_MIGRATION_RECEIPT_VERSION.to_be_bytes());
-        prefix.extend_from_slice(&migration_id);
-        prefix.extend_from_slice(&source.source_payload_version().to_be_bytes());
-        prefix.extend_from_slice(source.source_checksum().as_bytes());
-        prefix.extend_from_slice(source.source_store_instance_id());
-        prefix.extend_from_slice(
-            source
-                .source_owner_identity_fingerprint()
-                .value()
-                .as_bytes(),
-        );
-        prefix.extend_from_slice(&source.source_snapshot_sequence().to_be_bytes());
+        prefix.extend_from_slice(&input.receipt_version.to_be_bytes());
+        prefix.extend_from_slice(&input.migration_id);
+        prefix.extend_from_slice(&input.source_payload_version.to_be_bytes());
+        prefix.extend_from_slice(input.source_checksum.as_bytes());
+        prefix.extend_from_slice(&input.source_store_instance_id);
+        prefix.extend_from_slice(input.source_owner_identity_fingerprint.as_bytes());
+        prefix.extend_from_slice(&input.source_snapshot_sequence.to_be_bytes());
         prefix.extend_from_slice(&source_snapshot_length.to_be_bytes());
         prefix.extend_from_slice(source_snapshot_digest.as_bytes());
-        prefix.extend_from_slice(&CONTROLLER_PAYLOAD_VERSION.to_be_bytes());
+        prefix.extend_from_slice(&input.target_payload_version.to_be_bytes());
         prefix.extend_from_slice(&target_snapshot_length.to_be_bytes());
         prefix.extend_from_slice(target_snapshot_digest.as_bytes());
         if prefix.len() != MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES {
@@ -226,15 +298,16 @@ impl ControllerStoreMigrationReceipt {
             .try_into()
             .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
         Ok(Self {
-            migration_id,
-            source_payload_version: source.source_payload_version(),
-            source_checksum: source.source_checksum(),
-            source_store_instance_id: *source.source_store_instance_id(),
-            source_owner_identity_fingerprint: source.source_owner_identity_fingerprint().value(),
-            source_snapshot_sequence: source.source_snapshot_sequence(),
+            receipt_version: input.receipt_version,
+            migration_id: input.migration_id,
+            source_payload_version: input.source_payload_version,
+            source_checksum: input.source_checksum,
+            source_store_instance_id: input.source_store_instance_id,
+            source_owner_identity_fingerprint: input.source_owner_identity_fingerprint,
+            source_snapshot_sequence: input.source_snapshot_sequence,
             source_snapshot_length,
             source_snapshot_digest,
-            target_payload_version: CONTROLLER_PAYLOAD_VERSION,
+            target_payload_version: input.target_payload_version,
             target_snapshot_length,
             target_snapshot_digest,
             canonical_wire,
@@ -246,11 +319,10 @@ impl ControllerStoreMigrationReceipt {
             return Err(ControllerStoreMigrationError::InvalidReceipt);
         }
         let mut cursor = MigrationReceiptCursor::new(frame);
-        if cursor.array::<4>()? != *CONTROLLER_MIGRATION_RECEIPT_MAGIC
-            || cursor.u16()? != CONTROLLER_MIGRATION_RECEIPT_VERSION
-        {
+        if cursor.array::<4>()? != *CONTROLLER_MIGRATION_RECEIPT_MAGIC {
             return Err(ControllerStoreMigrationError::InvalidReceipt);
         }
+        let receipt_version = cursor.u16()?;
         let migration_id = cursor.array::<32>()?;
         let source_payload_version = cursor.u16()?;
         let source_checksum = Digest32::from_bytes(cursor.array::<32>()?);
@@ -264,9 +336,24 @@ impl ControllerStoreMigrationReceipt {
         let target_snapshot_digest = Digest32::from_bytes(cursor.array::<32>()?);
         let checksum = Digest32::from_bytes(cursor.array::<32>()?);
         cursor.finish()?;
+        let supported_versions = matches!(
+            (
+                receipt_version,
+                source_payload_version,
+                target_payload_version
+            ),
+            (
+                CONTROLLER_MIGRATION_RECEIPT_VERSION,
+                CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION,
+                CONTROLLER_MIGRATION_TARGET_PAYLOAD_VERSION
+            ) | (
+                CONTROLLER_PAYLOAD_V8_MIGRATION_RECEIPT_VERSION,
+                CONTROLLER_PAYLOAD_V8_MIGRATION_SOURCE_VERSION,
+                CONTROLLER_PAYLOAD_V8_MIGRATION_TARGET_VERSION
+            )
+        );
         if migration_id.iter().all(|byte| *byte == 0)
-            || source_payload_version != CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION
-            || target_payload_version != CONTROLLER_PAYLOAD_VERSION
+            || !supported_versions
             || source_store_instance_id.iter().all(|byte| *byte == 0)
             || source_owner_identity_fingerprint
                 .as_bytes()
@@ -283,6 +370,7 @@ impl ControllerStoreMigrationReceipt {
             return Err(ControllerStoreMigrationError::InvalidReceipt);
         }
         Ok(Self {
+            receipt_version,
             migration_id,
             source_payload_version,
             source_checksum,
@@ -304,6 +392,10 @@ impl ControllerStoreMigrationReceipt {
         &self.migration_id
     }
 
+    pub(crate) const fn receipt_version(&self) -> u16 {
+        self.receipt_version
+    }
+
     pub(crate) const fn source_payload_version(&self) -> u16 {
         self.source_payload_version
     }
@@ -322,6 +414,10 @@ impl ControllerStoreMigrationReceipt {
 
     pub(crate) const fn source_snapshot_sequence(&self) -> u64 {
         self.source_snapshot_sequence
+    }
+
+    pub(crate) const fn target_payload_version(&self) -> u16 {
+        self.target_payload_version
     }
 
     pub(crate) const fn canonical_wire(&self) -> &[u8; MIGRATION_RECEIPT_BYTES] {
@@ -559,6 +655,35 @@ impl fmt::Debug for ClaimedDistributedRuntimeObservationV1 {
     }
 }
 
+/// Move-only authority to perform exactly one transport exchange whose
+/// `AttemptInFlight` phase has already been atomically published.
+pub(crate) struct ClaimedControllerRemoteConnectorAttemptV1 {
+    snapshot_sequence: u64,
+    step: ControllerRemoteConnectorStepV1,
+    request_wire: Box<[u8]>,
+}
+
+impl ClaimedControllerRemoteConnectorAttemptV1 {
+    pub(crate) const fn step(&self) -> ControllerRemoteConnectorStepV1 {
+        self.step
+    }
+
+    pub(crate) fn request_wire(&self) -> &[u8] {
+        &self.request_wire
+    }
+}
+
+impl fmt::Debug for ClaimedControllerRemoteConnectorAttemptV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaimedControllerRemoteConnectorAttemptV1")
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("step", &self.step)
+            .field("request_bytes", &self.request_wire.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ControllerMigrationRequest<'a> {
     directory: &'a Path,
@@ -687,7 +812,7 @@ impl ControllerStore {
         }
         let active = read_active_controller_snapshot_bytes(&guard.directory)
             .map_err(ControllerStoreMigrationError::Store)?;
-        match ControllerJournalSnapshot::decode(&active.encoded) {
+        match ControllerJournalSnapshot::migrate_payload_v8(&active.encoded) {
             Ok(target) => resume_completed_controller_migration(
                 &guard,
                 &evidence_directory,
@@ -700,6 +825,82 @@ impl ControllerStore {
                     ControllerJournalSnapshot::migrate_payload_v7_with_metadata(&active.encoded)
                         .map_err(ControllerStoreMigrationError::Journal)?;
                 publish_controller_migration(
+                    &guard,
+                    &evidence_directory,
+                    request,
+                    active,
+                    source,
+                    failpoints,
+                )
+            }
+            Err(error) => Err(ControllerStoreMigrationError::Journal(error)),
+        }
+    }
+
+    /// Explicitly migrates one stopped Controller store from payload v8 to
+    /// v9. Normal open is v9-only and never invokes this path implicitly.
+    pub(crate) fn migrate_payload_v8_offline(
+        directory: &Path,
+        evidence_directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+        migration_id: [u8; 32],
+    ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+        Self::migrate_payload_v8_offline_with_policy(
+            ControllerMigrationRequest {
+                directory,
+                evidence_directory,
+                expected_store_instance_id,
+                expected_owner_identity,
+                migration_id,
+            },
+            ControllerFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    fn migrate_payload_v8_offline_with_policy(
+        request: ControllerMigrationRequest<'_>,
+        filesystem_policy: ControllerFilesystemPolicy,
+    ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+        Self::migrate_payload_v8_offline_with_policy_and_failpoints(
+            request,
+            filesystem_policy,
+            ControllerMigrationFailpoints::NONE,
+        )
+    }
+
+    fn migrate_payload_v8_offline_with_policy_and_failpoints(
+        request: ControllerMigrationRequest<'_>,
+        filesystem_policy: ControllerFilesystemPolicy,
+        failpoints: ControllerMigrationFailpoints,
+    ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+        validate_migration_inputs(
+            request.expected_store_instance_id,
+            request.expected_owner_identity,
+            request.migration_id,
+        )?;
+        let guard = acquire_controller_migration_guard(request.directory, filesystem_policy)?;
+        let evidence_directory =
+            open_controller_directory(request.evidence_directory, filesystem_policy)
+                .map_err(ControllerStoreMigrationError::EvidenceDirectory)?;
+        if guard.directory.identity == evidence_directory.identity {
+            return Err(ControllerStoreMigrationError::EvidenceDirectoryMatchesStore);
+        }
+        let active = read_active_controller_snapshot_bytes(&guard.directory)
+            .map_err(ControllerStoreMigrationError::Store)?;
+        match ControllerJournalSnapshot::decode(&active.encoded) {
+            Ok(target) => resume_completed_payload_v8_controller_migration(
+                &guard,
+                &evidence_directory,
+                request,
+                active,
+                target,
+            ),
+            Err(ControllerJournalError::UnknownPayloadVersion) => {
+                let source =
+                    ControllerJournalSnapshot::migrate_payload_v8_with_metadata(&active.encoded)
+                        .map_err(ControllerStoreMigrationError::Journal)?;
+                publish_payload_v8_controller_migration(
                     &guard,
                     &evidence_directory,
                     request,
@@ -862,6 +1063,190 @@ impl ControllerStore {
     pub(crate) fn snapshot(&self) -> Result<&ControllerJournalSnapshot, ControllerStoreError> {
         self.ensure_operational()?;
         Ok(&self.snapshot)
+    }
+
+    /// Atomically persists the owner-private PXCR identity/configuration
+    /// before any remote connector request can be prepared.
+    pub(crate) fn initialize_remote_connector(
+        &mut self,
+        configuration_digest: Digest32,
+        target: RuntimeHostId,
+        successor_store_instance_id: [u8; 32],
+        authority_store_instance_id: [u8; 32],
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_current()?;
+        let next = self
+            .snapshot
+            .try_initialize_remote_connector(
+                configuration_digest,
+                target,
+                successor_store_instance_id,
+                authority_store_instance_id,
+            )
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// First half of request-before-send: the exact outer wire is durable but
+    /// is not yet transport-authorized.
+    pub(crate) fn prepare_remote_connector_request(
+        &mut self,
+        step: ControllerRemoteConnectorStepV1,
+        request_wire: &[u8],
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_current()?;
+        let next = self
+            .snapshot
+            .try_prepare_remote_connector_request(step, request_wire)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// Second half of request-before-send. The returned non-cloneable value is
+    /// created only after the `AttemptInFlight` snapshot is published.
+    pub(crate) fn claim_remote_connector_attempt(
+        &mut self,
+        step: ControllerRemoteConnectorStepV1,
+    ) -> Result<ClaimedControllerRemoteConnectorAttemptV1, ControllerStoreError> {
+        self.revalidate_current()?;
+        let request_wire = self
+            .snapshot
+            .remote_connector_current_attempt()
+            .filter(|(current_step, phase, _)| {
+                *current_step == step
+                    && (*phase == ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
+                        || step == ControllerRemoteConnectorStepV1::NodePublish
+                            && matches!(
+                                *phase,
+                                ControllerRemoteConnectorAttemptPhaseV1::Uncertain
+                                    | ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+                            ))
+            })
+            .map(|(_, _, wire)| Box::<[u8]>::from(wire))
+            .ok_or(ControllerStoreError::InvalidSuccessor(
+                ControllerJournalError::InvalidRemoteConnectorSuccessor,
+            ))?;
+        let next = self
+            .snapshot
+            .try_claim_remote_connector_attempt(step)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)?;
+        let snapshot = self.revalidate_current()?;
+        let (current_step, current_phase, current_wire) = snapshot
+            .remote_connector_current_attempt()
+            .ok_or(ControllerStoreError::Codec(
+                ControllerJournalError::InvalidRemoteConnectorState,
+            ))?;
+        if current_step != step
+            || current_phase != ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+            || current_wire != request_wire.as_ref()
+        {
+            self.state = ControllerStoreState::Stopped;
+            return Err(ControllerStoreError::ActiveSnapshotChanged);
+        }
+        Ok(ClaimedControllerRemoteConnectorAttemptV1 {
+            snapshot_sequence: snapshot.snapshot_sequence(),
+            step,
+            request_wire,
+        })
+    }
+
+    /// Commits the exact response for one consumed claim. A stale or already
+    /// consumed claim cannot mutate the active snapshot.
+    pub(crate) fn commit_remote_connector_response(
+        &mut self,
+        claim: ClaimedControllerRemoteConnectorAttemptV1,
+        response_wire: &[u8],
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_remote_connector_claim(&claim)?;
+        let next = self
+            .snapshot
+            .try_record_remote_connector_response(claim.step, response_wire)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// Commits one explicit transport closure for a consumed claim.
+    pub(crate) fn close_remote_connector_attempt(
+        &mut self,
+        claim: ClaimedControllerRemoteConnectorAttemptV1,
+        closure: ControllerRemoteConnectorAttemptPhaseV1,
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_remote_connector_claim(&claim)?;
+        let next = self
+            .snapshot
+            .try_close_remote_connector_attempt(claim.step, closure)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// Restart closure is deliberately a separate durable operation. It never
+    /// produces transport authority or prepares a replacement request.
+    pub(crate) fn recover_remote_connector_attempt(
+        &mut self,
+        step: ControllerRemoteConnectorStepV1,
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_current()?;
+        let next = self
+            .snapshot
+            .try_recover_remote_connector_attempt(step)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// Retires an expired challenge only where the journal proves PXNO was
+    /// never sent. A full fresh Node/Runtime discovery round must then be
+    /// prepared separately before a new challenge is accepted.
+    pub(crate) fn abandon_remote_connector_challenge_round(
+        &mut self,
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_current()?;
+        let next = self
+            .snapshot
+            .try_abandon_remote_connector_challenge_round()
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    pub(crate) fn remote_connector_restart_requirement(
+        &mut self,
+    ) -> Result<ControllerRemoteConnectorRestartRequirementV1, ControllerStoreError> {
+        Ok(self
+            .revalidate_current()?
+            .remote_connector_restart_requirement())
+    }
+
+    /// Returns terminal facts only after re-reading the active path while this
+    /// store still owns its original lock.
+    pub(crate) fn revalidate_remote_connector_cutover_ready(
+        &mut self,
+    ) -> Result<ControllerRemoteConnectorCutoverReadyFactsV1, ControllerStoreError> {
+        self.revalidate_current()?
+            .remote_connector_cutover_ready_facts()
+            .map_err(ControllerStoreError::Codec)?
+            .ok_or(ControllerStoreError::Codec(
+                ControllerJournalError::RemoteConnectorCutoverNotReady,
+            ))
+    }
+
+    fn revalidate_remote_connector_claim(
+        &mut self,
+        claim: &ClaimedControllerRemoteConnectorAttemptV1,
+    ) -> Result<(), ControllerStoreError> {
+        let snapshot = self.revalidate_current()?;
+        let valid = snapshot.snapshot_sequence() == claim.snapshot_sequence
+            && snapshot
+                .remote_connector_current_attempt()
+                .is_some_and(|(step, phase, wire)| {
+                    step == claim.step
+                        && phase == ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+                        && wire == claim.request_wire.as_ref()
+                });
+        if !valid {
+            self.state = ControllerStoreState::Stopped;
+            return Err(ControllerStoreError::ActiveSnapshotChanged);
+        }
+        Ok(())
     }
 
     /// Reopens only an owner extension that has not yet introduced PXQR. Once
@@ -2038,6 +2423,19 @@ fn validate_migration_source_identity(
     Ok(())
 }
 
+fn validate_payload_v8_migration_source_identity(
+    source: &ControllerJournalPayloadV8Migration,
+    request: ControllerMigrationRequest<'_>,
+) -> Result<(), ControllerStoreMigrationError> {
+    if source.source_store_instance_id() != &request.expected_store_instance_id {
+        return Err(ControllerStoreMigrationError::StoreInstanceMismatch);
+    }
+    if source.source_owner_identity_fingerprint() != request.expected_owner_identity {
+        return Err(ControllerStoreMigrationError::OwnerIdentityMismatch);
+    }
+    Ok(())
+}
+
 fn validate_migration_target_identity(
     target: &ControllerJournalSnapshot,
     request: ControllerMigrationRequest<'_>,
@@ -2060,7 +2458,7 @@ fn resume_completed_controller_migration(
 ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
     validate_migration_target_identity(&target, request)?;
     let target_wire = target
-        .encode()
+        .encode_payload_v8_for_migration()
         .map_err(ControllerStoreMigrationError::Journal)?;
     if target_wire.as_ref() != active.encoded {
         return Err(ControllerStoreMigrationError::TargetMismatch);
@@ -2121,9 +2519,9 @@ fn publish_controller_migration(
     validate_migration_source_identity(&source, request)?;
     let target_wire = source
         .snapshot()
-        .encode()
+        .encode_payload_v8_for_migration()
         .map_err(ControllerStoreMigrationError::Journal)?;
-    let target = ControllerJournalSnapshot::decode(&target_wire)
+    let target = ControllerJournalSnapshot::migrate_payload_v8(&target_wire)
         .map_err(ControllerStoreMigrationError::Journal)?;
     validate_migration_target_identity(&target, request)?;
     let receipt = ControllerStoreMigrationReceipt::try_new(
@@ -2185,12 +2583,166 @@ fn publish_controller_migration(
             ControllerFileStage::ReadBackPublished,
         ));
     }
-    ControllerJournalSnapshot::decode(&published.encoded)
+    ControllerJournalSnapshot::migrate_payload_v8(&published.encoded)
         .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
     validate_migration_handles(guard, evidence_directory)
         .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
     let (post_source, post_receipt) =
         read_controller_migration_evidence(evidence_directory, request.migration_id)
+            .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    if post_source != active.encoded || post_receipt != receipt {
+        return Err(published_but_unverified(
+            ControllerFileStage::VerifyPublishedMigration,
+        ));
+    }
+    Ok(ControllerStoreMigrationOutcome {
+        disposition: ControllerStoreMigrationDisposition::Migrated,
+        receipt,
+    })
+}
+
+fn resume_completed_payload_v8_controller_migration(
+    guard: &ControllerMigrationGuard,
+    evidence_directory: &ControllerDirectoryHandle,
+    request: ControllerMigrationRequest<'_>,
+    active: ActiveSnapshotBytes,
+    target: ControllerJournalSnapshot,
+) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+    validate_migration_target_identity(&target, request)?;
+    let target_wire = target
+        .encode()
+        .map_err(ControllerStoreMigrationError::Journal)?;
+    if target_wire.as_ref() != active.encoded {
+        return Err(ControllerStoreMigrationError::TargetMismatch);
+    }
+    clean_controller_migration_evidence_temps(evidence_directory, request.migration_id)
+        .map_err(|_| published_but_unverified(ControllerFileStage::InspectMigrationEvidence))?;
+    let (source_wire, stored_receipt) =
+        read_payload_v8_controller_migration_evidence(evidence_directory, request.migration_id)
+            .map_err(|_| {
+                published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence)
+            })?;
+    let source = ControllerJournalSnapshot::migrate_payload_v8_with_metadata(&source_wire)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence))?;
+    validate_payload_v8_migration_source_identity(&source, request)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence))?;
+    if source.snapshot() != &target {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackPublished,
+        ));
+    }
+    let expected_receipt = ControllerStoreMigrationReceipt::try_new_payload_v8(
+        request.migration_id,
+        &source,
+        &source_wire,
+        &target,
+        &target_wire,
+    )
+    .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence))?;
+    if stored_receipt != expected_receipt {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+    validate_migration_handles(guard, evidence_directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    clean_valid_orphan_temps(&guard.directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    let revalidated = read_active_controller_snapshot_bytes(&guard.directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
+    if revalidated.identity != active.identity || revalidated.encoded != active.encoded {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackPublished,
+        ));
+    }
+    Ok(ControllerStoreMigrationOutcome {
+        disposition: ControllerStoreMigrationDisposition::AlreadyMigrated,
+        receipt: stored_receipt,
+    })
+}
+
+fn publish_payload_v8_controller_migration(
+    guard: &ControllerMigrationGuard,
+    evidence_directory: &ControllerDirectoryHandle,
+    request: ControllerMigrationRequest<'_>,
+    active: ActiveSnapshotBytes,
+    source: ControllerJournalPayloadV8Migration,
+    failpoints: ControllerMigrationFailpoints,
+) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+    validate_payload_v8_migration_source_identity(&source, request)?;
+    let target_wire = source
+        .snapshot()
+        .encode()
+        .map_err(ControllerStoreMigrationError::Journal)?;
+    let target = ControllerJournalSnapshot::decode(&target_wire)
+        .map_err(ControllerStoreMigrationError::Journal)?;
+    validate_migration_target_identity(&target, request)?;
+    let receipt = ControllerStoreMigrationReceipt::try_new_payload_v8(
+        request.migration_id,
+        &source,
+        &active.encoded,
+        &target,
+        &target_wire,
+    )?;
+
+    clean_valid_orphan_temps(&guard.directory).map_err(ControllerStoreMigrationError::Store)?;
+    clean_controller_migration_evidence_temps(evidence_directory, request.migration_id)?;
+    ensure_read_only_migration_evidence(
+        evidence_directory,
+        request.migration_id,
+        &payload_v8_migration_source_file_name(request.migration_id),
+        &active.encoded,
+        MigrationEvidenceKind::Source,
+        migration_random_token()?,
+        failpoints.source_evidence,
+    )?;
+    ensure_read_only_migration_evidence(
+        evidence_directory,
+        request.migration_id,
+        &payload_v8_migration_receipt_file_name(request.migration_id),
+        receipt.canonical_wire(),
+        MigrationEvidenceKind::Receipt,
+        migration_random_token()?,
+        failpoints.receipt_evidence,
+    )?;
+    let (stored_source, stored_receipt) =
+        read_payload_v8_controller_migration_evidence(evidence_directory, request.migration_id)
+            .map_err(|_| {
+                uncertain_migration_evidence(ControllerFileStage::ReadBackMigrationEvidence)
+            })?;
+    if stored_source != active.encoded || stored_receipt != receipt {
+        return Err(uncertain_migration_evidence(
+            ControllerFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+
+    validate_migration_handles(guard, evidence_directory)?;
+    let current = read_active_controller_snapshot_bytes(&guard.directory)
+        .map_err(ControllerStoreMigrationError::Store)?;
+    if current.identity != active.identity || current.encoded != active.encoded {
+        return Err(ControllerStoreMigrationError::TargetMismatch);
+    }
+    publish_controller_snapshot(
+        &guard.directory,
+        &target_wire,
+        migration_random_token()?,
+        ControllerPublishMode::ReplaceExisting(active.identity),
+        failpoints.active_snapshot,
+    )
+    .map_err(ControllerStoreMigrationError::Publish)?;
+    let published = read_active_controller_snapshot_bytes(&guard.directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
+    if published.encoded != target_wire.as_ref() {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackPublished,
+        ));
+    }
+    ControllerJournalSnapshot::decode(&published.encoded)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
+    validate_migration_handles(guard, evidence_directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    let (post_source, post_receipt) =
+        read_payload_v8_controller_migration_evidence(evidence_directory, request.migration_id)
             .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
     if post_source != active.encoded || post_receipt != receipt {
         return Err(published_but_unverified(
@@ -2234,6 +2786,26 @@ fn migration_receipt_file_name(migration_id: [u8; 32]) -> String {
         MIGRATION_RECEIPT_FILE_PREFIX.len() + 64 + MIGRATION_RECEIPT_FILE_SUFFIX.len(),
     );
     name.push_str(MIGRATION_RECEIPT_FILE_PREFIX);
+    append_lower_hex(&mut name, &migration_id);
+    name.push_str(MIGRATION_RECEIPT_FILE_SUFFIX);
+    name
+}
+
+fn payload_v8_migration_source_file_name(migration_id: [u8; 32]) -> String {
+    let mut name = String::with_capacity(
+        PAYLOAD_V8_MIGRATION_SOURCE_FILE_PREFIX.len() + 64 + MIGRATION_SOURCE_FILE_SUFFIX.len(),
+    );
+    name.push_str(PAYLOAD_V8_MIGRATION_SOURCE_FILE_PREFIX);
+    append_lower_hex(&mut name, &migration_id);
+    name.push_str(MIGRATION_SOURCE_FILE_SUFFIX);
+    name
+}
+
+fn payload_v8_migration_receipt_file_name(migration_id: [u8; 32]) -> String {
+    let mut name = String::with_capacity(
+        PAYLOAD_V8_MIGRATION_RECEIPT_FILE_PREFIX.len() + 64 + MIGRATION_RECEIPT_FILE_SUFFIX.len(),
+    );
+    name.push_str(PAYLOAD_V8_MIGRATION_RECEIPT_FILE_PREFIX);
     append_lower_hex(&mut name, &migration_id);
     name.push_str(MIGRATION_RECEIPT_FILE_SUFFIX);
     name
@@ -2591,9 +3163,37 @@ fn read_controller_migration_evidence(
         MIGRATION_RECEIPT_BYTES,
     )?;
     let receipt = ControllerStoreMigrationReceipt::decode(&receipt_wire)?;
-    if receipt.migration_id != migration_id
+    if receipt.receipt_version != CONTROLLER_MIGRATION_RECEIPT_VERSION
+        || receipt.migration_id != migration_id
         || receipt.source_snapshot_length != source.len() as u64
         || receipt.source_snapshot_digest != migration_evidence_digest(&source)?
+    {
+        return Err(ControllerStoreMigrationError::EvidenceMismatch);
+    }
+    Ok((source, receipt))
+}
+
+fn read_payload_v8_controller_migration_evidence(
+    directory: &ControllerDirectoryHandle,
+    migration_id: [u8; 32],
+) -> Result<(Vec<u8>, ControllerStoreMigrationReceipt), ControllerStoreMigrationError> {
+    let source = read_read_only_migration_evidence(
+        directory,
+        &payload_v8_migration_source_file_name(migration_id),
+        MAX_CONTROLLER_SNAPSHOT_BYTES,
+    )?;
+    let receipt_wire = read_read_only_migration_evidence(
+        directory,
+        &payload_v8_migration_receipt_file_name(migration_id),
+        MIGRATION_RECEIPT_BYTES,
+    )?;
+    let receipt = ControllerStoreMigrationReceipt::decode(&receipt_wire)?;
+    if receipt.receipt_version() != CONTROLLER_PAYLOAD_V8_MIGRATION_RECEIPT_VERSION
+        || receipt.migration_id() != &migration_id
+        || migration_evidence_digest(&source)? != receipt.source_snapshot_digest
+        || u64::try_from(source.len())
+            .map_err(|_| ControllerStoreMigrationError::EvidenceTooLarge)?
+            != receipt.source_snapshot_length
     {
         return Err(ControllerStoreMigrationError::EvidenceMismatch);
     }
@@ -3999,11 +4599,12 @@ mod tests {
     use crate::controller_journal::{
         ControllerAuthKeyFingerprint, ControllerJournalError, ControllerJournalSnapshot,
         ControllerJournalState, ControllerOperationId, ControllerOwnerIdentityFingerprint,
-        ControllerRequestAuthPin, ControllerTenurePhase, controller_test_manifest,
-        refresh_controller_test_checksum,
+        ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorRestartRequirementV1,
+        ControllerRemoteConnectorStepV1, ControllerRequestAuthPin, ControllerTenurePhase,
+        controller_test_manifest, refresh_controller_test_checksum,
         tests::{
             decode_frozen_base64, frozen_v7_opaque_query_wire, frozen_v7_zero_wire,
-            frozen_v8_zero_target_wire,
+            frozen_v8_zero_target_wire, remote_node_describe_wire,
         },
     };
     use crate::controller_tenure::{
@@ -4411,12 +5012,85 @@ mod tests {
     }
 
     #[test]
-    fn offline_v7_migration_retains_exact_read_only_evidence_and_resumes_exactly() {
+    fn remote_connector_store_commits_before_send_and_restart_only_closes_authority() {
+        let directory = TestDirectory::new();
+        let initial = initial_snapshot();
+        install(&initial, &directory);
+        let first = remote_node_describe_wire(0xb1);
+        {
+            let mut store = open_fixture(&directory);
+            store
+                .initialize_remote_connector(
+                    digest(0xa1),
+                    RuntimeHostId::from_bytes([0x31; 16]),
+                    [0xa2; 32],
+                    [0xa3; 32],
+                )
+                .expect("remote connector identity must become durable");
+            store
+                .prepare_remote_connector_request(
+                    ControllerRemoteConnectorStepV1::NodeDescribe,
+                    &first,
+                )
+                .expect("request must commit before send authority exists");
+            assert_eq!(
+                active_snapshot(&directory).remote_connector_current_attempt(),
+                Some((
+                    ControllerRemoteConnectorStepV1::NodeDescribe,
+                    ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent,
+                    first.as_ref(),
+                ))
+            );
+            let claim = store
+                .claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeDescribe)
+                .expect("atomic claim");
+            assert_eq!(claim.step(), ControllerRemoteConnectorStepV1::NodeDescribe);
+            assert_eq!(claim.request_wire(), first.as_ref());
+            assert_eq!(
+                active_snapshot(&directory).remote_connector_current_attempt(),
+                Some((
+                    ControllerRemoteConnectorStepV1::NodeDescribe,
+                    ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight,
+                    first.as_ref(),
+                ))
+            );
+        }
+
+        let mut restarted = open_fixture(&directory);
+        assert_eq!(
+            restarted
+                .remote_connector_restart_requirement()
+                .expect("restart requirement"),
+            ControllerRemoteConnectorRestartRequirementV1::RecoverInFlight(
+                ControllerRemoteConnectorStepV1::NodeDescribe
+            )
+        );
+        restarted
+            .recover_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeDescribe)
+            .expect("separate restart command closes old resident authority");
+        let second = remote_node_describe_wire(0xb2);
+        restarted
+            .prepare_remote_connector_request(
+                ControllerRemoteConnectorStepV1::NodeDescribe,
+                &second,
+            )
+            .expect("fresh read-only request is a separate durable attempt");
+        assert!(matches!(
+            restarted.revalidate_remote_connector_cutover_ready(),
+            Err(ControllerStoreError::Codec(
+                ControllerJournalError::RemoteConnectorCutoverNotReady
+            ))
+        ));
+    }
+
+    #[test]
+    fn offline_v7_and_v8_migrations_retain_exact_evidence_and_resume_exactly() {
         let directory = TestDirectory::new();
         let evidence = TestDirectory::new();
         let source_wire = frozen_v7_zero_wire();
-        let expected_target = ControllerJournalSnapshot::decode(&frozen_v8_zero_target_wire())
-            .expect("frozen v8 target must decode");
+        let expected_target_wire = frozen_v8_zero_target_wire();
+        let expected_target = ControllerJournalSnapshot::migrate_payload_v8(&expected_target_wire)
+            .expect("frozen v8 target must parse explicitly");
         install_wire(&source_wire, &directory);
         assert_eq!(
             ControllerStore::open_with_policy(
@@ -4425,7 +5099,7 @@ mod tests {
                 owner(),
                 ControllerFilesystemPolicy::ExplicitFixture,
             )
-            .expect_err("normal v8 open must reject v7"),
+            .expect_err("normal v9 open must reject v7"),
             ControllerStoreOpenError::Codec(ControllerJournalError::UnknownPayloadVersion)
         );
 
@@ -4451,7 +5125,10 @@ mod tests {
             decode_frozen_base64(include_str!("testdata/controller_v7_v8_receipt.b64")).as_ref(),
             "receipt bytes are frozen against the accepted HEAD-v7 source and exact v8 target"
         );
-        assert_eq!(active_snapshot(&directory), expected_target);
+        assert_eq!(
+            fs::read(directory.path().join(CONTROLLER_ACTIVE_FILE_NAME)).expect("v8 active bytes"),
+            expected_target_wire.as_ref()
+        );
         let source_path = evidence
             .path()
             .join(super::migration_source_file_name([0x91; 32]));
@@ -4489,6 +5166,45 @@ mod tests {
             ControllerStoreMigrationDisposition::AlreadyMigrated
         );
         assert_eq!(resumed.receipt, migrated.receipt);
+
+        let v8_request = super::ControllerMigrationRequest {
+            migration_id: [0x95; 32],
+            ..request
+        };
+        let v9 = ControllerStore::migrate_payload_v8_offline_with_policy(
+            v8_request,
+            ControllerFilesystemPolicy::ExplicitFixture,
+        )
+        .expect("v8 to v9 migration must succeed");
+        assert_eq!(
+            v9.disposition,
+            ControllerStoreMigrationDisposition::Migrated
+        );
+        assert_eq!(v9.receipt.receipt_version(), 2);
+        assert_eq!(v9.receipt.source_payload_version(), 8);
+        assert_eq!(v9.receipt.target_payload_version(), 9);
+        assert_eq!(active_snapshot(&directory), expected_target);
+        assert_eq!(
+            ControllerStore::migrate_payload_v8_offline_with_policy(
+                v8_request,
+                ControllerFilesystemPolicy::ExplicitFixture,
+            )
+            .expect("exact v8 migration retry must resume")
+            .disposition,
+            ControllerStoreMigrationDisposition::AlreadyMigrated
+        );
+        assert!(
+            evidence
+                .path()
+                .join(super::payload_v8_migration_source_file_name([0x95; 32]))
+                .is_file()
+        );
+        assert!(
+            evidence
+                .path()
+                .join(super::payload_v8_migration_receipt_file_name([0x95; 32]))
+                .is_file()
+        );
 
         let held = open_fixture(&directory);
         assert_eq!(
@@ -4611,7 +5327,18 @@ mod tests {
                 ControllerPublishFailure::UncertainAfterPublish(_)
             ))
         ));
-        assert_eq!(active_snapshot(&active_uncertain_store), source);
+        assert_eq!(
+            fs::read(
+                active_uncertain_store
+                    .path()
+                    .join(CONTROLLER_ACTIVE_FILE_NAME)
+            )
+            .expect("v8 active after uncertain publish"),
+            source
+                .encode_payload_v8_for_migration()
+                .expect("exact v8 target")
+                .as_ref()
+        );
         assert_eq!(
             ControllerStore::migrate_payload_v7_offline_with_policy(
                 active_request,

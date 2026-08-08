@@ -40,6 +40,9 @@ use paraegox_runtime_contracts::temporal::{
 use paraegox_runtime_contracts::wire::{ApplyAuthError, ApplyAuthKeyRef, ApplyRequestAuthClaim};
 
 use crate::controller_journal::{ControllerJournalError, ControllerJournalState};
+use crate::managed_serving_client::{
+    ManagedServingDescribeIngressV1, ManagedServingDescribeVerifierV1,
+};
 use crate::plan::DeploymentWriterRef;
 
 const ED25519_ALGORITHM: u16 = 1;
@@ -184,6 +187,39 @@ pub(crate) struct ManagedFabricControllerProvisioningV1 {
     controller: ManagedFabricControllerIdentityV1,
     authority: ManagedFabricTenureAuthorityPinV1,
     runtime: ManagedFabricRuntimeChannelPinV1,
+}
+
+/// Protected remote connector pins used after a verified PXDR Describe.
+///
+/// Unlike [`ManagedFabricControllerProvisioningV1`], this value contains no
+/// UDS path or POSIX peer identity. The complete PXCB, Controller key and
+/// Runtime response key are retained by the Describe verifier derived from
+/// the out-of-band enrollment artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedFabricRemoteControllerProvisioningV1 {
+    controller: ManagedFabricControllerIdentityV1,
+    authority: ManagedFabricTenureAuthorityPinV1,
+    describe: ManagedServingDescribeVerifierV1,
+}
+
+impl ManagedFabricRemoteControllerProvisioningV1 {
+    #[must_use]
+    pub(crate) const fn new(
+        controller: ManagedFabricControllerIdentityV1,
+        authority: ManagedFabricTenureAuthorityPinV1,
+        describe: ManagedServingDescribeVerifierV1,
+    ) -> Self {
+        Self {
+            controller,
+            authority,
+            describe,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn describe(&self) -> &ManagedServingDescribeVerifierV1 {
+        &self.describe
+    }
 }
 
 impl ManagedFabricControllerProvisioningV1 {
@@ -423,6 +459,81 @@ impl VerifiedManagedFabricProducerContextV1 {
             channel,
             runtime_response_key: runtime.response_key_ref,
             runtime_response_public_key: runtime.response_public_key,
+        })
+    }
+
+    /// Builds the managed-Fabric producer context from an authenticated remote
+    /// PXDR observation and enrollment-pinned PXCB. This path deliberately
+    /// does not consult or synthesize the legacy PXBR/UDS target binding.
+    pub(crate) fn try_from_remote_describe(
+        state: &ControllerJournalState,
+        controller_signer: &SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+    ) -> Result<Self, ManagedFabricProducerError> {
+        validate_controller_signer(state, controller_signer)?;
+        ingress
+            .revalidate(&provisioning.describe)
+            .map_err(|_| ManagedFabricProducerError::RemoteDescribeMismatch)?;
+        let target = state.installed_manifest().target();
+        let source_scope = SourceScopeRef::from_bytes(*state.scope().as_bytes());
+        let source_plan = SourcePlanRef::from_bytes(*state.plan_lineage().as_bytes());
+        let request_auth = state.request_auth();
+        let carrier = provisioning.describe.carrier();
+        let facts = ingress.serving_facts();
+        let channel = ingress.channel();
+        if provisioning.describe.target() != target
+            || provisioning.describe.manifest_digest()
+                != state.installed_manifest().manifest_digest()
+            || provisioning.describe.controller_public_key()
+                != controller_signer.verifying_key().to_bytes()
+            || carrier.target() != target
+            || carrier.controller_principal() != provisioning.controller.controller_principal
+            || carrier.controller_request_key() != request_auth.key()
+            || channel.target() != target
+            || channel.runtime_peer() != carrier.runtime_principal()
+            || facts.target() != target
+            || facts.runtime_store_instance_id() == [0; 32]
+            || facts.projection() != ingress.projection()
+        {
+            return Err(ManagedFabricProducerError::RemoteDescribeMismatch);
+        }
+        let projection = ManagedFabricManifestProjectionV1::try_from_verified_legacy_manifest(
+            state.installed_manifest().verified_manifest(),
+        )?;
+        if projection.target() != target || &projection != ingress.projection() {
+            return Err(ManagedFabricProducerError::ProjectionMismatch);
+        }
+        let plan_writer = PlanWriterRef::from_bytes(*provisioning.controller.writer.as_bytes());
+        let proof = state
+            .latest_committed_tenure_proof(plan_writer)
+            .ok_or(ManagedFabricProducerError::MissingCommittedTenureProof)?
+            .clone();
+        validate_tenure_proof(&proof, source_scope, plan_writer, provisioning.authority)?;
+        let writer_context =
+            PlanWriterContext::try_new(plan_writer, proof.claim().epoch(), proof.clone())?;
+        let runtime_response_public_key =
+            VerifyingKey::from_bytes(&provisioning.describe.runtime_response_public_key())
+                .map_err(|_| ManagedFabricProducerError::InvalidRuntimeChannel)?;
+        if runtime_response_public_key.is_weak() {
+            return Err(ManagedFabricProducerError::InvalidRuntimeChannel);
+        }
+        Ok(Self {
+            target,
+            source_scope,
+            source_plan,
+            legacy_revision: state.current_revision(),
+            projection,
+            writer_context,
+            controller_principal: provisioning.controller.controller_principal,
+            request_key: request_auth.key(),
+            controller_verifying_key: controller_signer.verifying_key().to_bytes(),
+            clock_domain: facts.clock_domain(),
+            clock_generation: facts.clock_generation(),
+            runtime_store_instance_id: facts.runtime_store_instance_id(),
+            channel,
+            runtime_response_key: carrier.runtime_response_key(),
+            runtime_response_public_key,
         })
     }
 
@@ -846,6 +957,7 @@ pub(crate) enum ManagedFabricProducerError {
     InvalidControllerIdentity,
     InvalidTenureAuthority,
     InvalidRuntimeChannel,
+    RemoteDescribeMismatch,
     MissingTargetBinding,
     MissingCommittedTenureProof,
     BootstrapBindingMismatch,

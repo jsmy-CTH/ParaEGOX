@@ -6,6 +6,7 @@
 //! timeout, disconnect, cancellation, or process loss cannot authorize replay.
 
 use core::fmt;
+use core::future::Future;
 
 use ed25519_dalek::Signature;
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
@@ -19,7 +20,9 @@ use paraegox_runtime_contracts::managed_fabric_plan::{
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::ManagedModelAgentStackTargetModeV1;
 use paraegox_runtime_contracts::managed_service::ManagedServiceSpecV1;
-use paraegox_runtime_contracts::managed_serving_bootstrap::ManagedServingBootstrapRequestV1;
+use paraegox_runtime_contracts::managed_serving_bootstrap::{
+    ManagedServingBootstrapRequestV1, RuntimeControlCarrierRequestV1,
+};
 use paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1;
 
 use crate::controller_journal::{ControllerJournalError, ControllerJournalSnapshot};
@@ -29,14 +32,16 @@ use crate::managed_agent_stack_apply::{
 use crate::managed_fabric_producer::{
     FreshManagedFabricApplyV1, ManagedFabricControllerProvisioningV1,
     ManagedFabricControllerRequestDraftV1, ManagedFabricDesiredPlanV1, ManagedFabricProducerError,
-    VerifiedManagedFabricProducerContextV1,
+    ManagedFabricRemoteControllerProvisioningV1, VerifiedManagedFabricProducerContextV1,
 };
 use crate::managed_model_agent_stack_apply::{
     ManagedModelAgentStackControllerStateV1, ManagedModelAgentStackDecodeContextV1,
 };
 use crate::managed_serving_client::{
     FreshManagedServingBootstrapV1, ManagedServingBootstrapPhaseV1, ManagedServingBootstrapStateV1,
-    ManagedServingControllerError, VerifiedManagedServingPinV1,
+    ManagedServingControllerError, ManagedServingDescribeIngressV1,
+    RuntimeManagedServingMtlsExchangeSuccessV1, RuntimeManagedServingTransportErrorV1,
+    VerifiedManagedServingPinV1, VerifiedRuntimeManagedServingResponseV1,
 };
 
 const ED25519_ALGORITHM: u16 = 1;
@@ -47,8 +52,10 @@ const LEGACY_STATE_VERSION: u16 = 2;
 const LEGACY_STATE_FIXED_BYTES: usize = 100;
 const AGENT_STACK_STATE_VERSION: u16 = 3;
 const AGENT_STACK_STATE_FIXED_BYTES: usize = 104;
-const STATE_VERSION: u16 = 4;
-const STATE_FIXED_BYTES: usize = 108;
+const MODEL_STACK_STATE_VERSION: u16 = 4;
+const MODEL_STACK_STATE_FIXED_BYTES: usize = 108;
+const STATE_VERSION: u16 = 5;
+const STATE_FIXED_BYTES: usize = 112;
 const STATE_CHECKSUM_BYTES: usize = 32;
 const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 const STATE_CHECKSUM_DOMAIN: &[u8] =
@@ -87,6 +94,15 @@ pub(crate) struct CompletedManagedFabricApplyV1 {
     receipt: ManagedFabricApplyTerminalReceiptV1,
 }
 
+#[derive(Clone, Copy)]
+enum ManagedFabricDecodeProvisioningV1<'a> {
+    Local(&'a ManagedFabricControllerProvisioningV1),
+    Remote {
+        provisioning: &'a ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &'a ManagedServingDescribeIngressV1,
+    },
+}
+
 impl ManagedFabricControllerStateV1 {
     pub(crate) fn try_from_cutover(
         cutover_marker_digest: Digest32,
@@ -112,6 +128,43 @@ impl ManagedFabricControllerStateV1 {
             sequence: 1,
             cutover_marker_digest,
             legacy_snapshot,
+            phase: ManagedFabricApplyPhaseV1::CutoverReady,
+            serving: ManagedServingBootstrapStateV1::initial(),
+            desired: None,
+            request: None,
+            receipt: None,
+            archived_active: None,
+            agent_stack: None,
+            model_stack: None,
+        })
+    }
+
+    /// Initializes PXFJ only from the durable terminal of the single-target
+    /// remote PXJR workflow. A verified PXDR alone is insufficient: the
+    /// predecessor snapshot must also prove PXNA and the post-publish PXNS.
+    pub(crate) fn try_from_remote_connector_cutover(
+        cutover_marker_digest: Digest32,
+        predecessor_snapshot: ControllerJournalSnapshot,
+    ) -> Result<Self, ManagedFabricApplyControllerError> {
+        if digest_is_zero(cutover_marker_digest) || predecessor_snapshot.snapshot_sequence() == 0 {
+            return Err(ManagedFabricApplyControllerError::InvalidCutoverState);
+        }
+        let facts = predecessor_snapshot
+            .remote_connector_cutover_ready_facts()?
+            .ok_or(ManagedFabricApplyControllerError::RemoteCutoverNotReady)?;
+        if facts.successor_store_instance_id() == [0; 32]
+            || facts.successor_store_instance_id() == *predecessor_snapshot.store_instance_id()
+        {
+            return Err(ManagedFabricApplyControllerError::InvalidCutoverState);
+        }
+        let encoded = predecessor_snapshot.encode()?;
+        if ControllerJournalSnapshot::decode(&encoded)? != predecessor_snapshot {
+            return Err(ManagedFabricApplyControllerError::InvalidCutoverState);
+        }
+        Ok(Self {
+            sequence: 1,
+            cutover_marker_digest,
+            legacy_snapshot: predecessor_snapshot,
             phase: ManagedFabricApplyPhaseV1::CutoverReady,
             serving: ManagedServingBootstrapStateV1::initial(),
             desired: None,
@@ -187,6 +240,7 @@ impl ManagedFabricControllerStateV1 {
         let legacy = self.legacy_snapshot.encode()?;
         let serving_request = self.serving.request_wire();
         let serving_response = self.serving.response_wire();
+        let serving_carrier_request = self.serving.carrier_request_wire();
         let (revision, execution) = self.desired.as_ref().map_or((0, &[][..]), |desired| {
             (
                 desired.revision().value(),
@@ -234,6 +288,8 @@ impl ManagedFabricControllerStateV1 {
             .map_err(|_| ManagedFabricApplyControllerError::StateTooLarge)?;
         let serving_response_length = u32::try_from(serving_response.len())
             .map_err(|_| ManagedFabricApplyControllerError::StateTooLarge)?;
+        let serving_carrier_request_length = u32::try_from(serving_carrier_request.len())
+            .map_err(|_| ManagedFabricApplyControllerError::StateTooLarge)?;
         let execution_length = u32::try_from(execution.len())
             .map_err(|_| ManagedFabricApplyControllerError::StateTooLarge)?;
         let request_length = u32::try_from(request.len())
@@ -254,6 +310,7 @@ impl ManagedFabricControllerStateV1 {
             .checked_add(legacy.len())
             .and_then(|value| value.checked_add(serving_request.len()))
             .and_then(|value| value.checked_add(serving_response.len()))
+            .and_then(|value| value.checked_add(serving_carrier_request.len()))
             .and_then(|value| value.checked_add(execution.len()))
             .and_then(|value| value.checked_add(request.len()))
             .and_then(|value| value.checked_add(receipt.len()))
@@ -292,9 +349,11 @@ impl ManagedFabricControllerStateV1 {
         encoded.extend_from_slice(&archived_receipt_length.to_be_bytes());
         encoded.extend_from_slice(&agent_stack_length.to_be_bytes());
         encoded.extend_from_slice(&model_stack_length.to_be_bytes());
+        encoded.extend_from_slice(&serving_carrier_request_length.to_be_bytes());
         encoded.extend_from_slice(&legacy);
         encoded.extend_from_slice(serving_request);
         encoded.extend_from_slice(serving_response);
+        encoded.extend_from_slice(serving_carrier_request);
         encoded.extend_from_slice(execution);
         encoded.extend_from_slice(request);
         encoded.extend_from_slice(receipt);
@@ -313,6 +372,34 @@ impl ManagedFabricControllerStateV1 {
         controller_signer: &ed25519_dalek::SigningKey,
         provisioning: &ManagedFabricControllerProvisioningV1,
     ) -> Result<Self, ManagedFabricApplyControllerError> {
+        Self::decode_with_provisioning(
+            frame,
+            controller_signer,
+            ManagedFabricDecodeProvisioningV1::Local(provisioning),
+        )
+    }
+
+    pub(crate) fn decode_remote(
+        frame: &[u8],
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+    ) -> Result<Self, ManagedFabricApplyControllerError> {
+        Self::decode_with_provisioning(
+            frame,
+            controller_signer,
+            ManagedFabricDecodeProvisioningV1::Remote {
+                provisioning,
+                ingress,
+            },
+        )
+    }
+
+    fn decode_with_provisioning(
+        frame: &[u8],
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: ManagedFabricDecodeProvisioningV1<'_>,
+    ) -> Result<Self, ManagedFabricApplyControllerError> {
         if frame.len() < LEGACY_STATE_FIXED_BYTES + STATE_CHECKSUM_BYTES {
             return Err(ManagedFabricApplyControllerError::StateTruncated);
         }
@@ -326,7 +413,10 @@ impl ManagedFabricControllerStateV1 {
         let state_version = cursor.u16()?;
         if !matches!(
             state_version,
-            LEGACY_STATE_VERSION | AGENT_STACK_STATE_VERSION | STATE_VERSION
+            LEGACY_STATE_VERSION
+                | AGENT_STACK_STATE_VERSION
+                | MODEL_STACK_STATE_VERSION
+                | STATE_VERSION
         ) {
             return Err(ManagedFabricApplyControllerError::InvalidStateEncoding);
         }
@@ -351,15 +441,30 @@ impl ManagedFabricControllerStateV1 {
         let archived_execution_length = cursor.usize_u32()?;
         let archived_request_length = cursor.usize_u32()?;
         let archived_receipt_length = cursor.usize_u32()?;
-        let (agent_stack_length, model_stack_length, fixed_bytes) = match state_version {
-            LEGACY_STATE_VERSION => (0, 0, LEGACY_STATE_FIXED_BYTES),
-            AGENT_STACK_STATE_VERSION => (cursor.usize_u32()?, 0, AGENT_STACK_STATE_FIXED_BYTES),
-            STATE_VERSION => (cursor.usize_u32()?, cursor.usize_u32()?, STATE_FIXED_BYTES),
-            _ => return Err(ManagedFabricApplyControllerError::InvalidStateEncoding),
-        };
+        let (agent_stack_length, model_stack_length, serving_carrier_request_length, fixed_bytes) =
+            match state_version {
+                LEGACY_STATE_VERSION => (0, 0, 0, LEGACY_STATE_FIXED_BYTES),
+                AGENT_STACK_STATE_VERSION => {
+                    (cursor.usize_u32()?, 0, 0, AGENT_STACK_STATE_FIXED_BYTES)
+                }
+                MODEL_STACK_STATE_VERSION => (
+                    cursor.usize_u32()?,
+                    cursor.usize_u32()?,
+                    0,
+                    MODEL_STACK_STATE_FIXED_BYTES,
+                ),
+                STATE_VERSION => (
+                    cursor.usize_u32()?,
+                    cursor.usize_u32()?,
+                    cursor.usize_u32()?,
+                    STATE_FIXED_BYTES,
+                ),
+                _ => return Err(ManagedFabricApplyControllerError::InvalidStateEncoding),
+            };
         let variable_length = legacy_length
             .checked_add(serving_request_length)
             .and_then(|value| value.checked_add(serving_response_length))
+            .and_then(|value| value.checked_add(serving_carrier_request_length))
             .and_then(|value| value.checked_add(execution_length))
             .and_then(|value| value.checked_add(request_length))
             .and_then(|value| value.checked_add(receipt_length))
@@ -379,6 +484,7 @@ impl ManagedFabricControllerStateV1 {
         let legacy = cursor.take(legacy_length)?;
         let serving_request = cursor.take(serving_request_length)?;
         let serving_response = cursor.take(serving_response_length)?;
+        let serving_carrier_request = cursor.take(serving_carrier_request_length)?;
         let execution = cursor.take(execution_length)?;
         let request = cursor.take(request_length)?;
         let receipt = cursor.take(receipt_length)?;
@@ -393,17 +499,43 @@ impl ManagedFabricControllerStateV1 {
             return Err(ManagedFabricApplyControllerError::StateChecksumMismatch);
         }
         let legacy_snapshot = ControllerJournalSnapshot::decode(legacy)?;
-        let base = Self::try_from_cutover(cutover_marker_digest, legacy_snapshot)?;
-        let base_context = VerifiedManagedFabricProducerContextV1::try_from_provisioning(
-            base.legacy_snapshot.state(),
-            controller_signer,
-            provisioning,
-        )?;
-        let serving = ManagedServingBootstrapStateV1::decode(
+        let base = match provisioning {
+            ManagedFabricDecodeProvisioningV1::Local(_) => {
+                Self::try_from_cutover(cutover_marker_digest, legacy_snapshot)?
+            }
+            ManagedFabricDecodeProvisioningV1::Remote { .. } => {
+                Self::try_from_remote_connector_cutover(cutover_marker_digest, legacy_snapshot)?
+            }
+        };
+        let (base_context, describe_verifier) = match provisioning {
+            ManagedFabricDecodeProvisioningV1::Local(provisioning) => (
+                VerifiedManagedFabricProducerContextV1::try_from_provisioning(
+                    base.legacy_snapshot.state(),
+                    controller_signer,
+                    provisioning,
+                )?,
+                None,
+            ),
+            ManagedFabricDecodeProvisioningV1::Remote {
+                provisioning,
+                ingress,
+            } => (
+                VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+                    base.legacy_snapshot.state(),
+                    controller_signer,
+                    provisioning,
+                    ingress,
+                )?,
+                Some(provisioning.describe()),
+            ),
+        };
+        let serving = ManagedServingBootstrapStateV1::decode_with_remote_carrier(
             serving_phase,
             serving_request,
             serving_response,
+            serving_carrier_request,
             &base_context,
+            describe_verifier,
         )?;
         if phase == ManagedFabricApplyPhaseV1::CutoverReady {
             if sequence == 0
@@ -855,6 +987,21 @@ impl ManagedFabricControllerStateV1 {
         )?;
         Ok(self.serving.verified_pin(&base)?.apply_context(&base)?)
     }
+
+    pub(crate) fn verified_current_remote_context(
+        &self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+    ) -> Result<VerifiedManagedFabricProducerContextV1, ManagedFabricApplyControllerError> {
+        let base = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            self.legacy_snapshot.state(),
+            controller_signer,
+            provisioning,
+            ingress,
+        )?;
+        Ok(self.serving.verified_pin(&base)?.apply_context(&base)?)
+    }
 }
 
 /// Proof that PXAR bytes are durable but have never been exposed to transport.
@@ -908,6 +1055,8 @@ pub(crate) struct ManagedServingBootstrapSendActionV1 {
     state_sequence: u64,
     cutover_marker_digest: Digest32,
     request: ManagedServingBootstrapRequestV1,
+    carrier_request: Option<RuntimeControlCarrierRequestV1>,
+    remote_send_available: bool,
 }
 
 impl ManagedServingBootstrapSendActionV1 {
@@ -917,6 +1066,8 @@ impl ManagedServingBootstrapSendActionV1 {
             state_sequence: 1,
             cutover_marker_digest: Digest32::from_bytes([0x7f; 32]),
             request,
+            carrier_request: None,
+            remote_send_available: false,
         }
     }
 
@@ -928,6 +1079,76 @@ impl ManagedServingBootstrapSendActionV1 {
     #[must_use]
     pub(crate) fn canonical_request_bytes(&self) -> &[u8] {
         self.request.canonical_wire()
+    }
+
+    #[must_use]
+    pub(crate) const fn carrier_request(&self) -> Option<&RuntimeControlCarrierRequestV1> {
+        self.carrier_request.as_ref()
+    }
+
+    /// Consumes the sole durable remote send authority and invokes exactly one
+    /// transport closure with the persisted outer PXCC bytes. The action is
+    /// returned on every path so its owner can commit PXFR or close uncertain.
+    pub(crate) async fn exchange_remote_once<Exchange, ExchangeFuture>(
+        self,
+        verifier: &crate::managed_serving_client::ManagedServingDescribeVerifierV1,
+        ingress: &ManagedServingDescribeIngressV1,
+        context: &VerifiedManagedFabricProducerContextV1,
+        exchange: Exchange,
+    ) -> ManagedServingBootstrapRemoteExchangeOutcomeV1
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<
+                RuntimeManagedServingMtlsExchangeSuccessV1,
+                RuntimeManagedServingTransportErrorV1,
+            >,
+        >,
+    {
+        let mut action = self;
+        let response = if action.remote_send_available {
+            action.remote_send_available = false;
+            match action.carrier_request.as_ref() {
+                Some(carrier_request) => match verifier.revalidate_managed_serving_carrier(
+                    ingress,
+                    context,
+                    carrier_request,
+                ) {
+                    Ok(()) => match exchange(carrier_request.canonical_wire().into()).await {
+                        Ok(transport) => verifier.try_accept_managed_serving_response(
+                            ingress,
+                            context,
+                            carrier_request,
+                            &transport,
+                        ),
+                        Err(error) => Err(error.into()),
+                    },
+                    Err(error) => Err(error),
+                },
+                None => Err(ManagedServingControllerError::ManagedServingCarrierRequestMismatch),
+            }
+        } else {
+            Err(ManagedServingControllerError::ManagedServingTransportAuthoritySpent)
+        };
+        ManagedServingBootstrapRemoteExchangeOutcomeV1 { action, response }
+    }
+}
+
+/// Result of one and only one remote PXCC/PXFR transport invocation.
+#[derive(Debug)]
+pub(crate) struct ManagedServingBootstrapRemoteExchangeOutcomeV1 {
+    action: ManagedServingBootstrapSendActionV1,
+    response: Result<VerifiedRuntimeManagedServingResponseV1, ManagedServingControllerError>,
+}
+
+impl ManagedServingBootstrapRemoteExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedServingBootstrapSendActionV1,
+        Result<VerifiedRuntimeManagedServingResponseV1, ManagedServingControllerError>,
+    ) {
+        (self.action, self.response)
     }
 }
 
@@ -1017,6 +1238,49 @@ impl ManagedFabricApplyJournalV1 {
         self.prepared_serving_bootstrap()
     }
 
+    /// Remote counterpart of `prepare_serving_bootstrap_with`. The inner PXFB
+    /// is derived solely from the authenticated PXDR facts and is committed
+    /// before any outer carrier or send authority exists.
+    pub(crate) fn prepare_remote_serving_bootstrap_with<Commit>(
+        &mut self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+        fresh: FreshManagedServingBootstrapV1,
+        commit: Commit,
+    ) -> Result<PreparedManagedServingBootstrapV1, ManagedFabricApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedFabricApplyControllerError>,
+    {
+        if self.state.phase != ManagedFabricApplyPhaseV1::CutoverReady
+            || self.state.desired.is_some()
+            || self.state.request.is_some()
+            || self.state.receipt.is_some()
+            || self.state.archived_active.is_some()
+        {
+            return Err(ManagedFabricApplyControllerError::ServingRefreshForbidden);
+        }
+        self.state.serving.require_remote_prepare_ready()?;
+        let base = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            self.state.legacy_snapshot.state(),
+            controller_signer,
+            provisioning,
+            ingress,
+        )?;
+        let serving = self
+            .state
+            .serving
+            .try_prepare(&base, fresh, controller_signer)?;
+        let mut next = self.state.clone();
+        next.sequence = next_sequence(next.sequence)?;
+        next.serving = serving;
+        commit(&next)?;
+        self.state = next;
+        self.prepared_serving_bootstrap()
+    }
+
     /// Reconstructs only the local durable token for a PXFB that never crossed
     /// the in-flight fence. It allocates no identity and signs no new bytes.
     pub(crate) fn prepared_serving_bootstrap(
@@ -1048,6 +1312,21 @@ impl ManagedFabricApplyJournalV1 {
             self.state.legacy_snapshot.state(),
             controller_signer,
             provisioning,
+        )?;
+        Ok(self.state.serving.verified_pin(&base)?)
+    }
+
+    pub(crate) fn current_remote_serving_pin(
+        &self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+    ) -> Result<VerifiedManagedServingPinV1, ManagedFabricApplyControllerError> {
+        let base = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            self.state.legacy_snapshot.state(),
+            controller_signer,
+            provisioning,
+            ingress,
         )?;
         Ok(self.state.serving.verified_pin(&base)?)
     }
@@ -1086,11 +1365,77 @@ impl ManagedFabricApplyJournalV1 {
             state_sequence: self.state.sequence,
             cutover_marker_digest: self.state.cutover_marker_digest,
             request,
+            carrier_request: None,
+            remote_send_available: false,
+        })
+    }
+
+    /// Builds the outer PXCC from the already-durable inner PXFB, commits both
+    /// the exact carrier and `AttemptInFlight`, then releases one move-only
+    /// action. A restart can observe the bytes but cannot recreate this action.
+    pub(crate) fn claim_remote_serving_bootstrap_with<Commit>(
+        &mut self,
+        prepared: PreparedManagedServingBootstrapV1,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+        carrier_fresh: FreshManagedServingBootstrapV1,
+        commit: Commit,
+    ) -> Result<ManagedServingBootstrapSendActionV1, ManagedFabricApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedFabricApplyControllerError>,
+    {
+        let request = self
+            .state
+            .serving
+            .request()
+            .ok_or(ManagedFabricApplyControllerError::InvalidStateEncoding)?;
+        if self.state.phase != ManagedFabricApplyPhaseV1::CutoverReady
+            || self.state.serving.phase() != ManagedServingBootstrapPhaseV1::RequestDurable
+            || prepared.state_sequence != self.state.sequence
+            || prepared.cutover_marker_digest != self.state.cutover_marker_digest
+            || prepared.request_digest != request.request_digest()
+        {
+            return Err(ManagedFabricApplyControllerError::PreparedServingTokenMismatch);
+        }
+        let base = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            self.state.legacy_snapshot.state(),
+            controller_signer,
+            provisioning,
+            ingress,
+        )?;
+        let carrier_request = provisioning
+            .describe()
+            .try_build_managed_serving_bootstrap_carrier(
+                ingress,
+                &base,
+                carrier_fresh,
+                controller_signer,
+                request,
+            )?;
+        let (serving, request) = self
+            .state
+            .serving
+            .try_claim_remote(provisioning.describe(), carrier_request.clone())?;
+        let mut next = self.state.clone();
+        next.sequence = next_sequence(next.sequence)?;
+        next.serving = serving;
+        commit(&next)?;
+        self.state = next;
+        Ok(ManagedServingBootstrapSendActionV1 {
+            state_sequence: self.state.sequence,
+            cutover_marker_digest: self.state.cutover_marker_digest,
+            request,
+            carrier_request: Some(carrier_request),
+            remote_send_available: true,
         })
     }
 
     /// Durably closes timeout/EOF/no-response without claiming a Runtime-side
-    /// effect. A retry requires a later explicit call with fresh entropy.
+    /// effect. The local UDS path may later start a fresh observation; the
+    /// remote path remains blocked pending a fresh Describe reconciliation.
     pub(crate) fn close_serving_bootstrap_no_response_with<Commit>(
         &mut self,
         action: ManagedServingBootstrapSendActionV1,
@@ -1111,9 +1456,10 @@ impl ManagedFabricApplyJournalV1 {
         Ok(())
     }
 
-    /// Closes a read-only observation attempt recovered in-flight after local
-    /// process loss. PXFB cannot mutate Runtime, so this records only that the
-    /// Controller no longer owns a live transport exchange.
+    /// Closes resident transport authority recovered in-flight after local
+    /// process loss. It deliberately makes no claim about Runtime effect. A
+    /// remote PXCC retained in this state prevents another PXFB until a fresh
+    /// Describe reconciliation transition is explicitly admitted.
     pub(crate) fn close_recovered_serving_bootstrap_with<Commit>(
         &mut self,
         commit: Commit,
@@ -1170,6 +1516,50 @@ impl ManagedFabricApplyJournalV1 {
         Ok(pin)
     }
 
+    /// Commits a PXFR that was already verified against the exact persisted
+    /// outer PXCC, inner PXFB, TLS peer pins and Runtime response signature.
+    pub(crate) fn consume_remote_serving_bootstrap_response_with<Commit>(
+        &mut self,
+        action: ManagedServingBootstrapSendActionV1,
+        response: VerifiedRuntimeManagedServingResponseV1,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+        commit: Commit,
+    ) -> Result<VerifiedManagedServingPinV1, ManagedFabricApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedFabricApplyControllerError>,
+    {
+        self.validate_serving_action(&action)?;
+        let carrier_request = action
+            .carrier_request
+            .as_ref()
+            .ok_or(ManagedFabricApplyControllerError::ServingSendActionMismatch)?;
+        if response.carrier_request_digest() != carrier_request.request_digest()
+            || response.inner_request_digest() != action.request.request_digest()
+        {
+            return Err(ManagedFabricApplyControllerError::ServingResponseCorrelationMismatch);
+        }
+        let base = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            self.state.legacy_snapshot.state(),
+            controller_signer,
+            provisioning,
+            ingress,
+        )?;
+        let (serving, pin) = self
+            .state
+            .serving
+            .try_accept_response(&base, response.response().canonical_wire())?;
+        let mut next = self.state.clone();
+        next.sequence = next_sequence(next.sequence)?;
+        next.serving = serving;
+        commit(&next)?;
+        self.state = next;
+        Ok(pin)
+    }
+
     fn validate_serving_action(
         &self,
         action: &ManagedServingBootstrapSendActionV1,
@@ -1184,6 +1574,7 @@ impl ManagedFabricApplyJournalV1 {
             || action.state_sequence != self.state.sequence
             || action.cutover_marker_digest != self.state.cutover_marker_digest
             || action.request != *request
+            || action.carrier_request.as_ref() != self.state.serving.carrier_request()
         {
             return Err(ManagedFabricApplyControllerError::ServingSendActionMismatch);
         }
@@ -1723,6 +2114,7 @@ pub(crate) enum ManagedFabricApplyControllerError {
     Serving(ManagedServingControllerError),
     Digest(DigestBuildError),
     InvalidCutoverState,
+    RemoteCutoverNotReady,
     InvalidPhase,
     SequenceExhausted,
     DesiredConflict,
@@ -1731,6 +2123,7 @@ pub(crate) enum ManagedFabricApplyControllerError {
     PreparedServingTokenMismatch,
     SendActionMismatch,
     ServingSendActionMismatch,
+    ServingResponseCorrelationMismatch,
     ServingRefreshForbidden,
     OpaqueReplayForbidden,
     ReceiptCorrelationMismatch,
@@ -1799,6 +2192,9 @@ pub(crate) mod tests {
         TenureProofAlgorithm, TenureProofAuthority, WriterTenureClaim, WriterTenureProof,
         WriterTenureSigningTranscript,
     };
+    use paraegox_runtime_contracts::distributed_agent_stack_plan::{
+        RestrictedRuntimeApplyCarrierBindingFieldsV1, RestrictedRuntimeApplyCarrierBindingV1,
+    };
     use paraegox_runtime_contracts::execution::{CardDefinitionRef, CardImplementationRef};
     use paraegox_runtime_contracts::installation::{
         InstalledRuntimeArtifactObservationV1, RuntimeCompiledInstallationFactsV1,
@@ -1815,8 +2211,10 @@ pub(crate) mod tests {
         ManagedServiceSpecV1,
     };
     use paraegox_runtime_contracts::managed_serving_bootstrap::{
-        ManagedServingBootstrapFactsV1, ManagedServingBootstrapResponseAuthClaimV1,
-        ManagedServingBootstrapResponseDraftV1,
+        ManagedServingBootstrapFactsV1, ManagedServingBootstrapRequestDraftV1,
+        ManagedServingBootstrapRequestIdV1, ManagedServingBootstrapResponseAuthClaimV1,
+        ManagedServingBootstrapResponseDraftV1, RuntimeControlDescribeReadyFactsV1,
+        RuntimeControlDescribeReadyPhaseV1, RuntimeControlDescribeReadyResponseDraftV1,
     };
     use paraegox_runtime_contracts::provenance::SourceScopeRef;
     use paraegox_runtime_contracts::reference_control::{
@@ -1849,16 +2247,23 @@ pub(crate) mod tests {
     };
 
     use super::{
-        AGENT_STACK_STATE_VERSION, LEGACY_STATE_VERSION, ManagedFabricApplyControllerError,
-        ManagedFabricApplyJournalV1, ManagedFabricApplyPhaseV1, ManagedFabricControllerStateV1,
-        STATE_CHECKSUM_BYTES, STATE_VERSION, state_checksum,
+        AGENT_STACK_STATE_VERSION, LEGACY_STATE_VERSION, MODEL_STACK_STATE_VERSION,
+        ManagedFabricApplyControllerError, ManagedFabricApplyJournalV1, ManagedFabricApplyPhaseV1,
+        ManagedFabricControllerStateV1, STATE_CHECKSUM_BYTES, STATE_VERSION, state_checksum,
     };
     use crate::managed_fabric_producer::{
         FreshManagedFabricApplyV1, ManagedFabricControllerIdentityV1,
-        ManagedFabricControllerProvisioningV1, ManagedFabricRuntimeChannelPinV1,
+        ManagedFabricControllerProvisioningV1, ManagedFabricProducerError,
+        ManagedFabricRemoteControllerProvisioningV1, ManagedFabricRuntimeChannelPinV1,
         ManagedFabricServiceAccountsV1, ManagedFabricTenureAuthorityPinV1,
+        VerifiedManagedFabricProducerContextV1,
     };
-    use crate::managed_serving_client::FreshManagedServingBootstrapV1;
+    use crate::managed_serving_client::{
+        FreshManagedServingBootstrapV1, ManagedServingBootstrapStateV1,
+        ManagedServingControllerError, ManagedServingDescribeIngressV1,
+        ManagedServingDescribeVerifierV1, RuntimeManagedServingMtlsExchangeSuccessV1,
+        RuntimeManagedServingTransportErrorV1,
+    };
 
     const TARGET: RuntimeHostId = RuntimeHostId::from_bytes([0x31; 16]);
     const SCOPE: DeploymentScopeId = DeploymentScopeId::from_bytes([0x32; 16]);
@@ -2208,10 +2613,13 @@ pub(crate) mod tests {
             .expect("bound successor")
     }
 
-    pub(crate) fn provisioning() -> ManagedFabricControllerProvisioningV1 {
-        let controller = ManagedFabricControllerIdentityV1::try_new(CONTROLLER_PRINCIPAL, WRITER)
-            .expect("controller identity");
-        let authority = ManagedFabricTenureAuthorityPinV1::try_new(
+    fn managed_controller_identity() -> ManagedFabricControllerIdentityV1 {
+        ManagedFabricControllerIdentityV1::try_new(CONTROLLER_PRINCIPAL, WRITER)
+            .expect("controller identity")
+    }
+
+    fn managed_authority_pin() -> ManagedFabricTenureAuthorityPinV1 {
+        ManagedFabricTenureAuthorityPinV1::try_new(
             AUTHORITY_PRINCIPAL,
             AUTHORITY_UID,
             AUTHORITY_GID,
@@ -2221,7 +2629,12 @@ pub(crate) mod tests {
                 .verifying_key()
                 .to_bytes(),
         )
-        .expect("authority pin");
+        .expect("authority pin")
+    }
+
+    pub(crate) fn provisioning() -> ManagedFabricControllerProvisioningV1 {
+        let controller = managed_controller_identity();
+        let authority = managed_authority_pin();
         let accounts = ManagedFabricServiceAccountsV1::try_new(
             RUNTIME_UID,
             RUNTIME_GID,
@@ -2240,6 +2653,117 @@ pub(crate) mod tests {
         )
         .expect("Runtime channel pin");
         ManagedFabricControllerProvisioningV1::new(controller, authority, runtime)
+    }
+
+    fn remote_provisioning_and_ingress() -> (
+        ManagedFabricRemoteControllerProvisioningV1,
+        ManagedServingDescribeIngressV1,
+    ) {
+        remote_provisioning_and_ingress_with_phase(RuntimeControlDescribeReadyPhaseV1::LegacyReady)
+    }
+
+    fn remote_provisioning_and_ingress_with_phase(
+        phase: RuntimeControlDescribeReadyPhaseV1,
+    ) -> (
+        ManagedFabricRemoteControllerProvisioningV1,
+        ManagedServingDescribeIngressV1,
+    ) {
+        let snapshot = ready_snapshot();
+        let controller = controller_signer();
+        let runtime = runtime_signer();
+        let projection =
+            paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricManifestProjectionV1::
+                try_from_verified_legacy_manifest(
+                    snapshot.state().installed_manifest().verified_manifest(),
+                )
+                .expect("managed projection");
+        let carrier = RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: TARGET,
+                runtime_principal: RUNTIME_PRINCIPAL,
+                controller_principal: CONTROLLER_PRINCIPAL,
+                endpoint_ref: [0x81; 16],
+                endpoint_generation: 1,
+                route: "paraegox/runtime-fixture/apply",
+                controller_request_key: CONTROLLER_KEY_REF,
+                controller_request_key_fingerprint: ed25519_control_key_fingerprint(
+                    controller.verifying_key().as_bytes(),
+                )
+                .expect("Controller fingerprint"),
+                runtime_response_key: RUNTIME_KEY_REF,
+                runtime_response_key_fingerprint: ed25519_control_key_fingerprint(
+                    runtime.verifying_key().as_bytes(),
+                )
+                .expect("Runtime fingerprint"),
+                control_transport_profile_ref: [0x82; 16],
+                control_transport_profile_digest: Digest32::from_bytes([0x83; 32]),
+            },
+        )
+        .expect("remote carrier");
+        let verifier = ManagedServingDescribeVerifierV1::try_new(
+            TARGET,
+            carrier,
+            controller.verifying_key().to_bytes(),
+            runtime.verifying_key().to_bytes(),
+            snapshot.state().installed_manifest().manifest_digest(),
+        )
+        .expect("Describe verifier");
+        let request = verifier
+            .try_build_request(
+                None,
+                FreshManagedServingBootstrapV1::try_new([0x84; 16], [0x85; 32])
+                    .expect("fresh Describe"),
+                &controller,
+            )
+            .expect("Describe request");
+        let serving = ManagedServingBootstrapFactsV1::try_recovered_ready(
+            TARGET,
+            RUNTIME_STORE_ID,
+            projection,
+            2,
+            1,
+            ClockReading::new(
+                CLOCK_DOMAIN,
+                ClockGeneration::try_new(3).expect("Describe clock generation"),
+                MonotonicInstant::from_ticks(91),
+            ),
+        )
+        .expect("Describe serving facts");
+        let ready = RuntimeControlDescribeReadyFactsV1::try_new(phase, serving, channel())
+            .expect("Describe ready facts");
+        let auth = ManagedServingBootstrapResponseAuthClaimV1::try_new(
+            channel(),
+            RUNTIME_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+        )
+        .expect("Describe response claim");
+        let draft = RuntimeControlDescribeReadyResponseDraftV1::try_new(&request, ready, auth)
+            .expect("Describe response draft");
+        let signature = runtime.sign(
+            draft
+                .signing_transcript()
+                .expect("Describe response transcript")
+                .as_bytes(),
+        );
+        let response = draft
+            .finalize(&signature.to_bytes())
+            .expect("Describe response");
+        let ingress = ManagedServingDescribeIngressV1::try_accept(
+            &verifier,
+            None,
+            request,
+            response.canonical_wire(),
+        )
+        .expect("Describe ingress");
+        (
+            ManagedFabricRemoteControllerProvisioningV1::new(
+                managed_controller_identity(),
+                managed_authority_pin(),
+                verifier,
+            ),
+            ingress,
+        )
     }
 
     pub(crate) fn service() -> ManagedServiceSpecV1 {
@@ -2449,13 +2973,20 @@ pub(crate) mod tests {
             u32::from_be_bytes(frame[104..108].try_into().expect("model length")),
             0
         );
+        assert_eq!(
+            u32::from_be_bytes(frame[108..112].try_into().expect("carrier length")),
+            0
+        );
         let mut body = frame[..frame.len() - STATE_CHECKSUM_BYTES].to_vec();
         match version {
             LEGACY_STATE_VERSION => {
-                body.drain(100..108);
+                body.drain(100..112);
             }
             AGENT_STACK_STATE_VERSION => {
-                body.drain(104..108);
+                body.drain(104..112);
+            }
+            MODEL_STACK_STATE_VERSION => {
+                body.drain(108..112);
             }
             _ => panic!("unsupported downgrade fixture version"),
         }
@@ -2466,17 +2997,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pxfj_v4_roundtrips_and_strictly_reopens_v2_v3_without_siblings() {
+    fn pxfj_v5_roundtrips_and_strictly_reopens_v2_v3_v4_without_siblings() {
         let controller = controller_signer();
         let provisioning = provisioning();
         let journal = journal();
-        let encoded = journal.state().encode().expect("PXFJ v4 state");
+        let encoded = journal.state().encode().expect("PXFJ v5 state");
         assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), STATE_VERSION);
         let decoded = ManagedFabricControllerStateV1::decode(&encoded, &controller, &provisioning)
-            .expect("PXFJ v4 reopens");
+            .expect("PXFJ v5 reopens");
         assert_eq!(&decoded, journal.state());
 
-        for version in [LEGACY_STATE_VERSION, AGENT_STACK_STATE_VERSION] {
+        for version in [
+            LEGACY_STATE_VERSION,
+            AGENT_STACK_STATE_VERSION,
+            MODEL_STACK_STATE_VERSION,
+        ] {
             let legacy = downgrade_pxfj_without_siblings(&encoded, version);
             let decoded =
                 ManagedFabricControllerStateV1::decode(&legacy, &controller, &provisioning)
@@ -2486,13 +3021,424 @@ pub(crate) mod tests {
             assert_eq!(
                 u16::from_be_bytes([migrated[4], migrated[5]]),
                 STATE_VERSION,
-                "migration-on-write must emit only PXFJ v4"
+                "migration-on-write must emit only PXFJ v5"
             );
         }
     }
 
     #[test]
-    fn pxfj_v4_rejects_dual_sibling_payloads() {
+    fn remote_cutover_rejects_a_predecessor_without_px_j_r_terminal_facts() {
+        assert_eq!(
+            ManagedFabricControllerStateV1::try_from_remote_connector_cutover(
+                Digest32::from_bytes([0xd7; 32]),
+                ready_snapshot(),
+            ),
+            Err(ManagedFabricApplyControllerError::RemoteCutoverNotReady)
+        );
+    }
+
+    #[test]
+    fn managed_ready_px_d_r_requires_a_fresh_px_f_b_and_never_synthesizes_px_f_r() {
+        let controller = controller_signer();
+        let (remote, ingress) = remote_provisioning_and_ingress_with_phase(
+            RuntimeControlDescribeReadyPhaseV1::ManagedReady,
+        );
+        let mut journal = ManagedFabricApplyJournalV1::new(
+            ManagedFabricControllerStateV1::try_from_cutover(
+                Digest32::from_bytes([0xda; 32]),
+                ready_snapshot(),
+            )
+            .expect("cutover state"),
+        );
+        assert_eq!(
+            journal.current_remote_serving_pin(&controller, &remote, &ingress),
+            Err(ManagedFabricApplyControllerError::Serving(
+                ManagedServingControllerError::ServingPinRequired
+            ))
+        );
+        let prepared = journal
+            .prepare_remote_serving_bootstrap_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xdb; 16], [0xdc; 32])
+                    .expect("fresh inner PXFB"),
+                |_| Ok(()),
+            )
+            .expect("fresh ManagedReady Describe may authorize a new idempotent PXFB");
+        let action = journal
+            .claim_remote_serving_bootstrap_with(
+                prepared,
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xdb; 16], [0xde; 32])
+                    .expect("fresh outer PXCC"),
+                |_| Ok(()),
+            )
+            .expect("new PXFB/PXCC attempt");
+        assert!(action.carrier_request().is_some());
+        assert_eq!(
+            journal.current_remote_serving_pin(&controller, &remote, &ingress),
+            Err(ManagedFabricApplyControllerError::Serving(
+                ManagedServingControllerError::ServingPinRequired
+            ))
+        );
+    }
+
+    #[test]
+    fn remote_producer_context_rejects_manifest_and_tenure_pin_drift() {
+        let snapshot = ready_snapshot();
+        let controller = controller_signer();
+        let runtime = runtime_signer();
+        let (remote, ingress) = remote_provisioning_and_ingress();
+        VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            snapshot.state(),
+            &controller,
+            &remote,
+            &ingress,
+        )
+        .expect("matching remote context");
+
+        let wrong_authority = ManagedFabricTenureAuthorityPinV1::try_new(
+            AUTHORITY_PRINCIPAL,
+            AUTHORITY_UID,
+            AUTHORITY_GID,
+            TENURE_AUTHORITY_REF,
+            TENURE_KEY_REF,
+            SigningKey::from_bytes(&[0xd8; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .expect("well-shaped wrong authority pin");
+        let wrong_tenure = ManagedFabricRemoteControllerProvisioningV1::new(
+            managed_controller_identity(),
+            wrong_authority,
+            remote.describe().clone(),
+        );
+        assert_eq!(
+            VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+                snapshot.state(),
+                &controller,
+                &wrong_tenure,
+                &ingress,
+            ),
+            Err(ManagedFabricProducerError::InvalidTenureAuthority)
+        );
+
+        let wrong_manifest_verifier = ManagedServingDescribeVerifierV1::try_new(
+            TARGET,
+            remote.describe().carrier().clone(),
+            controller.verifying_key().to_bytes(),
+            runtime.verifying_key().to_bytes(),
+            Digest32::from_bytes([0xd9; 32]),
+        )
+        .expect("well-shaped wrong manifest pin");
+        let wrong_manifest = ManagedFabricRemoteControllerProvisioningV1::new(
+            managed_controller_identity(),
+            managed_authority_pin(),
+            wrong_manifest_verifier,
+        );
+        assert_eq!(
+            VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+                snapshot.state(),
+                &controller,
+                &wrong_manifest,
+                &ingress,
+            ),
+            Err(ManagedFabricProducerError::RemoteDescribeMismatch)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_px_f_b_persists_exact_outer_px_c_c_and_accepts_one_correlated_px_f_r() {
+        let controller = controller_signer();
+        let (remote, ingress) = remote_provisioning_and_ingress();
+        let mut journal = ManagedFabricApplyJournalV1::new(
+            ManagedFabricControllerStateV1::try_from_cutover(
+                Digest32::from_bytes([0x91; 32]),
+                ready_snapshot(),
+            )
+            .expect("cutover state"),
+        );
+        let prepared = journal
+            .prepare_remote_serving_bootstrap_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0x92; 16], [0x93; 32])
+                    .expect("fresh inner PXFB"),
+                |_| Ok(()),
+            )
+            .expect("inner PXFB durable");
+        let action = journal
+            .claim_remote_serving_bootstrap_with(
+                prepared,
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0x92; 16], [0x95; 32])
+                    .expect("fresh outer PXCC"),
+                |_| Ok(()),
+            )
+            .expect("outer PXCC durable before action");
+        let outer = action
+            .carrier_request()
+            .expect("remote action retains outer PXCC")
+            .clone();
+        assert_eq!(outer.request_id(), action.request().request_id());
+        assert_ne!(
+            outer.authentication().claim().nonce(),
+            action.request().authentication().claim().nonce(),
+        );
+        assert_eq!(
+            outer.managed_serving_bootstrap_request(),
+            Some(action.request()),
+            "PXCC must embed the byte-identical durable PXFB"
+        );
+        assert_eq!(
+            outer
+                .managed_serving_bootstrap_request()
+                .expect("PXCC inner PXFB")
+                .canonical_wire(),
+            action.canonical_request_bytes(),
+        );
+        assert_eq!(
+            journal.state().serving.carrier_request_wire(),
+            outer.canonical_wire(),
+            "PXFJ must retain the exact signed outer PXCC"
+        );
+        let encoded = journal.state().encode().expect("PXFJ v5 encodes");
+        assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), STATE_VERSION);
+        assert!(
+            encoded
+                .windows(outer.canonical_wire().len())
+                .any(|window| window == outer.canonical_wire())
+        );
+        let context = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            journal.state().legacy_snapshot().state(),
+            &controller,
+            &remote,
+            &ingress,
+        )
+        .expect("remote producer context");
+        let response = current_serving_response(action.request());
+        let expected_outer = outer.canonical_wire().to_vec();
+        let wrong_transport = RuntimeManagedServingMtlsExchangeSuccessV1::try_new(
+            PrincipalRef::from_bytes([0xee; 16]),
+            remote.describe().carrier().binding_digest(),
+            response.canonical_wire().into(),
+        )
+        .expect("well-shaped wrong TLS observation");
+        assert_eq!(
+            remote.describe().try_accept_managed_serving_response(
+                &ingress,
+                &context,
+                &outer,
+                &wrong_transport,
+            ),
+            Err(ManagedServingControllerError::ManagedServingTransportPinMismatch)
+        );
+        let other_claim = ApplyRequestAuthClaim::try_new(
+            CONTROLLER_PRINCIPAL,
+            CONTROLLER_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+            &[0x97; 32],
+        )
+        .expect("other inner claim");
+        let other_draft = ManagedServingBootstrapRequestDraftV1::try_new(
+            ManagedServingBootstrapRequestIdV1::try_from_bytes([0x96; 16]).expect("other inner id"),
+            context.target(),
+            context.source_scope(),
+            context.runtime_store_instance_id(),
+            context.projection().clone(),
+            context.channel(),
+            other_claim,
+        )
+        .expect("other inner draft");
+        let other_signature = controller.sign(
+            other_draft
+                .signing_transcript()
+                .expect("other inner transcript")
+                .as_bytes(),
+        );
+        let other_request = other_draft
+            .finalize(&other_signature.to_bytes())
+            .expect("other inner request");
+        let other_response = current_serving_response(&other_request);
+        let wrong_correlation = RuntimeManagedServingMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            other_response.canonical_wire().into(),
+        )
+        .expect("well-shaped wrong response correlation");
+        assert!(
+            remote
+                .describe()
+                .try_accept_managed_serving_response(
+                    &ingress,
+                    &context,
+                    &outer,
+                    &wrong_correlation,
+                )
+                .is_err()
+        );
+        let transport = RuntimeManagedServingMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            response.canonical_wire().into(),
+        )
+        .expect("authenticated transport result");
+        let outcome = action
+            .exchange_remote_once(remote.describe(), &ingress, &context, |wire| async move {
+                assert_eq!(wire.as_ref(), expected_outer.as_slice());
+                Ok(transport)
+            })
+            .await;
+        let (action, response) = outcome.into_parts();
+        let verified = response.expect("PXFR verifies");
+        journal
+            .consume_remote_serving_bootstrap_response_with(
+                action,
+                verified,
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("verified PXFR durable");
+        assert_eq!(
+            journal.state().serving_phase(),
+            crate::managed_serving_client::ManagedServingBootstrapPhaseV1::ResponseDurable
+        );
+        assert_eq!(journal.state().serving.carrier_request(), Some(&outer));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_uncertain_px_f_b_closes_without_replay_or_old_describe_retry() {
+        let controller = controller_signer();
+        let (remote, ingress) = remote_provisioning_and_ingress();
+        let mut journal = ManagedFabricApplyJournalV1::new(
+            ManagedFabricControllerStateV1::try_from_cutover(
+                Digest32::from_bytes([0xa1; 32]),
+                ready_snapshot(),
+            )
+            .expect("cutover state"),
+        );
+        let prepared = journal
+            .prepare_remote_serving_bootstrap_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xa2; 16], [0xa3; 32])
+                    .expect("fresh inner PXFB"),
+                |_| Ok(()),
+            )
+            .expect("inner PXFB durable");
+        let action = journal
+            .claim_remote_serving_bootstrap_with(
+                prepared,
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xa2; 16], [0xa5; 32])
+                    .expect("fresh outer PXCC"),
+                |_| Ok(()),
+            )
+            .expect("remote action");
+        let context = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            journal.state().legacy_snapshot().state(),
+            &controller,
+            &remote,
+            &ingress,
+        )
+        .expect("remote context");
+        let outcome = action
+            .exchange_remote_once(remote.describe(), &ingress, &context, |_| async {
+                Err(RuntimeManagedServingTransportErrorV1::Uncertain)
+            })
+            .await;
+        let (action, response) = outcome.into_parts();
+        assert_eq!(
+            response,
+            Err(ManagedServingControllerError::ManagedServingTransport(
+                RuntimeManagedServingTransportErrorV1::Uncertain
+            ))
+        );
+        let spent_outcome = action
+            .exchange_remote_once(remote.describe(), &ingress, &context, |_| async {
+                Err(RuntimeManagedServingTransportErrorV1::Rejected)
+            })
+            .await;
+        let (action, response) = spent_outcome.into_parts();
+        assert_eq!(
+            response,
+            Err(ManagedServingControllerError::ManagedServingTransportAuthoritySpent)
+        );
+        journal
+            .close_serving_bootstrap_no_response_with(action, |_| Ok(()))
+            .expect("uncertain attempt closes durably");
+        let persisted = &journal.state().serving;
+        let reopened = ManagedServingBootstrapStateV1::decode_with_remote_carrier(
+            persisted.phase(),
+            persisted.request_wire(),
+            persisted.response_wire(),
+            persisted.carrier_request_wire(),
+            &context,
+            Some(remote.describe()),
+        )
+        .expect("closed remote serving state reopens from exact durable bytes");
+        assert_eq!(&reopened, persisted);
+        assert_eq!(
+            ManagedServingBootstrapStateV1::decode_with_remote_carrier(
+                persisted.phase(),
+                persisted.request_wire(),
+                persisted.response_wire(),
+                &[],
+                &context,
+                Some(remote.describe()),
+            ),
+            Err(ManagedServingControllerError::InvalidStateEncoding)
+        );
+        let mut forged_outer = persisted.carrier_request_wire().to_vec();
+        *forged_outer.last_mut().expect("outer PXCC signature") ^= 1;
+        assert!(
+            ManagedServingBootstrapStateV1::decode_with_remote_carrier(
+                persisted.phase(),
+                persisted.request_wire(),
+                persisted.response_wire(),
+                &forged_outer,
+                &context,
+                Some(remote.describe()),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            reopened.require_remote_prepare_ready(),
+            Err(ManagedServingControllerError::RemoteDescribeReconcileRequired)
+        );
+        let error = journal
+            .prepare_remote_serving_bootstrap_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xa6; 16], [0xa7; 32])
+                    .expect("fresh values cannot bypass reconciliation"),
+                |_| Ok(()),
+            )
+            .expect_err("old Describe must not authorize another remote PXFB");
+        assert_eq!(
+            error,
+            ManagedFabricApplyControllerError::Serving(
+                ManagedServingControllerError::RemoteDescribeReconcileRequired
+            )
+        );
+        assert!(journal.prepared_serving_bootstrap().is_err());
+    }
+
+    #[test]
+    fn pxfj_v5_rejects_dual_sibling_payloads() {
         let controller = controller_signer();
         let provisioning = provisioning();
         let mut journal = journal();
@@ -2521,7 +3467,7 @@ pub(crate) mod tests {
             )
             .expect("commit active Fabric terminal");
 
-        let encoded = journal.state().encode().expect("PXFJ v4 state");
+        let encoded = journal.state().encode().expect("PXFJ v5 state");
         let mut body = encoded[..encoded.len() - STATE_CHECKSUM_BYTES].to_vec();
         body[100..104].copy_from_slice(&1_u32.to_be_bytes());
         body[104..108].copy_from_slice(&1_u32.to_be_bytes());

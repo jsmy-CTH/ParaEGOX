@@ -1,10 +1,11 @@
-//! One-way legacy cutover and owner-local successor snapshot store.
+//! One-way predecessor cutover and owner-local successor snapshot store.
 //!
-//! The legacy `ControllerStore` is consumed while its writer lock is held. Its
-//! v8 active snapshot is atomically replaced by a durable marker whose magic is
-//! intentionally not accepted by the v8 opener. The marker carries the exact
-//! canonical legacy snapshot, so a crash after marker publication but before
-//! successor initialization has one deterministic recovery path.
+//! The predecessor `ControllerStore` is consumed while its writer lock is
+//! held. Its active snapshot is atomically replaced by a durable marker whose
+//! magic is intentionally not accepted by the Controller opener. The marker
+//! carries the exact canonical predecessor snapshot, so a crash after marker
+//! publication but before successor initialization has one deterministic
+//! recovery path.
 
 use core::fmt;
 use std::fs::{self, File, Metadata, TryLockError};
@@ -34,7 +35,10 @@ use crate::managed_fabric_apply::{
 };
 use crate::managed_fabric_producer::{
     ManagedFabricControllerProvisioningV1, ManagedFabricProducerError,
-    VerifiedManagedFabricProducerContextV1,
+    ManagedFabricRemoteControllerProvisioningV1, VerifiedManagedFabricProducerContextV1,
+};
+use crate::managed_serving_client::{
+    ManagedServingControllerError, ManagedServingDescribeIngressV1,
 };
 
 const CUTOVER_MAGIC: &[u8; 4] = b"PXFC";
@@ -66,7 +70,7 @@ const PRIVATE_FILE_MODE_BITS: u32 = 0o600;
 const PRIVATE_FILE_MODE_MASK: u32 = 0o7777;
 const PRIVATE_FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
 
-/// Canonical, self-contained proof that the v8 writer was cut over once.
+/// Canonical, self-contained proof that the Controller writer was cut over once.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManagedFabricCutoverMarkerV1 {
     successor_store_instance_id: [u8; 32],
@@ -275,11 +279,17 @@ impl Drop for ManagedFabricSuccessorStoreV1 {
 struct ManagedFabricCutoverRequest<'a> {
     legacy_directory: &'a Path,
     successor_directory: &'a Path,
-    successor_store_instance_id: [u8; 32],
+    requested_successor_store_instance_id: Option<[u8; 32]>,
     expected_owner_identity: ControllerOwnerIdentityFingerprint,
     controller_signer: &'a ed25519_dalek::SigningKey,
-    provisioning: &'a ManagedFabricControllerProvisioningV1,
+    provisioning: ManagedFabricStoreProvisioningV1<'a>,
     filesystem_policy: ControllerFilesystemPolicy,
+}
+
+#[derive(Clone, Copy)]
+enum ManagedFabricStoreProvisioningV1<'a> {
+    Local(&'a ManagedFabricControllerProvisioningV1),
+    Remote(&'a ManagedFabricRemoteControllerProvisioningV1),
 }
 
 impl ManagedFabricSuccessorStoreV1 {
@@ -298,10 +308,10 @@ impl ManagedFabricSuccessorStoreV1 {
             ManagedFabricCutoverRequest {
                 legacy_directory,
                 successor_directory,
-                successor_store_instance_id,
+                requested_successor_store_instance_id: Some(successor_store_instance_id),
                 expected_owner_identity,
                 controller_signer,
-                provisioning,
+                provisioning: ManagedFabricStoreProvisioningV1::Local(provisioning),
                 filesystem_policy: ControllerFilesystemPolicy::ProductionReference,
             },
             ManagedFabricCutoverFailpoint::None,
@@ -322,10 +332,59 @@ impl ManagedFabricSuccessorStoreV1 {
             ManagedFabricCutoverRequest {
                 legacy_directory,
                 successor_directory,
-                successor_store_instance_id,
+                requested_successor_store_instance_id: Some(successor_store_instance_id),
                 expected_owner_identity,
                 controller_signer,
-                provisioning,
+                provisioning: ManagedFabricStoreProvisioningV1::Local(provisioning),
+                filesystem_policy: ControllerFilesystemPolicy::DeveloperLocal,
+            },
+            ManagedFabricCutoverFailpoint::None,
+        )
+    }
+
+    /// Cuts over only after the current PXJR snapshot proves the complete
+    /// single-target remote connector terminal. The successor store identity
+    /// is read from that durable predecessor; composition cannot replace it.
+    pub(crate) fn cutover_from_remote_connector(
+        predecessor_store: ControllerStore,
+        predecessor_directory: &Path,
+        successor_directory: &Path,
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        Self::cutover_from_legacy_with_policy_and_failpoint(
+            predecessor_store,
+            ManagedFabricCutoverRequest {
+                legacy_directory: predecessor_directory,
+                successor_directory,
+                requested_successor_store_instance_id: None,
+                expected_owner_identity,
+                controller_signer,
+                provisioning: ManagedFabricStoreProvisioningV1::Remote(provisioning),
+                filesystem_policy: ControllerFilesystemPolicy::ProductionReference,
+            },
+            ManagedFabricCutoverFailpoint::None,
+        )
+    }
+
+    pub(crate) fn cutover_from_remote_connector_developer_local(
+        predecessor_store: ControllerStore,
+        predecessor_directory: &Path,
+        successor_directory: &Path,
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        Self::cutover_from_legacy_with_policy_and_failpoint(
+            predecessor_store,
+            ManagedFabricCutoverRequest {
+                legacy_directory: predecessor_directory,
+                successor_directory,
+                requested_successor_store_instance_id: None,
+                expected_owner_identity,
+                controller_signer,
+                provisioning: ManagedFabricStoreProvisioningV1::Remote(provisioning),
                 filesystem_policy: ControllerFilesystemPolicy::DeveloperLocal,
             },
             ManagedFabricCutoverFailpoint::None,
@@ -339,13 +398,34 @@ impl ManagedFabricSuccessorStoreV1 {
     ) -> Result<Self, ManagedFabricStoreError> {
         let legacy_snapshot = legacy_store.revalidate_current()?.clone();
         let cutover_identity = legacy_store.managed_fabric_cutover_identity()?;
-        let _ = VerifiedManagedFabricProducerContextV1::try_from_provisioning(
-            legacy_snapshot.state(),
-            request.controller_signer,
-            request.provisioning,
-        )?;
+        let successor_store_instance_id = match request.provisioning {
+            ManagedFabricStoreProvisioningV1::Local(provisioning) => {
+                let _ = VerifiedManagedFabricProducerContextV1::try_from_provisioning(
+                    legacy_snapshot.state(),
+                    request.controller_signer,
+                    provisioning,
+                )?;
+                request
+                    .requested_successor_store_instance_id
+                    .ok_or(ManagedFabricStoreError::InvalidCutoverIdentity)?
+            }
+            ManagedFabricStoreProvisioningV1::Remote(provisioning) => {
+                if request.requested_successor_store_instance_id.is_some() {
+                    return Err(ManagedFabricStoreError::InvalidCutoverIdentity);
+                }
+                let facts = legacy_store.revalidate_remote_connector_cutover_ready()?;
+                let ingress = remote_describe_ingress(&legacy_snapshot, provisioning)?;
+                let _ = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+                    legacy_snapshot.state(),
+                    request.controller_signer,
+                    provisioning,
+                    &ingress,
+                )?;
+                facts.successor_store_instance_id()
+            }
+        };
         let marker = ManagedFabricCutoverMarkerV1::try_new(
-            request.successor_store_instance_id,
+            successor_store_instance_id,
             request.expected_owner_identity,
             legacy_snapshot,
         )?;
@@ -400,7 +480,7 @@ impl ManagedFabricSuccessorStoreV1 {
         )
     }
 
-    /// Deterministically resumes the only valid path after the v8 marker won.
+    /// Deterministically resumes the only valid path after the cutover marker won.
     pub(crate) fn resume_from_cutover_marker(
         legacy_directory: &Path,
         successor_directory: &Path,
@@ -412,10 +492,10 @@ impl ManagedFabricSuccessorStoreV1 {
         Self::resume_from_cutover_marker_with_policy(
             legacy_directory,
             successor_directory,
-            expected_successor_store_instance_id,
+            Some(expected_successor_store_instance_id),
             expected_owner_identity,
             controller_signer,
-            provisioning,
+            ManagedFabricStoreProvisioningV1::Local(provisioning),
             ControllerFilesystemPolicy::ProductionReference,
         )
     }
@@ -431,10 +511,46 @@ impl ManagedFabricSuccessorStoreV1 {
         Self::resume_from_cutover_marker_with_policy(
             legacy_directory,
             successor_directory,
-            expected_successor_store_instance_id,
+            Some(expected_successor_store_instance_id),
             expected_owner_identity,
             controller_signer,
-            provisioning,
+            ManagedFabricStoreProvisioningV1::Local(provisioning),
+            ControllerFilesystemPolicy::DeveloperLocal,
+        )
+    }
+
+    pub(crate) fn resume_from_remote_connector_cutover_marker(
+        predecessor_directory: &Path,
+        successor_directory: &Path,
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        Self::resume_from_cutover_marker_with_policy(
+            predecessor_directory,
+            successor_directory,
+            None,
+            expected_owner_identity,
+            controller_signer,
+            ManagedFabricStoreProvisioningV1::Remote(provisioning),
+            ControllerFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    pub(crate) fn resume_from_remote_connector_cutover_marker_developer_local(
+        predecessor_directory: &Path,
+        successor_directory: &Path,
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+    ) -> Result<Self, ManagedFabricStoreError> {
+        Self::resume_from_cutover_marker_with_policy(
+            predecessor_directory,
+            successor_directory,
+            None,
+            expected_owner_identity,
+            controller_signer,
+            ManagedFabricStoreProvisioningV1::Remote(provisioning),
             ControllerFilesystemPolicy::DeveloperLocal,
         )
     }
@@ -442,13 +558,13 @@ impl ManagedFabricSuccessorStoreV1 {
     fn resume_from_cutover_marker_with_policy(
         legacy_directory: &Path,
         successor_directory: &Path,
-        expected_successor_store_instance_id: [u8; 32],
+        expected_successor_store_instance_id: Option<[u8; 32]>,
         expected_owner_identity: ControllerOwnerIdentityFingerprint,
         controller_signer: &ed25519_dalek::SigningKey,
-        provisioning: &ManagedFabricControllerProvisioningV1,
+        provisioning: ManagedFabricStoreProvisioningV1<'_>,
         filesystem_policy: ControllerFilesystemPolicy,
     ) -> Result<Self, ManagedFabricStoreError> {
-        if bytes_are_zero(&expected_successor_store_instance_id) {
+        if expected_successor_store_instance_id.is_some_and(|value| bytes_are_zero(&value)) {
             return Err(ManagedFabricStoreError::InvalidCutoverIdentity);
         }
         let legacy_directory_handle = open_store_directory(legacy_directory, filesystem_policy)?;
@@ -464,16 +580,13 @@ impl ManagedFabricSuccessorStoreV1 {
             MAX_CUTOVER_BYTES,
         )?;
         let marker = ManagedFabricCutoverMarkerV1::decode(&marker_wire.bytes)?;
-        if marker.successor_store_instance_id != expected_successor_store_instance_id
-            || marker.owner_identity != expected_owner_identity
+        if marker.owner_identity != expected_owner_identity
+            || expected_successor_store_instance_id
+                .is_some_and(|expected| marker.successor_store_instance_id != expected)
         {
             return Err(ManagedFabricStoreError::InvalidCutoverIdentity);
         }
-        let _ = VerifiedManagedFabricProducerContextV1::try_from_provisioning(
-            marker.legacy_snapshot.state(),
-            controller_signer,
-            provisioning,
-        )?;
+        validate_store_provisioning(&marker, controller_signer, provisioning)?;
         let successor_directory_handle =
             open_store_directory(successor_directory, filesystem_policy)?;
         if file_identity(&successor_directory_handle)? == file_identity(&legacy_directory_handle)? {
@@ -495,16 +608,27 @@ impl ManagedFabricSuccessorStoreV1 {
         directory: File,
         marker: ManagedFabricCutoverMarkerV1,
         controller_signer: &ed25519_dalek::SigningKey,
-        provisioning: &ManagedFabricControllerProvisioningV1,
+        provisioning: ManagedFabricStoreProvisioningV1<'_>,
     ) -> Result<Self, ManagedFabricStoreError> {
         let lock_file = open_or_create_successor_lock(&directory)?;
         try_lock(&lock_file)?;
         let lock_identity = file_identity(&lock_file)?;
         clean_successor_temps(&directory)?;
-        let initial_state = ManagedFabricControllerStateV1::try_from_cutover(
-            marker.marker_digest,
-            marker.legacy_snapshot.clone(),
-        )?;
+        validate_store_provisioning(&marker, controller_signer, provisioning)?;
+        let initial_state = match provisioning {
+            ManagedFabricStoreProvisioningV1::Local(_) => {
+                ManagedFabricControllerStateV1::try_from_cutover(
+                    marker.marker_digest,
+                    marker.legacy_snapshot.clone(),
+                )?
+            }
+            ManagedFabricStoreProvisioningV1::Remote(_) => {
+                ManagedFabricControllerStateV1::try_from_remote_connector_cutover(
+                    marker.marker_digest,
+                    marker.legacy_snapshot.clone(),
+                )?
+            }
+        };
         let (state, state_wire) = match read_optional_named_snapshot(
             &directory,
             SUCCESSOR_ACTIVE_FILE_NAME,
@@ -656,7 +780,7 @@ fn decode_successor_snapshot(
     frame: &[u8],
     marker: &ManagedFabricCutoverMarkerV1,
     controller_signer: &ed25519_dalek::SigningKey,
-    provisioning: &ManagedFabricControllerProvisioningV1,
+    provisioning: ManagedFabricStoreProvisioningV1<'_>,
 ) -> Result<(ManagedFabricControllerStateV1, Box<[u8]>), ManagedFabricStoreError> {
     if frame.len() < SUCCESSOR_HEADER_BYTES + SUCCESSOR_CHECKSUM_BYTES {
         return Err(ManagedFabricStoreError::SnapshotTruncated);
@@ -695,8 +819,20 @@ fn decode_successor_snapshot(
     {
         return Err(ManagedFabricStoreError::InvalidSuccessorState);
     }
-    let state =
-        ManagedFabricControllerStateV1::decode(state_wire, controller_signer, provisioning)?;
+    let state = match provisioning {
+        ManagedFabricStoreProvisioningV1::Local(provisioning) => {
+            ManagedFabricControllerStateV1::decode(state_wire, controller_signer, provisioning)?
+        }
+        ManagedFabricStoreProvisioningV1::Remote(provisioning) => {
+            let ingress = remote_describe_ingress(&marker.legacy_snapshot, provisioning)?;
+            ManagedFabricControllerStateV1::decode_remote(
+                state_wire,
+                controller_signer,
+                provisioning,
+                &ingress,
+            )?
+        }
+    };
     if state.sequence() != sequence
         || state.cutover_marker_digest() != marker.marker_digest
         || state.legacy_snapshot() != &marker.legacy_snapshot
@@ -704,6 +840,61 @@ fn decode_successor_snapshot(
         return Err(ManagedFabricStoreError::InvalidSuccessorState);
     }
     Ok((state, frame.into()))
+}
+
+fn remote_describe_ingress(
+    snapshot: &ControllerJournalSnapshot,
+    provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+) -> Result<ManagedServingDescribeIngressV1, ManagedFabricStoreError> {
+    let facts = snapshot
+        .remote_connector_cutover_ready_facts()?
+        .ok_or(ManagedFabricStoreError::RemoteCutoverNotReady)?;
+    Ok(ManagedServingDescribeIngressV1::try_accept(
+        provisioning.describe(),
+        None,
+        facts.runtime_describe_request().clone(),
+        facts.runtime_describe_response().canonical_wire(),
+    )?)
+}
+
+fn validate_store_provisioning(
+    marker: &ManagedFabricCutoverMarkerV1,
+    controller_signer: &ed25519_dalek::SigningKey,
+    provisioning: ManagedFabricStoreProvisioningV1<'_>,
+) -> Result<(), ManagedFabricStoreError> {
+    match provisioning {
+        ManagedFabricStoreProvisioningV1::Local(provisioning) => {
+            let _ = VerifiedManagedFabricProducerContextV1::try_from_provisioning(
+                marker.legacy_snapshot.state(),
+                controller_signer,
+                provisioning,
+            )?;
+        }
+        ManagedFabricStoreProvisioningV1::Remote(provisioning) => {
+            let facts = marker
+                .legacy_snapshot
+                .remote_connector_cutover_ready_facts()?
+                .ok_or(ManagedFabricStoreError::RemoteCutoverNotReady)?;
+            let runtime_store_instance_id = facts
+                .runtime_describe_facts()
+                .serving()
+                .runtime_store_instance_id();
+            if marker.successor_store_instance_id != facts.successor_store_instance_id()
+                || marker.successor_store_instance_id == facts.authority_store_instance_id()
+                || marker.successor_store_instance_id == runtime_store_instance_id
+            {
+                return Err(ManagedFabricStoreError::InvalidCutoverIdentity);
+            }
+            let ingress = remote_describe_ingress(&marker.legacy_snapshot, provisioning)?;
+            let _ = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+                marker.legacy_snapshot.state(),
+                controller_signer,
+                provisioning,
+                &ingress,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1231,10 +1422,12 @@ pub(crate) enum ManagedFabricStoreError {
     ControllerStore(ControllerStoreError),
     Journal(ControllerJournalError),
     Producer(ManagedFabricProducerError),
+    Serving(ManagedServingControllerError),
     Apply(ManagedFabricApplyControllerError),
     Digest(DigestBuildError),
     InvalidCutoverIdentity,
     InvalidCutoverMarker,
+    RemoteCutoverNotReady,
     InvalidSuccessorState,
     LegacyDirectoryCapabilityMismatch,
     SuccessorMatchesLegacyDirectory,
@@ -1278,6 +1471,12 @@ impl From<ControllerJournalError> for ManagedFabricStoreError {
 impl From<ManagedFabricProducerError> for ManagedFabricStoreError {
     fn from(value: ManagedFabricProducerError) -> Self {
         Self::Producer(value)
+    }
+}
+
+impl From<ManagedServingControllerError> for ManagedFabricStoreError {
+    fn from(value: ManagedServingControllerError) -> Self {
+        Self::Serving(value)
     }
 }
 
@@ -1334,7 +1533,7 @@ mod tests {
 
     use super::{
         ManagedFabricCutoverFailpoint, ManagedFabricCutoverRequest, ManagedFabricStoreError,
-        ManagedFabricSuccessorStoreV1,
+        ManagedFabricStoreProvisioningV1, ManagedFabricSuccessorStoreV1,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -1437,10 +1636,10 @@ mod tests {
             ManagedFabricCutoverRequest {
                 legacy_directory: legacy_b.path(),
                 successor_directory: successor.path(),
-                successor_store_instance_id: SUCCESSOR_STORE_ID,
+                requested_successor_store_instance_id: Some(SUCCESSOR_STORE_ID),
                 expected_owner_identity: owner,
                 controller_signer: &signer,
-                provisioning: &provision,
+                provisioning: ManagedFabricStoreProvisioningV1::Local(&provision),
                 filesystem_policy: ControllerFilesystemPolicy::ExplicitFixture,
             },
             ManagedFabricCutoverFailpoint::None,
@@ -1485,10 +1684,10 @@ mod tests {
             ManagedFabricCutoverRequest {
                 legacy_directory: legacy.path(),
                 successor_directory: legacy.path(),
-                successor_store_instance_id: SUCCESSOR_STORE_ID,
+                requested_successor_store_instance_id: Some(SUCCESSOR_STORE_ID),
                 expected_owner_identity: owner,
                 controller_signer: &signer,
-                provisioning: &provision,
+                provisioning: ManagedFabricStoreProvisioningV1::Local(&provision),
                 filesystem_policy: ControllerFilesystemPolicy::ExplicitFixture,
             },
             ManagedFabricCutoverFailpoint::None,
@@ -1522,10 +1721,10 @@ mod tests {
             ManagedFabricCutoverRequest {
                 legacy_directory: legacy_directory.path(),
                 successor_directory: successor_directory.path(),
-                successor_store_instance_id: SUCCESSOR_STORE_ID,
+                requested_successor_store_instance_id: Some(SUCCESSOR_STORE_ID),
                 expected_owner_identity: owner,
                 controller_signer: &signer,
-                provisioning: &provision,
+                provisioning: ManagedFabricStoreProvisioningV1::Local(&provision),
                 filesystem_policy: ControllerFilesystemPolicy::ExplicitFixture,
             },
             ManagedFabricCutoverFailpoint::AfterMarkerDurableBeforeSuccessorSnapshot,
@@ -1556,10 +1755,10 @@ mod tests {
         let recovered = ManagedFabricSuccessorStoreV1::resume_from_cutover_marker_with_policy(
             legacy_directory.path(),
             successor_directory.path(),
-            SUCCESSOR_STORE_ID,
+            Some(SUCCESSOR_STORE_ID),
             owner,
             &signer,
-            &provision,
+            ManagedFabricStoreProvisioningV1::Local(&provision),
             ControllerFilesystemPolicy::ExplicitFixture,
         )
         .expect("marker deterministically initializes successor");
@@ -1573,10 +1772,10 @@ mod tests {
         let reopened = ManagedFabricSuccessorStoreV1::resume_from_cutover_marker_with_policy(
             legacy_directory.path(),
             successor_directory.path(),
-            SUCCESSOR_STORE_ID,
+            Some(SUCCESSOR_STORE_ID),
             owner,
             &signer,
-            &provision,
+            ManagedFabricStoreProvisioningV1::Local(&provision),
             ControllerFilesystemPolicy::ExplicitFixture,
         )
         .expect("durable successor reopens from the same marker");
@@ -1600,10 +1799,10 @@ mod tests {
                 ManagedFabricCutoverRequest {
                     legacy_directory: legacy_directory.path(),
                     successor_directory: successor_directory.path(),
-                    successor_store_instance_id: SUCCESSOR_STORE_ID,
+                    requested_successor_store_instance_id: Some(SUCCESSOR_STORE_ID),
                     expected_owner_identity: owner,
                     controller_signer: &signer,
-                    provisioning: &provision,
+                    provisioning: ManagedFabricStoreProvisioningV1::Local(&provision),
                     filesystem_policy: ControllerFilesystemPolicy::ExplicitFixture,
                 },
                 ManagedFabricCutoverFailpoint::None,
@@ -1718,10 +1917,10 @@ mod tests {
         let reopened = ManagedFabricSuccessorStoreV1::resume_from_cutover_marker_with_policy(
             legacy_directory.path(),
             successor_directory.path(),
-            SUCCESSOR_STORE_ID,
+            Some(SUCCESSOR_STORE_ID),
             owner,
             &signer,
-            &provision,
+            ManagedFabricStoreProvisioningV1::Local(&provision),
             ControllerFilesystemPolicy::ExplicitFixture,
         )
         .expect("terminal successor state reopens");
