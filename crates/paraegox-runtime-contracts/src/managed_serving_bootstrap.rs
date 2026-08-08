@@ -4780,11 +4780,8 @@ mod tests {
                 + fabric_request.canonical_wire().len()
                 + 64
         );
-        let authenticated_fabric_outer = authenticate_agent_control_request(
-            &fabric_outer,
-            &fabric_carrier,
-            &[0xa2; 64],
-        );
+        let authenticated_fabric_outer =
+            authenticate_agent_control_request(&fabric_outer, &fabric_carrier, &[0xa2; 64]);
         let fabric_pxah = RuntimeAgentControlReceiptDraftV1::try_managed_fabric_apply(
             authenticated_fabric_outer,
             fabric_terminal.clone(),
@@ -4862,11 +4859,8 @@ mod tests {
                 .canonical_wire(),
             agent_request.canonical_wire()
         );
-        let authenticated_agent_outer = authenticate_agent_control_request(
-            &agent_outer,
-            &agent_carrier,
-            &[0xa5; 64],
-        );
+        let authenticated_agent_outer =
+            authenticate_agent_control_request(&agent_outer, &agent_carrier, &[0xa5; 64]);
         let agent_pxah = RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
             authenticated_agent_outer,
             agent_terminal.clone(),
@@ -4967,8 +4961,7 @@ mod tests {
         .expect("epoch is an outer expectation")
         .finalize(&[0xb3; 64])
         .expect("PXAG");
-        let authenticated_outer =
-            authenticate_agent_control_request(&outer, &carrier, &[0xb3; 64]);
+        let authenticated_outer = authenticate_agent_control_request(&outer, &carrier, &[0xb3; 64]);
         assert_eq!(
             RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
                 authenticated_outer,
@@ -5018,11 +5011,8 @@ mod tests {
         .expect("Describe")
         .finalize(&[0xb9; 64])
         .expect("PXAG Describe");
-        let authenticated_describe = authenticate_agent_control_request(
-            &describe,
-            &describe_carrier,
-            &[0xb9; 64],
-        );
+        let authenticated_describe =
+            authenticate_agent_control_request(&describe, &describe_carrier, &[0xb9; 64]);
         assert_eq!(
             RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
                 authenticated_describe,
