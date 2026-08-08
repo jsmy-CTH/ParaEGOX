@@ -312,6 +312,23 @@ def test_console_help_clear_and_quit_are_local_commands() -> None:
     asyncio.run(scenario())
 
 
+def test_console_ctrl_c_binding_closes_client_and_exits() -> None:
+    async def scenario() -> None:
+        client = FakeConversationClient()
+        app = ParaEGOXConsoleApp(client)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await _wait_until(pilot, lambda: app.connected)
+
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+
+            assert client.close_calls == 1
+            assert app.return_code == 0
+        assert client.close_calls == 1
+
+    asyncio.run(scenario())
+
+
 def test_console_rejects_utf8_input_above_protocol_limit() -> None:
     async def scenario() -> None:
         client = FakeConversationClient()

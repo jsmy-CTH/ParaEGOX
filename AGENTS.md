@@ -91,13 +91,13 @@ On the current Mac source-authority host, the permitted non-Rust validation subs
 ```bash
 uv lock --check
 uv run --frozen ruff check .
-uv run --frozen pytest --deselect=tests/system/test_s6_python_reference_worker.py::test_rust_process_domain_owns_real_python_worker_fault_matrix
+uv run --frozen pytest tests/agent_worker tests/console tests/contract tests/unit tests/governance/test_s7_pure_compile_boundary.py tests/governance/test_s7_tenure_authority_boundary.py
 ```
 
 Do not run the complete governance checker on this Mac: its Cargo metadata phase is mandatory, so
 there is no valid Mac-only flag, environment override, filtered invocation, or replacement command
-that can establish a governance pass. The complete checker, the deselected system case, and all
-Rust gates remain required on Ubuntu/CI with pinned Rust; this host split does not waive, skip
-globally, or reduce the repository-wide validation contract.
+that can establish a governance pass. The complete checker, the excluded governance integration
+test, all system tests, and all Rust gates remain required on Ubuntu/CI with pinned Rust; this host
+split does not waive, skip globally, or reduce the repository-wide validation contract.
 
 If a command cannot run, report it as blocked; do not claim it passed.

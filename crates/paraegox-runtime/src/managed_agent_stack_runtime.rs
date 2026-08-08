@@ -1717,8 +1717,7 @@ mod provider_resolver_tests {
             deterministic(0x11),
             &crate::runtime_agent_provider::UnavailableRuntimeAgentProviderResolver,
         )
-        .err()
-        .expect("unavailable resolver must reject the deterministic fixture");
+        .expect_err("unavailable resolver must reject the deterministic fixture");
 
         assert!(matches!(
             error,
@@ -1733,8 +1732,7 @@ mod provider_resolver_tests {
             (provisioned(0x41), provisioned(0x51)),
         ] {
             let error = prepare_agent_provider(requested, &ReturnedSelectionResolver(different))
-                .err()
-                .expect("mismatched resolver output must fail");
+                .expect_err("mismatched resolver output must fail");
 
             assert!(matches!(
                 error,

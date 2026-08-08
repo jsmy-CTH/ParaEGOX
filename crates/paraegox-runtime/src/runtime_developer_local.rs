@@ -325,6 +325,17 @@ pub struct RuntimeDeveloperLocalConfigV1 {
     restricted_runtime_apply_endpoint: Option<RuntimeRestrictedApplyEndpointDependenciesV1>,
 }
 
+struct RestrictedRuntimeApplyConstructorInput {
+    state_directory: PathBuf,
+    socket_path: PathBuf,
+    identity: RuntimeDeveloperLocalIdentityV1,
+    transport_profile: RestrictedRuntimeApplyTransportProfileV1,
+    resolved_profile_ref: [u8; 16],
+    expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    root_ca_certificate_file: PathBuf,
+    listener_identity: ResolvedRemoteMtlsIdentityFiles,
+}
+
 impl fmt::Debug for RuntimeDeveloperLocalConfigV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RuntimeDeveloperLocalConfigV1(<redacted>)")
@@ -437,9 +448,36 @@ impl RuntimeDeveloperLocalConfigV1 {
         transport_profile: RestrictedRuntimeApplyTransportProfileV1,
         resolved_profile_ref: [u8; 16],
         expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
-        root_ca_certificate_file: PathBuf,
-        listener_identity: ResolvedRemoteMtlsIdentityFiles,
+        listener_credentials: (PathBuf, ResolvedRemoteMtlsIdentityFiles),
     ) -> Result<Self, RuntimeDeveloperLocalError> {
+        let (root_ca_certificate_file, listener_identity) = listener_credentials;
+        Self::try_new_with_restricted_runtime_apply_endpoint_input(
+            RestrictedRuntimeApplyConstructorInput {
+                state_directory,
+                socket_path,
+                identity,
+                transport_profile,
+                resolved_profile_ref,
+                expected_carrier,
+                root_ca_certificate_file,
+                listener_identity,
+            },
+        )
+    }
+
+    fn try_new_with_restricted_runtime_apply_endpoint_input(
+        input: RestrictedRuntimeApplyConstructorInput,
+    ) -> Result<Self, RuntimeDeveloperLocalError> {
+        let RestrictedRuntimeApplyConstructorInput {
+            state_directory,
+            socket_path,
+            identity,
+            transport_profile,
+            resolved_profile_ref,
+            expected_carrier,
+            root_ca_certificate_file,
+            listener_identity,
+        } = input;
         Self::try_new(state_directory, socket_path, identity)?
             .try_with_restricted_runtime_apply_endpoint(
                 transport_profile,
@@ -1780,8 +1818,10 @@ mod tests {
                 profile,
                 RESTRICTED_PROFILE_REF,
                 carrier,
-                PathBuf::from("/tmp/paraegox-developer-local-root-ca.pem"),
-                restricted_listener_identity(),
+                (
+                    PathBuf::from("/tmp/paraegox-developer-local-root-ca.pem"),
+                    restricted_listener_identity(),
+                ),
             )
             .unwrap_or_else(|error| panic!("restricted config rejected: {error}"));
 

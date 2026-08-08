@@ -76,9 +76,9 @@ use crate::deck::{
 };
 use crate::deployment_process::{
     DistributedAgentStackOwnerApplyErrorV1, DistributedAgentStackOwnerApplyOutcomeV1,
-    DistributedAgentStackOwnerConnectorInputV1, DistributedAgentStackOwnerNodeInputV1,
-    DistributedAgentStackOwnerTargetInputV1, DistributedCoordinatorContextV1,
-    run_developer_local_distributed_agent_stack_owner_v1,
+    DistributedAgentStackOwnerConnectorInputV1, DistributedAgentStackOwnerNodeInputFieldsV1,
+    DistributedAgentStackOwnerNodeInputV1, DistributedAgentStackOwnerTargetInputV1,
+    DistributedCoordinatorContextV1, run_developer_local_distributed_agent_stack_owner_v1,
     verify_distributed_coordinator_context_v1,
 };
 use crate::distributed_agent_stack_producer::VerifiedDistributedAgentStackPredecessorV1;
@@ -575,10 +575,13 @@ impl DeveloperFixtureDistributedTransportV1 {
         runtime_response_verification_key: [u8; 32],
         profile_ref: [u8; 16],
         transport_profile: RestrictedRuntimeApplyTransportProfileV1,
-        root_ca_certificate_file: PathBuf,
-        connector_certificate_file: PathBuf,
-        connector_private_key_file: PathBuf,
+        credential_files: [PathBuf; 3],
     ) -> Result<Self, DeveloperFixtureDistributedAgentStackError> {
+        let [
+            root_ca_certificate_file,
+            connector_certificate_file,
+            connector_private_key_file,
+        ] = credential_files;
         for path in [
             &root_ca_certificate_file,
             &connector_certificate_file,
@@ -1480,14 +1483,16 @@ pub fn complete_developer_fixture_distributed_agent_stack_v1(
                 DistributedAgentStackOwnerTargetInputV1::new(
                     first.topology,
                     DistributedAgentStackOwnerNodeInputV1::new(
-                        first_node.management_target,
-                        first_node.socket_path,
-                        peer.uid(),
-                        peer.gid(),
-                        first_node.token,
-                        first_node.observation_endpoint_ref,
-                        first_node.observation_socket_path,
-                        first_node.observation_token,
+                        DistributedAgentStackOwnerNodeInputFieldsV1 {
+                            management_target: first_node.management_target,
+                            socket_path: first_node.socket_path,
+                            expected_uid: peer.uid(),
+                            expected_gid: peer.gid(),
+                            token: first_node.token,
+                            observation_endpoint_ref: first_node.observation_endpoint_ref,
+                            observation_socket_path: first_node.observation_socket_path,
+                            observation_token: first_node.observation_token,
+                        },
                     ),
                     first.connector,
                     first_authority,
@@ -1496,14 +1501,16 @@ pub fn complete_developer_fixture_distributed_agent_stack_v1(
                 DistributedAgentStackOwnerTargetInputV1::new(
                     second.topology,
                     DistributedAgentStackOwnerNodeInputV1::new(
-                        second_node.management_target,
-                        second_node.socket_path,
-                        peer.uid(),
-                        peer.gid(),
-                        second_node.token,
-                        second_node.observation_endpoint_ref,
-                        second_node.observation_socket_path,
-                        second_node.observation_token,
+                        DistributedAgentStackOwnerNodeInputFieldsV1 {
+                            management_target: second_node.management_target,
+                            socket_path: second_node.socket_path,
+                            expected_uid: peer.uid(),
+                            expected_gid: peer.gid(),
+                            token: second_node.token,
+                            observation_endpoint_ref: second_node.observation_endpoint_ref,
+                            observation_socket_path: second_node.observation_socket_path,
+                            observation_token: second_node.observation_token,
+                        },
                     ),
                     second.connector,
                     second_authority,
@@ -3744,9 +3751,11 @@ mod tests {
             runtime_key,
             [0x36; 16],
             restricted_transport_profile(identities),
-            PathBuf::from("/tmp/paraegox-root-ca.pem"),
-            PathBuf::from("/tmp/paraegox-connector.pem"),
-            PathBuf::from("/tmp/paraegox-connector.key"),
+            [
+                PathBuf::from("/tmp/paraegox-root-ca.pem"),
+                PathBuf::from("/tmp/paraegox-connector.pem"),
+                PathBuf::from("/tmp/paraegox-connector.key"),
+            ],
         )
         .expect("pre-start distributed transport");
         assert_eq!(

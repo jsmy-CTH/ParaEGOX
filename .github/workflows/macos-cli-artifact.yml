@@ -50,6 +50,7 @@ jobs:
             src/paraegox_sdk/console_tui.py \
             tests/console \
             scripts/smoke_macos_textual_chat.py
+          uv run --frozen python scripts/check_governance.py
           uv run --frozen pytest tests/console -q
           uv run --frozen paraegox-console --help
 
@@ -150,10 +151,30 @@ jobs:
             shasum -a 256 -c SHA256SUMS
           )
 
+      - name: Archive bundle with executable modes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_name="paraegox-macos-x86_64-${GITHUB_SHA}.tar.gz"
+          mkdir -p release
+          tar -czf "release/$archive_name" -C artifact .
+          (
+            cd release
+            shasum -a 256 "$archive_name" > "$archive_name.sha256"
+            shasum -a 256 -c "$archive_name.sha256"
+          )
+
+          mode_check="$RUNNER_TEMP/paraegox-archive-mode-check"
+          mkdir -p "$mode_check"
+          tar -xzf "release/$archive_name" -C "$mode_check"
+          test -x "$mode_check/paraegox"
+          test -x "$mode_check/paraegox-console"
+
       - name: Upload commit-addressed macOS chat bundle
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: paraegox-macos-x86_64-${{ github.sha }}
-          path: artifact/
+          path: release/
           if-no-files-found: error
           retention-days: 7

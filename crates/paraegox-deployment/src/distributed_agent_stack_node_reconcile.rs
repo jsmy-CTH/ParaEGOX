@@ -1813,16 +1813,15 @@ fn validate_runtime_query_state(
     if !shape {
         return Err(DistributedAgentStackNodeReconcileError::InvalidState);
     }
-    if let Some(response) = &query.response {
-        if ReferenceQueryResponseV1::decode(response.canonical_wire())
+    if let Some(response) = &query.response
+        && ReferenceQueryResponseV1::decode(response.canonical_wire())
             .map_err(|_| DistributedAgentStackNodeReconcileError::InvalidState)?
             != *response
-        {
-            return Err(DistributedAgentStackNodeReconcileError::InvalidState);
-        }
+    {
+        return Err(DistributedAgentStackNodeReconcileError::InvalidState);
     }
-    if let Some(observation) = &query.observation {
-        if RuntimeObservationRequestV1::decode(observation.canonical_wire())
+    if let Some(observation) = &query.observation
+        && (RuntimeObservationRequestV1::decode(observation.canonical_wire())
             .map_err(|_| DistributedAgentStackNodeReconcileError::InvalidState)?
             != *observation
             || observation.runtime_host_id() != query.target
@@ -1833,10 +1832,9 @@ fn validate_runtime_query_state(
             || observation.challenge_expires_at_unix_nanos()
                 != query.challenge_expires_at_unix_nanos
             || observation.query_request() != &query.request
-            || query.response.as_ref() != Some(observation.query_response())
-        {
-            return Err(DistributedAgentStackNodeReconcileError::InvalidState);
-        }
+            || query.response.as_ref() != Some(observation.query_response()))
+    {
+        return Err(DistributedAgentStackNodeReconcileError::InvalidState);
     }
     if let Some(ack) = &query.ack {
         let observation = query
@@ -2405,14 +2403,13 @@ fn validate_row(
     {
         return Err(DistributedAgentStackNodeReconcileError::InvalidState);
     }
-    if let Some(high_water) = &row.runtime_high_water {
-        if high_water.runtime_host_epoch == 0
+    if let Some(high_water) = &row.runtime_high_water
+        && (high_water.runtime_host_epoch == 0
             || high_water.observation_sequence == 0
             || digest_is_zero(high_water.status_digest)
-            || high_water.endpoint_generation == 0
-        {
-            return Err(DistributedAgentStackNodeReconcileError::InvalidState);
-        }
+            || high_water.endpoint_generation == 0)
+    {
+        return Err(DistributedAgentStackNodeReconcileError::InvalidState);
     }
     if let Some(response) = &row.status_response {
         if row.status_observed_at_nanos == 0

@@ -543,7 +543,7 @@ impl ManagedModelAssembly {
             state: Mutex::new(ManagedModelSlotState::Cold),
         });
         let implementation = RuntimeManagedModelService {
-            plan: plan.clone(),
+            plan,
             generation,
             resolver,
             prepared: None,

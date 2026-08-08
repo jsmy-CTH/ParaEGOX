@@ -793,18 +793,20 @@ fn prepare_distributed_target_prestart_v1(
         runtime_response_verification_key,
         *target_identity.transport_profile_ref(),
         transport_profile,
-        target_config
-            .pxrp()
-            .root_ca_certificate_file()
-            .to_path_buf(),
-        target_config
-            .pxrp()
-            .controller_client_certificate_file()
-            .to_path_buf(),
-        target_config
-            .pxrp()
-            .controller_client_private_key_file()
-            .to_path_buf(),
+        [
+            target_config
+                .pxrp()
+                .root_ca_certificate_file()
+                .to_path_buf(),
+            target_config
+                .pxrp()
+                .controller_client_certificate_file()
+                .to_path_buf(),
+            target_config
+                .pxrp()
+                .controller_client_private_key_file()
+                .to_path_buf(),
+        ],
     )
     .map_err(|_| LocalProcessError::DistributedDeploymentActivation)?;
     let restricted_listener_identity = ResolvedRemoteMtlsIdentityFiles::try_new(

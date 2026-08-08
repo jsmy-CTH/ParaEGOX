@@ -5,9 +5,10 @@ ParaEGOX is a distributed Agent OS for robotics and embodied agents, currently b
 ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). The original baseline remains available on the `archive/phanthymotus-baseline` branch, with its license attribution preserved.
 
 > Status: the current worktree contains the first DeveloperLocal backend, Textual chat composition,
-> and typed one-shot Inspection startup view. The r21 integration run reached a real Echo terminal,
-> but its joined exit exceeded the workflow's 20-second limit, so presentation closeout remains
-> pending an r22 rerun with a 60-second exit budget. ParaEGOX is adopting a Rust-first core with
+> and typed one-shot Inspection startup view. The r22 macOS run reached typed Inspection markers,
+> Runtime readiness, and a real Echo terminal, but its PTY-timed `/quit` was not consumed and joined
+> exit exceeded 60 seconds. The r23 Ctrl-C smoke revision still awaits CI, so presentation closeout
+> remains pending. ParaEGOX is adopting a Rust-first core with
 > polyglot managed workloads; no stable release is currently available.
 
 ## Runnable DeveloperLocal slice
@@ -42,10 +43,11 @@ command -v paraegox-console
 
 `paraegox-console` is internal packaging, not a second public conversation command. On macOS, keep
 the example's state root under canonical `/private/tmp` because `/tmp` is a symlink rejected by the
-path policy. The macOS CI artifact is a relocatable directory containing `paraegox`, its executable
-`paraegox-console` sibling, and vendored packages under `python/`; keep them together and provide
-Python 3.11 or newer as `python3` on `PATH`. To exercise the configured DeepSeek path, supply the
-referenced Secret through the process environment and pass an absolute config path:
+path policy. The macOS CI artifact contains a SHA-256-checked `tar.gz`; verify its adjacent
+`.sha256` file before extraction. The extracted relocatable directory contains `paraegox`, its
+executable `paraegox-console` sibling, and vendored packages under `python/`; keep them together and
+provide Python 3.11 or newer as `python3` on `PATH`. To exercise the configured DeepSeek path,
+supply the referenced Secret through the process environment and pass an absolute config path:
 
 ```zsh
 read -s 'DEEPSEEK_API_KEY?DeepSeek API key: '; echo
@@ -60,20 +62,23 @@ unset DEEPSEEK_API_KEY
 Build the native binary on the designated server or GitHub CI and download the complete bundle to
 the Mac. Do not run Cargo on the Mac for this workflow.
 
-Source snapshot r21 passed the build server's locked workspace check, all 36 Inspection tests, all
-89 DeveloperLocal tests under a non-root identity, and all 364 Deployment tests under a non-root
-identity. Its native Intel macOS CI run built the binary, passed the Python checks, and completed a
-real Textual-to-Runtime Echo terminal. The workflow still failed because joined process exit exceeded
-its 20-second limit. Formatting findings and four Clippy findings from the r21 gates have been fixed
-in the Mac source authority, but those fixes are not claimed as passed until r22 reruns the remote
-format/Clippy gates and the same macOS smoke with a 60-second exit budget. A credentialed external
+Ubuntu validation of r22 source snapshot `ff2d8109` passed workspace formatting, locked metadata,
+and locked all-targets check. It also passed all 39 Inspection tests, all 89 DeveloperLocal tests
+under a non-root identity, and all 364 Deployment tests under a non-root identity. Workspace Clippy
+did not pass because it found approximately 30 historical structural lints. Those findings have
+been fixed in parallel in the Mac source authority, but the fixes still await r23 validation and
+must not be described as passed. The native Intel macOS r22 run reached typed Inspection markers,
+Runtime readiness, and a real Textual-to-Runtime Echo terminal; its PTY-timed `/quit` was not
+consumed, so joined exit exceeded the 60-second budget and the workflow failed. The r23 smoke now
+uses Textual's public priority Ctrl-C binding, but it still awaits CI and is not a passing result.
+A credentialed external
 DeepSeek smoke is also still pending, so the configured DeepSeek path must not yet be described as
 externally validated or production ready. For an offline substrate check, use the same config schema with
 `model.provider = "deterministic-echo-v1"` and omit model/SecretRef; `echo: <message>` proves only the
 DeveloperLocal owner chain. The standalone Rust `paraegox-tui fixture-v1` executable is retained
 temporarily as a retirement reference only: `paraegox-local` no longer depends on or launches it,
-and it is not an alternative public `paraegox chat` entry. It is scheduled for deletion only after
-the next replacement-validation gate passes; it is not claimed deleted today.
+and it is not an alternative public `paraegox chat` entry. It remains until r23 is genuinely green;
+it is not claimed deleted today.
 
 The current A2 slice is non-streaming, permits one Model call in flight, and sends only the current
 turn's prompt; conversation-history recall, Memory, Tools, planning, and multi-agent orchestration

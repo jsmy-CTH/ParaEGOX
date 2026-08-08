@@ -176,7 +176,7 @@ const QUERY_REQUEST_MAGIC: &[u8; 4] = b"PXQR";
 const APPLY_REQUEST_MAGIC: &[u8; 4] = b"PXAR";
 const MODE_MASK: u32 = 0o7777;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CONTROL_REQUEST_BYTES: usize = maximum_eight(
+const MAX_CONTROL_REQUEST_BYTES: usize = maximum_eight([
     MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES,
     MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES,
     MAX_REFERENCE_QUERY_REQUEST_BYTES,
@@ -185,8 +185,8 @@ const MAX_CONTROL_REQUEST_BYTES: usize = maximum_eight(
     MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
-);
-const MAX_CONTROL_RESPONSE_BYTES: usize = maximum_eight(
+]);
+const MAX_CONTROL_RESPONSE_BYTES: usize = maximum_eight([
     MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES,
     MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES,
     MAX_REFERENCE_QUERY_RESPONSE_BYTES,
@@ -195,7 +195,7 @@ const MAX_CONTROL_RESPONSE_BYTES: usize = maximum_eight(
     MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
     MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
     MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
-);
+]);
 
 /// Builds the scheduler used by every process owner that can host managed
 /// Fabric. Zenoh requires Tokio's multi-thread scheduler; one worker keeps the
@@ -363,27 +363,16 @@ impl fmt::Debug for RuntimeManagedFabricServiceDependenciesV1 {
     }
 }
 
-const fn maximum_eight(
-    first: usize,
-    second: usize,
-    third: usize,
-    fourth: usize,
-    fifth: usize,
-    sixth: usize,
-    seventh: usize,
-    eighth: usize,
-) -> usize {
-    let pair = if first > second { first } else { second };
-    let triple = if pair > third { pair } else { third };
-    let quadruple = if triple > fourth { triple } else { fourth };
-    let quintuple = if quadruple > fifth { quadruple } else { fifth };
-    let sextuple = if quintuple > sixth { quintuple } else { sixth };
-    let septuple = if sextuple > seventh {
-        sextuple
-    } else {
-        seventh
-    };
-    if septuple > eighth { septuple } else { eighth }
+const fn maximum_eight(values: [usize; 8]) -> usize {
+    let mut maximum = values[0];
+    let mut index = 1;
+    while index < values.len() {
+        if values[index] > maximum {
+            maximum = values[index];
+        }
+        index += 1;
+    }
+    maximum
 }
 
 fn validate_snapshot_pins(
@@ -2027,7 +2016,7 @@ impl ManagedFabricControlService {
                         return managed_model_agent_stack_terminal_response_wire(&receipt);
                     }
                     ManagedModelAgentStackCutoverOutcome::Installed(model_stack, outcome) => {
-                        self.model_stack = Some(model_stack);
+                        self.model_stack = Some(*model_stack);
                         outcome
                     }
                 }

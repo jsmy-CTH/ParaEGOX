@@ -1520,10 +1520,12 @@ fn validate_evidence_snapshot_successor(
     match (
         prior.evidence_state.handoff(),
         next.evidence_state.handoff(),
+        next.phase,
     ) {
         (
             DistributedAgentStackEvidenceHandoffV2::Committed(_),
             DistributedAgentStackEvidenceHandoffV2::Committed(_),
+            _,
         ) => {
             if prior.transition() != next.transition() {
                 return Err(DistributedAgentStackStateError::InvalidEvidenceState);
@@ -1532,22 +1534,37 @@ fn validate_evidence_snapshot_successor(
         (
             DistributedAgentStackEvidenceHandoffV2::Committed(prior_commit),
             DistributedAgentStackEvidenceHandoffV2::None,
-        ) => match next.phase {
-            DistributedAgentStackDurablePhase::ActiveReady => {
-                validate_committed_active_ready_successor(prior, next, prior_commit.batch())?;
-            }
-            DistributedAgentStackDurablePhase::RecoveryIntent => {
-                validate_committed_recovery_successor(prior, next, prior_commit.batch())?;
-            }
-            DistributedAgentStackDurablePhase::ExactZero => {
-                validate_committed_exact_zero_successor(prior, next, prior_commit.batch())?;
-            }
-            DistributedAgentStackDurablePhase::Quarantined => {
-                validate_committed_quarantined_successor(prior, next, prior_commit.batch())?;
-            }
-            _ => return Err(DistributedAgentStackStateError::InvalidEvidenceState),
-        },
-        (_, _) if next.phase == DistributedAgentStackDurablePhase::ActiveReady => {
+            DistributedAgentStackDurablePhase::ActiveReady,
+        ) => {
+            validate_committed_active_ready_successor(prior, next, prior_commit.batch())?;
+        }
+        (
+            DistributedAgentStackEvidenceHandoffV2::Committed(prior_commit),
+            DistributedAgentStackEvidenceHandoffV2::None,
+            DistributedAgentStackDurablePhase::RecoveryIntent,
+        ) => {
+            validate_committed_recovery_successor(prior, next, prior_commit.batch())?;
+        }
+        (
+            DistributedAgentStackEvidenceHandoffV2::Committed(prior_commit),
+            DistributedAgentStackEvidenceHandoffV2::None,
+            DistributedAgentStackDurablePhase::ExactZero,
+        ) => {
+            validate_committed_exact_zero_successor(prior, next, prior_commit.batch())?;
+        }
+        (
+            DistributedAgentStackEvidenceHandoffV2::Committed(prior_commit),
+            DistributedAgentStackEvidenceHandoffV2::None,
+            DistributedAgentStackDurablePhase::Quarantined,
+        ) => {
+            validate_committed_quarantined_successor(prior, next, prior_commit.batch())?;
+        }
+        (
+            DistributedAgentStackEvidenceHandoffV2::Committed(_),
+            DistributedAgentStackEvidenceHandoffV2::None,
+            _,
+        ) => return Err(DistributedAgentStackStateError::InvalidEvidenceState),
+        (_, _, DistributedAgentStackDurablePhase::ActiveReady) => {
             if prior.phase != DistributedAgentStackDurablePhase::ActiveReady
                 || prior.transition() != next.transition()
             {
@@ -2750,8 +2767,8 @@ mod tests {
         (intent, committed, batch)
     }
 
-    fn signed_active_ready_terminal(
-        request: &DistributedAgentStackApplyRequestV1,
+    struct SignedActiveReadyTerminalInput<'a> {
+        request: &'a DistributedAgentStackApplyRequestV1,
         response_channel: ReferenceChannelBindingV1,
         proofs: Vec<DistributedFabricObservedTransportProofV1>,
         fabric_generation: ManagedServiceGeneration,
@@ -2760,7 +2777,22 @@ mod tests {
         completion_snapshot_sequence: u64,
         installed_binding_set_digest: Digest32,
         raw_outcome_digest: Digest32,
+    }
+
+    fn signed_active_ready_terminal(
+        input: SignedActiveReadyTerminalInput<'_>,
     ) -> DistributedAgentStackTerminalReceiptV1 {
+        let SignedActiveReadyTerminalInput {
+            request,
+            response_channel,
+            proofs,
+            fabric_generation,
+            agent_generation,
+            runtime_host_epoch,
+            completion_snapshot_sequence,
+            installed_binding_set_digest,
+            raw_outcome_digest,
+        } = input;
         let observations = DistributedAgentStackTerminalObservationsV1::try_new(request, proofs)
             .unwrap_or_else(|error| panic!("terminal observations rejected: {error}"));
         let facts = DistributedAgentStackTerminalFactsV1::try_new(
@@ -3187,17 +3219,17 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("binding-set digest rejected: {error}"));
         let raw_outcome_digest = Digest32::from_bytes([0x74; 32]);
-        let receipt = signed_active_ready_terminal(
-            &pending.request,
-            pending.response_channel,
+        let receipt = signed_active_ready_terminal(SignedActiveReadyTerminalInput {
+            request: &pending.request,
+            response_channel: pending.response_channel,
             proofs,
             fabric_generation,
             agent_generation,
-            8,
-            committed.sequence() + 1,
+            runtime_host_epoch: 8,
+            completion_snapshot_sequence: committed.sequence() + 1,
             installed_binding_set_digest,
             raw_outcome_digest,
-        );
+        });
         let ready_transition = active_ready_transition(
             &committed,
             receipt,
@@ -3245,17 +3277,17 @@ mod tests {
 
         let wrong_proof = decode_evidence_transport_proof(&evidence_record(2, 0x61, 1, None, 0))
             .unwrap_or_else(|error| panic!("alternate PXTP rejected: {error}"));
-        let wrong_proof_receipt = signed_active_ready_terminal(
-            &pending.request,
-            pending.response_channel,
-            vec![wrong_proof],
+        let wrong_proof_receipt = signed_active_ready_terminal(SignedActiveReadyTerminalInput {
+            request: &pending.request,
+            response_channel: pending.response_channel,
+            proofs: vec![wrong_proof],
             fabric_generation,
             agent_generation,
-            8,
-            committed.sequence() + 1,
+            runtime_host_epoch: 8,
+            completion_snapshot_sequence: committed.sequence() + 1,
             installed_binding_set_digest,
             raw_outcome_digest,
-        );
+        });
         let wrong_proof_transition = active_ready_transition(
             &committed,
             wrong_proof_receipt,
@@ -3280,24 +3312,25 @@ mod tests {
         );
 
         let mut phase_eleven_direct_ready = ready_transition;
-        phase_eleven_direct_ready.terminals[0].receipt = signed_active_ready_terminal(
-            &pending.request,
-            pending.response_channel,
-            batch
-                .records()
-                .iter()
-                .map(|record| {
-                    decode_evidence_transport_proof(record)
-                        .unwrap_or_else(|error| panic!("batch PXTP rejected: {error}"))
-                })
-                .collect(),
-            fabric_generation,
-            agent_generation,
-            7,
-            intent.sequence() + 1,
-            installed_binding_set_digest,
-            raw_outcome_digest,
-        );
+        phase_eleven_direct_ready.terminals[0].receipt =
+            signed_active_ready_terminal(SignedActiveReadyTerminalInput {
+                request: &pending.request,
+                response_channel: pending.response_channel,
+                proofs: batch
+                    .records()
+                    .iter()
+                    .map(|record| {
+                        decode_evidence_transport_proof(record)
+                            .unwrap_or_else(|error| panic!("batch PXTP rejected: {error}"))
+                    })
+                    .collect(),
+                fabric_generation,
+                agent_generation,
+                runtime_host_epoch: 7,
+                completion_snapshot_sequence: intent.sequence() + 1,
+                installed_binding_set_digest,
+                raw_outcome_digest,
+            });
         assert_eq!(
             intent.try_v2_successor_at_epoch(
                 7,
@@ -3324,10 +3357,10 @@ mod tests {
             .pending
             .as_ref()
             .unwrap_or_else(|| panic!("bare PXDA v2 lacks pending activation"));
-        let bare_receipt = signed_active_ready_terminal(
-            &bare_pending.request,
-            bare_pending.response_channel,
-            batch
+        let bare_receipt = signed_active_ready_terminal(SignedActiveReadyTerminalInput {
+            request: &bare_pending.request,
+            response_channel: bare_pending.response_channel,
+            proofs: batch
                 .records()
                 .iter()
                 .map(|record| {
@@ -3337,11 +3370,11 @@ mod tests {
                 .collect(),
             fabric_generation,
             agent_generation,
-            7,
-            bare_v2.sequence() + 1,
+            runtime_host_epoch: 7,
+            completion_snapshot_sequence: bare_v2.sequence() + 1,
             installed_binding_set_digest,
             raw_outcome_digest,
-        );
+        });
         let bare_ready = active_ready_transition(
             &bare_v2,
             bare_receipt,
@@ -3371,22 +3404,22 @@ mod tests {
             Digest32::from_bytes([0x82; 32]),
         )
         .unwrap_or_else(|error| panic!("historical binding-set digest rejected: {error}"));
-        let historical_receipt = signed_active_ready_terminal(
-            &pending.request,
-            pending.response_channel,
-            vec![
+        let historical_receipt = signed_active_ready_terminal(SignedActiveReadyTerminalInput {
+            request: &pending.request,
+            response_channel: pending.response_channel,
+            proofs: vec![
                 decode_evidence_transport_proof(&evidence_record(2, 0x61, 1, None, 0))
                     .unwrap_or_else(|error| panic!("historical PXTP rejected: {error}")),
             ],
-            ManagedServiceGeneration::try_new(7)
+            fabric_generation: ManagedServiceGeneration::try_new(7)
                 .unwrap_or_else(|error| panic!("historical fabric generation rejected: {error}")),
-            ManagedServiceGeneration::try_new(8)
+            agent_generation: ManagedServiceGeneration::try_new(8)
                 .unwrap_or_else(|error| panic!("historical Agent generation rejected: {error}")),
-            7,
-            1,
-            historical_installed,
-            Digest32::from_bytes([0x83; 32]),
-        );
+            runtime_host_epoch: 7,
+            completion_snapshot_sequence: 1,
+            installed_binding_set_digest: historical_installed,
+            raw_outcome_digest: Digest32::from_bytes([0x83; 32]),
+        });
         let mut historical_transition = committed.transition();
         historical_transition
             .terminals

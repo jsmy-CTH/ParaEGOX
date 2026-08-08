@@ -101,7 +101,7 @@ pub(crate) enum ManagedModelAgentStackApplyOutcome {
 pub(crate) enum ManagedModelAgentStackCutoverOutcome {
     NoEffect(ManagedModelAgentStackTerminalReceiptV1),
     Installed(
-        ManagedModelAgentStackRuntimeCore,
+        Box<ManagedModelAgentStackRuntimeCore>,
         ManagedModelAgentStackApplyOutcome,
     ),
 }
@@ -137,6 +137,33 @@ struct QuarantineObservation {
     fabric_ready: bool,
     model_ready: bool,
     model_cleanup_exact_zero: Option<bool>,
+}
+
+struct RecoveryModelIntentInput<'a> {
+    request: &'a ManagedModelAgentStackApplyRequestV1,
+    response_channel: ReferenceChannelBindingV1,
+    fabric_generation: ManagedServiceGeneration,
+    model_generation: ManagedServiceGeneration,
+    reading: ClockReading,
+    deadline_nanos: u64,
+}
+
+struct ActiveReadyCommitInput<'a> {
+    request: &'a ManagedModelAgentStackApplyRequestV1,
+    response_channel: ReferenceChannelBindingV1,
+    fabric_generation: ManagedServiceGeneration,
+    model_generation: ManagedServiceGeneration,
+    agent_generation: ManagedServiceGeneration,
+    raw_code: u16,
+}
+
+struct UncertainTerminalInput<'a> {
+    request: &'a ManagedModelAgentStackApplyRequestV1,
+    response_channel: ReferenceChannelBindingV1,
+    raw_code: u16,
+    fabric_generation: Option<ManagedServiceGeneration>,
+    model_generation: Option<ManagedServiceGeneration>,
+    agent_generation: Option<ManagedServiceGeneration>,
 }
 
 impl ManagedModelAgentStackRuntimeCore {
@@ -294,7 +321,7 @@ impl ManagedModelAgentStackRuntimeCore {
                     },
                 )?;
                 return Ok(ManagedModelAgentStackCutoverOutcome::Installed(
-                    core,
+                    Box::new(core),
                     ManagedModelAgentStackApplyOutcome::Committed(receipt),
                 ));
             }
@@ -334,23 +361,25 @@ impl ManagedModelAgentStackRuntimeCore {
                 },
             )?;
             return Ok(ManagedModelAgentStackCutoverOutcome::Installed(
-                core,
+                Box::new(core),
                 ManagedModelAgentStackApplyOutcome::Committed(receipt),
             ));
         }
 
         let receipt = core.commit_active_ready(
             fabric,
-            &request,
-            response_channel,
-            predecessor.generation,
-            model_generation,
-            agent_generation,
-            1,
+            ActiveReadyCommitInput {
+                request: &request,
+                response_channel,
+                fabric_generation: predecessor.generation,
+                model_generation,
+                agent_generation,
+                raw_code: 1,
+            },
         )?;
         core.publish_handle(&receipt)?;
         Ok(ManagedModelAgentStackCutoverOutcome::Installed(
-            core,
+            Box::new(core),
             ManagedModelAgentStackApplyOutcome::Committed(receipt),
         ))
     }
@@ -400,12 +429,14 @@ impl ManagedModelAgentStackRuntimeCore {
         let deadline_nanos = recovery_deadline(&request, reading)?;
         self.commit_recovery_model_intent(
             fabric,
-            &request,
-            response_channel,
-            predecessor.generation,
-            model_generation,
-            reading,
-            deadline_nanos,
+            RecoveryModelIntentInput {
+                request: &request,
+                response_channel,
+                fabric_generation: predecessor.generation,
+                model_generation,
+                reading,
+                deadline_nanos,
+            },
         )?;
 
         let model_dependency = match self
@@ -487,12 +518,14 @@ impl ManagedModelAgentStackRuntimeCore {
             }
             None => self.commit_active_ready(
                 fabric,
-                &request,
-                response_channel,
-                predecessor.generation,
-                model_generation,
-                agent_generation,
-                42,
+                ActiveReadyCommitInput {
+                    request: &request,
+                    response_channel,
+                    fabric_generation: predecessor.generation,
+                    model_generation,
+                    agent_generation,
+                    raw_code: 42,
+                },
             )?,
         };
         self.publish_handle(&receipt)?;
@@ -693,12 +726,14 @@ impl ManagedModelAgentStackRuntimeCore {
             Err(_) => {
                 let receipt = self.terminalize_uncertain(
                     fabric,
-                    &request,
-                    response_channel,
-                    53,
-                    Some(active.fabric_generation),
-                    Some(active.model_generation),
-                    Some(active.agent_generation),
+                    UncertainTerminalInput {
+                        request: &request,
+                        response_channel,
+                        raw_code: 53,
+                        fabric_generation: Some(active.fabric_generation),
+                        model_generation: Some(active.model_generation),
+                        agent_generation: Some(active.agent_generation),
+                    },
                 )?;
                 Ok(ManagedModelAgentStackApplyOutcome::Committed(receipt))
             }
@@ -872,13 +907,16 @@ impl ManagedModelAgentStackRuntimeCore {
     fn commit_recovery_model_intent(
         &mut self,
         fabric: &mut ManagedFabricRuntimeCore,
-        request: &ManagedModelAgentStackApplyRequestV1,
-        response_channel: ReferenceChannelBindingV1,
-        fabric_generation: ManagedServiceGeneration,
-        model_generation: ManagedServiceGeneration,
-        reading: ClockReading,
-        deadline_nanos: u64,
+        input: RecoveryModelIntentInput<'_>,
     ) -> Result<(), ManagedModelAgentStackRuntimeError> {
+        let RecoveryModelIntentInput {
+            request,
+            response_channel,
+            fabric_generation,
+            model_generation,
+            reading,
+            deadline_nanos,
+        } = input;
         let mut intent = self.snapshot.transition();
         intent.fabric_generation_high_water = intent
             .fabric_generation_high_water
@@ -951,13 +989,16 @@ impl ManagedModelAgentStackRuntimeCore {
     fn commit_active_ready(
         &mut self,
         fabric: &mut ManagedFabricRuntimeCore,
-        request: &ManagedModelAgentStackApplyRequestV1,
-        response_channel: ReferenceChannelBindingV1,
-        fabric_generation: ManagedServiceGeneration,
-        model_generation: ManagedServiceGeneration,
-        agent_generation: ManagedServiceGeneration,
-        raw_code: u16,
+        input: ActiveReadyCommitInput<'_>,
     ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackRuntimeError> {
+        let ActiveReadyCommitInput {
+            request,
+            response_channel,
+            fabric_generation,
+            model_generation,
+            agent_generation,
+            raw_code,
+        } = input;
         let receipt = self.build_terminal(
             request,
             response_channel,
@@ -990,9 +1031,7 @@ impl ManagedModelAgentStackRuntimeCore {
             agent_generation,
         );
         insert_terminal(&mut ready.terminals, request, receipt.clone())?;
-        if let Err(error) = self.commit_transition(fabric, ready) {
-            return Err(error);
-        }
+        self.commit_transition(fabric, ready)?;
         Ok(receipt)
     }
 
@@ -1342,13 +1381,16 @@ impl ManagedModelAgentStackRuntimeCore {
     fn terminalize_uncertain(
         &mut self,
         fabric: &mut ManagedFabricRuntimeCore,
-        request: &ManagedModelAgentStackApplyRequestV1,
-        response_channel: ReferenceChannelBindingV1,
-        raw_code: u16,
-        fabric_generation: Option<ManagedServiceGeneration>,
-        model_generation: Option<ManagedServiceGeneration>,
-        agent_generation: Option<ManagedServiceGeneration>,
+        input: UncertainTerminalInput<'_>,
     ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackRuntimeError> {
+        let UncertainTerminalInput {
+            request,
+            response_channel,
+            raw_code,
+            fabric_generation,
+            model_generation,
+            agent_generation,
+        } = input;
         let receipt = self.build_terminal(
             request,
             response_channel,

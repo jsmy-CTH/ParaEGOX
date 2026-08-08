@@ -252,7 +252,32 @@ impl CleanedNonReadyTerminalDecision {
 
 enum ActivationTerminalMode {
     RecordActiveReady,
-    PreserveHistoricalActive(DistributedAgentStackTerminalReceiptV1),
+    PreserveHistoricalActive(Box<DistributedAgentStackTerminalReceiptV1>),
+}
+
+#[derive(Clone, Copy)]
+struct ActivationContext<'a> {
+    request: &'a DistributedAgentStackApplyRequestV1,
+    response_channel: ReferenceChannelBindingV1,
+    fabric_generation: ManagedServiceGeneration,
+    agent_generation: ManagedServiceGeneration,
+    raw_code: u16,
+    terminal_mode: &'a ActivationTerminalMode,
+}
+
+impl ActivationContext<'_> {
+    const fn with_raw_code(self, raw_code: u16) -> Self {
+        Self { raw_code, ..self }
+    }
+}
+
+struct UncertainCleanupInput<'a> {
+    request: &'a DistributedAgentStackApplyRequestV1,
+    response_channel: ReferenceChannelBindingV1,
+    proofs: Vec<DistributedFabricObservedTransportProofV1>,
+    raw_code: u16,
+    generations: TerminalGenerations,
+    terminal_mode: &'a ActivationTerminalMode,
 }
 
 /// Conservative compatibility path used only when no Evidence owner was
@@ -615,12 +640,14 @@ impl DistributedAgentStackRuntimeCore {
         let receipt = core
             .execute_pending_activation(
                 owner,
-                &request,
-                response_channel,
-                fabric_generation,
-                agent_generation,
-                30,
-                &terminal_mode,
+                ActivationContext {
+                    request: &request,
+                    response_channel,
+                    fabric_generation,
+                    agent_generation,
+                    raw_code: 30,
+                    terminal_mode: &terminal_mode,
+                },
             )
             .await;
         match receipt {
@@ -742,12 +769,14 @@ impl DistributedAgentStackRuntimeCore {
         let receipt = self
             .execute_pending_activation(
                 owner,
-                &request,
-                response_channel,
-                fabric_generation,
-                agent_generation,
-                50,
-                &terminal_mode,
+                ActivationContext {
+                    request: &request,
+                    response_channel,
+                    fabric_generation,
+                    agent_generation,
+                    raw_code: 50,
+                    terminal_mode: &terminal_mode,
+                },
             )
             .await?;
         Ok(self.activation_apply_outcome(receipt))
@@ -912,7 +941,7 @@ impl DistributedAgentStackRuntimeCore {
                     == DistributedAgentStackTerminalOutcomeV1::ActiveReady =>
             {
                 self.validate_historical_active_terminal(&request, response_channel, &historical)?;
-                ActivationTerminalMode::PreserveHistoricalActive(historical)
+                ActivationTerminalMode::PreserveHistoricalActive(Box::new(historical))
             }
             Some(_) => return Err(DistributedAgentStackRuntimeError::InvalidDurableState),
             None => ActivationTerminalMode::RecordActiveReady,
@@ -976,7 +1005,7 @@ impl DistributedAgentStackRuntimeCore {
                         pending.response_channel,
                         &historical,
                     )?;
-                    ActivationTerminalMode::PreserveHistoricalActive(historical)
+                    ActivationTerminalMode::PreserveHistoricalActive(Box::new(historical))
                 }
                 Some(_) => return Err(DistributedAgentStackRuntimeError::InvalidDurableState),
                 None => ActivationTerminalMode::RecordActiveReady,
@@ -986,15 +1015,17 @@ impl DistributedAgentStackRuntimeCore {
         if !self.cleanup_live().await {
             self.complete_uncertain_cleanup(
                 owner,
-                &pending.request,
-                pending.response_channel,
-                proofs,
-                0x86,
-                TerminalGenerations {
-                    fabric: Some(batch.fabric_generation()),
-                    agent: pending.agent_generation,
+                UncertainCleanupInput {
+                    request: &pending.request,
+                    response_channel: pending.response_channel,
+                    proofs,
+                    raw_code: 0x86,
+                    generations: TerminalGenerations {
+                        fabric: Some(batch.fabric_generation()),
+                        agent: pending.agent_generation,
+                    },
+                    terminal_mode: &terminal_mode,
                 },
-                &terminal_mode,
             )?;
             return Err(DistributedAgentStackRuntimeError::RecoveryQuarantined);
         }
@@ -1062,12 +1093,14 @@ impl DistributedAgentStackRuntimeCore {
         self.fabric = prepared;
         self.execute_pending_activation(
             owner,
-            &request,
-            response_channel,
-            fabric_generation,
-            agent_generation,
-            70,
-            &terminal_mode,
+            ActivationContext {
+                request: &request,
+                response_channel,
+                fabric_generation,
+                agent_generation,
+                raw_code: 70,
+                terminal_mode: &terminal_mode,
+            },
         )
         .await?;
         if self.snapshot.phase == DistributedAgentStackDurablePhase::ExactZero {
@@ -1101,26 +1134,29 @@ impl DistributedAgentStackRuntimeCore {
     async fn execute_pending_activation(
         &mut self,
         owner: &mut ManagedFabricRuntimeCore,
-        request: &DistributedAgentStackApplyRequestV1,
-        response_channel: ReferenceChannelBindingV1,
-        fabric_generation: ManagedServiceGeneration,
-        agent_generation: ManagedServiceGeneration,
-        raw_code: u16,
-        terminal_mode: &ActivationTerminalMode,
+        context: ActivationContext<'_>,
     ) -> Result<DistributedAgentStackTerminalReceiptV1, DistributedAgentStackRuntimeError> {
+        let request = context.request;
+        let response_channel = context.response_channel;
+        let fabric_generation = context.fabric_generation;
+        let agent_generation = context.agent_generation;
+        let raw_code = context.raw_code;
+        let terminal_mode = context.terminal_mode;
         if self.fabric.is_none() {
             if !self.cleanup_live().await {
                 return self.complete_uncertain_cleanup(
                     owner,
-                    request,
-                    response_channel,
-                    Vec::new(),
-                    raw_code,
-                    TerminalGenerations {
-                        fabric: Some(fabric_generation),
-                        agent: Some(agent_generation),
+                    UncertainCleanupInput {
+                        request,
+                        response_channel,
+                        proofs: Vec::new(),
+                        raw_code,
+                        generations: TerminalGenerations {
+                            fabric: Some(fabric_generation),
+                            agent: Some(agent_generation),
+                        },
+                        terminal_mode,
                     },
-                    terminal_mode,
                 );
             }
             return self.complete_exact_cleanup(
@@ -1161,15 +1197,17 @@ impl DistributedAgentStackRuntimeCore {
                 } else {
                     self.complete_uncertain_cleanup(
                         owner,
-                        request,
-                        response_channel,
-                        Vec::new(),
-                        raw_code + 2,
-                        TerminalGenerations {
-                            fabric: Some(fabric_generation),
-                            agent: None,
+                        UncertainCleanupInput {
+                            request,
+                            response_channel,
+                            proofs: Vec::new(),
+                            raw_code: raw_code + 2,
+                            generations: TerminalGenerations {
+                                fabric: Some(fabric_generation),
+                                agent: None,
+                            },
+                            terminal_mode,
                         },
-                        terminal_mode,
                     )
                 };
             }
@@ -1182,13 +1220,9 @@ impl DistributedAgentStackRuntimeCore {
                 return self
                     .commit_snapshot_evidence_and_activate(
                         owner,
-                        request,
-                        response_channel,
                         snapshot,
                         fabric_control,
-                        agent_generation,
-                        raw_code,
-                        terminal_mode,
+                        context,
                     )
                     .await;
             }
@@ -1198,19 +1232,21 @@ impl DistributedAgentStackRuntimeCore {
         if !exact {
             return self.complete_uncertain_cleanup(
                 owner,
-                request,
-                response_channel,
-                Vec::new(),
-                if snapshot_result.is_ok() {
-                    raw_code + 10
-                } else {
-                    raw_code + 8
+                UncertainCleanupInput {
+                    request,
+                    response_channel,
+                    proofs: Vec::new(),
+                    raw_code: if snapshot_result.is_ok() {
+                        raw_code + 10
+                    } else {
+                        raw_code + 8
+                    },
+                    generations: TerminalGenerations {
+                        fabric: Some(fabric_generation),
+                        agent: None,
+                    },
+                    terminal_mode,
                 },
-                TerminalGenerations {
-                    fabric: Some(fabric_generation),
-                    agent: None,
-                },
-                terminal_mode,
             );
         }
         match snapshot_result {
@@ -1237,20 +1273,22 @@ impl DistributedAgentStackRuntimeCore {
     async fn commit_snapshot_evidence_and_activate(
         &mut self,
         owner: &mut ManagedFabricRuntimeCore,
-        request: &DistributedAgentStackApplyRequestV1,
-        response_channel: ReferenceChannelBindingV1,
         snapshot: ValidatedExperimentalSnapshot,
         fabric_control: ManagedFabricControlHandle,
-        agent_generation: ManagedServiceGeneration,
-        raw_code: u16,
-        terminal_mode: &ActivationTerminalMode,
+        context: ActivationContext<'_>,
     ) -> Result<DistributedAgentStackTerminalReceiptV1, DistributedAgentStackRuntimeError> {
+        let request = context.request;
+        let raw_code = context.raw_code;
         let owner_ref = self
             .evidence_store_config
             .as_ref()
             .ok_or(DistributedAgentStackRuntimeError::EvidenceConfigurationMismatch)?
             .owner_ref();
         let fabric_generation = snapshot.fabric_generation;
+        let context = ActivationContext {
+            fabric_generation,
+            ..context
+        };
         let batch = match build_evidence_batch(
             request,
             snapshot,
@@ -1291,14 +1329,9 @@ impl DistributedAgentStackRuntimeCore {
         };
         self.start_agent_after_verified_evidence(
             owner,
-            request,
-            response_channel,
             fabric_control,
-            fabric_generation,
-            agent_generation,
             proofs,
-            raw_code,
-            terminal_mode,
+            context,
         )
         .await
     }
@@ -1306,15 +1339,16 @@ impl DistributedAgentStackRuntimeCore {
     async fn start_agent_after_verified_evidence(
         &mut self,
         owner: &mut ManagedFabricRuntimeCore,
-        request: &DistributedAgentStackApplyRequestV1,
-        response_channel: ReferenceChannelBindingV1,
         fabric_control: ManagedFabricControlHandle,
-        fabric_generation: ManagedServiceGeneration,
-        agent_generation: ManagedServiceGeneration,
         proofs: Vec<DistributedFabricObservedTransportProofV1>,
-        raw_code: u16,
-        terminal_mode: &ActivationTerminalMode,
+        context: ActivationContext<'_>,
     ) -> Result<DistributedAgentStackTerminalReceiptV1, DistributedAgentStackRuntimeError> {
+        let request = context.request;
+        let response_channel = context.response_channel;
+        let fabric_generation = context.fabric_generation;
+        let agent_generation = context.agent_generation;
+        let raw_code = context.raw_code;
+        let terminal_mode = context.terminal_mode;
         let pending = self
             .snapshot
             .pending
@@ -1344,13 +1378,8 @@ impl DistributedAgentStackRuntimeCore {
             self.recovery_completed = false;
             return self.commit_agent_activation_quarantine(
                 owner,
-                request,
-                response_channel,
                 proofs,
-                raw_code + 12,
-                fabric_generation,
-                agent_generation,
-                terminal_mode,
+                context.with_raw_code(raw_code + 12),
             );
         }
 
@@ -1368,13 +1397,8 @@ impl DistributedAgentStackRuntimeCore {
                 return self
                     .complete_agent_activation_failure(
                         owner,
-                        request,
-                        response_channel,
                         proofs,
-                        raw_code + 13,
-                        fabric_generation,
-                        agent_generation,
-                        terminal_mode,
+                        context.with_raw_code(raw_code + 13),
                         None,
                         agent_start_failure_requires_fabric_retention(&error),
                     )
@@ -1403,13 +1427,8 @@ impl DistributedAgentStackRuntimeCore {
                 return self
                     .complete_agent_activation_failure(
                         owner,
-                        request,
-                        response_channel,
                         proofs,
-                        raw_code + 14,
-                        fabric_generation,
-                        agent_generation,
-                        terminal_mode,
+                        context.with_raw_code(raw_code + 14),
                         Some(assembly),
                         false,
                     )
@@ -1472,9 +1491,9 @@ impl DistributedAgentStackRuntimeCore {
                     self.validate_historical_active_terminal(
                         request,
                         response_channel,
-                        historical,
+                        historical.as_ref(),
                     )?;
-                    historical.clone()
+                    historical.as_ref().clone()
                 }
             };
             let cleared_evidence = self.snapshot.evidence_state().try_clear_committed()?;
@@ -1488,13 +1507,8 @@ impl DistributedAgentStackRuntimeCore {
                 return self
                     .complete_agent_activation_failure(
                         owner,
-                        request,
-                        response_channel,
                         proofs,
-                        raw_code + 15,
-                        fabric_generation,
-                        agent_generation,
-                        terminal_mode,
+                        context.with_raw_code(raw_code + 15),
                         Some(assembly),
                         false,
                     )
@@ -1533,34 +1547,30 @@ impl DistributedAgentStackRuntimeCore {
     async fn complete_agent_activation_failure(
         &mut self,
         owner: &mut ManagedFabricRuntimeCore,
-        request: &DistributedAgentStackApplyRequestV1,
-        response_channel: ReferenceChannelBindingV1,
         proofs: Vec<DistributedFabricObservedTransportProofV1>,
-        raw_code: u16,
-        fabric_generation: ManagedServiceGeneration,
-        agent_generation: ManagedServiceGeneration,
-        terminal_mode: &ActivationTerminalMode,
+        context: ActivationContext<'_>,
         assembly: Option<ManagedAgentAssembly>,
         mut agent_cleanup_uncertain: bool,
     ) -> Result<DistributedAgentStackTerminalReceiptV1, DistributedAgentStackRuntimeError> {
+        let request = context.request;
+        let response_channel = context.response_channel;
+        let raw_code = context.raw_code;
+        let fabric_generation = context.fabric_generation;
+        let agent_generation = context.agent_generation;
+        let terminal_mode = context.terminal_mode;
         self.handle = None;
         self.handle_publication_pending = false;
-        if let Some(mut assembly) = assembly {
-            if assembly.shutdown().await.is_err() {
-                self.assembly = Some(assembly);
-                agent_cleanup_uncertain = true;
-            }
+        if let Some(mut assembly) = assembly
+            && assembly.shutdown().await.is_err()
+        {
+            self.assembly = Some(assembly);
+            agent_cleanup_uncertain = true;
         }
         if agent_cleanup_uncertain {
             return self.commit_agent_activation_quarantine(
                 owner,
-                request,
-                response_channel,
                 proofs,
-                raw_code,
-                fabric_generation,
-                agent_generation,
-                terminal_mode,
+                context,
             );
         }
         if self.cleanup_live().await {
@@ -1574,15 +1584,17 @@ impl DistributedAgentStackRuntimeCore {
         } else {
             self.complete_uncertain_cleanup(
                 owner,
-                request,
-                response_channel,
-                proofs,
-                raw_code,
-                TerminalGenerations {
-                    fabric: Some(fabric_generation),
-                    agent: Some(agent_generation),
+                UncertainCleanupInput {
+                    request,
+                    response_channel,
+                    proofs,
+                    raw_code,
+                    generations: TerminalGenerations {
+                        fabric: Some(fabric_generation),
+                        agent: Some(agent_generation),
+                    },
+                    terminal_mode,
                 },
-                terminal_mode,
             )
         }
     }
@@ -1603,17 +1615,17 @@ impl DistributedAgentStackRuntimeCore {
     fn commit_agent_activation_quarantine(
         &mut self,
         owner: &mut ManagedFabricRuntimeCore,
-        request: &DistributedAgentStackApplyRequestV1,
-        response_channel: ReferenceChannelBindingV1,
         proofs: Vec<DistributedFabricObservedTransportProofV1>,
-        raw_code: u16,
-        fabric_generation: ManagedServiceGeneration,
-        agent_generation: ManagedServiceGeneration,
-        terminal_mode: &ActivationTerminalMode,
+        context: ActivationContext<'_>,
     ) -> Result<DistributedAgentStackTerminalReceiptV1, DistributedAgentStackRuntimeError> {
+        let request = context.request;
+        let response_channel = context.response_channel;
+        let raw_code = context.raw_code;
+        let fabric_generation = context.fabric_generation;
+        let agent_generation = context.agent_generation;
         self.handle = None;
         self.handle_publication_pending = false;
-        match terminal_mode {
+        match context.terminal_mode {
             ActivationTerminalMode::RecordActiveReady => self.terminalize_quarantined(
                 owner,
                 request,
@@ -1626,9 +1638,13 @@ impl DistributedAgentStackRuntimeCore {
                 },
             ),
             ActivationTerminalMode::PreserveHistoricalActive(historical) => {
-                self.validate_historical_active_terminal(request, response_channel, historical)?;
+                self.validate_historical_active_terminal(
+                    request,
+                    response_channel,
+                    historical.as_ref(),
+                )?;
                 self.commit_cleanup_quarantine(owner, request, raw_code)?;
-                Ok(historical.clone())
+                Ok(historical.as_ref().clone())
             }
         }
     }
@@ -1742,7 +1758,7 @@ impl DistributedAgentStackRuntimeCore {
                     owner,
                     request,
                     response_channel,
-                    historical,
+                    historical.as_ref(),
                     decision.raw_code,
                 ),
         }?;
@@ -1756,13 +1772,16 @@ impl DistributedAgentStackRuntimeCore {
     fn complete_uncertain_cleanup(
         &mut self,
         owner: &mut ManagedFabricRuntimeCore,
-        request: &DistributedAgentStackApplyRequestV1,
-        response_channel: ReferenceChannelBindingV1,
-        proofs: Vec<DistributedFabricObservedTransportProofV1>,
-        raw_code: u16,
-        generations: TerminalGenerations,
-        terminal_mode: &ActivationTerminalMode,
+        input: UncertainCleanupInput<'_>,
     ) -> Result<DistributedAgentStackTerminalReceiptV1, DistributedAgentStackRuntimeError> {
+        let UncertainCleanupInput {
+            request,
+            response_channel,
+            proofs,
+            raw_code,
+            generations,
+            terminal_mode,
+        } = input;
         match terminal_mode {
             ActivationTerminalMode::RecordActiveReady => self.terminalize_quarantined(
                 owner,
@@ -1773,9 +1792,13 @@ impl DistributedAgentStackRuntimeCore {
                 generations,
             ),
             ActivationTerminalMode::PreserveHistoricalActive(historical) => {
-                self.validate_historical_active_terminal(request, response_channel, historical)?;
+                self.validate_historical_active_terminal(
+                    request,
+                    response_channel,
+                    historical.as_ref(),
+                )?;
                 self.commit_cleanup_quarantine(owner, request, raw_code)?;
-                Ok(historical.clone())
+                Ok(historical.as_ref().clone())
             }
         }
     }
@@ -4166,13 +4189,16 @@ mod tests {
         let receipt = distributed
             .commit_snapshot_evidence_and_activate(
                 &mut owner,
-                &request,
-                channel,
                 validated_snapshot,
                 fabric_control.clone(),
-                agent_generation,
-                0xd8,
-                &terminal_mode,
+                ActivationContext {
+                    request: &request,
+                    response_channel: channel,
+                    fabric_generation,
+                    agent_generation,
+                    raw_code: 0xd8,
+                    terminal_mode: &terminal_mode,
+                },
             )
             .await
             .unwrap_or_else(|error| panic!("activation vertical failed: {error}"));
@@ -4409,8 +4435,9 @@ mod tests {
             recovery_selection.contains("match self.lookup_terminal(&request, response_channel)?")
         );
         assert!(
-            recovery_selection
-                .contains("ActivationTerminalMode::PreserveHistoricalActive(historical)")
+            recovery_selection.contains(
+                "ActivationTerminalMode::PreserveHistoricalActive(Box::new(historical))",
+            )
         );
         assert!(recovery_selection.contains(
             "Some(_) => return Err(DistributedAgentStackRuntimeError::InvalidDurableState)"
@@ -4654,19 +4681,22 @@ mod tests {
             &fixture.request,
             INITIAL_RUNTIME_EPOCH + 1,
         );
-        let mode = ActivationTerminalMode::PreserveHistoricalActive(fixture.historical.clone());
+        let mode =
+            ActivationTerminalMode::PreserveHistoricalActive(Box::new(fixture.historical.clone()));
         let returned = distributed
             .complete_uncertain_cleanup(
                 &mut owner,
-                &fixture.request,
-                fixture.channel,
-                Vec::new(),
-                0x71,
-                TerminalGenerations {
-                    fabric: Some(generation(FABRIC_GENERATION)),
-                    agent: Some(generation(AGENT_GENERATION)),
+                UncertainCleanupInput {
+                    request: &fixture.request,
+                    response_channel: fixture.channel,
+                    proofs: Vec::new(),
+                    raw_code: 0x71,
+                    generations: TerminalGenerations {
+                        fabric: Some(generation(FABRIC_GENERATION)),
+                        agent: Some(generation(AGENT_GENERATION)),
+                    },
+                    terminal_mode: &mode,
                 },
-                &mode,
             )
             .unwrap_or_else(|error| panic!("uncertain cleanup quarantine failed: {error}"));
         assert_eq!(

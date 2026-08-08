@@ -118,9 +118,9 @@ pub fn run_deploymentd_process() -> Result<(), DeploymentdProcessError> {
 #[cfg(unix)]
 pub(crate) use platform::{
     DistributedAgentStackOwnerApplyErrorV1, DistributedAgentStackOwnerApplyOutcomeV1,
-    DistributedAgentStackOwnerConnectorInputV1, DistributedAgentStackOwnerNodeInputV1,
-    DistributedAgentStackOwnerTargetInputV1, DistributedCoordinatorContextV1,
-    run_developer_local_distributed_agent_stack_owner_v1,
+    DistributedAgentStackOwnerConnectorInputV1, DistributedAgentStackOwnerNodeInputFieldsV1,
+    DistributedAgentStackOwnerNodeInputV1, DistributedAgentStackOwnerTargetInputV1,
+    DistributedCoordinatorContextV1, run_developer_local_distributed_agent_stack_owner_v1,
     verify_distributed_coordinator_context_v1,
 };
 
@@ -1764,17 +1764,29 @@ mod platform {
         observation_token: Zeroizing<[u8; 32]>,
     }
 
+    pub(crate) struct DistributedAgentStackOwnerNodeInputFieldsV1 {
+        pub(crate) management_target: NodeManagementTargetV1,
+        pub(crate) socket_path: PathBuf,
+        pub(crate) expected_uid: u32,
+        pub(crate) expected_gid: u32,
+        pub(crate) token: Zeroizing<[u8; 32]>,
+        pub(crate) observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+        pub(crate) observation_socket_path: PathBuf,
+        pub(crate) observation_token: Zeroizing<[u8; 32]>,
+    }
+
     impl DistributedAgentStackOwnerNodeInputV1 {
-        pub(crate) fn new(
-            management_target: NodeManagementTargetV1,
-            socket_path: PathBuf,
-            expected_uid: u32,
-            expected_gid: u32,
-            token: Zeroizing<[u8; 32]>,
-            observation_endpoint_ref: RuntimeObservationEndpointRefV1,
-            observation_socket_path: PathBuf,
-            observation_token: Zeroizing<[u8; 32]>,
-        ) -> Self {
+        pub(crate) fn new(fields: DistributedAgentStackOwnerNodeInputFieldsV1) -> Self {
+            let DistributedAgentStackOwnerNodeInputFieldsV1 {
+                management_target,
+                socket_path,
+                expected_uid,
+                expected_gid,
+                token,
+                observation_endpoint_ref,
+                observation_socket_path,
+                observation_token,
+            } = fields;
             Self {
                 management_target,
                 socket_path,
@@ -2116,7 +2128,7 @@ mod platform {
     }
 
     enum StagedNodeObservationV1 {
-        Response(TransportAuthenticatedNodeResponseV1),
+        Response(Box<TransportAuthenticatedNodeResponseV1>),
         Disconnected(u64),
     }
 
@@ -2135,7 +2147,7 @@ mod platform {
 
         fn next(&mut self) -> u64 {
             let elapsed = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            let minimum = self.last.checked_add(1).unwrap_or(u64::MAX);
+            let minimum = self.last.saturating_add(1);
             let next = elapsed.max(minimum);
             self.last = next;
             next
@@ -2403,8 +2415,7 @@ mod platform {
             .state()
             .ok_or_else(|| process_error(ProcessErrorKind::NodeDiscovery))?;
         let runtime_targets = owner.node_discovery().runtime_targets();
-        for index in 0..2 {
-            let row = &state.targets()[index];
+        for (index, row) in state.targets().iter().enumerate() {
             if row.target() != runtime_targets[index]
                 || row.request().target_execution().topology()
                     != Some(&input.targets[index].topology)
@@ -2717,7 +2728,7 @@ mod platform {
         ] {
             node_state = match staged {
                 StagedNodeObservationV1::Response(response) => {
-                    node_state.try_observe_authenticated(target, request, response)
+                    node_state.try_observe_authenticated(target, request, *response)
                 }
                 StagedNodeObservationV1::Disconnected(observed_at_nanos) => {
                     node_state.try_observe_disconnect(target, generation, observed_at_nanos)
@@ -2867,32 +2878,32 @@ mod platform {
                     .ok_or(DistributedAgentStackOwnerApplyErrorV1::Operation)?,
             ];
             let inputs = [
-                build_distributed_runtime_query_input(
-                    &coordinator.controller_signer,
-                    &predecessors[0],
-                    input.targets[0].node_target.management_target(),
-                    first_observation,
-                    intended_sequences[0],
-                    entropy[..16]
+                build_distributed_runtime_query_input(DistributedRuntimeQueryBuildInputV1 {
+                    signer: &coordinator.controller_signer,
+                    predecessor: &predecessors[0],
+                    node_target: input.targets[0].node_target.management_target(),
+                    observation: first_observation,
+                    intended_status_sequence: intended_sequences[0],
+                    query_id: entropy[..16]
                         .try_into()
                         .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?,
-                    issued_at,
-                    expires_at,
-                    freshness_budget,
-                )?,
-                build_distributed_runtime_query_input(
-                    &coordinator.controller_signer,
-                    &predecessors[1],
-                    input.targets[1].node_target.management_target(),
-                    second_observation,
-                    intended_sequences[1],
-                    entropy[16..]
+                    issued_at_unix_nanos: issued_at,
+                    expires_at_unix_nanos: expires_at,
+                    freshness_budget_nanos: freshness_budget,
+                })?,
+                build_distributed_runtime_query_input(DistributedRuntimeQueryBuildInputV1 {
+                    signer: &coordinator.controller_signer,
+                    predecessor: &predecessors[1],
+                    node_target: input.targets[1].node_target.management_target(),
+                    observation: second_observation,
+                    intended_status_sequence: intended_sequences[1],
+                    query_id: entropy[16..]
                         .try_into()
                         .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?,
-                    issued_at,
-                    expires_at,
-                    freshness_budget,
-                )?,
+                    issued_at_unix_nanos: issued_at,
+                    expires_at_unix_nanos: expires_at,
+                    freshness_budget_nanos: freshness_budget,
+                })?,
             ];
             let next = owner
                 .node_discovery()
@@ -2939,7 +2950,7 @@ mod platform {
         }
 
         let mut stages = [DistributedRuntimeObservationStageV1::Complete; 2];
-        for index in 0..2 {
+        for (index, stage) in stages.iter_mut().enumerate() {
             let publication = advance_distributed_runtime_observation_once(
                 &runtime,
                 &mut coordinator,
@@ -2947,7 +2958,7 @@ mod platform {
                 input,
                 index,
             )?;
-            stages[index] = publication;
+            *stage = publication;
         }
         if stages
             .iter()
@@ -2992,20 +3003,35 @@ mod platform {
         }
     }
 
-    fn build_distributed_runtime_query_input(
-        signer: &SigningKey,
-        predecessor: &VerifiedDistributedAgentStackPredecessorV1,
+    struct DistributedRuntimeQueryBuildInputV1<'a> {
+        signer: &'a SigningKey,
+        predecessor: &'a VerifiedDistributedAgentStackPredecessorV1,
         node_target: NodeManagementTargetV1,
-        observation: &DistributedAgentStackOwnerRuntimeObservationV1,
+        observation: &'a DistributedAgentStackOwnerRuntimeObservationV1,
         intended_status_sequence: u64,
         query_id: [u8; 16],
         issued_at_unix_nanos: u64,
         expires_at_unix_nanos: u64,
         freshness_budget_nanos: u64,
+    }
+
+    fn build_distributed_runtime_query_input(
+        input: DistributedRuntimeQueryBuildInputV1<'_>,
     ) -> Result<DistributedAgentStackRuntimeQueryInputV1, DistributedAgentStackOwnerApplyErrorV1>
     {
+        let DistributedRuntimeQueryBuildInputV1 {
+            signer,
+            predecessor,
+            node_target,
+            observation,
+            intended_status_sequence,
+            query_id,
+            issued_at_unix_nanos,
+            expires_at_unix_nanos,
+            freshness_budget_nanos,
+        } = input;
         let nonce = derive_runtime_observation_query_nonce_v1(
-            &*observation.token,
+            &observation.token,
             node_target,
             observation.endpoint_ref,
             &observation.authority,
@@ -3623,7 +3649,7 @@ mod platform {
         clock: &mut CurrentProcessObservationClockV1,
     ) -> Result<StagedNodeObservationV1, DeploymentdProcessError> {
         match runtime.block_on(endpoint.exchange(request, generation, || clock.next())) {
-            Ok(response) => Ok(StagedNodeObservationV1::Response(response)),
+            Ok(response) => Ok(StagedNodeObservationV1::Response(Box::new(response))),
             Err(TrustedLocalNodeClientErrorV1::Disconnected) => {
                 Ok(StagedNodeObservationV1::Disconnected(clock.next()))
             }
@@ -5563,10 +5589,9 @@ mod platform {
             if let (Some(first), Some(second)) = (
                 self.predecessors[0].connector.as_ref(),
                 self.predecessors[1].connector.as_ref(),
-            ) {
-                if first.profile_ref == second.profile_ref {
-                    return Err(process_error(ProcessErrorKind::NodeDiscovery));
-                }
+            ) && first.profile_ref == second.profile_ref
+            {
+                return Err(process_error(ProcessErrorKind::NodeDiscovery));
             }
             let roots = [
                 &self.coordinator.common.state_directory,

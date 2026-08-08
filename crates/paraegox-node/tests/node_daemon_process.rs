@@ -280,7 +280,7 @@ impl Fixture {
         assert_eq!(decoded_observation.node_target(), target);
         assert_eq!(
             decoded_observation.authorities(),
-            &[observation_authority.clone()]
+            std::slice::from_ref(&observation_authority)
         );
         observation_bootstrap
             .write_owner_private_file(&observation_bootstrap_path)

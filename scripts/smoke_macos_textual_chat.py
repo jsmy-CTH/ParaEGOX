@@ -109,7 +109,7 @@ def _wait_for_exit(process: subprocess.Popen[bytes], timeout_seconds: float) -> 
     try:
         return_code = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
-        raise TimeoutError("paraegox did not join after /quit") from error
+        raise TimeoutError("paraegox did not join after the Textual Ctrl+C quit binding") from error
     if return_code != 0:
         raise RuntimeError(f"paraegox exited unsuccessfully with code {return_code}")
 
@@ -202,7 +202,11 @@ def main() -> int:
                 f"echo: {_MESSAGE}".encode(),
                 _REPLY_TIMEOUT_SECONDS,
             )
-            os.write(master_fd, b"/quit\r")
+            # Textual owns Ctrl+C as a priority binding while it is in raw
+            # terminal mode. Exercise that public application-level exit path
+            # directly instead of racing a second Input submission with the
+            # response redraw that supplied the Echo marker above.
+            os.write(master_fd, b"\x03")
             _wait_for_exit(process, _EXIT_TIMEOUT_SECONDS)
         except Exception:
             print(_safe_terminal_tail(capture))

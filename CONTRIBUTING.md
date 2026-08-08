@@ -183,15 +183,15 @@ are:
 ```bash
 uv lock --check
 uv run --frozen ruff check .
-uv run --frozen pytest --deselect=tests/system/test_s6_python_reference_worker.py::test_rust_process_domain_owns_real_python_worker_fault_matrix
+uv run --frozen pytest tests/agent_worker tests/console tests/contract tests/unit tests/governance/test_s7_pure_compile_boundary.py tests/governance/test_s7_tenure_authority_boundary.py
 ```
 
-The complete governance checker and the deselected case remain required and run on Ubuntu/CI with
-the pinned Rust toolchain in this workflow. All Rust commands in the repository-wide list also
-remain required on their admitted Ubuntu/CI host. A Mac result may report the permitted checks that
-actually ran, but must report the complete governance checker as not run; it must never claim a
-governance pass from a Cargo-free subset. This host-specific orchestration split is not a waiver, a
-global skip, or a reduction of required validation.
+The complete governance checker, its excluded integration test, and all system tests remain
+required and run on Ubuntu/CI with the pinned Rust toolchain in this workflow. All Rust commands in
+the repository-wide list also remain required on their admitted Ubuntu/CI host. A Mac result may
+report the permitted checks that actually ran, but must report the complete governance checker as
+not run; it must never claim a governance pass from a Cargo-free subset. This host-specific
+orchestration split is not a waiver, a global skip, or a reduction of required validation.
 
 Cargo is the authority for Rust dependencies, builds and tests, while `uv`, Python
 `pyproject.toml` and `uv.lock` remain

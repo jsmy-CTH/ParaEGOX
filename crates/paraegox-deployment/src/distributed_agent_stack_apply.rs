@@ -379,7 +379,6 @@ impl DistributedAgentStackRestrictedTerminalizeOutcomeV1 {
         self.target
     }
 
-    #[must_use]
     pub(crate) const fn terminal_result(
         &self,
     ) -> &Result<
@@ -429,6 +428,12 @@ impl fmt::Display for DistributedAgentStackRestrictedDispatchErrorV1 {
 
 #[cfg(unix)]
 impl std::error::Error for DistributedAgentStackRestrictedDispatchErrorV1 {}
+
+#[cfg(unix)]
+type DistributedAgentStackRestrictedShutdownAfterDispatchPartsV1 = (
+    [DistributedAgentStackRestrictedDispatchOutcomeV1; 2],
+    [Result<(), RestrictedRuntimeApplyErrorV1>; 2],
+);
 
 /// Stable Controller connector-composition failures. Primary start/dispatch
 /// failures and every explicit session-cleanup result remain independently
@@ -527,13 +532,7 @@ impl DistributedAgentStackRestrictedConnectorErrorV1 {
     /// outcomes beside both cleanup results. Other variants remain intact.
     pub(crate) fn into_shutdown_after_dispatch_parts(
         self,
-    ) -> Result<
-        (
-            [DistributedAgentStackRestrictedDispatchOutcomeV1; 2],
-            [Result<(), RestrictedRuntimeApplyErrorV1>; 2],
-        ),
-        Self,
-    > {
+    ) -> Result<DistributedAgentStackRestrictedShutdownAfterDispatchPartsV1, Self> {
         match self {
             Self::ShutdownAfterDispatch {
                 outcomes,
