@@ -448,12 +448,18 @@ client_private_key_file = "{credentials / 'node-client-key.pem'}"
 
 def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
     if sys.platform != "linux":
-        pytest.skip("the public Deployment process smoke is Linux-only")
+        pytest.skip(  # GOV-WAIVER-0013
+            "the public Deployment process smoke is Linux-only"
+        )
     if os.geteuid() != 0:
-        pytest.skip("the harness requires root only to prepare and drop to a non-root uid")
+        pytest.skip(  # GOV-WAIVER-0013
+            "the harness requires root only to prepare and drop to a non-root uid"
+        )
     binary_value = os.environ.get("PARAEGOX_PUBLIC_CLI_BINARY")
     if binary_value is None:
-        pytest.skip("set PARAEGOX_PUBLIC_CLI_BINARY to an already built exact-ref binary")
+        pytest.skip(  # GOV-WAIVER-0013
+            "set PARAEGOX_PUBLIC_CLI_BINARY to an already built exact-ref binary"
+        )
     source_binary = Path(binary_value).resolve(strict=True)
     setpriv = shutil.which("setpriv")
     assert setpriv is not None
