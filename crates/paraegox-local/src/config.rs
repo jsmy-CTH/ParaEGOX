@@ -32,8 +32,8 @@ use paraegox_runtime_contracts::distributed_agent_stack_plan::{
 };
 use paraegox_runtime_contracts::{
     managed_agent_stack_plan::{
-        ManagedAgentProviderProfileV1, ManagedAgentProviderRefV1,
-        ManagedAgentProviderSelectionV1, ManagedAgentStackPlanError,
+        ManagedAgentProviderProfileV1, ManagedAgentProviderRefV1, ManagedAgentProviderSelectionV1,
+        ManagedAgentStackPlanError,
     },
     managed_fabric_plan::ManagedFabricListenEndpointV1,
     managed_service::ManagedServiceId,
@@ -332,9 +332,7 @@ impl DeveloperNodeConfigV1 {
         self.node_control.as_ref()
     }
 
-    pub(crate) const fn managed_agent_bootstrap(
-        &self,
-    ) -> Option<&ManagedAgentBootstrapFixtureV3> {
+    pub(crate) const fn managed_agent_bootstrap(&self) -> Option<&ManagedAgentBootstrapFixtureV3> {
         self.managed_agent_bootstrap.as_ref()
     }
 
@@ -665,9 +663,7 @@ impl DeveloperDeploymentAgentBootstrapConfigV2 {
         &self.fabric_listen
     }
 
-    pub(crate) const fn limits_profile(
-        &self,
-    ) -> DeveloperDeploymentAgentBootstrapLimitsProfileV1 {
+    pub(crate) const fn limits_profile(&self) -> DeveloperDeploymentAgentBootstrapLimitsProfileV1 {
         self.limits_profile
     }
 }
@@ -2082,10 +2078,9 @@ pub(crate) fn parse_developer_deployment_config_toml_v1(
         (DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V2, true) => {
             DeveloperDeploymentConfigSchemaV1::ManagedAgentBootstrapV2
         }
-        (
-            DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1 | DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V2,
-            _,
-        ) => return Err(ConfigError::InvalidDeploymentConfiguration),
+        (DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1 | DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V2, _) => {
+            return Err(ConfigError::InvalidDeploymentConfiguration);
+        }
         _ => return Err(ConfigError::UnsupportedConfigSchema),
     };
     let state_root = parse_deployment_path(document.state_root)?;
@@ -2222,9 +2217,7 @@ fn parse_node_config_document(
     ) {
         (NODE_CONFIG_SCHEMA_V1, false, false) => DeveloperNodeConfigSchemaV1::HostLocalV1,
         (NODE_CONFIG_SCHEMA_V2, true, false) => DeveloperNodeConfigSchemaV1::RemoteControlV2,
-        (NODE_CONFIG_SCHEMA_V3, true, true) => {
-            DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
-        }
+        (NODE_CONFIG_SCHEMA_V3, true, true) => DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3,
         (NODE_CONFIG_SCHEMA_V1 | NODE_CONFIG_SCHEMA_V2 | NODE_CONFIG_SCHEMA_V3, _, _) => {
             return Err(ConfigError::InvalidNodeConfiguration);
         }
@@ -2505,9 +2498,7 @@ fn developer_node_config_commitment(
     digest.update(match schema {
         DeveloperNodeConfigSchemaV1::HostLocalV1 => NODE_CONFIG_COMMITMENT_V1_DOMAIN,
         DeveloperNodeConfigSchemaV1::RemoteControlV2 => NODE_CONFIG_COMMITMENT_V2_DOMAIN,
-        DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3 => {
-            NODE_CONFIG_COMMITMENT_V3_DOMAIN
-        }
+        DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3 => NODE_CONFIG_COMMITMENT_V3_DOMAIN,
     });
     digest.update(schema.wire_value().to_be_bytes());
     update_node_commitment_field(&mut digest, state_root.as_os_str().as_encoded_bytes());
@@ -2537,10 +2528,7 @@ fn developer_node_config_commitment(
         }
     }
     if let Some(managed_agent_bootstrap) = managed_agent_bootstrap {
-        update_node_commitment_field(
-            &mut digest,
-            managed_agent_bootstrap.provider.as_bytes(),
-        );
+        update_node_commitment_field(&mut digest, managed_agent_bootstrap.provider.as_bytes());
     }
     digest.finalize().into()
 }
@@ -2560,9 +2548,7 @@ pub(crate) fn derive_developer_node_managed_agent_provider_ref(
     let mut digest = Sha256::new();
     digest.update(NODE_MANAGED_AGENT_PROVIDER_REF_DOMAIN);
     digest.update(NODE_CONFIG_SCHEMA_V3.to_be_bytes());
-    digest.update(
-        (ManagedAgentProviderProfileV1::DeterministicFixture as u16).to_be_bytes(),
-    );
+    digest.update((ManagedAgentProviderProfileV1::DeterministicFixture as u16).to_be_bytes());
     digest.update(target.as_bytes());
     digest.update(node_config_commitment.as_bytes());
     digest.update(provider_config_digest.as_bytes());
@@ -2584,10 +2570,7 @@ fn developer_node_managed_agent_provider_selection(
         node_config_commitment,
         provider_config_digest,
     )?;
-    ManagedAgentProviderSelectionV1::try_deterministic_fixture(
-        provider_ref,
-        provider_config_digest,
-    )
+    ManagedAgentProviderSelectionV1::try_deterministic_fixture(provider_ref, provider_config_digest)
 }
 
 struct DeveloperNodeControlRouteConfigDigestInputV2<'a> {
@@ -3463,11 +3446,9 @@ client_private_key_file = {:?}
         }
 
         fn document_v2(&self) -> String {
-            let enrollment = self.document().replacen(
-                "schema_version = 1",
-                "schema_version = 2",
-                1,
-            );
+            let enrollment =
+                self.document()
+                    .replacen("schema_version = 1", "schema_version = 2", 1);
             format!(
                 r#"{enrollment}
 [managed_agent_bootstrap]
@@ -3857,8 +3838,8 @@ limits_profile = "developer-agent-bootstrap-v1"
         let fixture = DeploymentConfigFixture::new();
         let v1 = fixture.document();
         let v2 = fixture.document_v2();
-        let config = parse_developer_deployment_config_toml_v1(&v2)
-            .expect("strict Deployment v2 config");
+        let config =
+            parse_developer_deployment_config_toml_v1(&v2).expect("strict Deployment v2 config");
         assert_eq!(
             config.schema(),
             DeveloperDeploymentConfigSchemaV1::ManagedAgentBootstrapV2
@@ -4338,10 +4319,9 @@ limits_profile = "developer-agent-bootstrap-v1"
             Err(ConfigError::InvalidNodeConfiguration)
         );
         assert_eq!(
-            parse_node_config_toml_for_test(&document.replace(
-                "deterministic-echo-v1",
-                "openai-responses-v1"
-            )),
+            parse_node_config_toml_for_test(
+                &document.replace("deterministic-echo-v1", "openai-responses-v1")
+            ),
             Err(ConfigError::InvalidNodeConfiguration)
         );
         let desired_injection = document.replace(

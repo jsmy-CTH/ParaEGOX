@@ -51,11 +51,11 @@ use sha2::{Digest as _, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{
-    derive_developer_node_managed_agent_provider_ref,
-    deterministic_fixture_provider_configuration_digest,
     DeveloperDistributedFixtureActionV1, DeveloperDistributedFixtureConfigV1,
     DeveloperFixtureConfigV1, DeveloperNodeConfigSchemaV1, DeveloperNodeConfigV1,
     DeveloperProvisionedConfigV1, ProviderProfileV1,
+    derive_developer_node_managed_agent_provider_ref,
+    deterministic_fixture_provider_configuration_digest,
 };
 
 const IDENTITY_DIRECTORY_NAME: &str = "developer-local-identity-v1";
@@ -3662,11 +3662,8 @@ impl DeveloperNodeEnrollmentArtifactV2 {
     }
 
     fn decode(frame: &[u8]) -> Result<Self, IdentityManifestError> {
-        DeveloperNodeEnrollmentArtifactV1::decode_exact(
-            frame,
-            NODE_ENROLLMENT_ARTIFACT_V2_VERSION,
-        )
-        .map(Self)
+        DeveloperNodeEnrollmentArtifactV1::decode_exact(frame, NODE_ENROLLMENT_ARTIFACT_V2_VERSION)
+            .map(Self)
     }
 
     pub(crate) const fn common(&self) -> &DeveloperNodeEnrollmentArtifactV1 {
@@ -3694,9 +3691,7 @@ fn node_enrollment_artifact_signature_transcript(
         NODE_ENROLLMENT_ARTIFACT_V2_VERSION => NODE_ENROLLMENT_ARTIFACT_V2_SIGNATURE_DOMAIN,
         _ => return Err(IdentityManifestError::InvalidEnrollmentArtifact),
     };
-    let mut transcript = Vec::with_capacity(
-        domain.len() + 2 + 4 + unsigned.len(),
-    );
+    let mut transcript = Vec::with_capacity(domain.len() + 2 + 4 + unsigned.len());
     transcript.extend_from_slice(domain);
     transcript.extend_from_slice(&version.to_be_bytes());
     transcript.extend_from_slice(
@@ -3754,8 +3749,7 @@ fn publish_or_reopen_enrollment_artifact(
             {
                 return Err(IdentityManifestError::EnrollmentArtifactPublicationConflict);
             }
-            let recovered =
-                read_enrollment_artifact_file(path, 2, expected.wire_version)?;
+            let recovered = read_enrollment_artifact_file(path, 2, expected.wire_version)?;
             if recovered.canonical_wire != expected.canonical_wire {
                 return Err(IdentityManifestError::EnrollmentArtifactPublicationConflict);
             }
@@ -5178,9 +5172,10 @@ mod tests {
                     1,
                 )
                 .expect("Node target"),
-                runtime_observation_endpoint_ref:
-                    RuntimeObservationEndpointRefV1::try_from_bytes([0x1d; 16])
-                        .expect("Runtime observation endpoint"),
+                runtime_observation_endpoint_ref: RuntimeObservationEndpointRefV1::try_from_bytes(
+                    [0x1d; 16],
+                )
+                .expect("Runtime observation endpoint"),
                 enrollment_issuer_ref: [0x0c; 16],
             }
         }
@@ -5239,10 +5234,7 @@ mod tests {
         let digest_offset = wire.len() - NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES;
         let signature = SigningKey::from_bytes(runtime_response_signing_seed)
             .sign(
-                &node_enrollment_artifact_signature_transcript(
-                    version,
-                    &wire[..signature_offset],
-                )
+                &node_enrollment_artifact_signature_transcript(version, &wire[..signature_offset])
                     .expect("PXEA test signing transcript"),
             )
             .to_bytes();
@@ -5832,7 +5824,12 @@ mod tests {
             .expect("strict node v3 identity reopen");
         assert_eq!(reopened.encode_v3().as_bytes(), first_wire.as_bytes());
         assert!(!directory.path.join(NODE_IDENTITY_DIRECTORY_NAME).exists());
-        assert!(!directory.path.join(NODE_V2_IDENTITY_DIRECTORY_NAME).exists());
+        assert!(
+            !directory
+                .path
+                .join(NODE_V2_IDENTITY_DIRECTORY_NAME)
+                .exists()
+        );
 
         let v2 = crate::config::developer_node_config_v2_for_test(&directory.path);
         assert_eq!(
@@ -6092,10 +6089,7 @@ mod tests {
         let wire = artifact.canonical_wire();
 
         assert_eq!(read_u16(wire, 4), NODE_ENROLLMENT_ARTIFACT_V2_VERSION);
-        assert_eq!(
-            read_u16(wire, 12),
-            NODE_ENROLLMENT_ARTIFACT_V2_FIELD_COUNT
-        );
+        assert_eq!(read_u16(wire, 12), NODE_ENROLLMENT_ARTIFACT_V2_FIELD_COUNT);
         assert_eq!(wire.len(), legacy.canonical_wire().len() + 50);
         assert_eq!(
             &wire[PROVIDER_PROFILE_OFFSET..PROVIDER_REF_OFFSET],
@@ -6123,8 +6117,7 @@ mod tests {
             "../../../tests/fixtures/wire/t1_node_enrollment_artifact_v2.json"
         ))
         .expect("valid public-safe PXEA v2 golden fixture");
-        let provider_extension =
-            &wire[PROVIDER_PROFILE_OFFSET..PROVIDER_CONFIG_DIGEST_OFFSET + 32];
+        let provider_extension = &wire[PROVIDER_PROFILE_OFFSET..PROVIDER_CONFIG_DIGEST_OFFSET + 32];
         let provider_config_digest_hex = lower_hex(provider.config_digest().as_bytes());
         let provider_ref_hex = lower_hex(provider.provider_ref().as_bytes());
         let provider_extension_hex = lower_hex(provider_extension);
@@ -6261,10 +6254,7 @@ mod tests {
         let mut unknown_profile = wire.to_vec();
         unknown_profile[PROVIDER_PROFILE_OFFSET..PROVIDER_REF_OFFSET]
             .copy_from_slice(&u16::MAX.to_be_bytes());
-        resign_enrollment_wire(
-            &mut unknown_profile,
-            &fixture.runtime_response_signing_seed,
-        );
+        resign_enrollment_wire(&mut unknown_profile, &fixture.runtime_response_signing_seed);
         assert_eq!(
             DeveloperNodeEnrollmentArtifactV2::decode(&unknown_profile).unwrap_err(),
             IdentityManifestError::InvalidEnrollmentArtifact
