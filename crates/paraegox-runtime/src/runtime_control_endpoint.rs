@@ -11894,17 +11894,31 @@ mod tests {
         assert_local_unavailable_continues(managed);
 
         let assert_restricted_unavailable_continues = |service: &str| {
-            let unavailable = service
-                .find("Err(RuntimeRestrictedRemoteApplyErrorV1::Unavailable)")
+            let legacy_unavailable = service
+                .find("RuntimeRestrictedRemoteApplyErrorV1::Unavailable => None")
                 .unwrap_or_else(|| panic!("restricted Unavailable classification disappeared"));
-            let internal = service[unavailable..]
-                .find("Err(error @ RuntimeRestrictedRemoteApplyErrorV1::Internal)")
-                .map(|offset| unavailable + offset)
-                .unwrap_or_else(|| panic!("restricted Internal classification disappeared"));
-            let nonfatal = &service[unavailable..internal];
+            let control_unavailable = service
+                .find("RuntimeControlRequestError::Unavailable => None")
+                .unwrap_or_else(|| panic!("control Unavailable classification disappeared"));
+            let nonfatal_response = service
+                .find("Err(None) => {")
+                .unwrap_or_else(|| panic!("generic nonfatal response classification disappeared"));
+            let internal_response = service[nonfatal_response..]
+                .find("Err(Some(error)) => {")
+                .map(|offset| nonfatal_response + offset)
+                .unwrap_or_else(|| panic!("generic Internal classification disappeared"));
+            let continuation = service[internal_response..]
+                .find("continue;")
+                .map(|offset| internal_response + offset)
+                .unwrap_or_else(|| panic!("restricted loop continuation disappeared"));
+            assert!(legacy_unavailable < nonfatal_response);
+            assert!(control_unavailable < nonfatal_response);
+            let nonfatal = &service[nonfatal_response..internal_response];
             assert!(nonfatal.contains("drop(inbound)"));
             assert!(!nonfatal.contains("break"));
-            assert!(service[internal..].contains("continue;"));
+            let fatal = &service[internal_response..continuation];
+            assert!(fatal.contains("drop(inbound)"));
+            assert!(fatal.contains("break"));
         };
         assert_restricted_unavailable_continues(developer);
         assert_restricted_unavailable_continues(managed);
