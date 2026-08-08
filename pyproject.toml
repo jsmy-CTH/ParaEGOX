@@ -1,11 +1,14 @@
 [project]
-name = "paraegox-governance"
+name = "paraegox-sdk"
 version = "0.0.0"
-description = "ParaEGOX Python governance tooling and subordinate reference worker"
+description = "ParaEGOX Python governance tooling, typed Textual console, and managed-workload SDK"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "textual>=8.2.1,<9",
+]
 
 [project.scripts]
+paraegox-console = "paraegox_sdk.console_tui:main"
 paraegox-worker = "paraegox_sdk.worker.__main__:main"
 
 [build-system]

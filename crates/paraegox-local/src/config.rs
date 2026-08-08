@@ -478,8 +478,6 @@ impl FabricLoopbackListenV1 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DeveloperLocalProfileV1 {
-    platform: PlatformProfileV1,
-    topology: DeveloperLocalTopologyV1,
     provider: ProviderProfileV1,
     request_deadline_budget: Duration,
     operation_timeout: Duration,
@@ -489,8 +487,6 @@ pub(crate) struct DeveloperLocalProfileV1 {
 impl DeveloperLocalProfileV1 {
     const fn fixed_fixture() -> Self {
         Self {
-            platform: PlatformProfileV1::UnixDeveloperLocalV1,
-            topology: DeveloperLocalTopologyV1::SingleLogicalNodeV1,
             provider: ProviderProfileV1::DeterministicFixtureV1,
             request_deadline_budget: DEVELOPER_REQUEST_DEADLINE_BUDGET,
             operation_timeout: DEVELOPER_OPERATION_TIMEOUT,
@@ -500,8 +496,6 @@ impl DeveloperLocalProfileV1 {
 
     const fn fixed_distributed_fixture() -> Self {
         Self {
-            platform: PlatformProfileV1::UnixDeveloperLocalV1,
-            topology: DeveloperLocalTopologyV1::TwoLogicalNodesV1,
             provider: ProviderProfileV1::DeterministicFixtureV1,
             request_deadline_budget: DEVELOPER_REQUEST_DEADLINE_BUDGET,
             operation_timeout: DEVELOPER_OPERATION_TIMEOUT,
@@ -511,8 +505,6 @@ impl DeveloperLocalProfileV1 {
 
     const fn fixed_openai() -> Self {
         Self {
-            platform: PlatformProfileV1::UnixDeveloperLocalV1,
-            topology: DeveloperLocalTopologyV1::SingleLogicalNodeV1,
             provider: ProviderProfileV1::OpenAiResponsesV1,
             request_deadline_budget: DEVELOPER_REQUEST_DEADLINE_BUDGET,
             operation_timeout: DEVELOPER_OPERATION_TIMEOUT,
@@ -522,46 +514,11 @@ impl DeveloperLocalProfileV1 {
 
     const fn fixed_deepseek() -> Self {
         Self {
-            platform: PlatformProfileV1::UnixDeveloperLocalV1,
-            topology: DeveloperLocalTopologyV1::SingleLogicalNodeV1,
             provider: ProviderProfileV1::DeepSeekChatCompletionsV1,
             request_deadline_budget: DEVELOPER_REQUEST_DEADLINE_BUDGET,
             operation_timeout: DEVELOPER_OPERATION_TIMEOUT,
             command_capacity: DEVELOPER_COMMAND_CAPACITY,
         }
-    }
-
-    pub(crate) const fn tui_mode_label(self) -> &'static str {
-        match (self.platform, self.topology, self.provider) {
-            (
-                PlatformProfileV1::UnixDeveloperLocalV1,
-                DeveloperLocalTopologyV1::SingleLogicalNodeV1,
-                ProviderProfileV1::DeterministicFixtureV1,
-            ) => "DEVELOPER FIXTURE V1",
-            (
-                PlatformProfileV1::UnixDeveloperLocalV1,
-                DeveloperLocalTopologyV1::TwoLogicalNodesV1,
-                ProviderProfileV1::DeterministicFixtureV1,
-            ) => "INTERNAL DISTRIBUTED FIXTURE V1",
-            (
-                PlatformProfileV1::UnixDeveloperLocalV1,
-                DeveloperLocalTopologyV1::SingleLogicalNodeV1,
-                ProviderProfileV1::OpenAiResponsesV1,
-            ) => "DEVELOPER OPENAI V1",
-            (
-                PlatformProfileV1::UnixDeveloperLocalV1,
-                DeveloperLocalTopologyV1::SingleLogicalNodeV1,
-                ProviderProfileV1::DeepSeekChatCompletionsV1,
-            ) => "DEVELOPER DEEPSEEK V1",
-            // All fields are private and the admitted constructors above never
-            // create this unimplemented topology/provider combination.
-            _ => unreachable!(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn topology(self) -> DeveloperLocalTopologyV1 {
-        self.topology
     }
 
     pub(crate) const fn request_deadline_budget(self) -> Duration {
@@ -579,17 +536,6 @@ impl DeveloperLocalProfileV1 {
     pub(crate) const fn provider(self) -> ProviderProfileV1 {
         self.provider
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PlatformProfileV1 {
-    UnixDeveloperLocalV1,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DeveloperLocalTopologyV1 {
-    SingleLogicalNodeV1,
-    TwoLogicalNodesV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1769,7 +1715,6 @@ mod tests {
             std::path::Path::new("/tmp/paraegox-local-test")
         );
         assert_eq!(config.fabric_listen(), "tcp/127.0.0.1:7447");
-        assert_eq!(config.profile().tui_mode_label(), "DEVELOPER FIXTURE V1");
         assert_eq!(
             config.profile().request_deadline_budget(),
             Duration::from_secs(30)
@@ -1779,10 +1724,6 @@ mod tests {
             Duration::from_secs(30)
         );
         assert_eq!(config.profile().command_capacity(), 4);
-        assert_eq!(
-            config.profile().topology(),
-            DeveloperLocalTopologyV1::SingleLogicalNodeV1
-        );
     }
 
     #[test]
@@ -1912,14 +1853,6 @@ mod tests {
             Path::new("/nonexistent/paraegox/fabric-b/connect.key")
         );
         assert_eq!(
-            config.profile().tui_mode_label(),
-            "INTERNAL DISTRIBUTED FIXTURE V1"
-        );
-        assert_eq!(
-            config.profile().topology(),
-            DeveloperLocalTopologyV1::TwoLogicalNodesV1
-        );
-        assert_eq!(
             config.profile().request_deadline_budget(),
             Duration::from_secs(30)
         );
@@ -1976,14 +1909,9 @@ mod tests {
             config.secret_ref(),
             ProvisionedSecretRefV1::OpenAiApiKeyEnvironment
         );
-        assert_eq!(config.profile().tui_mode_label(), "DEVELOPER OPENAI V1");
         assert_eq!(
             config.provider_profile(),
             ProviderProfileV1::OpenAiResponsesV1
-        );
-        assert_eq!(
-            config.profile().topology(),
-            DeveloperLocalTopologyV1::SingleLogicalNodeV1
         );
 
         let provider_ref =
@@ -2028,7 +1956,6 @@ mod tests {
             config.secret_ref(),
             ProvisionedSecretRefV1::DeepSeekApiKeyEnvironment
         );
-        assert_eq!(config.profile().tui_mode_label(), "DEVELOPER DEEPSEEK V1");
         assert_eq!(
             config.provider_profile(),
             ProviderProfileV1::DeepSeekChatCompletionsV1

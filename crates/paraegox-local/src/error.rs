@@ -18,7 +18,6 @@ pub(crate) enum LocalProcessError {
     ConversationIpc,
     InspectionIpc,
     ConversationChild,
-    ConversationSession,
     NodeChild,
     JoinedShutdown,
     DistributedIdentityInitialization,
@@ -53,7 +52,6 @@ impl LocalProcessError {
             Self::ConversationIpc => "PXLC-CONVERSATION-IPC",
             Self::InspectionIpc => "PXLC-INSPECTION-IPC",
             Self::ConversationChild => "PXLC-CONVERSATION-CHILD",
-            Self::ConversationSession => "PXLC-CONVERSATION-SESSION",
             Self::NodeChild => "PXLC-NODE-CHILD",
             Self::JoinedShutdown => "PXLC-JOINED-SHUTDOWN",
             Self::DistributedIdentityInitialization => "PXLC-DISTRIBUTED-IDENTITY-INITIALIZATION",
@@ -92,9 +90,8 @@ impl LocalProcessError {
             Self::ConversationIpc => "Runtime-backed local conversation IPC failed closed",
             Self::InspectionIpc => "node-local read-only Inspection IPC failed closed",
             Self::ConversationChild => {
-                "local terminal child process failed to complete joined execution"
+                "local Textual console child failed to complete joined execution"
             }
-            Self::ConversationSession => "Runtime-backed terminal conversation failed",
             Self::NodeChild => "DeveloperLocal NodeDaemon child process failed",
             Self::JoinedShutdown => "DeveloperLocal owners did not complete joined shutdown",
             Self::DistributedIdentityInitialization => {

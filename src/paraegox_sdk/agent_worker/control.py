@@ -712,9 +712,18 @@ def _decode_body(
     payload: bytes,
 ) -> AgentConversationControlV1:
     try:
-        if kind is AgentConversationControlKindV1.OPEN_REQUEST and outcome == 0 and not payload:
+        if (
+            kind is AgentConversationControlKindV1.OPEN_REQUEST
+            and outcome == 0
+            and request_id is None
+            and not payload
+        ):
             return AgentConversationControlV1.open_request(deck_run_id, session_id)
-        if kind is AgentConversationControlKindV1.OPEN_RESULT and not payload:
+        if (
+            kind is AgentConversationControlKindV1.OPEN_RESULT
+            and request_id is None
+            and not payload
+        ):
             return AgentConversationControlV1.open_result(
                 deck_run_id, session_id, AgentConversationOpenOutcomeV1(outcome)
             )
@@ -741,6 +750,7 @@ def _decode_body(
         if (
             kind is AgentConversationControlKindV1.WATCH_REQUEST
             and outcome == 0
+            and request_id is None
             and len(payload) == 12
         ):
             cursor, limit = struct.unpack(">QI", payload)
@@ -748,11 +758,14 @@ def _decode_body(
         if (
             kind is AgentConversationControlKindV1.WATCH_RESULT
             and outcome == int(AgentConversationWatchOutcomeV1.NOT_FOUND)
+            and request_id is None
             and not payload
         ):
             return AgentConversationControlV1.watch_not_found(deck_run_id, session_id)
-        if kind is AgentConversationControlKindV1.WATCH_RESULT and outcome == int(
-            AgentConversationWatchOutcomeV1.BATCH
+        if (
+            kind is AgentConversationControlKindV1.WATCH_RESULT
+            and outcome == int(AgentConversationWatchOutcomeV1.BATCH)
+            and request_id is None
         ):
             return AgentConversationControlV1.watch_result(
                 deck_run_id, session_id, _decode_watch_batch(deck_run_id, session_id, payload)

@@ -509,64 +509,6 @@ impl EntropySource for OsEntropy {
     }
 }
 
-/// Per-launch TUI request namespace. It is never persisted or accepted from
-/// the CLI. Fresh process entropy makes sequence 1 safe after every restart.
-#[cfg(test)]
-pub(crate) struct TuiProcessIdentityV1 {
-    client_instance_nonce: [u8; 32],
-    initial_request_sequence: u64,
-}
-
-#[cfg(test)]
-impl TuiProcessIdentityV1 {
-    fn try_generate(entropy: &mut impl EntropySource) -> Result<Self, IdentityManifestError> {
-        let mut nonce = [0_u8; 32];
-        entropy.fill(&mut nonce)?;
-        let identity = Self {
-            client_instance_nonce: nonce,
-            initial_request_sequence: 1,
-        };
-        if bytes_are_zero(identity.client_instance_nonce())
-            || identity.initial_request_sequence() == 0
-        {
-            return Err(IdentityManifestError::InvalidFreshEntropy);
-        }
-        Ok(identity)
-    }
-
-    pub(crate) fn client_instance_nonce(&self) -> &[u8; 32] {
-        &self.client_instance_nonce
-    }
-
-    pub(crate) const fn initial_request_sequence(&self) -> u64 {
-        self.initial_request_sequence
-    }
-}
-
-#[cfg(test)]
-impl fmt::Debug for TuiProcessIdentityV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TuiProcessIdentityV1")
-            .field("client_instance_nonce", &Redacted)
-            .field("initial_request_sequence", &self.initial_request_sequence)
-            .finish()
-    }
-}
-
-#[cfg(test)]
-impl Drop for TuiProcessIdentityV1 {
-    fn drop(&mut self) {
-        self.client_instance_nonce.zeroize();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn generate_tui_process_identity() -> Result<TuiProcessIdentityV1, IdentityManifestError>
-{
-    TuiProcessIdentityV1::try_generate(&mut OsEntropy)
-}
-
 struct IdentityPaths {
     directory: PathBuf,
     manifest: PathBuf,
@@ -2372,13 +2314,6 @@ fn load_or_create_with_entropy(
 }
 
 #[cfg(test)]
-fn generate_tui_process_identity_with_entropy(
-    entropy: &mut impl EntropySource,
-) -> Result<TuiProcessIdentityV1, IdentityManifestError> {
-    TuiProcessIdentityV1::try_generate(entropy)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
@@ -2943,22 +2878,6 @@ mod tests {
         assert_eq!(debug.matches("<redacted>").count(), 5);
         assert!(!debug.contains("controller_instance_id:"));
         assert!(!debug.contains("[20,"));
-    }
-
-    #[test]
-    fn tui_request_namespace_is_fresh_process_local_entropy() {
-        let identity = generate_tui_process_identity_with_entropy(&mut PatternEntropy::new())
-            .expect("process identity");
-        assert!(!bytes_are_zero(identity.client_instance_nonce()));
-        assert_eq!(identity.initial_request_sequence(), 1);
-        let debug = format!("{identity:?}");
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("[20,"));
-
-        assert_eq!(
-            generate_tui_process_identity_with_entropy(&mut ZeroEntropy).unwrap_err(),
-            IdentityManifestError::InvalidFreshEntropy
-        );
     }
 
     #[test]

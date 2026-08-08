@@ -23,9 +23,6 @@ mod inspection;
 #[cfg(unix)]
 mod layout;
 
-pub(crate) const RUNTIME_AGENT_TUI_CHILD_MODE: &str = "__runtime-agent-tui-child-v1";
-pub(crate) const RUNTIME_BOOTSTRAP_FILE_OPTION: &str = "--runtime-bootstrap-file";
-pub(crate) const INSPECTION_BOOTSTRAP_FILE_OPTION: &str = "--inspection-bootstrap-file";
 pub(crate) const NODE_DAEMON_CHILD_MODE: &str = "__node-daemon-child-v1";
 pub(crate) const NODE_BOOTSTRAP_FILE_OPTION: &str = "--node-bootstrap-file";
 pub(crate) const NODE_OBSERVATION_BOOTSTRAP_FILE_OPTION: &str = "--node-observation-bootstrap-file";
@@ -50,9 +47,6 @@ fn main() -> ExitCode {
 
 fn dispatch(arguments: impl IntoIterator<Item = OsString>) -> Result<(), LocalProcessError> {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
-    if let Some(paths) = parse_runtime_agent_tui_child(&arguments)? {
-        return run_runtime_agent_tui_child(&paths);
-    }
     if let Some(paths) = parse_node_daemon_child(&arguments)? {
         return run_node_daemon_child(&paths);
     }
@@ -110,70 +104,12 @@ struct NodeChildBootstrapPathsV1 {
     observation_bootstrap_path: Option<PathBuf>,
 }
 
-fn parse_runtime_agent_tui_child(
-    arguments: &[OsString],
-) -> Result<Option<TuiChildBootstrapPathsV1>, LocalProcessError> {
-    if arguments.first().map(OsString::as_os_str) != Some(OsStr::new(RUNTIME_AGENT_TUI_CHILD_MODE))
-    {
-        return Ok(None);
-    }
-    if !matches!(arguments.len(), 3 | 5)
-        || arguments[1].as_os_str() != OsStr::new(RUNTIME_BOOTSTRAP_FILE_OPTION)
-        || arguments.len() == 5
-            && arguments[3].as_os_str() != OsStr::new(INSPECTION_BOOTSTRAP_FILE_OPTION)
-    {
-        return Err(LocalProcessError::ConversationConfiguration);
-    }
-    let runtime_bootstrap_path = PathBuf::from(&arguments[2]);
-    let inspection_bootstrap_path = arguments.get(4).map(PathBuf::from);
-    if !is_lexically_absolute_file(&runtime_bootstrap_path)
-        || inspection_bootstrap_path.as_ref().is_some_and(|path| {
-            !is_lexically_absolute_file(path) || path == &runtime_bootstrap_path
-        })
-    {
-        return Err(LocalProcessError::ConversationConfiguration);
-    }
-    Ok(Some(TuiChildBootstrapPathsV1 {
-        runtime_bootstrap_path,
-        inspection_bootstrap_path,
-    }))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TuiChildBootstrapPathsV1 {
-    runtime_bootstrap_path: PathBuf,
-    inspection_bootstrap_path: Option<PathBuf>,
-}
-
 fn is_lexically_absolute_file(path: &Path) -> bool {
     path.is_absolute()
         && path.file_name().is_some()
         && path
             .components()
             .all(|component| !matches!(component, Component::CurDir | Component::ParentDir))
-}
-
-fn run_runtime_agent_tui_child(paths: &TuiChildBootstrapPathsV1) -> Result<(), LocalProcessError> {
-    #[cfg(unix)]
-    {
-        match &paths.inspection_bootstrap_path {
-            Some(inspection_bootstrap_path) => {
-                paraegox_tui::run_runtime_developer_local_ipc_chat_with_inspection(
-                    &paths.runtime_bootstrap_path,
-                    inspection_bootstrap_path,
-                )
-            }
-            None => {
-                paraegox_tui::run_runtime_developer_local_ipc_chat(&paths.runtime_bootstrap_path)
-            }
-        }
-        .map_err(|_| LocalProcessError::ConversationSession)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = paths;
-        Err(LocalProcessError::ConversationConfiguration)
-    }
 }
 
 fn run_node_daemon_child(paths: &NodeChildBootstrapPathsV1) -> Result<(), LocalProcessError> {
@@ -277,7 +213,7 @@ fn usage() -> &'static str {
     r"Usage: paraegox chat --config <absolute-paraegox.toml>
        paraegox --help
 
-chat starts the configured ParaEGOX conversation owner chain and typed TUI.
+chat starts the configured ParaEGOX conversation owner chain and Textual console.
 The absolute versioned configuration is the sole public input for provider and
 model selection, Fabric settings, and durable state location. Secret fields
 contain references only; Secret values are obtained from the configured
@@ -415,66 +351,12 @@ mod tests {
         assert!(!text.contains("--retry"));
         assert!(!text.contains("--nonce"));
         assert!(!text.contains("--identity"));
-        assert!(!text.contains(RUNTIME_AGENT_TUI_CHILD_MODE));
-        assert!(!text.contains(RUNTIME_BOOTSTRAP_FILE_OPTION));
-        assert!(!text.contains(INSPECTION_BOOTSTRAP_FILE_OPTION));
+        assert!(!text.contains("paraegox-console"));
+        assert!(!text.contains("--runtime-bootstrap-file"));
+        assert!(!text.contains("--inspection-bootstrap-file"));
         assert!(!text.contains(NODE_DAEMON_CHILD_MODE));
         assert!(!text.contains(NODE_BOOTSTRAP_FILE_OPTION));
         assert!(!text.contains(NODE_OBSERVATION_BOOTSTRAP_FILE_OPTION));
-    }
-
-    #[test]
-    fn hidden_tui_child_accepts_runtime_only_or_distinct_inspection_bootstraps() {
-        let runtime_path = OsString::from("/private/tmp/pxl-test/c.pxab");
-        let inspection_path = OsString::from("/private/tmp/pxl-test/i.pxib");
-        assert_eq!(
-            parse_runtime_agent_tui_child(&[
-                OsString::from(RUNTIME_AGENT_TUI_CHILD_MODE),
-                OsString::from(RUNTIME_BOOTSTRAP_FILE_OPTION),
-                runtime_path.clone(),
-                OsString::from(INSPECTION_BOOTSTRAP_FILE_OPTION),
-                inspection_path.clone(),
-            ]),
-            Ok(Some(TuiChildBootstrapPathsV1 {
-                runtime_bootstrap_path: PathBuf::from(runtime_path),
-                inspection_bootstrap_path: Some(PathBuf::from(inspection_path)),
-            }))
-        );
-        assert_eq!(
-            parse_runtime_agent_tui_child(&[
-                OsString::from(RUNTIME_AGENT_TUI_CHILD_MODE),
-                OsString::from(RUNTIME_BOOTSTRAP_FILE_OPTION),
-                OsString::from("/private/tmp/pxl-test/c.pxab"),
-            ]),
-            Ok(Some(TuiChildBootstrapPathsV1 {
-                runtime_bootstrap_path: PathBuf::from("/private/tmp/pxl-test/c.pxab"),
-                inspection_bootstrap_path: None,
-            }))
-        );
-        assert_eq!(
-            parse_runtime_agent_tui_child(&[
-                OsString::from(RUNTIME_AGENT_TUI_CHILD_MODE),
-                OsString::from(RUNTIME_BOOTSTRAP_FILE_OPTION),
-                OsString::from("relative.pxab"),
-                OsString::from(INSPECTION_BOOTSTRAP_FILE_OPTION),
-                OsString::from("/private/tmp/pxl-test/i.pxib"),
-            ]),
-            Err(LocalProcessError::ConversationConfiguration)
-        );
-        assert_eq!(
-            parse_runtime_agent_tui_child(&[
-                OsString::from(RUNTIME_AGENT_TUI_CHILD_MODE),
-                OsString::from(RUNTIME_BOOTSTRAP_FILE_OPTION),
-                OsString::from("/private/tmp/pxl-test/c.pxab"),
-                OsString::from(INSPECTION_BOOTSTRAP_FILE_OPTION),
-                OsString::from("/private/tmp/pxl-test/c.pxab"),
-            ]),
-            Err(LocalProcessError::ConversationConfiguration)
-        );
-        assert_eq!(
-            parse_runtime_agent_tui_child(&[OsString::from("chat")]),
-            Ok(None)
-        );
     }
 
     #[test]

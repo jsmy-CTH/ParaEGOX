@@ -13,6 +13,7 @@ from paraegox_sdk.agent_worker.control import (
     AgentConversationWatchBatchV1,
     AgentConversationWatchEventKindV1,
     AgentConversationWatchEventV1,
+    control_digest_v1,
     decode_control_v1,
 )
 from paraegox_sdk.agent_worker.protocol import (
@@ -199,6 +200,41 @@ def test_control_decoder_fails_closed(
     with pytest.raises(AgentConversationControlError) as captured:
         decode_control_v1(bytes(wire))
     assert captured.value.code is expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        AgentConversationControlV1.open_request(_deck(), _session()),
+        AgentConversationControlV1.open_result(
+            _deck(), _session(), AgentConversationOpenOutcomeV1.OPENED
+        ),
+        AgentConversationControlV1.watch_request(_deck(), _session(), 7, 8),
+        AgentConversationControlV1.watch_not_found(_deck(), _session()),
+        AgentConversationControlV1.watch_result(
+            _deck(),
+            _session(),
+            AgentConversationWatchBatchV1((), 0, 0, False, False),
+        ),
+    ],
+)
+def test_unscoped_control_decoder_rejects_nonzero_request_identity(
+    value: AgentConversationControlV1,
+) -> None:
+    wire = bytearray(value.canonical_wire())
+    wire[68:84] = _request_id()
+    wire[84:116] = control_digest_v1(
+        value.kind,
+        value.outcome,
+        value.deck_run_id,
+        value.session_id,
+        _request_id(),
+        bytes(wire[128:]),
+    )
+
+    with pytest.raises(AgentConversationControlError) as captured:
+        decode_control_v1(bytes(wire))
+    assert captured.value.code is AgentConversationControlErrorCode.INVALID_OUTCOME
 
 
 def test_watch_and_terminal_correlation_are_bounded_and_fail_closed() -> None:

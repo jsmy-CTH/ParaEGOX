@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+set -eu
+
+bundle_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+bundled_python="$bundle_dir/python"
+
+if [ ! -d "$bundled_python/paraegox_sdk" ]; then
+    printf '%s\n' \
+        'paraegox-console: bundled Python runtime files are missing' >&2
+    exit 1
+fi
+
+if ! env python3 -c \
+    'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+    >/dev/null 2>&1; then
+    printf '%s\n' \
+        'paraegox-console: Python 3.11 or newer is required as python3 on PATH' >&2
+    exit 1
+fi
+
+PYTHONPATH="$bundled_python" \
+PYTHONNOUSERSITE=1 \
+export PYTHONPATH PYTHONNOUSERSITE
+
+exec env python3 -P -m paraegox_sdk.console_tui "$@"

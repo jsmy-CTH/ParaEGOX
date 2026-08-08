@@ -1946,7 +1946,6 @@ dependencies = [
  "paraegox-node",
  "paraegox-runtime",
  "paraegox-runtime-contracts",
- "paraegox-tui",
  "rustix",
  "serde",
  "serde_json",

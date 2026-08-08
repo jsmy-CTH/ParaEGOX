@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -96,9 +96,6 @@ use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
 use paraegox_runtime_contracts::managed_service::{
     ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
 };
-#[cfg(test)]
-use paraegox_tui::LOCAL_CHAT_CLIENT_INSTANCE_NONCE_BYTES;
-use paraegox_tui::{BackgroundConversationClientConfig, TuiOptions};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
@@ -117,16 +114,15 @@ use crate::inspection::{
     DeveloperLocalDeploymentOutcomeV1, DeveloperLocalInspectionSourcesV2,
     start_developer_local_inspection_v2,
 };
-use crate::{
-    INSPECTION_BOOTSTRAP_FILE_OPTION, RUNTIME_AGENT_TUI_CHILD_MODE, RUNTIME_BOOTSTRAP_FILE_OPTION,
-    identity, layout,
-};
+use crate::{identity, layout};
 #[cfg(not(test))]
 use crate::{
     NODE_BOOTSTRAP_FILE_OPTION, NODE_DAEMON_CHILD_MODE, NODE_OBSERVATION_BOOTSTRAP_FILE_OPTION,
 };
 
-const TUI_TITLE: &str = "ParaEGOX Agent";
+const CONSOLE_COMMAND: &str = "paraegox-console";
+const RUNTIME_BOOTSTRAP_FILE_OPTION: &str = "--runtime-bootstrap-file";
+const INSPECTION_BOOTSTRAP_FILE_OPTION: &str = "--inspection-bootstrap-file";
 const OPENAI_SECRET_REF_DOMAIN: &[u8] = b"paraegox.local.developer-openai-secret-ref.sha256.v1";
 const DEEPSEEK_SECRET_REF_DOMAIN: &[u8] = b"paraegox.local.developer-deepseek-secret-ref.sha256.v1";
 const DEVELOPER_MODEL_SERVICE_MAX_IN_FLIGHT: usize = 1;
@@ -413,29 +409,19 @@ pub(crate) fn run_distributed(
             .expect("Runtime A exists through conversation")
             .claim_distributed_agent_handle(receipts[0])
             .map_err(|_| LocalProcessError::ConversationCapability)?;
-        let conversation_config = BackgroundConversationClientConfig::try_new(
+        let conversation_config = LocalConversationBounds::try_new(
             AgentConversationDeckRunId::try_from_bytes(*target_a_identity.deck_run_id())
                 .map_err(|_| LocalProcessError::ConversationConfiguration)?,
             AgentConversationSessionId::try_from_bytes(*target_a_identity.session_id())
                 .map_err(|_| LocalProcessError::ConversationConfiguration)?,
+            config.profile().request_deadline_budget(),
             config.profile().command_capacity(),
             operation_timeout,
-        )
-        .map_err(|_| LocalProcessError::ConversationConfiguration)?;
-        let deadline_budget_nanos =
-            u64::try_from(config.profile().request_deadline_budget().as_nanos())
-                .map_err(|_| LocalProcessError::ConversationConfiguration)?;
-        let options = TuiOptions::try_new(
-            TUI_TITLE,
-            config.profile().tui_mode_label(),
-            deadline_budget_nanos,
-        )
-        .map_err(|_| LocalProcessError::ConversationConfiguration)?;
+        )?;
         let mut runner = ChildProcessConversationRunner;
         runner.run(ConversationRunInput {
             handle,
             config: conversation_config,
-            options,
             ipc_socket_path: layout
                 .target(target_a)
                 .agent_ipc_socket_path()
@@ -606,28 +592,18 @@ fn run_prepared(
             .runtime()
             .claim_model_agent_handle(deployment.agent_terminal_receipt())
             .map_err(|_| LocalProcessError::ConversationCapability)?;
-        let conversation_config = BackgroundConversationClientConfig::try_new(
+        let conversation_config = LocalConversationBounds::try_new(
             AgentConversationDeckRunId::try_from_bytes(*manifest.deck_run_id())
                 .map_err(|_| LocalProcessError::ConversationConfiguration)?,
             AgentConversationSessionId::try_from_bytes(*manifest.session_id())
                 .map_err(|_| LocalProcessError::ConversationConfiguration)?,
+            config.profile().request_deadline_budget(),
             config.profile().command_capacity(),
             config.profile().operation_timeout(),
-        )
-        .map_err(|_| LocalProcessError::ConversationConfiguration)?;
-        let request_deadline_budget = config.profile().request_deadline_budget();
-        let deadline_budget_nanos = u64::try_from(request_deadline_budget.as_nanos())
-            .map_err(|_| LocalProcessError::ConversationConfiguration)?;
-        let options = TuiOptions::try_new(
-            TUI_TITLE,
-            config.profile().tui_mode_label(),
-            deadline_budget_nanos,
-        )
-        .map_err(|_| LocalProcessError::ConversationConfiguration)?;
+        )?;
         runner.run(ConversationRunInput {
             handle: conversation_handle,
             config: conversation_config,
-            options,
             ipc_socket_path: layout.agent_ipc_socket_path().to_path_buf(),
             ipc_bootstrap_path: layout.agent_ipc_bootstrap_path().to_path_buf(),
             inspection: Some(ConversationInspectionInput {
@@ -1320,10 +1296,51 @@ impl ModelBackendV1 for LocalDeterministicEchoModelBackendV1 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LocalConversationBounds {
+    deck_run_id: AgentConversationDeckRunId,
+    session_id: AgentConversationSessionId,
+    request_deadline_budget: Duration,
+    command_capacity: usize,
+    operation_timeout: Duration,
+}
+
+impl LocalConversationBounds {
+    fn try_new(
+        deck_run_id: AgentConversationDeckRunId,
+        session_id: AgentConversationSessionId,
+        request_deadline_budget: Duration,
+        command_capacity: usize,
+        operation_timeout: Duration,
+    ) -> Result<Self, LocalProcessError> {
+        let command_capacity_wire = u16::try_from(command_capacity)
+            .map_err(|_| LocalProcessError::ConversationConfiguration)?;
+        RuntimeAgentDeveloperLocalConversationV1::try_new(
+            deck_run_id,
+            session_id,
+            request_deadline_budget,
+            operation_timeout,
+        )
+        .map_err(|_| LocalProcessError::ConversationConfiguration)?;
+        RuntimeAgentDeveloperLocalIpcLimitsV1::try_new(
+            operation_timeout,
+            command_capacity_wire,
+            command_capacity,
+        )
+        .map_err(|_| LocalProcessError::ConversationConfiguration)?;
+        Ok(Self {
+            deck_run_id,
+            session_id,
+            request_deadline_budget,
+            command_capacity,
+            operation_timeout,
+        })
+    }
+}
+
 struct ConversationRunInput {
     handle: RuntimeAgentConversationHandle,
-    config: BackgroundConversationClientConfig,
-    options: TuiOptions,
+    config: LocalConversationBounds,
     ipc_socket_path: PathBuf,
     ipc_bootstrap_path: PathBuf,
     inspection: Option<ConversationInspectionInput>,
@@ -1351,7 +1368,7 @@ impl ConversationRunner for ChildProcessConversationRunner {
             .as_ref()
             .map(|inspection| start_inspection_ipc(&input, inspection))
             .transpose()?;
-        let child_result = spawn_and_join_tui_child(
+        let child_result = spawn_and_join_console(
             &input.ipc_bootstrap_path,
             input
                 .inspection
@@ -1387,7 +1404,7 @@ fn start_inspection_ipc(
 fn start_conversation_ipc(
     input: &ConversationRunInput,
 ) -> Result<RuntimeAgentDeveloperLocalIpcLifecycleV1, LocalProcessError> {
-    let command_capacity = u16::try_from(input.config.command_capacity())
+    let command_capacity = u16::try_from(input.config.command_capacity)
         .map_err(|_| LocalProcessError::ConversationConfiguration)?;
     let paths = RuntimeAgentDeveloperLocalIpcPathsV1::try_new(
         input.ipc_socket_path.clone(),
@@ -1397,16 +1414,16 @@ fn start_conversation_ipc(
     )
     .map_err(|_| LocalProcessError::ConversationIpc)?;
     let conversation = RuntimeAgentDeveloperLocalConversationV1::try_new(
-        input.config.deck_run_id(),
-        input.config.session_id(),
-        Duration::from_nanos(input.options.deadline_budget_nanos()),
-        input.config.operation_timeout(),
+        input.config.deck_run_id,
+        input.config.session_id,
+        input.config.request_deadline_budget,
+        input.config.operation_timeout,
     )
     .map_err(|_| LocalProcessError::ConversationConfiguration)?;
     let limits = RuntimeAgentDeveloperLocalIpcLimitsV1::try_new(
-        input.config.operation_timeout(),
+        input.config.operation_timeout,
         command_capacity,
-        input.config.command_capacity(),
+        input.config.command_capacity,
     )
     .map_err(|_| LocalProcessError::ConversationConfiguration)?;
     let config = RuntimeAgentDeveloperLocalIpcConfigV1::try_new(paths, conversation, limits)
@@ -1415,14 +1432,25 @@ fn start_conversation_ipc(
         .map_err(|_| LocalProcessError::ConversationIpc)
 }
 
-fn spawn_and_join_tui_child(
+fn spawn_and_join_console(
     runtime_bootstrap_path: &std::path::Path,
     inspection_bootstrap_path: Option<&std::path::Path>,
 ) -> Result<(), LocalProcessError> {
-    let executable = env::current_exe().map_err(|_| LocalProcessError::ConversationChild)?;
-    let mut command = Command::new(executable);
+    let mut command = build_console_command(runtime_bootstrap_path, inspection_bootstrap_path);
+    let status = JoinedChild::spawn(&mut command)?.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(LocalProcessError::ConversationChild)
+    }
+}
+
+fn build_console_command(
+    runtime_bootstrap_path: &std::path::Path,
+    inspection_bootstrap_path: Option<&std::path::Path>,
+) -> Command {
+    let mut command = Command::new(resolve_console_program());
     command
-        .arg(RUNTIME_AGENT_TUI_CHILD_MODE)
         .arg(RUNTIME_BOOTSTRAP_FILE_OPTION)
         .arg(runtime_bootstrap_path);
     if let Some(inspection_bootstrap_path) = inspection_bootstrap_path {
@@ -1436,11 +1464,31 @@ fn spawn_and_join_tui_child(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let status = JoinedChild::spawn(&mut command)?.wait()?;
-    if status.success() {
-        Ok(())
+    command
+}
+
+fn resolve_console_program() -> PathBuf {
+    env::current_exe().map_or_else(
+        |_| PathBuf::from(CONSOLE_COMMAND),
+        |executable| console_program_for_executable(&executable),
+    )
+}
+
+fn console_program_for_executable(executable: &Path) -> PathBuf {
+    let Some(directory) = executable.parent() else {
+        return PathBuf::from(CONSOLE_COMMAND);
+    };
+    let sibling = directory.join(CONSOLE_COMMAND);
+    let Ok(metadata) = fs::symlink_metadata(&sibling) else {
+        return PathBuf::from(CONSOLE_COMMAND);
+    };
+    if metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.permissions().mode() & 0o111 != 0
+    {
+        sibling
     } else {
-        Err(LocalProcessError::ConversationChild)
+        PathBuf::from(CONSOLE_COMMAND)
     }
 }
 
@@ -2335,18 +2383,30 @@ impl Drop for RunningOwners {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::os::unix::net::UnixStream as StdUnixStream;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use paraegox_agent_contracts::AgentConversationTerminalResultV1;
+    use paraegox_agent_contracts::{
+        AgentConversationRequestId, AgentConversationRequestV1,
+        AgentConversationTerminalResultV1, AgentConversationTurnId,
+    };
+    use paraegox_inspection::developer_local::{
+        DeveloperLocalInspectionBootstrapV2, encode_authenticated_request_v2,
+    };
+    use paraegox_inspection::protocol::{
+        InspectionClientV2, InspectionEndpointErrorV2, InspectionEndpointV2,
+        InspectionRequestV2, InspectionResponseOutcomeV2, MAX_INSPECTION_RESPONSE_V2_BYTES,
+    };
     use paraegox_inspection::{
         InspectionFreshnessV1, InspectionHealthV1, InspectionLivenessV1, InspectionReadinessV1,
-        InspectionReasonV1, LocalInspectionOverallV1,
+        InspectionReasonV1, LocalInspectionOverallV1, LocalInspectionSnapshotV2,
     };
     use paraegox_kernel::identity::RuntimeHostId;
     use paraegox_kernel::time::BoundedDuration;
@@ -2360,11 +2420,6 @@ mod tests {
     };
     use paraegox_runtime_contracts::managed_service::{
         ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
-    };
-    use paraegox_tui::{
-        AgentConversationRequestFactory, ConversationClient, ConversationClientEvent,
-        ConversationConnectionState, LocalChatRequestFactoryV1, compose_runtime_local_chat_client,
-        read_developer_local_inspection_status_v2,
     };
 
     const RUNNER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2388,6 +2443,91 @@ mod tests {
     const INSPECTION_PROBE_BOOTSTRAP_ENVIRONMENT: &str = "PARAEGOX_TEST_INSPECTION_BOOTSTRAP";
     const IPC_PROBE_TEST_NAME: &str = "composition::tests::runtime_ipc_subprocess_probe";
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn console_command_passes_private_bootstraps_and_removes_provider_secrets() {
+        let runtime_bootstrap = Path::new("/private/tmp/paraegox/runtime.pxab");
+        let inspection_bootstrap = Path::new("/private/tmp/paraegox/inspection.pxib");
+        let command = build_console_command(runtime_bootstrap, Some(inspection_bootstrap));
+        let expected_program = resolve_console_program();
+
+        assert_eq!(command.get_program(), expected_program.as_os_str());
+        assert_eq!(
+            command.get_args().map(OsString::from).collect::<Vec<_>>(),
+            vec![
+                OsString::from(RUNTIME_BOOTSTRAP_FILE_OPTION),
+                runtime_bootstrap.as_os_str().to_os_string(),
+                OsString::from(INSPECTION_BOOTSTRAP_FILE_OPTION),
+                inspection_bootstrap.as_os_str().to_os_string(),
+            ]
+        );
+        for secret_name in ["OPENAI_API_KEY", "DEEPSEEK_API_KEY"] {
+            assert!(command.get_envs().any(|(name, value)| {
+                name == OsStr::new(secret_name) && value.is_none()
+            }));
+        }
+    }
+
+    #[test]
+    fn console_command_omits_inspection_argument_when_no_endpoint_exists() {
+        let runtime_bootstrap = Path::new("/private/tmp/paraegox/runtime.pxab");
+        let command = build_console_command(runtime_bootstrap, None);
+
+        assert_eq!(
+            command.get_args().map(OsString::from).collect::<Vec<_>>(),
+            vec![
+                OsString::from(RUNTIME_BOOTSTRAP_FILE_OPTION),
+                runtime_bootstrap.as_os_str().to_os_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn console_program_prefers_only_a_regular_executable_sibling() {
+        let directory = fresh_state_root("console-sibling");
+        fs::create_dir(&directory).expect("create launcher test directory");
+        let _cleanup = TestCleanup {
+            state_root: directory.clone(),
+            socket_directory: None,
+        };
+        let executable = directory.join("paraegox");
+        let sibling = directory.join(CONSOLE_COMMAND);
+        fs::write(&sibling, b"#!/bin/sh\n").expect("write sibling launcher");
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755))
+            .expect("make sibling launcher executable");
+
+        assert_eq!(console_program_for_executable(&executable), sibling);
+    }
+
+    #[test]
+    fn console_program_falls_back_to_path_for_unsafe_siblings() {
+        let directory = fresh_state_root("console-sibling-rejections");
+        fs::create_dir(&directory).expect("create launcher test directory");
+        let _cleanup = TestCleanup {
+            state_root: directory.clone(),
+            socket_directory: None,
+        };
+        let executable = directory.join("paraegox");
+        let sibling = directory.join(CONSOLE_COMMAND);
+        fs::write(&sibling, b"#!/bin/sh\n").expect("write sibling launcher");
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o644))
+            .expect("keep sibling launcher non-executable");
+        assert_eq!(
+            console_program_for_executable(&executable),
+            PathBuf::from(CONSOLE_COMMAND)
+        );
+
+        fs::remove_file(&sibling).expect("remove non-executable launcher");
+        let target = directory.join("launcher-target");
+        fs::write(&target, b"#!/bin/sh\n").expect("write executable launcher target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+            .expect("make launcher target executable");
+        std::os::unix::fs::symlink(&target, &sibling).expect("symlink sibling launcher");
+        assert_eq!(
+            console_program_for_executable(&executable),
+            PathBuf::from(CONSOLE_COMMAND)
+        );
+    }
 
     struct LoopbackModelFactory {
         descriptor: ModelAdapterDescriptorV1,
@@ -2742,7 +2882,7 @@ mod tests {
         expected_prefix: &'static str,
         successful_turns: usize,
         retired_probe: Option<RuntimeAgentConversationHandle>,
-        retired_config: Option<BackgroundConversationClientConfig>,
+        retired_config: Option<LocalConversationBounds>,
     }
 
     impl NonInteractiveConversationRunner {
@@ -2769,30 +2909,21 @@ mod tests {
         fn assert_old_handle_is_retired(&mut self) {
             let handle = self.retired_probe.take().expect("retirement probe");
             let config = self.retired_config.take().expect("retirement config");
-            let mut nonce = [0_u8; LOCAL_CHAT_CLIENT_INSTANCE_NONCE_BYTES];
-            getrandom::fill(&mut nonce).expect("retirement probe entropy");
-            let mut client = compose_runtime_local_chat_client(config, nonce, 1, handle)
-                .expect("retirement probe client");
-            client.begin_connect().expect("queue retirement probe");
-            let deadline = Instant::now() + RUNNER_TIMEOUT;
-            loop {
-                match client.poll_event() {
-                    Err(error)
-                        if error.message()
-                            == "Runtime-managed Agent conversation generation is retired" =>
-                    {
-                        break;
-                    }
-                    Err(error) => panic!("unexpected retirement error: {error}"),
-                    Ok(Some(ConversationClientEvent::ConnectionChanged(
-                        ConversationConnectionState::Connected,
-                    ))) => panic!("retired handle unexpectedly connected"),
-                    Ok(Some(_) | None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    Ok(Some(_) | None) => panic!("retirement probe timed out"),
-                }
-            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("retirement probe runtime");
+            let error = runtime
+                .block_on(handle.open_session(
+                    config.deck_run_id,
+                    config.session_id,
+                    config.operation_timeout,
+                ))
+                .expect_err("retired handle must fail closed");
+            assert_eq!(
+                error.to_string(),
+                "Agent conversation generation is retired"
+            );
         }
     }
 
@@ -2800,69 +2931,164 @@ mod tests {
         fn run(&mut self, launch: ConversationRunInput) -> Result<(), LocalProcessError> {
             self.retired_probe = Some(launch.handle.clone());
             self.retired_config = Some(launch.config);
-            let tui_identity = identity::generate_tui_process_identity()
-                .map_err(|_| LocalProcessError::IdentityManifest)?;
-            let mut client = compose_runtime_local_chat_client(
-                launch.config,
-                *tui_identity.client_instance_nonce(),
-                tui_identity.initial_request_sequence(),
-                launch.handle,
-            )
-            .map_err(|_| LocalProcessError::ConversationSession)?;
-            client
-                .begin_connect()
-                .map_err(|_| LocalProcessError::ConversationSession)?;
-            let connect_deadline = Instant::now() + RUNNER_TIMEOUT;
-            loop {
-                match client
-                    .poll_event()
-                    .map_err(|_| LocalProcessError::ConversationSession)?
-                {
-                    Some(ConversationClientEvent::ConnectionChanged(
-                        ConversationConnectionState::Connected,
-                    )) => break,
-                    Some(_) | None if Instant::now() < connect_deadline => {
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    Some(_) | None => return Err(LocalProcessError::ConversationSession),
-                }
-            }
-            for input in &self.inputs {
-                let request = client
-                    .submit_turn(input, launch.options.deadline_budget_nanos())
-                    .map_err(|_| LocalProcessError::ConversationSession)?;
-                let expected_output = format!("{}{input}", self.expected_prefix);
-                let terminal_deadline = Instant::now() + RUNNER_TIMEOUT;
-                loop {
-                    match client
-                        .poll_event()
-                        .map_err(|_| LocalProcessError::ConversationSession)?
+            let mut handle = launch.handle;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| LocalProcessError::ConversationCapability)?;
+            runtime.block_on(async {
+                handle
+                    .open_session(
+                        launch.config.deck_run_id,
+                        launch.config.session_id,
+                        launch.config.operation_timeout,
+                    )
+                    .await
+                    .map_err(|_| LocalProcessError::ConversationCapability)?;
+                for input in &self.inputs {
+                    let request = conversation_request(launch.config, input)?;
+                    let terminal = handle
+                        .submit(request.clone(), launch.config.operation_timeout)
+                        .await
+                        .map_err(|_| LocalProcessError::ConversationCapability)?;
+                    let expected_output = format!("{}{input}", self.expected_prefix);
+                    if !terminal.correlates(&request)
+                        || !matches!(
+                            terminal.result(),
+                            AgentConversationTerminalResultV1::Success(output)
+                                if output.as_ref() == expected_output.as_str()
+                        )
                     {
-                        Some(ConversationClientEvent::Terminal(terminal)) => {
-                            if !terminal.correlates(&request)
-                                || !matches!(
-                                    terminal.result(),
-                                    AgentConversationTerminalResultV1::Success(output)
-                                        if output.as_ref() == expected_output.as_str()
-                                )
-                            {
-                                return Err(LocalProcessError::ConversationSession);
-                            }
-                            self.successful_turns += 1;
-                            break;
-                        }
-                        Some(_) | None if Instant::now() < terminal_deadline => {
-                            std::thread::sleep(Duration::from_millis(2));
-                        }
-                        Some(_) | None => return Err(LocalProcessError::ConversationSession),
+                        return Err(LocalProcessError::ConversationCapability);
                     }
+                    self.successful_turns += 1;
                 }
-            }
-            client
-                .close()
-                .map_err(|_| LocalProcessError::ConversationSession)?;
-            Ok(())
+                handle
+                    .close()
+                    .await
+                    .map_err(|_| LocalProcessError::ConversationCapability)
+            })
         }
+    }
+
+    fn conversation_request(
+        config: LocalConversationBounds,
+        input: &str,
+    ) -> Result<AgentConversationRequestV1, LocalProcessError> {
+        conversation_request_for_scope(
+            config.deck_run_id,
+            config.session_id,
+            u64::try_from(config.request_deadline_budget.as_nanos())
+                .map_err(|_| LocalProcessError::ConversationConfiguration)?,
+            input,
+        )
+    }
+
+    fn conversation_request_for_scope(
+        deck_run_id: AgentConversationDeckRunId,
+        session_id: AgentConversationSessionId,
+        deadline_budget_nanos: u64,
+        input: &str,
+    ) -> Result<AgentConversationRequestV1, LocalProcessError> {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+        let mut turn_id = [0_u8; 16];
+        turn_id[0] = 1;
+        turn_id[8..].copy_from_slice(&sequence.to_be_bytes());
+        let mut request_id = [0_u8; 16];
+        request_id[0] = 2;
+        request_id[8..].copy_from_slice(&sequence.to_be_bytes());
+        AgentConversationRequestV1::try_new(
+            deck_run_id,
+            session_id,
+            AgentConversationTurnId::try_from_bytes(turn_id)
+                .map_err(|_| LocalProcessError::ConversationConfiguration)?,
+            AgentConversationRequestId::try_from_bytes(request_id)
+                .map_err(|_| LocalProcessError::ConversationConfiguration)?,
+            deadline_budget_nanos,
+            input,
+        )
+        .map_err(|_| LocalProcessError::ConversationConfiguration)
+    }
+
+    struct TestInspectionEndpointV2 {
+        bootstrap: DeveloperLocalInspectionBootstrapV2,
+    }
+
+    impl InspectionEndpointV2 for TestInspectionEndpointV2 {
+        fn exchange(
+            &mut self,
+            canonical_request: &[u8],
+        ) -> Result<Box<[u8]>, InspectionEndpointErrorV2> {
+            let request = InspectionRequestV2::decode(canonical_request)
+                .map_err(|_| InspectionEndpointErrorV2::MalformedRequest)?;
+            let wire = encode_authenticated_request_v2(
+                self.bootstrap.generation_token(),
+                &request,
+            )
+            .map_err(|_| InspectionEndpointErrorV2::MalformedRequest)?;
+            let mut stream = StdUnixStream::connect(self.bootstrap.socket_path())
+                .map_err(|_| InspectionEndpointErrorV2::Unavailable)?;
+            let operation_timeout = Some(self.bootstrap.operation_timeout());
+            stream
+                .set_read_timeout(operation_timeout)
+                .map_err(|_| InspectionEndpointErrorV2::Unavailable)?;
+            stream
+                .set_write_timeout(operation_timeout)
+                .map_err(|_| InspectionEndpointErrorV2::Unavailable)?;
+            stream
+                .write_all(&wire)
+                .map_err(|_| InspectionEndpointErrorV2::Unavailable)?;
+            stream
+                .shutdown(Shutdown::Write)
+                .map_err(|_| InspectionEndpointErrorV2::Unavailable)?;
+
+            let mut response_length = [0_u8; 4];
+            stream
+                .read_exact(&mut response_length)
+                .map_err(|_| InspectionEndpointErrorV2::Unavailable)?;
+            let response_length = usize::try_from(u32::from_be_bytes(response_length))
+                .map_err(|_| InspectionEndpointErrorV2::ResponseUnavailable)?;
+            if !(1..=MAX_INSPECTION_RESPONSE_V2_BYTES).contains(&response_length) {
+                return Err(InspectionEndpointErrorV2::ResponseUnavailable);
+            }
+            let mut response = vec![0_u8; response_length];
+            stream
+                .read_exact(&mut response)
+                .map_err(|_| InspectionEndpointErrorV2::Unavailable)?;
+            let mut trailing = [0_u8; 1];
+            if stream
+                .read(&mut trailing)
+                .map_err(|_| InspectionEndpointErrorV2::Unavailable)?
+                != 0
+            {
+                return Err(InspectionEndpointErrorV2::ResponseUnavailable);
+            }
+            Ok(response.into_boxed_slice())
+        }
+    }
+
+    fn read_test_inspection_status_v2(
+        bootstrap_path: &Path,
+    ) -> Result<LocalInspectionSnapshotV2, &'static str> {
+        let bootstrap = DeveloperLocalInspectionBootstrapV2::decode_owned(
+            fs::read(bootstrap_path).map_err(|_| "Inspection bootstrap is unavailable")?,
+        )
+        .map_err(|_| "Inspection bootstrap is invalid")?;
+        let request_id = bootstrap
+            .request_id(1)
+            .map_err(|_| "Inspection request identity is invalid")?;
+        let projection_id = bootstrap.projection_id();
+        let mut client = InspectionClientV2::new(TestInspectionEndpointV2 { bootstrap });
+        let response = client
+            .latest(request_id, projection_id)
+            .map_err(|_| "Inspection exchange failed")?;
+        if response.outcome() != InspectionResponseOutcomeV2::Snapshot {
+            return Err("Inspection endpoint did not return a snapshot");
+        }
+        response
+            .snapshot_value()
+            .cloned()
+            .ok_or("Inspection snapshot is absent")
     }
 
     #[derive(Default)]
@@ -2891,9 +3117,8 @@ mod tests {
                 launch.expected_gid,
             )
             .expect("stale-source Inspection endpoint");
-            let stale_snapshot =
-                read_developer_local_inspection_status_v2(&stale_inspection_bootstrap)
-                    .expect("stale-source Inspection snapshot");
+            let stale_snapshot = read_test_inspection_status_v2(&stale_inspection_bootstrap)
+                .expect("stale-source Inspection snapshot");
             assert_eq!(stale_snapshot.projection_revision(), 1);
             assert_eq!(
                 stale_snapshot.node().freshness(),
@@ -2907,9 +3132,8 @@ mod tests {
                     .all(|record| record.freshness() == InspectionFreshnessV1::Stale)
             );
             std::thread::sleep(Duration::from_millis(250));
-            let stable_stale_snapshot =
-                read_developer_local_inspection_status_v2(&stale_inspection_bootstrap)
-                    .expect("already-stale Inspection snapshot remains readable");
+            let stable_stale_snapshot = read_test_inspection_status_v2(&stale_inspection_bootstrap)
+                .expect("already-stale Inspection snapshot remains readable");
             assert_eq!(stable_stale_snapshot.projection_revision(), 1);
             assert_eq!(
                 stable_stale_snapshot.node().freshness(),
@@ -3030,7 +3254,7 @@ mod tests {
         };
         let inspection_bootstrap_path = env::var_os(INSPECTION_PROBE_BOOTSTRAP_ENVIRONMENT)
             .expect("Inspection probe bootstrap environment");
-        let inspection = read_developer_local_inspection_status_v2(std::path::Path::new(
+        let inspection = read_test_inspection_status_v2(std::path::Path::new(
             &inspection_bootstrap_path,
         ))
         .expect("typed read-only Inspection exchange");
@@ -3070,13 +3294,13 @@ mod tests {
             std::path::Path::new(&bootstrap_path),
         )
         .expect("private Runtime IPC bootstrap");
-        let mut request_factory = LocalChatRequestFactoryV1::try_new(
+        let request = conversation_request_for_scope(
             client.deck_run_id(),
             client.session_id(),
-            client.client_instance_nonce(),
-            client.initial_request_sequence(),
+            client.request_deadline_budget_nanos(),
+            "process IPC turn",
         )
-        .expect("IPC request identity allocator");
+        .expect("typed IPC request");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3090,9 +3314,6 @@ mod tests {
                 )
                 .await
                 .expect("typed IPC open");
-            let request = request_factory
-                .create_request("process IPC turn", client.request_deadline_budget_nanos())
-                .expect("typed IPC request");
             let terminal = client
                 .submit(request.clone(), client.operation_timeout())
                 .await

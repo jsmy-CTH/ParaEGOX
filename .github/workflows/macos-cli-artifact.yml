@@ -28,6 +28,31 @@ jobs:
       - name: Report active Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Install repository-pinned uv
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/paraegox-uv-bootstrap"
+          "$RUNNER_TEMP/paraegox-uv-bootstrap/bin/python" -m pip install \
+            --disable-pip-version-check \
+            'uv==0.11.32'
+          printf '%s\n' "$RUNNER_TEMP/paraegox-uv-bootstrap/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare locked Python environment
+        run: uv sync --locked
+
+      - name: Verify Textual client and internal entrypoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --frozen ruff check \
+            src/paraegox_sdk/console_client.py \
+            src/paraegox_sdk/console_tui.py \
+            tests/console \
+            scripts/smoke_macos_textual_chat.py
+          uv run --frozen pytest tests/console -q
+          uv run --frozen paraegox-console --help
+
       - name: Build the ParaEGOX CLI
         run: cargo build --locked -p paraegox-local --bin paraegox
 
@@ -61,25 +86,74 @@ jobs:
             exit 1
           fi
 
-      - name: Stage binary and checksum
+      - name: Stage relocatable CLI and Textual bundle
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p artifact
           install -m 0755 target/debug/paraegox artifact/paraegox
+          uv pip install --target artifact/python --no-compile .
+          if [ -d artifact/python/bin ]; then
+            for generated_script in artifact/python/bin/*; do
+              [ -e "$generated_script" ] || continue
+              test -f "$generated_script"
+              test ! -L "$generated_script"
+              rm -- "$generated_script"
+            done
+            rmdir artifact/python/bin
+          fi
+          if [ -e artifact/python/.lock ]; then
+            test -f artifact/python/.lock
+            test ! -L artifact/python/.lock
+            rm artifact/python/.lock
+          fi
+          install -m 0755 scripts/paraegox-console artifact/paraegox-console
+
+          test "$(head -n 1 artifact/paraegox-console)" = '#!/usr/bin/env sh'
+          test -f artifact/python/paraegox_sdk/console_tui.py
+          test -f artifact/python/paraegox_sdk/console_client.py
+          if grep -RIlE '^#!.*(/Users/runner|/_temp/|/home/runner)' artifact; then
+            printf 'bundle contains a CI-absolute shebang\n' >&2
+            exit 1
+          fi
+
+      - name: Smoke relocated parent, Textual child, and Rust Agent IPC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          relocated_bundle="$RUNNER_TEMP/ParaEGOX bundle"
+          cp -R artifact "$relocated_bundle"
+          smoke_python_prefix="$(.venv/bin/python3 -c 'import sys; print(sys.base_prefix)')"
+          smoke_python="$smoke_python_prefix/bin/python3"
+          test -x "$smoke_python"
+          if "$smoke_python" -I -c 'import textual' >/dev/null 2>&1; then
+            printf 'smoke interpreter unexpectedly contains Textual outside the bundle\n' >&2
+            exit 1
+          fi
+          PATH="$smoke_python_prefix/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+            "$smoke_python" scripts/smoke_macos_textual_chat.py \
+              --bundle-dir "$relocated_bundle"
+
+      - name: Checksum the complete bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
           (
             cd artifact
-            shasum -a 256 paraegox > paraegox.sha256
-            shasum -a 256 -c paraegox.sha256
+            find . -type f ! -name SHA256SUMS -print \
+              | LC_ALL=C sort \
+              | while IFS= read -r path; do shasum -a 256 "$path"; done \
+              > SHA256SUMS
+            shasum -a 256 -c SHA256SUMS
           )
 
-      - name: Upload commit-addressed macOS CLI artifact
+      - name: Upload commit-addressed macOS chat bundle
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: paraegox-macos-x86_64-${{ github.sha }}
-          path: |
-            artifact/paraegox
-            artifact/paraegox.sha256
+          path: artifact/
           if-no-files-found: error
           retention-days: 7
