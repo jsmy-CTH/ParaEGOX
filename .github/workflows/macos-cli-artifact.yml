@@ -79,11 +79,12 @@ jobs:
           "$binary" --help | tee "$help_output"
 
           grep -Fqx 'Usage: paraegox chat --config <absolute-paraegox.toml>' "$help_output"
+          grep -Fqx '       paraegox node --config <absolute-paraegox-node.toml>' "$help_output"
           grep -Fqx '       paraegox --help' "$help_output"
-          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 2
+          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 3
 
-          if grep -Eq 'paraegox-local|developer-|fixture-v1|openai-v1|deepseek-v1' "$help_output"; then
-            printf 'legacy provider-specific CLI surface is still exposed\n' >&2
+          if grep -Eq 'paraegox-local|developer-|fixture-v1|openai-v1|deepseek-v1|__node-daemon-child-v1|--node-bootstrap-file|--node-observation-bootstrap-file' "$help_output"; then
+            printf 'hidden or legacy CLI surface is still exposed\n' >&2
             exit 1
           fi
 

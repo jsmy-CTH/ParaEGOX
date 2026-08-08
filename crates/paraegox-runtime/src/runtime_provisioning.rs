@@ -34,7 +34,7 @@ use paraegox_runtime_contracts::reference_control::{
     reference_developer_local_bootstrap_channel_policy_fingerprint_v1,
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::admission::{
     AdmissionConfigurationError, AdmissionStateLimits, ApplyAdmissionPolicy, ED25519_ALGORITHM,
@@ -81,8 +81,10 @@ pub(crate) struct RuntimeProvisioningInputV1 {
 }
 
 /// In-memory identity material admitted only by the explicit DeveloperLocal
-/// composition root.  It deliberately has no production constructor and
-/// never changes the production protected-key-file path.
+/// composition root. Controller and tenure authority are verification-only;
+/// the Runtime response seed is the sole private signing capability. This
+/// deliberately has no production constructor and never changes the
+/// production protected-key-file path.
 pub(crate) struct RuntimeDeveloperLocalProvisioningInputV1 {
     pub(crate) socket_path: PathBuf,
     pub(crate) target: RuntimeHostId,
@@ -91,21 +93,13 @@ pub(crate) struct RuntimeDeveloperLocalProvisioningInputV1 {
     pub(crate) runtime_principal: PrincipalRef,
     pub(crate) controller_principal: PrincipalRef,
     pub(crate) controller_request_key_ref: ApplyAuthKeyRef,
-    pub(crate) controller_signing_seed: [u8; KEY_BYTES],
+    pub(crate) controller_request_verification_key: [u8; KEY_BYTES],
     pub(crate) runtime_response_key_ref: ApplyAuthKeyRef,
-    pub(crate) runtime_response_signing_seed: [u8; KEY_BYTES],
+    pub(crate) runtime_response_signing_seed: Zeroizing<[u8; KEY_BYTES]>,
     pub(crate) authority_principal: PrincipalRef,
     pub(crate) tenure_authority_ref: TenureAuthorityRef,
     pub(crate) tenure_key_ref: TenureKeyRef,
-    pub(crate) tenure_signing_seed: [u8; KEY_BYTES],
-}
-
-impl Drop for RuntimeDeveloperLocalProvisioningInputV1 {
-    fn drop(&mut self) {
-        self.controller_signing_seed.zeroize();
-        self.runtime_response_signing_seed.zeroize();
-        self.tenure_signing_seed.zeroize();
-    }
+    pub(crate) tenure_verification_key: [u8; KEY_BYTES],
 }
 
 struct RuntimeProvisioningMaterialV1 {
@@ -224,9 +218,9 @@ impl RuntimeProvisioningV1 {
     }
 
     /// Builds the same authenticated provisioning capability for the explicit
-    /// same-user DeveloperLocal launcher.  Role identities and signing keys
-    /// remain distinct; only the production multi-UID deployment requirement
-    /// is replaced by the current process credentials.
+    /// same-user DeveloperLocal launcher. External role verification keys and
+    /// the Runtime-local response signer remain distinct; only the production
+    /// multi-UID deployment requirement is replaced by current credentials.
     pub(crate) fn try_new_developer_local(
         input: RuntimeDeveloperLocalProvisioningInputV1,
     ) -> Result<Self, RuntimeProvisioningError> {
@@ -236,9 +230,7 @@ impl RuntimeProvisioningV1 {
         if uid == 0 || gid == 0 {
             return Err(RuntimeProvisioningError::InvalidProvisioning);
         }
-        let controller_signer = SigningKey::from_bytes(&input.controller_signing_seed);
         let response_signer = SigningKey::from_bytes(&input.runtime_response_signing_seed);
-        let tenure_signer = SigningKey::from_bytes(&input.tenure_signing_seed);
         let material = RuntimeProvisioningInputV1 {
             socket_path: input.socket_path.clone(),
             target: input.target,
@@ -263,14 +255,14 @@ impl RuntimeProvisioningV1 {
             tenure_public_key_path: PathBuf::new(),
         };
         validate_role_identities(&material, false)?;
-        let response_seed = input.runtime_response_signing_seed;
+        let response_seed = *input.runtime_response_signing_seed;
         Self::try_new_from_material(
             material,
             RuntimeProvisioningMaterialV1 {
-                controller_public_key: controller_signer.verifying_key().to_bytes(),
+                controller_public_key: input.controller_request_verification_key,
                 response_public_key: response_signer.verifying_key().to_bytes(),
                 response_seed,
-                tenure_public_key: tenure_signer.verifying_key().to_bytes(),
+                tenure_public_key: input.tenure_verification_key,
                 socket_directory_mode: DEVELOPER_LOCAL_SOCKET_DIRECTORY_MODE,
                 socket_mode: DEVELOPER_LOCAL_SOCKET_MODE,
                 developer_local: true,
@@ -796,6 +788,8 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use zeroize::Zeroizing;
+
     use super::*;
 
     const CONTROLLER_SEED: [u8; 32] = [0x41; 32];
@@ -898,6 +892,95 @@ mod tests {
         fs::write(path, bytes).unwrap_or_else(|error| panic!("key fixture write failed: {error}"));
         fs::set_permissions(path, Permissions::from_mode(KEY_FILE_MODE))
             .unwrap_or_else(|error| panic!("key fixture chmod failed: {error}"));
+    }
+
+    fn developer_local_input() -> RuntimeDeveloperLocalProvisioningInputV1 {
+        RuntimeDeveloperLocalProvisioningInputV1 {
+            socket_path: std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|error| panic!("temp directory canonicalization failed: {error}"))
+                .join("paraegox-runtime-developer-local-split-trust.sock"),
+            target: RuntimeHostId::from_bytes([0x11; 16]),
+            source_scope: SourceScopeRef::from_bytes([0x12; 16]),
+            writer: PlanWriterRef::from_bytes([0x13; 16]),
+            runtime_principal: PrincipalRef::from_bytes([0x21; 16]),
+            controller_principal: PrincipalRef::from_bytes([0x22; 16]),
+            controller_request_key_ref: ApplyAuthKeyRef::from_bytes([0x31; 16]),
+            controller_request_verification_key: SigningKey::from_bytes(&CONTROLLER_SEED)
+                .verifying_key()
+                .to_bytes(),
+            runtime_response_key_ref: ApplyAuthKeyRef::from_bytes([0x32; 16]),
+            runtime_response_signing_seed: Zeroizing::new(RESPONSE_SEED),
+            authority_principal: PrincipalRef::from_bytes([0x23; 16]),
+            tenure_authority_ref: TenureAuthorityRef::from_bytes([0x33; 16]),
+            tenure_key_ref: TenureKeyRef::from_bytes([0x34; 16]),
+            tenure_verification_key: SigningKey::from_bytes(&TENURE_SEED)
+                .verifying_key()
+                .to_bytes(),
+        }
+    }
+
+    #[test]
+    fn developer_local_uses_external_verification_keys_and_runtime_response_seed() {
+        let input = developer_local_input();
+        let controller_public_key = input.controller_request_verification_key;
+        let tenure_public_key = input.tenure_verification_key;
+        let expected_admission_policy_fingerprint =
+            reference_admission_policy_fingerprint_v1(ReferenceAdmissionPolicyInputV1 {
+                target: input.target,
+                source_scope: input.source_scope,
+                writer: input.writer,
+                controller_principal: input.controller_principal,
+                controller_key_ref: input.controller_request_key_ref,
+                controller_public_key: &controller_public_key,
+                authority_principal: input.authority_principal,
+                authority_uid: geteuid().as_raw(),
+                authority_gid: getegid().as_raw(),
+                tenure_authority_ref: input.tenure_authority_ref,
+                tenure_key_ref: input.tenure_key_ref,
+                tenure_public_key: &tenure_public_key,
+            })
+            .unwrap_or_else(|error| panic!("shared admission fingerprint failed: {error}"))
+            .digest();
+
+        let provisioning = RuntimeProvisioningV1::try_new_developer_local(input)
+            .unwrap_or_else(|error| panic!("DeveloperLocal provisioning rejected: {error}"));
+
+        assert_eq!(provisioning.controller_key().to_bytes(), controller_public_key);
+        assert_eq!(
+            provisioning.runtime_response_public_key(),
+            SigningKey::from_bytes(&RESPONSE_SEED).verifying_key().to_bytes()
+        );
+        assert_eq!(
+            provisioning.admission_policy_fingerprint(),
+            expected_admission_policy_fingerprint
+        );
+    }
+
+    #[test]
+    fn developer_local_rejects_weak_or_role_aliased_verification_keys() {
+        let mut weak_key = [0_u8; KEY_BYTES];
+        weak_key[0] = 1;
+        let mut weak = developer_local_input();
+        weak.controller_request_verification_key = weak_key;
+        assert!(matches!(
+            RuntimeProvisioningV1::try_new_developer_local(weak),
+            Err(RuntimeProvisioningError::InvalidProvisioning)
+        ));
+
+        let mut aliased = developer_local_input();
+        aliased.tenure_verification_key = aliased.controller_request_verification_key;
+        assert!(matches!(
+            RuntimeProvisioningV1::try_new_developer_local(aliased),
+            Err(RuntimeProvisioningError::InvalidProvisioning)
+        ));
+
+        let mut response_alias = developer_local_input();
+        response_alias.runtime_response_signing_seed = Zeroizing::new(CONTROLLER_SEED);
+        assert!(matches!(
+            RuntimeProvisioningV1::try_new_developer_local(response_alias),
+            Err(RuntimeProvisioningError::InvalidProvisioning)
+        ));
     }
 
     #[test]

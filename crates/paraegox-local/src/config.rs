@@ -11,14 +11,20 @@ use paraegox_model_adapters::{
     DeepSeekChatCompletionsProviderConfigV1, DeepSeekChatModelV1, MAX_OPENAI_RESPONSES_MODEL_BYTES,
     OpenAiResponsesProviderConfigV1,
 };
+use ed25519_dalek::VerifyingKey;
+use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     DistributedFabricCredentialRefV1, DistributedFabricTlsEndpointV1,
+    DistributedFabricTrustAnchorRefV1, DistributedFabricTrustDomainRefV1,
+    RestrictedRuntimeApplyTransportProfileFieldsV1, RestrictedRuntimeApplyTransportProfileV1,
     MAX_RESTRICTED_RUNTIME_APPLY_ROUTE_BYTES,
 };
 use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentProviderRefV1;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 
 const CHAT_COMMAND: &str = "chat";
+const NODE_COMMAND: &str = "node";
 const CONFIG_OPTION: &str = "--config";
 const DETERMINISTIC_ECHO_PROVIDER: &str = "deterministic-echo-v1";
 const OPENAI_RESPONSES_PROVIDER: &str = "openai-responses-v1";
@@ -26,7 +32,11 @@ const DEEPSEEK_CHAT_COMPLETIONS_PROVIDER: &str = "deepseek-chat-completions-v1";
 const OPENAI_SECRET_REF: &str = "env:OPENAI_API_KEY";
 const DEEPSEEK_SECRET_REF: &str = "env:DEEPSEEK_API_KEY";
 const CHAT_CONFIG_SCHEMA_VERSION: u16 = 1;
+const NODE_CONFIG_SCHEMA_VERSION: u16 = 1;
 const MAX_CHAT_CONFIG_BYTES: u64 = 64 * 1024;
+const NODE_CONFIG_COMMITMENT_DOMAIN: &[u8] =
+    b"paraegox.local.developer-node-config.sha256.v1";
+const DEVELOPER_NODE_OPERATION_TIMEOUT_NANOS: u64 = 30_000_000_000;
 // In-progress two-target composition is intentionally not a public CLI. Keep
 // its parser reachable only through the same double-underscore convention as
 // the existing process-child implementation modes until the real owner chain
@@ -90,6 +100,7 @@ pub(crate) const DEVELOPER_PROVISIONED_MAX_OUTPUT_TEXT_BYTES: usize = 32 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Command {
     Help,
+    DeveloperNodeV1(Box<DeveloperNodeConfigV1>),
     DeveloperFixtureV1(DeveloperFixtureConfigV1),
     DeveloperDistributedFixtureV1(DeveloperDistributedFixtureConfigV1),
     DeveloperProvisionedV1(DeveloperProvisionedConfigV1),
@@ -110,6 +121,217 @@ struct DeveloperLocalModelDocumentV1 {
     provider: String,
     model: Option<String>,
     secret_ref: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperNodeConfigDocumentV1 {
+    schema_version: u16,
+    state_root: String,
+    control: DeveloperNodeControlDocumentV1,
+    restricted_runtime_apply: DeveloperNodeRestrictedRuntimeApplyDocumentV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperNodeControlDocumentV1 {
+    installation_id: String,
+    target: String,
+    source_scope: String,
+    writer: String,
+    runtime_principal: String,
+    controller_principal: String,
+    authority_principal: String,
+    controller_request_key_ref: String,
+    runtime_response_key_ref: String,
+    tenure_authority_ref: String,
+    tenure_key_ref: String,
+    enrollment_issuer_ref: String,
+    controller_request_verification_key: String,
+    tenure_verification_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperNodeRestrictedRuntimeApplyDocumentV1 {
+    endpoint_ref: String,
+    endpoint_generation: u64,
+    tls_listener_locator: String,
+    route: String,
+    trust_domain_ref: String,
+    trust_anchor_ref: String,
+    controller_connector_credential_ref: String,
+    runtime_listener_credential_ref: String,
+    control_transport_profile_ref: String,
+    root_ca_certificate_file: String,
+    runtime_listener_certificate_file: String,
+    runtime_listener_private_key_file: String,
+}
+
+/// Strict, non-secret input for one host-local Runtime + NodeDaemon process.
+/// Controller and Authority private signing material can never be represented
+/// by this schema.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DeveloperNodeConfigV1 {
+    state_root: PathBuf,
+    control: DeveloperNodeControlConfigV1,
+    restricted_runtime_apply: DeveloperNodeRestrictedRuntimeApplyConfigV1,
+    config_commitment: [u8; 32],
+}
+
+impl fmt::Debug for DeveloperNodeConfigV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeveloperNodeConfigV1")
+            .field("state_root", &self.state_root)
+            .field("control", &self.control)
+            .field("restricted_runtime_apply", &self.restricted_runtime_apply)
+            .field("config_commitment", &"<redacted-digest>")
+            .finish()
+    }
+}
+
+impl DeveloperNodeConfigV1 {
+    pub(crate) fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    pub(crate) const fn control(&self) -> &DeveloperNodeControlConfigV1 {
+        &self.control
+    }
+
+    pub(crate) const fn restricted_runtime_apply(
+        &self,
+    ) -> &DeveloperNodeRestrictedRuntimeApplyConfigV1 {
+        &self.restricted_runtime_apply
+    }
+
+    pub(crate) const fn config_commitment(&self) -> [u8; 32] {
+        self.config_commitment
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DeveloperNodeControlConfigV1 {
+    installation_id: [u8; 16],
+    target: [u8; 16],
+    source_scope: [u8; 16],
+    writer: [u8; 16],
+    runtime_principal: [u8; 16],
+    controller_principal: [u8; 16],
+    authority_principal: [u8; 16],
+    controller_request_key_ref: [u8; 16],
+    runtime_response_key_ref: [u8; 16],
+    tenure_authority_ref: [u8; 16],
+    tenure_key_ref: [u8; 16],
+    enrollment_issuer_ref: [u8; 16],
+    controller_request_verification_key: [u8; 32],
+    tenure_verification_key: [u8; 32],
+}
+
+impl fmt::Debug for DeveloperNodeControlConfigV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeveloperNodeControlConfigV1(<non-secret-pins>)")
+    }
+}
+
+impl DeveloperNodeControlConfigV1 {
+    pub(crate) const fn installation_id(&self) -> [u8; 16] {
+        self.installation_id
+    }
+    pub(crate) const fn target(&self) -> [u8; 16] {
+        self.target
+    }
+    pub(crate) const fn source_scope(&self) -> [u8; 16] {
+        self.source_scope
+    }
+    pub(crate) const fn writer(&self) -> [u8; 16] {
+        self.writer
+    }
+    pub(crate) const fn runtime_principal(&self) -> [u8; 16] {
+        self.runtime_principal
+    }
+    pub(crate) const fn controller_principal(&self) -> [u8; 16] {
+        self.controller_principal
+    }
+    pub(crate) const fn authority_principal(&self) -> [u8; 16] {
+        self.authority_principal
+    }
+    pub(crate) const fn controller_request_key_ref(&self) -> [u8; 16] {
+        self.controller_request_key_ref
+    }
+    pub(crate) const fn runtime_response_key_ref(&self) -> [u8; 16] {
+        self.runtime_response_key_ref
+    }
+    pub(crate) const fn tenure_authority_ref(&self) -> [u8; 16] {
+        self.tenure_authority_ref
+    }
+    pub(crate) const fn tenure_key_ref(&self) -> [u8; 16] {
+        self.tenure_key_ref
+    }
+    pub(crate) const fn enrollment_issuer_ref(&self) -> [u8; 16] {
+        self.enrollment_issuer_ref
+    }
+    pub(crate) const fn controller_request_verification_key(&self) -> [u8; 32] {
+        self.controller_request_verification_key
+    }
+    pub(crate) const fn tenure_verification_key(&self) -> [u8; 32] {
+        self.tenure_verification_key
+    }
+
+    fn runtime_identity_refs(&self) -> [[u8; 16]; 11] {
+        [
+            self.installation_id,
+            self.target,
+            self.source_scope,
+            self.writer,
+            self.runtime_principal,
+            self.controller_principal,
+            self.authority_principal,
+            self.controller_request_key_ref,
+            self.runtime_response_key_ref,
+            self.tenure_authority_ref,
+            self.tenure_key_ref,
+        ]
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DeveloperNodeRestrictedRuntimeApplyConfigV1 {
+    transport_profile: RestrictedRuntimeApplyTransportProfileV1,
+    control_transport_profile_ref: [u8; 16],
+    root_ca_certificate_file: PathBuf,
+    runtime_listener_certificate_file: PathBuf,
+    runtime_listener_private_key_file: PathBuf,
+}
+
+impl fmt::Debug for DeveloperNodeRestrictedRuntimeApplyConfigV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeveloperNodeRestrictedRuntimeApplyConfigV1")
+            .field("transport_profile", &self.transport_profile)
+            .field("control_transport_profile_ref", &"<non-secret-ref>")
+            .field("credential_paths", &"<redacted-paths>")
+            .finish()
+    }
+}
+
+impl DeveloperNodeRestrictedRuntimeApplyConfigV1 {
+    pub(crate) const fn transport_profile(&self) -> &RestrictedRuntimeApplyTransportProfileV1 {
+        &self.transport_profile
+    }
+    pub(crate) const fn control_transport_profile_ref(&self) -> [u8; 16] {
+        self.control_transport_profile_ref
+    }
+    pub(crate) fn root_ca_certificate_file(&self) -> &Path {
+        &self.root_ca_certificate_file
+    }
+    pub(crate) fn runtime_listener_certificate_file(&self) -> &Path {
+        &self.runtime_listener_certificate_file
+    }
+    pub(crate) fn runtime_listener_private_key_file(&self) -> &Path {
+        &self.runtime_listener_private_key_file
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -753,6 +975,7 @@ pub(crate) enum ConfigError {
     UnsupportedConfigSchema,
     UnknownProvider,
     InvalidProviderConfiguration,
+    InvalidNodeConfiguration,
     UnexpectedHelpArgument,
     UnknownOption,
     MissingOptionValue,
@@ -830,6 +1053,7 @@ impl ConfigError {
             Self::UnsupportedConfigSchema => "PXLC-CONFIG-SCHEMA-UNSUPPORTED",
             Self::UnknownProvider => "PXLC-CONFIG-PROVIDER-UNKNOWN",
             Self::InvalidProviderConfiguration => "PXLC-CONFIG-PROVIDER-INVALID",
+            Self::InvalidNodeConfiguration => "PXLC-NODE-CONFIG-INVALID",
             Self::UnexpectedHelpArgument => "PXLC-HELP-EXTRA",
             Self::UnknownOption => "PXLC-OPTION-UNKNOWN",
             Self::MissingOptionValue => "PXLC-OPTION-VALUE-MISSING",
@@ -901,7 +1125,7 @@ impl ConfigError {
             }
             Self::MissingMode => "an explicit mode is required",
             Self::UnknownMode => "the requested mode is not supported",
-            Self::MissingConfigPath => "chat requires --config with one path",
+            Self::MissingConfigPath => "chat and node require --config with one path",
             Self::InvalidConfigPath => {
                 "config path must name an absolute lexically canonical regular file"
             }
@@ -912,6 +1136,9 @@ impl ConfigError {
             Self::UnknownProvider => "config selects an unsupported model provider",
             Self::InvalidProviderConfiguration => {
                 "config model fields do not match the selected provider"
+            }
+            Self::InvalidNodeConfiguration => {
+                "node config contains invalid or conflicting identity or transport pins"
             }
             Self::UnexpectedHelpArgument => "help accepts no additional arguments",
             Self::UnknownOption => "the mode contains an unknown or positional argument",
@@ -1056,6 +1283,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Com
             Ok(Command::Help)
         }
         CHAT_COMMAND => parse_chat(arguments),
+        NODE_COMMAND => parse_node(arguments),
         INTERNAL_DISTRIBUTED_FIXTURE_MODE => parse_developer_distributed_fixture_v1(
             arguments,
             DeveloperDistributedFixtureActionV1::Run,
@@ -1081,6 +1309,28 @@ fn parse_chat(mut arguments: impl Iterator<Item = String>) -> Result<Command, Co
 }
 
 fn parse_chat_config_file(path: String) -> Result<Command, ConfigError> {
+    let text = read_config_file(path)?;
+    let document = toml::from_str::<DeveloperLocalConfigDocumentV1>(&text)
+        .map_err(|_| ConfigError::InvalidConfigDocument)?;
+    parse_chat_config_document(document)
+}
+
+fn parse_node(mut arguments: impl Iterator<Item = String>) -> Result<Command, ConfigError> {
+    ensure_unix_developer_local()?;
+    if arguments.next().as_deref() != Some(CONFIG_OPTION) {
+        return Err(ConfigError::MissingConfigPath);
+    }
+    let path = arguments.next().ok_or(ConfigError::MissingConfigPath)?;
+    if arguments.next().is_some() {
+        return Err(ConfigError::UnknownOption);
+    }
+    let text = read_config_file(path)?;
+    let document = toml::from_str::<DeveloperNodeConfigDocumentV1>(&text)
+        .map_err(|_| ConfigError::InvalidConfigDocument)?;
+    parse_node_config_document(document)
+}
+
+fn read_config_file(path: String) -> Result<String, ConfigError> {
     let path = parse_config_path(path)?;
     let file = open_config_file(&path)?;
     let metadata = file.metadata().map_err(|_| ConfigError::ConfigFileRead)?;
@@ -1094,10 +1344,7 @@ fn parse_chat_config_file(path: String) -> Result<Command, ConfigError> {
     if bytes.len() as u64 > MAX_CHAT_CONFIG_BYTES {
         return Err(ConfigError::ConfigFileTooLarge);
     }
-    let text = std::str::from_utf8(&bytes).map_err(|_| ConfigError::InvalidConfigDocument)?;
-    let document = toml::from_str::<DeveloperLocalConfigDocumentV1>(text)
-        .map_err(|_| ConfigError::InvalidConfigDocument)?;
-    parse_chat_config_document(document)
+    String::from_utf8(bytes).map_err(|_| ConfigError::InvalidConfigDocument)
 }
 
 fn parse_config_path(value: String) -> Result<PathBuf, ConfigError> {
@@ -1199,6 +1446,171 @@ pub(crate) fn parse_chat_config_toml_for_test(document: &str) -> Result<Command,
     let document = toml::from_str::<DeveloperLocalConfigDocumentV1>(document)
         .map_err(|_| ConfigError::InvalidConfigDocument)?;
     parse_chat_config_document(document)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_node_config_toml_for_test(document: &str) -> Result<Command, ConfigError> {
+    let document = toml::from_str::<DeveloperNodeConfigDocumentV1>(document)
+        .map_err(|_| ConfigError::InvalidConfigDocument)?;
+    parse_node_config_document(document)
+}
+
+fn parse_node_config_document(
+    document: DeveloperNodeConfigDocumentV1,
+) -> Result<Command, ConfigError> {
+    if document.schema_version != NODE_CONFIG_SCHEMA_VERSION {
+        return Err(ConfigError::UnsupportedConfigSchema);
+    }
+    let state_root = parse_state_root(document.state_root)?;
+    let control_document = document.control;
+    let control = DeveloperNodeControlConfigV1 {
+        installation_id: parse_node_ref(&control_document.installation_id)?,
+        target: parse_node_ref(&control_document.target)?,
+        source_scope: parse_node_ref(&control_document.source_scope)?,
+        writer: parse_node_ref(&control_document.writer)?,
+        runtime_principal: parse_node_ref(&control_document.runtime_principal)?,
+        controller_principal: parse_node_ref(&control_document.controller_principal)?,
+        authority_principal: parse_node_ref(&control_document.authority_principal)?,
+        controller_request_key_ref: parse_node_ref(
+            &control_document.controller_request_key_ref,
+        )?,
+        runtime_response_key_ref: parse_node_ref(&control_document.runtime_response_key_ref)?,
+        tenure_authority_ref: parse_node_ref(&control_document.tenure_authority_ref)?,
+        tenure_key_ref: parse_node_ref(&control_document.tenure_key_ref)?,
+        enrollment_issuer_ref: parse_node_ref(&control_document.enrollment_issuer_ref)?,
+        controller_request_verification_key: parse_verification_key(
+            &control_document.controller_request_verification_key,
+        )?,
+        tenure_verification_key: parse_verification_key(
+            &control_document.tenure_verification_key,
+        )?,
+    };
+    let runtime_refs = control.runtime_identity_refs();
+    if runtime_refs.iter().enumerate().any(|(index, value)| {
+        runtime_refs[index + 1..]
+            .iter()
+            .any(|other| value == other)
+    }) || control.controller_request_verification_key == control.tenure_verification_key
+    {
+        return Err(ConfigError::InvalidNodeConfiguration);
+    }
+
+    let restricted = document.restricted_runtime_apply;
+    let endpoint_ref = parse_node_ref(&restricted.endpoint_ref)?;
+    let trust_domain_ref = DistributedFabricTrustDomainRefV1::try_from_bytes(parse_node_ref(
+        &restricted.trust_domain_ref,
+    )?)
+    .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let trust_anchor_ref = DistributedFabricTrustAnchorRefV1::try_from_bytes(parse_node_ref(
+        &restricted.trust_anchor_ref,
+    )?)
+    .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let controller_connector_credential_ref = DistributedFabricCredentialRefV1::try_from_bytes(
+        parse_node_ref(&restricted.controller_connector_credential_ref)?,
+    )
+    .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let runtime_listener_credential_ref = DistributedFabricCredentialRefV1::try_from_bytes(
+        parse_node_ref(&restricted.runtime_listener_credential_ref)?,
+    )
+    .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let transport_profile = RestrictedRuntimeApplyTransportProfileV1::try_new(
+        RestrictedRuntimeApplyTransportProfileFieldsV1 {
+            target: RuntimeHostId::from_bytes(control.target),
+            endpoint_ref,
+            endpoint_generation: restricted.endpoint_generation,
+            tls_listener_locator: &restricted.tls_listener_locator,
+            route: &restricted.route,
+            trust_domain_ref,
+            trust_anchor_ref,
+            controller_connector_credential_ref,
+            runtime_listener_credential_ref,
+            controller_principal: PrincipalRef::from_bytes(control.controller_principal),
+            runtime_principal: PrincipalRef::from_bytes(control.runtime_principal),
+            operation_timeout_nanos: DEVELOPER_NODE_OPERATION_TIMEOUT_NANOS,
+        },
+    )
+    .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let restricted_runtime_apply = DeveloperNodeRestrictedRuntimeApplyConfigV1 {
+        transport_profile,
+        control_transport_profile_ref: parse_node_ref(
+            &restricted.control_transport_profile_ref,
+        )?,
+        root_ca_certificate_file: parse_tls_file_path(restricted.root_ca_certificate_file)?,
+        runtime_listener_certificate_file: parse_tls_file_path(
+            restricted.runtime_listener_certificate_file,
+        )?,
+        runtime_listener_private_key_file: parse_tls_file_path(
+            restricted.runtime_listener_private_key_file,
+        )?,
+    };
+    let config_commitment = developer_node_config_commitment(
+        &state_root,
+        &control,
+        &restricted_runtime_apply,
+    );
+    Ok(Command::DeveloperNodeV1(Box::new(DeveloperNodeConfigV1 {
+        state_root,
+        control,
+        restricted_runtime_apply,
+        config_commitment,
+    })))
+}
+
+fn parse_node_ref(value: &str) -> Result<[u8; 16], ConfigError> {
+    parse_nonzero_ref(value).ok_or(ConfigError::InvalidNodeConfiguration)
+}
+
+fn parse_verification_key(value: &str) -> Result<[u8; 32], ConfigError> {
+    if value.len() != 64 {
+        return Err(ConfigError::InvalidNodeConfiguration);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0]).ok_or(ConfigError::InvalidNodeConfiguration)? << 4)
+            | hex_nibble(pair[1]).ok_or(ConfigError::InvalidNodeConfiguration)?;
+    }
+    let key = VerifyingKey::from_bytes(&decoded)
+        .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    if key.is_weak() {
+        return Err(ConfigError::InvalidNodeConfiguration);
+    }
+    Ok(decoded)
+}
+
+fn developer_node_config_commitment(
+    state_root: &Path,
+    control: &DeveloperNodeControlConfigV1,
+    restricted: &DeveloperNodeRestrictedRuntimeApplyConfigV1,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(NODE_CONFIG_COMMITMENT_DOMAIN);
+    digest.update(NODE_CONFIG_SCHEMA_VERSION.to_be_bytes());
+    update_node_commitment_field(&mut digest, state_root.as_os_str().as_encoded_bytes());
+    for field in control.runtime_identity_refs() {
+        digest.update(field);
+    }
+    digest.update(control.enrollment_issuer_ref);
+    digest.update(control.controller_request_verification_key);
+    digest.update(control.tenure_verification_key);
+    update_node_commitment_field(&mut digest, restricted.transport_profile.canonical_wire());
+    digest.update(restricted.control_transport_profile_ref);
+    for path in [
+        &restricted.root_ca_certificate_file,
+        &restricted.runtime_listener_certificate_file,
+        &restricted.runtime_listener_private_key_file,
+    ] {
+        update_node_commitment_field(&mut digest, path.as_os_str().as_encoded_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn update_node_commitment_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update(
+        u32::try_from(value.len())
+            .expect("bounded node config field length fits u32")
+            .to_be_bytes(),
+    );
+    digest.update(value);
 }
 
 fn parse_provisioned_config_document(
@@ -1506,6 +1918,59 @@ fn parse_canonical_nonzero_u16(value: &str) -> Option<u16> {
 }
 
 #[cfg(test)]
+pub(crate) fn developer_node_config_for_test(state_root: &Path) -> DeveloperNodeConfigV1 {
+    let state_root = state_root.to_str().expect("UTF-8 test state root");
+    match parse_node_config_toml_for_test(&developer_node_document_for_test(state_root))
+        .expect("valid developer node test config")
+    {
+        Command::DeveloperNodeV1(config) => *config,
+        Command::DeveloperFixtureV1(_)
+        | Command::DeveloperDistributedFixtureV1(_)
+        | Command::DeveloperProvisionedV1(_)
+        | Command::Help => panic!("unexpected developer node test command"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn developer_node_document_for_test(state_root: &str) -> String {
+    format!(
+        r#"schema_version = 1
+state_root = {state_root:?}
+
+[control]
+installation_id = "01010101010101010101010101010101"
+target = "02020202020202020202020202020202"
+source_scope = "03030303030303030303030303030303"
+writer = "04040404040404040404040404040404"
+runtime_principal = "05050505050505050505050505050505"
+controller_principal = "06060606060606060606060606060606"
+authority_principal = "07070707070707070707070707070707"
+controller_request_key_ref = "08080808080808080808080808080808"
+runtime_response_key_ref = "09090909090909090909090909090909"
+tenure_authority_ref = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+tenure_key_ref = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+enrollment_issuer_ref = "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+controller_request_verification_key = "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b"
+tenure_verification_key = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
+
+[restricted_runtime_apply]
+endpoint_ref = "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+endpoint_generation = 1
+tls_listener_locator = "tls/192.0.2.10:7448"
+route = "paraegox/runtime/target-a/apply"
+trust_domain_ref = "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"
+trust_anchor_ref = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+controller_connector_credential_ref = "10101010101010101010101010101010"
+runtime_listener_credential_ref = "11111111111111111111111111111111"
+control_transport_profile_ref = "12121212121212121212121212121212"
+root_ca_certificate_file = "{state_root}/credentials/root-ca.pem"
+runtime_listener_certificate_file = "{state_root}/credentials/runtime.pem"
+runtime_listener_private_key_file = "{state_root}/credentials/runtime-key.pem"
+"#
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1525,6 +1990,35 @@ mod tests {
             OsString::from(CONFIG_OPTION),
             path.into_os_string(),
         ]
+    }
+
+    fn node_config_arguments(contents: impl AsRef<[u8]>) -> Vec<OsString> {
+        let sequence = TEST_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = fs::canonicalize(std::env::temp_dir()).expect("canonical test temp dir");
+        let path = directory.join(format!(
+            "paraegox-node-config-test-{}-{sequence}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, contents).expect("write test node config");
+        vec![
+            OsString::from(NODE_COMMAND),
+            OsString::from(CONFIG_OPTION),
+            path.into_os_string(),
+        ]
+    }
+
+    fn node_document(state_root: &str) -> String {
+        developer_node_document_for_test(state_root)
+    }
+
+    fn parse_node_fixture(document: &str) -> DeveloperNodeConfigV1 {
+        match parse_node_config_toml_for_test(document).expect("valid developer node config") {
+            Command::DeveloperNodeV1(config) => *config,
+            Command::DeveloperFixtureV1(_)
+            | Command::DeveloperDistributedFixtureV1(_)
+            | Command::DeveloperProvisionedV1(_)
+            | Command::Help => panic!("unexpected node command"),
+        }
     }
 
     fn fixture_document(state_root: &str, fabric_listen: &str) -> String {
@@ -1678,7 +2172,7 @@ mod tests {
     fn parse_fixture(arguments: Vec<OsString>) -> DeveloperFixtureConfigV1 {
         match parse(arguments).expect("valid developer fixture arguments") {
             Command::DeveloperFixtureV1(config) => config,
-            Command::DeveloperDistributedFixtureV1(_) => {
+            Command::DeveloperNodeV1(_) | Command::DeveloperDistributedFixtureV1(_) => {
                 panic!("unexpected distributed fixture command")
             }
             Command::DeveloperProvisionedV1(_) => panic!("unexpected provisioned command"),
@@ -1689,7 +2183,9 @@ mod tests {
     fn parse_provisioned(arguments: Vec<OsString>) -> DeveloperProvisionedConfigV1 {
         match parse(arguments).expect("valid developer provisioned arguments") {
             Command::DeveloperProvisionedV1(config) => config,
-            Command::DeveloperFixtureV1(_) => panic!("unexpected fixture command"),
+            Command::DeveloperNodeV1(_) | Command::DeveloperFixtureV1(_) => {
+                panic!("unexpected fixture command")
+            }
             Command::DeveloperDistributedFixtureV1(_) => {
                 panic!("unexpected distributed fixture command")
             }
@@ -1700,10 +2196,78 @@ mod tests {
     fn parse_distributed(arguments: Vec<OsString>) -> DeveloperDistributedFixtureConfigV1 {
         match parse(arguments).expect("valid developer distributed fixture arguments") {
             Command::DeveloperDistributedFixtureV1(config) => config,
-            Command::DeveloperFixtureV1(_) => panic!("unexpected fixture command"),
+            Command::DeveloperNodeV1(_) | Command::DeveloperFixtureV1(_) => {
+                panic!("unexpected fixture command")
+            }
             Command::DeveloperProvisionedV1(_) => panic!("unexpected provisioned command"),
             Command::Help => panic!("unexpected help command"),
         }
+    }
+
+    #[test]
+    fn exact_node_config_selects_only_split_trust_host_local_inputs() {
+        let document = node_document("/var/tmp/paraegox-node-test");
+        let config = parse_node_fixture(&document);
+        assert_eq!(config.state_root(), Path::new("/var/tmp/paraegox-node-test"));
+        assert_eq!(config.control().target(), [0x02; 16]);
+        assert_eq!(config.control().controller_request_key_ref(), [0x08; 16]);
+        assert_eq!(config.control().runtime_response_key_ref(), [0x09; 16]);
+        assert_eq!(config.control().enrollment_issuer_ref(), [0x0c; 16]);
+        assert_ne!(config.config_commitment(), [0; 32]);
+        assert_eq!(
+            config
+                .restricted_runtime_apply()
+                .transport_profile()
+                .tls_listener_locator()
+                .as_str(),
+            "tls/192.0.2.10:7448"
+        );
+        assert!(matches!(
+            parse(node_config_arguments(document)),
+            Ok(Command::DeveloperNodeV1(_))
+        ));
+    }
+
+    #[test]
+    fn node_config_rejects_private_material_aliases_and_semantic_drift() {
+        let valid = node_document("/var/tmp/paraegox-node-test");
+        let with_seed = valid.replace(
+            "installation_id =",
+            "controller_signing_seed = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\ninstallation_id =",
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&with_seed),
+            Err(ConfigError::InvalidConfigDocument)
+        );
+
+        let aliased_ref = valid.replace(
+            "target = \"02020202020202020202020202020202\"",
+            "target = \"01010101010101010101010101010101\"",
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&aliased_ref),
+            Err(ConfigError::InvalidNodeConfiguration)
+        );
+        let aliased_key = valid.replace(
+            "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+            "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&aliased_key),
+            Err(ConfigError::InvalidNodeConfiguration)
+        );
+        let weak_key = valid.replace(
+            "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+            &"00".repeat(32),
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&weak_key),
+            Err(ConfigError::InvalidNodeConfiguration)
+        );
+
+        let first = parse_node_fixture(&valid);
+        let changed = parse_node_fixture(&valid.replace("endpoint_generation = 1", "endpoint_generation = 2"));
+        assert_ne!(first.config_commitment(), changed.config_commitment());
     }
 
     #[test]

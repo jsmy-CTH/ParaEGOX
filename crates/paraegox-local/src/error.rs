@@ -3,6 +3,8 @@ use crate::config::ConfigError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LocalProcessError {
     Configuration(ConfigError),
+    UnsafeExecutionIdentity,
+    SignalHandling,
     IdentityManifest,
     LayoutPreparation,
     IdentityDerivation,
@@ -11,6 +13,7 @@ pub(crate) enum LocalProcessError {
     AuthorityStartup,
     RuntimeStartup,
     NodeBootstrap,
+    NodeCredentialFiles,
     NodeStartup,
     DeploymentActivation,
     ConversationConfiguration,
@@ -37,6 +40,8 @@ impl LocalProcessError {
     pub(crate) const fn code(self) -> &'static str {
         match self {
             Self::Configuration(error) => error.code(),
+            Self::UnsafeExecutionIdentity => "PXLC-EXECUTION-IDENTITY",
+            Self::SignalHandling => "PXLC-SIGNAL-HANDLING",
             Self::IdentityManifest => "PXLC-IDENTITY-MANIFEST",
             Self::LayoutPreparation => "PXLC-LAYOUT-PREPARATION",
             Self::IdentityDerivation => "PXLC-IDENTITY-DERIVATION",
@@ -45,6 +50,7 @@ impl LocalProcessError {
             Self::AuthorityStartup => "PXLC-AUTHORITY-STARTUP",
             Self::RuntimeStartup => "PXLC-RUNTIME-STARTUP",
             Self::NodeBootstrap => "PXLC-NODE-BOOTSTRAP",
+            Self::NodeCredentialFiles => "PXLC-NODE-CREDENTIAL-FILES",
             Self::NodeStartup => "PXLC-NODE-STARTUP",
             Self::DeploymentActivation => "PXLC-DEPLOYMENT-ACTIVATION",
             Self::ConversationConfiguration => "PXLC-CONVERSATION-CONFIGURATION",
@@ -71,6 +77,10 @@ impl LocalProcessError {
     pub(crate) const fn message(self) -> &'static str {
         match self {
             Self::Configuration(error) => error.message(),
+            Self::UnsafeExecutionIdentity => {
+                "DeveloperLocal node must run as a non-root user and group"
+            }
+            Self::SignalHandling => "DeveloperLocal process signal handling failed closed",
             Self::IdentityManifest => "DeveloperLocal identity manifest failed closed",
             Self::LayoutPreparation => "DeveloperLocal filesystem layout failed closed",
             Self::IdentityDerivation => "DeveloperLocal identity derivation failed closed",
@@ -79,6 +89,9 @@ impl LocalProcessError {
             Self::AuthorityStartup => "DeveloperLocal tenure Authority failed to start",
             Self::RuntimeStartup => "DeveloperLocal Runtime failed to start",
             Self::NodeBootstrap => "DeveloperLocal Node registration bootstrap failed closed",
+            Self::NodeCredentialFiles => {
+                "DeveloperLocal Node TLS credential files failed closed"
+            }
             Self::NodeStartup => "DeveloperLocal NodeDaemon failed to start",
             Self::DeploymentActivation => {
                 "DeploymentController failed to activate the Fabric and Agent stack"

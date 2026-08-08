@@ -8,7 +8,7 @@ use std::{
 
 use config::{
     Command, DeveloperDistributedFixtureActionV1, DeveloperDistributedFixtureConfigV1,
-    DeveloperFixtureConfigV1, DeveloperProvisionedConfigV1,
+    DeveloperFixtureConfigV1, DeveloperNodeConfigV1, DeveloperProvisionedConfigV1,
 };
 use error::LocalProcessError;
 
@@ -55,6 +55,7 @@ fn dispatch(arguments: impl IntoIterator<Item = OsString>) -> Result<(), LocalPr
             print_usage();
             Ok(())
         }
+        Command::DeveloperNodeV1(config) => compose_real_node(*config),
         Command::DeveloperFixtureV1(config) => compose_real_local_stack(config),
         Command::DeveloperDistributedFixtureV1(config) => match config.action() {
             DeveloperDistributedFixtureActionV1::Run => {
@@ -65,6 +66,18 @@ fn dispatch(arguments: impl IntoIterator<Item = OsString>) -> Result<(), LocalPr
             }
         },
         Command::DeveloperProvisionedV1(config) => compose_real_provisioned_stack(config),
+    }
+}
+
+fn compose_real_node(config: DeveloperNodeConfigV1) -> Result<(), LocalProcessError> {
+    #[cfg(unix)]
+    {
+        composition::run_node(config)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        unreachable!("configuration rejects DeveloperLocal before node composition on non-Unix")
     }
 }
 
@@ -211,6 +224,7 @@ fn print_usage_to_stderr() {
 
 fn usage() -> &'static str {
     r"Usage: paraegox chat --config <absolute-paraegox.toml>
+       paraegox node --config <absolute-paraegox-node.toml>
        paraegox --help
 
 chat starts the configured ParaEGOX conversation owner chain and Textual console.
@@ -218,7 +232,13 @@ The absolute versioned configuration is the sole public input for provider and
 model selection, Fabric settings, and durable state location. Secret fields
 contain references only; Secret values are obtained from the configured
 resolver and injected at the owning boundary. Secret values are neither CLI
-inputs nor persisted in the versioned configuration."
+inputs nor persisted in the versioned configuration.
+
+node starts only one split-trust local Runtime restricted listener and one
+feature-only NodeDaemon. Its strict config contains remote verification keys,
+opaque references, and credential file paths, never Controller or Authority
+private keys. This command does not perform remote bootstrap, Runtime apply,
+Fabric activation, Agent/Model startup, Inspection, or distributed readiness."
 }
 
 #[cfg(test)]
@@ -245,6 +265,19 @@ mod tests {
             OsString::from("paraegox.toml"),
         ])
         .expect_err("a relative config path must fail before composition");
+
+        assert!(matches!(error, LocalProcessError::Configuration(_)));
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn node_rejects_a_non_absolute_config_path_before_composition() {
+        let error = dispatch([
+            OsString::from("node"),
+            OsString::from("--config"),
+            OsString::from("paraegox-node.toml"),
+        ])
+        .expect_err("a relative node config path must fail before composition");
 
         assert!(matches!(error, LocalProcessError::Configuration(_)));
         assert_eq!(error.exit_code(), 2);
@@ -320,9 +353,13 @@ mod tests {
     }
 
     #[test]
-    fn usage_exposes_only_one_versioned_config_driven_chat_command() {
+    fn usage_exposes_exact_chat_and_node_config_commands_only() {
         let text = usage();
         assert!(text.contains("paraegox chat --config <absolute-paraegox.toml>"));
+        assert!(text.contains("paraegox node --config <absolute-paraegox-node.toml>"));
+        assert!(text.contains("split-trust local Runtime restricted listener"));
+        assert!(text.contains("never Controller or Authority\nprivate keys"));
+        assert!(text.contains("does not perform remote bootstrap"));
         assert!(text.contains("absolute versioned configuration"));
         assert!(text.contains("provider and\nmodel selection"));
         assert!(text.contains("Fabric settings"));

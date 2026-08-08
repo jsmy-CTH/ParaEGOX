@@ -9,10 +9,10 @@ use std::path::{Component, Path, PathBuf};
 
 use nix::unistd::{Gid, Uid, chown};
 
-use crate::config::{DeveloperFixtureConfigV1, DeveloperProvisionedConfigV1};
+use crate::config::{DeveloperFixtureConfigV1, DeveloperNodeConfigV1, DeveloperProvisionedConfigV1};
 use crate::identity::{
-    DistributedDeveloperLocalIdentityManifestV1, DistributedDeveloperLocalTargetV1,
-    IdentityManifestV1,
+    DeveloperNodeIdentityManifestV1, DistributedDeveloperLocalIdentityManifestV1,
+    DistributedDeveloperLocalTargetV1, IdentityManifestV1,
 };
 
 const CONTROLLER_STATE_DIRECTORY: &str = "ctl";
@@ -108,6 +108,22 @@ pub(crate) struct DeveloperLocalLayoutV1 {
     inspection_ipc_bootstrap_path: PathBuf,
 }
 
+/// Minimal filesystem ownership for `paraegox node`: one Runtime owner, one
+/// NodeDaemon owner, and their private local capabilities only.
+#[derive(Debug)]
+pub(crate) struct DeveloperNodeLayoutV1 {
+    canonical_state_root: PathBuf,
+    runtime_state_directory: PathBuf,
+    node_owner_directory: PathBuf,
+    node_state_directory: PathBuf,
+    node_bootstrap_directory: PathBuf,
+    socket_directory: PathBuf,
+    node_socket_directory: PathBuf,
+    runtime_socket_path: PathBuf,
+    node_management_socket_path: PathBuf,
+    pxnb_bootstrap_path: PathBuf,
+}
+
 /// Shared owner paths for the two-target DeveloperLocal composition.
 #[derive(Debug)]
 pub(crate) struct DistributedDeveloperLocalCoordinatorLayoutV1 {
@@ -163,6 +179,55 @@ pub(crate) fn prepare_provisioned(
     identities: &IdentityManifestV1,
 ) -> Result<DeveloperLocalLayoutV1, DeveloperLocalLayoutError> {
     prepare_state_root(config.state_root(), identities)
+}
+
+pub(crate) fn prepare_node(
+    config: &DeveloperNodeConfigV1,
+    identities: &DeveloperNodeIdentityManifestV1,
+) -> Result<DeveloperNodeLayoutV1, DeveloperLocalLayoutError> {
+    let (canonical_state_root, uid, gid) = canonical_private_state_root(config.state_root())?;
+    let runtime_state_directory = canonical_state_root.join(RUNTIME_STATE_DIRECTORY);
+    let node_owner_directory = canonical_state_root.join(NODE_OWNER_DIRECTORY);
+    let node_state_directory = node_owner_directory.join(NODE_STATE_DIRECTORY);
+    let node_bootstrap_directory = node_owner_directory.join(NODE_BOOTSTRAP_DIRECTORY);
+    for directory in [
+        &runtime_state_directory,
+        &node_owner_directory,
+        &node_state_directory,
+        &node_bootstrap_directory,
+    ] {
+        ensure_private_directory(directory, uid, gid)?;
+    }
+
+    let canonical_socket_root = fs::canonicalize(SYSTEM_SOCKET_ROOT)?;
+    validate_canonical_path_chain(&canonical_socket_root)?;
+    let socket_directory =
+        canonical_socket_root.join(socket_directory_name(identities.manifest_instance_id()));
+    ensure_socket_directory(&socket_directory, uid, gid)?;
+    let node_socket_directory = socket_directory.join(NODE_SOCKET_DIRECTORY);
+    ensure_private_directory(&node_socket_directory, uid, gid)?;
+    let runtime_socket_path = socket_directory.join(RUNTIME_SOCKET_FILE);
+    let node_management_socket_path = node_socket_directory.join(NODE_MANAGEMENT_SOCKET_FILE);
+    let pxnb_bootstrap_path = node_bootstrap_directory.join(PXNB_BOOTSTRAP_FILE);
+    for path in [&runtime_socket_path, &node_management_socket_path] {
+        if path.as_os_str().as_bytes().len() > MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES {
+            return Err(DeveloperLocalLayoutError::SocketPathTooLong);
+        }
+    }
+    let layout = DeveloperNodeLayoutV1 {
+        canonical_state_root,
+        runtime_state_directory,
+        node_owner_directory,
+        node_state_directory,
+        node_bootstrap_directory,
+        socket_directory,
+        node_socket_directory,
+        runtime_socket_path,
+        node_management_socket_path,
+        pxnb_bootstrap_path,
+    };
+    layout.validate(uid, gid)?;
+    Ok(layout)
 }
 
 /// Prepares the isolated filesystem shape consumed by the hidden distributed
@@ -595,6 +660,122 @@ impl DeveloperLocalLayoutV1 {
             .iter()
             .enumerate()
             .any(|(index, left)| leaf_paths[index + 1..].iter().any(|right| left == right))
+        {
+            return Err(DeveloperLocalLayoutError::OverlappingPath);
+        }
+        Ok(())
+    }
+}
+
+impl DeveloperNodeLayoutV1 {
+    pub(crate) fn canonical_state_root(&self) -> &Path {
+        &self.canonical_state_root
+    }
+
+    pub(crate) fn runtime_state_directory(&self) -> &Path {
+        &self.runtime_state_directory
+    }
+
+    fn node_owner_directory(&self) -> &Path {
+        &self.node_owner_directory
+    }
+
+    pub(crate) fn node_state_directory(&self) -> &Path {
+        &self.node_state_directory
+    }
+
+    fn node_bootstrap_directory(&self) -> &Path {
+        &self.node_bootstrap_directory
+    }
+
+    pub(crate) fn socket_directory(&self) -> &Path {
+        &self.socket_directory
+    }
+
+    fn node_socket_directory(&self) -> &Path {
+        &self.node_socket_directory
+    }
+
+    pub(crate) fn runtime_socket_path(&self) -> &Path {
+        &self.runtime_socket_path
+    }
+
+    pub(crate) fn node_management_socket_path(&self) -> &Path {
+        &self.node_management_socket_path
+    }
+
+    pub(crate) fn pxnb_bootstrap_path(&self) -> &Path {
+        &self.pxnb_bootstrap_path
+    }
+
+    #[cfg(test)]
+    fn owned_paths(&self) -> [&Path; 10] {
+        [
+            self.canonical_state_root(),
+            self.runtime_state_directory(),
+            self.node_owner_directory(),
+            self.node_state_directory(),
+            self.node_bootstrap_directory(),
+            self.socket_directory(),
+            self.node_socket_directory(),
+            self.runtime_socket_path(),
+            self.node_management_socket_path(),
+            self.pxnb_bootstrap_path(),
+        ]
+    }
+
+    fn validate(&self, uid: u32, gid: u32) -> Result<(), DeveloperLocalLayoutError> {
+        validate_canonical_path_chain(self.canonical_state_root())?;
+        for directory in [
+            self.runtime_state_directory(),
+            self.node_owner_directory(),
+        ] {
+            validate_existing_child_directory(directory, self.canonical_state_root())?;
+        }
+        if self.runtime_state_directory() == self.node_owner_directory() {
+            return Err(DeveloperLocalLayoutError::OverlappingPath);
+        }
+        for directory in [
+            self.node_state_directory(),
+            self.node_bootstrap_directory(),
+        ] {
+            validate_existing_child_directory(directory, self.node_owner_directory())?;
+        }
+        if self.node_state_directory() == self.node_bootstrap_directory() {
+            return Err(DeveloperLocalLayoutError::OverlappingPath);
+        }
+        for directory in [
+            self.canonical_state_root(),
+            self.runtime_state_directory(),
+            self.node_owner_directory(),
+            self.node_state_directory(),
+            self.node_bootstrap_directory(),
+        ] {
+            validate_canonical_path_chain(directory)?;
+            validate_private_directory(&fs::symlink_metadata(directory)?, uid, gid)?;
+        }
+        validate_canonical_path_chain(self.socket_directory())?;
+        validate_socket_directory(&fs::symlink_metadata(self.socket_directory())?, uid, gid)?;
+        validate_existing_child_directory(self.node_socket_directory(), self.socket_directory())?;
+        validate_canonical_path_chain(self.node_socket_directory())?;
+        validate_private_directory(
+            &fs::symlink_metadata(self.node_socket_directory())?,
+            uid,
+            gid,
+        )?;
+        validate_reserved_path(self.runtime_socket_path(), self.socket_directory())?;
+        validate_reserved_path(
+            self.node_management_socket_path(),
+            self.node_socket_directory(),
+        )?;
+        validate_reserved_path(self.pxnb_bootstrap_path(), self.node_bootstrap_directory())?;
+        for path in [self.runtime_socket_path(), self.node_management_socket_path()] {
+            if path.as_os_str().as_bytes().len() > MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES {
+                return Err(DeveloperLocalLayoutError::SocketPathTooLong);
+            }
+        }
+        if self.runtime_socket_path() == self.node_management_socket_path()
+            || self.pxnb_bootstrap_path().starts_with(self.node_state_directory())
         {
             return Err(DeveloperLocalLayoutError::OverlappingPath);
         }
@@ -1168,7 +1349,8 @@ mod tests {
             .expect("valid fixture config")
         {
             crate::config::Command::DeveloperFixtureV1(config) => config,
-            crate::config::Command::DeveloperDistributedFixtureV1(_)
+            crate::config::Command::DeveloperNodeV1(_)
+            | crate::config::Command::DeveloperDistributedFixtureV1(_)
             | crate::config::Command::DeveloperProvisionedV1(_)
             | crate::config::Command::Help => panic!("unexpected fixture command"),
         }
@@ -1252,6 +1434,53 @@ mod tests {
         );
 
         let second = prepare(&config, &identities).expect("stable fixture filesystem reopen");
+        assert_eq!(first.owned_paths(), second.owned_paths());
+        drop(second);
+        drop(first);
+        drop(cleanup);
+    }
+
+    #[test]
+    fn public_node_layout_contains_only_runtime_and_node_owners() {
+        let directory = TestDirectory::new();
+        let config = crate::config::developer_node_config_for_test(&directory.path);
+        let identities =
+            crate::identity::load_or_create_node(&config).expect("node-only identity owner");
+        let first = prepare_node(&config, &identities).expect("node-only filesystem layout");
+        let cleanup = SocketDirectoryCleanup([first.socket_directory().to_path_buf()]);
+
+        for path in [
+            first.canonical_state_root(),
+            first.runtime_state_directory(),
+            first.node_owner_directory(),
+            first.node_state_directory(),
+            first.node_bootstrap_directory(),
+        ] {
+            assert_eq!(fs::canonicalize(path).expect("canonical node directory"), path);
+            assert_eq!(
+                fs::symlink_metadata(path)
+                    .expect("node directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o700
+            );
+        }
+        for absent in [
+            CONTROLLER_STATE_DIRECTORY,
+            SUCCESSOR_STATE_DIRECTORY,
+            AUTHORITY_STATE_DIRECTORY,
+            DISTRIBUTED_STATE_DIRECTORY,
+        ] {
+            assert!(!first.canonical_state_root().join(absent).exists());
+        }
+        assert!(!first.socket_directory().join(AGENT_IPC_SOCKET_FILE).exists());
+        assert!(!first.socket_directory().join(INSPECTION_IPC_SOCKET_FILE).exists());
+        assert!(!first
+            .node_bootstrap_directory()
+            .join(DISTRIBUTED_PXOB_BOOTSTRAP_FILE)
+            .exists());
+        let second = prepare_node(&config, &identities).expect("stable node-only reopen");
         assert_eq!(first.owned_paths(), second.owned_paths());
         drop(second);
         drop(first);

@@ -15,6 +15,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Component, Path, PathBuf};
 
 use nix::unistd::{Gid, Uid, chown};
+use ed25519_dalek::SigningKey;
 use paraegox_deployment::{DeveloperFixtureDerivedIdentityV1, DeveloperFixtureIdentitySeedV1};
 use paraegox_fabric::restricted_runtime_apply_peer_certificate_common_name_v1;
 use paraegox_kernel::identity::PrincipalRef;
@@ -25,7 +26,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{
     DeveloperDistributedFixtureActionV1, DeveloperDistributedFixtureConfigV1,
-    DeveloperFixtureConfigV1, DeveloperProvisionedConfigV1, ProviderProfileV1,
+    DeveloperFixtureConfigV1, DeveloperNodeConfigV1, DeveloperProvisionedConfigV1,
+    ProviderProfileV1,
 };
 
 const IDENTITY_DIRECTORY_NAME: &str = "developer-local-identity-v1";
@@ -33,6 +35,7 @@ const OPENAI_IDENTITY_DIRECTORY_NAME: &str = "developer-openai-identity-v1";
 const DEEPSEEK_IDENTITY_DIRECTORY_NAME: &str = "developer-deepseek-chat-completions-identity-v1";
 const LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME: &str = "developer-distributed-identity-v1";
 const DISTRIBUTED_IDENTITY_DIRECTORY_NAME: &str = "developer-distributed-identity-v2";
+const NODE_IDENTITY_DIRECTORY_NAME: &str = "developer-node-identity-v1";
 const MANIFEST_FILE_NAME: &str = "identity-manifest-v1.pxli";
 const MANIFEST_TEMP_FILE_NAME: &str = ".identity-manifest-v1.pxli.tmp";
 const OPENAI_MANIFEST_FILE_NAME: &str = "identity-manifest-v1.pxoi";
@@ -41,12 +44,15 @@ const DEEPSEEK_MANIFEST_FILE_NAME: &str = "identity-manifest-v1.pxds";
 const DEEPSEEK_MANIFEST_TEMP_FILE_NAME: &str = ".identity-manifest-v1.pxds.tmp";
 const DISTRIBUTED_MANIFEST_FILE_NAME: &str = "identity-manifest-v2.pxdi";
 const DISTRIBUTED_MANIFEST_TEMP_FILE_NAME: &str = ".identity-manifest-v2.pxdi.tmp";
+const NODE_MANIFEST_FILE_NAME: &str = "identity-manifest-v1.pxni";
+const NODE_MANIFEST_TEMP_FILE_NAME: &str = ".identity-manifest-v1.pxni.tmp";
 const WRITER_LOCK_FILE_NAME: &str = ".writer.lock";
 
 const MANIFEST_MAGIC: &[u8; 4] = b"PXLI";
 const OPENAI_MANIFEST_MAGIC: &[u8; 4] = b"PXOI";
 const DEEPSEEK_MANIFEST_MAGIC: &[u8; 4] = b"PXDS";
 const DISTRIBUTED_MANIFEST_MAGIC: &[u8; 4] = b"PXDI";
+const NODE_MANIFEST_MAGIC: &[u8; 4] = b"PXNI";
 const MANIFEST_VERSION: u16 = 1;
 const MANIFEST_HEADER_BYTES: usize = 16;
 const MANIFEST_FIELD_COUNT: u16 = 17;
@@ -83,6 +89,16 @@ const DISTRIBUTED_MANIFEST_WIRE_BYTES: usize =
 const DISTRIBUTED_FRESH_ENTROPY_BYTES: usize =
     DISTRIBUTED_MANIFEST_PAYLOAD_BYTES - (DISTRIBUTED_SHARED_DIGEST_FIELD_COUNT * 32);
 
+const NODE_MANIFEST_VERSION: u16 = 1;
+const NODE_MANIFEST_HEADER_BYTES: usize = 16;
+const NODE_MANIFEST_FIELD_COUNT: u16 = 8;
+const NODE_MANIFEST_FLAGS: u16 = 0;
+const NODE_IDENTITY_FIELD_COUNT: usize = 5;
+const NODE_MANIFEST_PAYLOAD_BYTES: usize = (2 * 32) + (NODE_IDENTITY_FIELD_COUNT * 16) + 32;
+const NODE_MANIFEST_CHECKSUM_OFFSET: usize = NODE_MANIFEST_HEADER_BYTES + NODE_MANIFEST_PAYLOAD_BYTES;
+const NODE_MANIFEST_WIRE_BYTES: usize = NODE_MANIFEST_CHECKSUM_OFFSET + CHECKSUM_BYTES;
+const NODE_FRESH_ENTROPY_BYTES: usize = (2 * 32) + (NODE_IDENTITY_FIELD_COUNT * 16);
+
 const MANIFEST_CHECKSUM_DOMAIN: &[u8] =
     b"paraegox.local.developer-identity-manifest.checksum.sha256.v1";
 const OPENAI_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
@@ -91,6 +107,8 @@ const DEEPSEEK_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
     b"paraegox.local.developer-deepseek-chat-completions-identity-manifest.checksum.sha256.v1";
 const DISTRIBUTED_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
     b"paraegox.local.developer-distributed-identity-manifest.checksum.sha256.v2";
+const NODE_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
+    b"paraegox.local.developer-node-identity-manifest.checksum.sha256.v1";
 const DETERMINISTIC_PROVIDER_CONFIG_DOMAIN: &[u8] =
     b"paraegox.local.developer-fixture-provider.config.sha256.v1";
 const DETERMINISTIC_PROVIDER_PROFILE: &[u8] = b"deterministic-fixture-v1";
@@ -113,15 +131,24 @@ impl IdentityProviderProfileV1 {
         }
     }
 
-    const fn conflicting_identity_directories(self) -> [&'static str; 2] {
+    const fn conflicting_identity_directories(self) -> [&'static str; 3] {
         match self {
             Self::DeterministicFixture => [
                 OPENAI_IDENTITY_DIRECTORY_NAME,
                 DEEPSEEK_IDENTITY_DIRECTORY_NAME,
+                NODE_IDENTITY_DIRECTORY_NAME,
             ],
-            Self::OpenAiResponses => [IDENTITY_DIRECTORY_NAME, DEEPSEEK_IDENTITY_DIRECTORY_NAME],
+            Self::OpenAiResponses => [
+                IDENTITY_DIRECTORY_NAME,
+                DEEPSEEK_IDENTITY_DIRECTORY_NAME,
+                NODE_IDENTITY_DIRECTORY_NAME,
+            ],
             Self::DeepSeekChatCompletions => {
-                [IDENTITY_DIRECTORY_NAME, OPENAI_IDENTITY_DIRECTORY_NAME]
+                [
+                    IDENTITY_DIRECTORY_NAME,
+                    OPENAI_IDENTITY_DIRECTORY_NAME,
+                    NODE_IDENTITY_DIRECTORY_NAME,
+                ]
             }
         }
     }
@@ -183,6 +210,7 @@ pub(crate) enum IdentityManifestError {
     PublicationOutcomeUncertain,
     ReopenMismatch,
     ProviderProfileMismatch,
+    InsecureCredentialFile,
     DistributedManifestNotInitialized,
     EnrollmentPlanEncoding,
 }
@@ -227,6 +255,9 @@ impl fmt::Display for IdentityManifestError {
             Self::ReopenMismatch => "DeveloperLocal identity manifest changed during strict reopen",
             Self::ProviderProfileMismatch => {
                 "DeveloperLocal state root is pinned to a different provider profile"
+            }
+            Self::InsecureCredentialFile => {
+                "DeveloperLocal node TLS credential file failed identity or permission checks"
             }
             Self::DistributedManifestNotInitialized => {
                 "distributed DeveloperLocal identity is not explicitly initialized"
@@ -291,6 +322,41 @@ impl Drop for IdentityManifestV1 {
         self.controller_signing_seed.zeroize();
         self.authority_signing_seed.zeroize();
         self.runtime_signing_seed.zeroize();
+    }
+}
+
+/// Owner-private identity for the public host-local Node command.
+///
+/// Only the Runtime response seed and the PXNB bearer token are secret. The
+/// remote Controller request and tenure Authority keys are verification-only
+/// config pins and are deliberately absent from this durable format.
+pub(crate) struct DeveloperNodeIdentityManifestV1 {
+    runtime_response_signing_seed: [u8; 32],
+    pxnb_reference_token: [u8; 32],
+    manifest_instance_id: [u8; 16],
+    node_id: [u8; 16],
+    node_principal: [u8; 16],
+    node_incarnation: [u8; 16],
+    node_management_endpoint_ref: [u8; 16],
+    config_commitment: [u8; 32],
+}
+
+impl fmt::Debug for DeveloperNodeIdentityManifestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeveloperNodeIdentityManifestV1")
+            .field("version", &NODE_MANIFEST_VERSION)
+            .field("secret_material", &Redacted)
+            .field("local_identities", &Redacted)
+            .field("config_commitment", &Redacted)
+            .finish()
+    }
+}
+
+impl Drop for DeveloperNodeIdentityManifestV1 {
+    fn drop(&mut self) {
+        self.runtime_response_signing_seed.zeroize();
+        self.pxnb_reference_token.zeroize();
     }
 }
 
@@ -497,6 +563,38 @@ impl Drop for SensitiveDistributedWire {
     }
 }
 
+struct SensitiveNodeEntropy([u8; NODE_FRESH_ENTROPY_BYTES]);
+
+impl SensitiveNodeEntropy {
+    const fn zeroed() -> Self {
+        Self([0; NODE_FRESH_ENTROPY_BYTES])
+    }
+}
+
+impl Drop for SensitiveNodeEntropy {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+struct SensitiveNodeWire([u8; NODE_MANIFEST_WIRE_BYTES]);
+
+impl SensitiveNodeWire {
+    const fn zeroed() -> Self {
+        Self([0; NODE_MANIFEST_WIRE_BYTES])
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SensitiveNodeWire {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 trait EntropySource {
     fn fill(&mut self, destination: &mut [u8]) -> Result<(), IdentityManifestError>;
 }
@@ -555,6 +653,15 @@ impl IdentityPaths {
         )
     }
 
+    fn node(state_root: &Path) -> Self {
+        Self::from_state_root_with_names(
+            state_root,
+            NODE_IDENTITY_DIRECTORY_NAME,
+            NODE_MANIFEST_FILE_NAME,
+            NODE_MANIFEST_TEMP_FILE_NAME,
+        )
+    }
+
     fn from_state_root_with_names(
         state_root: &Path,
         directory_name: &str,
@@ -610,6 +717,141 @@ pub(crate) fn load_or_create_provisioned(
         },
         &mut entropy,
     )
+}
+
+/// Loads or creates the isolated node-only identity selected by the exact
+/// semantic config commitment. Reusing the state root with changed control or
+/// transport pins fails closed instead of rotating local authority.
+pub(crate) fn load_or_create_node(
+    config: &DeveloperNodeConfigV1,
+) -> Result<DeveloperNodeIdentityManifestV1, IdentityManifestError> {
+    let mut entropy = OsEntropy;
+    load_or_create_node_inner(config, &mut entropy)
+}
+
+/// Performs the path-identity and mode gate required before any durable Node
+/// state is created. The Runtime listener still owns parsing and using these
+/// files; this check prevents Local from handing it a symlink, linked, or
+/// untrusted-user-replaceable credential path. DeveloperLocal deliberately
+/// trusts the same uid, which already owns the PXNI seed and PXNB token.
+pub(crate) fn validate_node_tls_files(
+    config: &DeveloperNodeConfigV1,
+) -> Result<(), IdentityManifestError> {
+    let canonical_state_root = open_existing_state_root(config.state_root())
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let restricted = config.restricted_runtime_apply();
+    let files = [
+        restricted.root_ca_certificate_file(),
+        restricted.runtime_listener_certificate_file(),
+        restricted.runtime_listener_private_key_file(),
+    ];
+    if files
+        .iter()
+        .enumerate()
+        .any(|(index, path)| files[index + 1..].contains(path))
+    {
+        return Err(IdentityManifestError::InsecureCredentialFile);
+    }
+    let parent = files[0]
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(IdentityManifestError::InsecureCredentialFile)?;
+    if parent != canonical_state_root.join("credentials") {
+        return Err(IdentityManifestError::InsecureCredentialFile);
+    }
+    if files[1..]
+        .iter()
+        .any(|path| path.parent() != Some(parent))
+    {
+        return Err(IdentityManifestError::InsecureCredentialFile);
+    }
+    validate_existing_path_chain(parent)
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let parent_before = fs::symlink_metadata(parent)
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    validate_node_tls_parent_metadata(&parent_before)?;
+    let parent_handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(parent)
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let parent_opened = parent_handle
+        .metadata()
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    validate_node_tls_parent_metadata(&parent_opened)?;
+    if !same_file(&parent_before, &parent_opened) {
+        return Err(IdentityManifestError::InsecureCredentialFile);
+    }
+    validate_node_tls_file(files[0], false)?;
+    validate_node_tls_file(files[1], false)?;
+    validate_node_tls_file(files[2], true)?;
+    let parent_after = fs::symlink_metadata(parent)
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    validate_node_tls_parent_metadata(&parent_after)?;
+    if !same_file(&parent_opened, &parent_after) {
+        return Err(IdentityManifestError::InsecureCredentialFile);
+    }
+    Ok(())
+}
+
+fn validate_node_tls_file(path: &Path, private_key: bool) -> Result<(), IdentityManifestError> {
+    validate_existing_path_chain(path)
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let before = fs::symlink_metadata(path)
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    validate_node_tls_file_metadata(&before, private_key)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    validate_node_tls_file_metadata(&opened, private_key)?;
+    validate_node_tls_file_metadata(&after, private_key)?;
+    if !same_file(&before, &opened)
+        || !same_file(&opened, &after)
+    {
+        return Err(IdentityManifestError::InsecureCredentialFile);
+    }
+    Ok(())
+}
+
+fn validate_node_tls_parent_metadata(
+    metadata: &fs::Metadata,
+) -> Result<(), IdentityManifestError> {
+    if !metadata.is_dir()
+        || metadata.uid() != Uid::effective().as_raw()
+        || metadata.gid() != Gid::effective().as_raw()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err(IdentityManifestError::InsecureCredentialFile);
+    }
+    Ok(())
+}
+
+fn validate_node_tls_file_metadata(
+    metadata: &fs::Metadata,
+    private_key: bool,
+) -> Result<(), IdentityManifestError> {
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(IdentityManifestError::InsecureCredentialFile);
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if private_key {
+        if metadata.uid() != Uid::effective().as_raw()
+            || metadata.gid() != Gid::effective().as_raw()
+            || mode != 0o600
+        {
+            return Err(IdentityManifestError::InsecureCredentialFile);
+        }
+    } else if mode & 0o022 != 0 {
+        return Err(IdentityManifestError::InsecureCredentialFile);
+    }
+    Ok(())
 }
 
 /// Loads or creates the isolated PXDI v2 source manifest consumed by the
@@ -840,6 +1082,7 @@ where
             conflicting_directories: &[
                 conflicting_profiles[0],
                 conflicting_profiles[1],
+                conflicting_profiles[2],
                 DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
                 LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
             ],
@@ -864,6 +1107,7 @@ fn load_or_create_distributed_inner(
                 IDENTITY_DIRECTORY_NAME,
                 OPENAI_IDENTITY_DIRECTORY_NAME,
                 DEEPSEEK_IDENTITY_DIRECTORY_NAME,
+                NODE_IDENTITY_DIRECTORY_NAME,
                 LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
             ],
             wire_bytes: DISTRIBUTED_MANIFEST_WIRE_BYTES,
@@ -872,6 +1116,47 @@ fn load_or_create_distributed_inner(
         || DistributedDeveloperLocalIdentityManifestV1::try_generate(entropy),
         DistributedDeveloperLocalIdentityManifestV1::encode,
         DistributedDeveloperLocalIdentityManifestV1::decode,
+    )
+}
+
+fn load_or_create_node_inner(
+    config: &DeveloperNodeConfigV1,
+    entropy: &mut impl EntropySource,
+) -> Result<DeveloperNodeIdentityManifestV1, IdentityManifestError> {
+    let config_commitment = config.config_commitment();
+    let controller_verification_key = config.control().controller_request_verification_key();
+    let tenure_verification_key = config.control().tenure_verification_key();
+    load_or_create_identity_manifest(
+        config.state_root(),
+        IdentityPaths::node,
+        IdentityManifestLoadOptions {
+            conflicting_directories: &[
+                IDENTITY_DIRECTORY_NAME,
+                OPENAI_IDENTITY_DIRECTORY_NAME,
+                DEEPSEEK_IDENTITY_DIRECTORY_NAME,
+                DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
+                LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
+            ],
+            wire_bytes: NODE_MANIFEST_WIRE_BYTES,
+            access: IdentityManifestAccessV1::Initialize,
+        },
+        || {
+            DeveloperNodeIdentityManifestV1::try_generate(
+                config_commitment,
+                controller_verification_key,
+                tenure_verification_key,
+                entropy,
+            )
+        },
+        DeveloperNodeIdentityManifestV1::encode,
+        |wire| {
+            DeveloperNodeIdentityManifestV1::decode(
+                wire,
+                config_commitment,
+                controller_verification_key,
+                tenure_verification_key,
+            )
+        },
     )
 }
 
@@ -886,6 +1171,7 @@ fn open_distributed_inner(
                 IDENTITY_DIRECTORY_NAME,
                 OPENAI_IDENTITY_DIRECTORY_NAME,
                 DEEPSEEK_IDENTITY_DIRECTORY_NAME,
+                NODE_IDENTITY_DIRECTORY_NAME,
                 LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
             ],
             wire_bytes: DISTRIBUTED_MANIFEST_WIRE_BYTES,
@@ -908,6 +1194,12 @@ impl SensitiveManifestWire for SensitiveWire {
 }
 
 impl SensitiveManifestWire for SensitiveDistributedWire {
+    fn as_sensitive_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl SensitiveManifestWire for SensitiveNodeWire {
     fn as_sensitive_bytes(&self) -> &[u8] {
         self.as_bytes()
     }
@@ -1314,6 +1606,192 @@ impl IdentityManifestV1 {
             self.provider_ref(),
             self.deck_run_id(),
             self.session_id(),
+        ]
+    }
+}
+
+impl DeveloperNodeIdentityManifestV1 {
+    pub(crate) const fn runtime_response_signing_seed(&self) -> &[u8; 32] {
+        &self.runtime_response_signing_seed
+    }
+
+    pub(crate) const fn pxnb_reference_token(&self) -> &[u8; 32] {
+        &self.pxnb_reference_token
+    }
+
+    pub(crate) const fn manifest_instance_id(&self) -> &[u8; 16] {
+        &self.manifest_instance_id
+    }
+
+    pub(crate) const fn node_id(&self) -> &[u8; 16] {
+        &self.node_id
+    }
+
+    pub(crate) const fn node_principal(&self) -> &[u8; 16] {
+        &self.node_principal
+    }
+
+    pub(crate) const fn node_incarnation(&self) -> &[u8; 16] {
+        &self.node_incarnation
+    }
+
+    pub(crate) const fn node_management_endpoint_ref(&self) -> &[u8; 16] {
+        &self.node_management_endpoint_ref
+    }
+
+    pub(crate) const fn config_commitment(&self) -> &[u8; 32] {
+        &self.config_commitment
+    }
+
+    fn try_generate(
+        config_commitment: [u8; 32],
+        controller_verification_key: [u8; 32],
+        tenure_verification_key: [u8; 32],
+        entropy: &mut impl EntropySource,
+    ) -> Result<Self, IdentityManifestError> {
+        let mut bytes = SensitiveNodeEntropy::zeroed();
+        entropy.fill(&mut bytes.0)?;
+        let mut cursor = ByteCursor::new(&bytes.0);
+        let manifest = Self {
+            runtime_response_signing_seed: cursor.array(),
+            pxnb_reference_token: cursor.array(),
+            manifest_instance_id: cursor.array(),
+            node_id: cursor.array(),
+            node_principal: cursor.array(),
+            node_incarnation: cursor.array(),
+            node_management_endpoint_ref: cursor.array(),
+            config_commitment,
+        };
+        debug_assert_eq!(cursor.remaining(), 0);
+        manifest
+            .validate(
+                config_commitment,
+                controller_verification_key,
+                tenure_verification_key,
+            )
+            .map_err(|_| IdentityManifestError::InvalidFreshEntropy)?;
+        Ok(manifest)
+    }
+
+    fn encode(&self) -> SensitiveNodeWire {
+        let mut wire = SensitiveNodeWire::zeroed();
+        wire.0[0..4].copy_from_slice(NODE_MANIFEST_MAGIC);
+        wire.0[4..6].copy_from_slice(&NODE_MANIFEST_VERSION.to_be_bytes());
+        wire.0[6..8].copy_from_slice(
+            &u16::try_from(NODE_MANIFEST_HEADER_BYTES)
+                .expect("node manifest header width fits u16")
+                .to_be_bytes(),
+        );
+        wire.0[8..12].copy_from_slice(
+            &u32::try_from(NODE_MANIFEST_WIRE_BYTES)
+                .expect("node manifest wire width fits u32")
+                .to_be_bytes(),
+        );
+        wire.0[12..14].copy_from_slice(&NODE_MANIFEST_FIELD_COUNT.to_be_bytes());
+        wire.0[14..16].copy_from_slice(&NODE_MANIFEST_FLAGS.to_be_bytes());
+
+        let mut cursor = NODE_MANIFEST_HEADER_BYTES;
+        for field in [
+            self.runtime_response_signing_seed(),
+            self.pxnb_reference_token(),
+        ] {
+            put_bytes(&mut wire.0, &mut cursor, field);
+        }
+        for field in self.identity_fields() {
+            put_bytes(&mut wire.0, &mut cursor, field);
+        }
+        put_bytes(&mut wire.0, &mut cursor, self.config_commitment());
+        debug_assert_eq!(cursor, NODE_MANIFEST_CHECKSUM_OFFSET);
+        let checksum = node_manifest_checksum(&wire.0[..NODE_MANIFEST_CHECKSUM_OFFSET]);
+        wire.0[NODE_MANIFEST_CHECKSUM_OFFSET..].copy_from_slice(&checksum);
+        wire
+    }
+
+    fn decode(
+        bytes: &[u8],
+        expected_config_commitment: [u8; 32],
+        controller_verification_key: [u8; 32],
+        tenure_verification_key: [u8; 32],
+    ) -> Result<Self, IdentityManifestError> {
+        if bytes.len() != NODE_MANIFEST_WIRE_BYTES {
+            return Err(IdentityManifestError::InvalidManifestLength);
+        }
+        if &bytes[0..4] != NODE_MANIFEST_MAGIC {
+            return Err(IdentityManifestError::InvalidManifestMagic);
+        }
+        if read_u16(bytes, 4) != NODE_MANIFEST_VERSION {
+            return Err(IdentityManifestError::UnsupportedManifestVersion);
+        }
+        if usize::from(read_u16(bytes, 6)) != NODE_MANIFEST_HEADER_BYTES
+            || usize::try_from(read_u32(bytes, 8)).ok() != Some(NODE_MANIFEST_WIRE_BYTES)
+            || read_u16(bytes, 12) != NODE_MANIFEST_FIELD_COUNT
+            || read_u16(bytes, 14) != NODE_MANIFEST_FLAGS
+        {
+            return Err(IdentityManifestError::InvalidManifestHeader);
+        }
+        let expected_checksum =
+            node_manifest_checksum(&bytes[..NODE_MANIFEST_CHECKSUM_OFFSET]);
+        if bytes[NODE_MANIFEST_CHECKSUM_OFFSET..] != expected_checksum {
+            return Err(IdentityManifestError::ManifestChecksumMismatch);
+        }
+        let mut cursor = ByteCursor::new(
+            &bytes[NODE_MANIFEST_HEADER_BYTES..NODE_MANIFEST_CHECKSUM_OFFSET],
+        );
+        let manifest = Self {
+            runtime_response_signing_seed: cursor.array(),
+            pxnb_reference_token: cursor.array(),
+            manifest_instance_id: cursor.array(),
+            node_id: cursor.array(),
+            node_principal: cursor.array(),
+            node_incarnation: cursor.array(),
+            node_management_endpoint_ref: cursor.array(),
+            config_commitment: cursor.array(),
+        };
+        debug_assert_eq!(cursor.remaining(), 0);
+        manifest.validate(
+            expected_config_commitment,
+            controller_verification_key,
+            tenure_verification_key,
+        )?;
+        if manifest.encode().as_bytes() != bytes {
+            return Err(IdentityManifestError::InvalidManifestField);
+        }
+        Ok(manifest)
+    }
+
+    fn validate(
+        &self,
+        expected_config_commitment: [u8; 32],
+        controller_verification_key: [u8; 32],
+        tenure_verification_key: [u8; 32],
+    ) -> Result<(), IdentityManifestError> {
+        let secrets = [
+            self.runtime_response_signing_seed(),
+            self.pxnb_reference_token(),
+        ];
+        let runtime_verification_key =
+            SigningKey::from_bytes(self.runtime_response_signing_seed())
+                .verifying_key()
+                .to_bytes();
+        if !all_nonzero_and_distinct(&secrets)
+            || !all_nonzero_and_distinct(&self.identity_fields())
+            || bytes_are_zero(self.config_commitment())
+            || self.config_commitment != expected_config_commitment
+            || runtime_verification_key == controller_verification_key
+            || runtime_verification_key == tenure_verification_key
+        {
+            return Err(IdentityManifestError::InvalidManifestField);
+        }
+        Ok(())
+    }
+
+    fn identity_fields(&self) -> [&[u8; 16]; NODE_IDENTITY_FIELD_COUNT] {
+        [
+            self.manifest_instance_id(),
+            self.node_id(),
+            self.node_principal(),
+            self.node_incarnation(),
+            self.node_management_endpoint_ref(),
         ]
     }
 }
@@ -2223,6 +2701,14 @@ fn distributed_manifest_checksum(bytes: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+fn node_manifest_checksum(bytes: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(NODE_MANIFEST_CHECKSUM_DOMAIN);
+    digest.update(NODE_MANIFEST_VERSION.to_be_bytes());
+    digest.update(bytes);
+    digest.finalize().into()
+}
+
 fn deterministic_provider_configuration_digest() -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(DETERMINISTIC_PROVIDER_CONFIG_DOMAIN);
@@ -2329,6 +2815,14 @@ fn load_or_create_with_entropy(
 }
 
 #[cfg(test)]
+fn load_or_create_node_with_entropy(
+    config: &DeveloperNodeConfigV1,
+    entropy: &mut impl EntropySource,
+) -> Result<DeveloperNodeIdentityManifestV1, IdentityManifestError> {
+    load_or_create_node_inner(config, entropy)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
@@ -2360,7 +2854,8 @@ mod tests {
             );
             match crate::config::parse_chat_config_toml_for_test(&document).expect("test config") {
                 crate::config::Command::DeveloperFixtureV1(config) => config,
-                crate::config::Command::DeveloperProvisionedV1(_) => {
+                crate::config::Command::DeveloperNodeV1(_)
+                | crate::config::Command::DeveloperProvisionedV1(_) => {
                     panic!("unexpected provisioned command")
                 }
                 crate::config::Command::DeveloperDistributedFixtureV1(_) => {
@@ -2384,7 +2879,8 @@ mod tests {
                 .expect("test provisioned config")
             {
                 crate::config::Command::DeveloperProvisionedV1(config) => config,
-                crate::config::Command::DeveloperFixtureV1(_) => {
+                crate::config::Command::DeveloperNodeV1(_)
+                | crate::config::Command::DeveloperFixtureV1(_) => {
                     panic!("unexpected fixture command")
                 }
                 crate::config::Command::DeveloperDistributedFixtureV1(_) => {
@@ -2523,7 +3019,8 @@ mod tests {
             }
             match crate::config::parse(arguments).expect("distributed identity init config") {
                 crate::config::Command::DeveloperDistributedFixtureV1(config) => config,
-                crate::config::Command::DeveloperFixtureV1(_) => {
+                crate::config::Command::DeveloperNodeV1(_)
+                | crate::config::Command::DeveloperFixtureV1(_) => {
                     panic!("unexpected fixture command")
                 }
                 crate::config::Command::DeveloperProvisionedV1(_) => {
@@ -2584,6 +3081,19 @@ mod tests {
         }
     }
 
+    struct ControllerAliasingNodeEntropy;
+
+    impl EntropySource for ControllerAliasingNodeEntropy {
+        fn fill(&mut self, destination: &mut [u8]) -> Result<(), IdentityManifestError> {
+            for (index, byte) in destination.iter_mut().enumerate() {
+                *byte =
+                    u8::try_from(((index * 73 + 19) % 251) + 1).expect("pattern byte is bounded");
+            }
+            destination[..32].fill(0x21);
+            Ok(())
+        }
+    }
+
     enum TestEntropy {
         Failing(FailingEntropy),
         Zero(ZeroEntropy),
@@ -2596,6 +3106,101 @@ mod tests {
                 Self::Zero(source) => source.fill(destination),
             }
         }
+    }
+
+    #[test]
+    fn node_manifest_is_private_byte_stable_and_config_pinned() {
+        let directory = TestDirectory::new();
+        let config = crate::config::developer_node_config_for_test(&directory.path);
+        let paths = IdentityPaths::node(&directory.path);
+        let mut entropy = PatternEntropy::new();
+        let first = load_or_create_node_with_entropy(&config, &mut entropy)
+            .expect("first node identity manifest");
+        assert_eq!(entropy.calls, 1);
+        assert_eq!(first.config_commitment(), &config.config_commitment());
+
+        let metadata = fs::symlink_metadata(&paths.manifest).expect("node manifest metadata");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.len(), NODE_MANIFEST_WIRE_BYTES as u64);
+        assert!(!paths.temporary.exists());
+        let first_wire = first.encode();
+        assert_eq!(&first_wire.as_bytes()[..4], NODE_MANIFEST_MAGIC);
+
+        let reopened = load_or_create_node_with_entropy(&config, &mut FailingEntropy)
+            .expect("strict node identity reopen");
+        assert_eq!(reopened.encode().as_bytes(), first_wire.as_bytes());
+
+        let state_root = directory.path.to_str().expect("UTF-8 node state root");
+        let changed_document = crate::config::developer_node_document_for_test(state_root)
+            .replace("endpoint_generation = 1\n", "endpoint_generation = 2\n");
+        let changed_config = match crate::config::parse_node_config_toml_for_test(&changed_document)
+            .expect("changed node config remains structurally valid")
+        {
+            crate::config::Command::DeveloperNodeV1(config) => *config,
+            crate::config::Command::DeveloperFixtureV1(_)
+            | crate::config::Command::DeveloperDistributedFixtureV1(_)
+            | crate::config::Command::DeveloperProvisionedV1(_)
+            | crate::config::Command::Help => panic!("unexpected changed node command"),
+        };
+        assert_ne!(changed_config.config_commitment(), config.config_commitment());
+        assert_eq!(
+            load_or_create_node_with_entropy(&changed_config, &mut FailingEntropy).unwrap_err(),
+            IdentityManifestError::InvalidManifestField
+        );
+        assert_eq!(
+            fs::read(&paths.manifest).expect("node manifest remains unchanged"),
+            first_wire.as_bytes()
+        );
+    }
+
+    #[test]
+    fn node_manifest_rejects_runtime_key_alias_before_publication() {
+        let directory = TestDirectory::new();
+        let config = crate::config::developer_node_config_for_test(&directory.path);
+        let paths = IdentityPaths::node(&directory.path);
+        assert_eq!(
+            load_or_create_node_with_entropy(&config, &mut ControllerAliasingNodeEntropy)
+                .unwrap_err(),
+            IdentityManifestError::InvalidFreshEntropy
+        );
+        assert!(!paths.manifest.exists());
+        assert!(!paths.temporary.exists());
+    }
+
+    #[test]
+    fn node_tls_gate_accepts_only_pinned_private_credentials_directory() {
+        let directory = TestDirectory::new();
+        let config = crate::config::developer_node_config_for_test(&directory.path);
+        ensure_state_root(&directory.path).expect("private node state root");
+        let credentials = directory.path.join("credentials");
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700).create(&credentials).expect("credentials directory");
+        fs::set_permissions(&credentials, fs::Permissions::from_mode(0o700))
+            .expect("credentials directory mode");
+        let restricted = config.restricted_runtime_apply();
+        for (path, mode) in [
+            (restricted.root_ca_certificate_file(), 0o644),
+            (restricted.runtime_listener_certificate_file(), 0o644),
+            (restricted.runtime_listener_private_key_file(), 0o600),
+        ] {
+            fs::write(path, b"test-only credential bytes").expect("credential file");
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .expect("credential file mode");
+        }
+        validate_node_tls_files(&config).expect("strict credential set");
+
+        fs::set_permissions(
+            restricted.runtime_listener_private_key_file(),
+            fs::Permissions::from_mode(0o640),
+        )
+        .expect("broaden private key mode");
+        assert_eq!(
+            validate_node_tls_files(&config).unwrap_err(),
+            IdentityManifestError::InsecureCredentialFile
+        );
     }
 
     #[test]
@@ -2753,7 +3358,8 @@ mod tests {
         let config =
             match crate::config::parse_chat_config_toml_for_test(&document).expect("test config") {
                 crate::config::Command::DeveloperFixtureV1(config) => config,
-                crate::config::Command::DeveloperProvisionedV1(_) => {
+                crate::config::Command::DeveloperNodeV1(_)
+                | crate::config::Command::DeveloperProvisionedV1(_) => {
                     panic!("unexpected provisioned command")
                 }
                 crate::config::Command::DeveloperDistributedFixtureV1(_) => {

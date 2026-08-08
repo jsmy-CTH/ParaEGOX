@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
 use nix::unistd::{getegid, geteuid};
@@ -41,7 +42,7 @@ use paraegox_runtime_contracts::provenance::SourceScopeRef;
 use paraegox_runtime_contracts::wire::ApplyAuthKeyRef;
 use sha2::{Digest as ShaDigest, Sha256};
 use tokio::sync::oneshot;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::distributed_agent_stack_runtime::DistributedAgentStackEvidenceStoreConfigV1;
 use crate::distributed_fabric_runtime::RuntimeFabricCredentialResolverV2;
@@ -84,8 +85,8 @@ const STARTUP_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const DEVELOPER_LOCAL_RUNTIME_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Non-secret stable identity references shared between Deployment and the
-/// Runtime facade.  Validation occurs when they are combined with signing
-/// material by [`RuntimeDeveloperLocalIdentityV1::try_new`].
+/// Runtime facade. Validation occurs when they are combined with exact role
+/// verification keys and Runtime-local signing material.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeDeveloperLocalIdentityRefsV1 {
     pub installation_id: [u8; 16],
@@ -133,14 +134,16 @@ impl Drop for RuntimeDeveloperLocalSigningSeedsV1 {
     }
 }
 
-/// Stable role and signing material supplied by the DeveloperLocal owner.
+/// Stable role and split-trust key material supplied by the DeveloperLocal owner.
 ///
-/// The three seed fields are redacted from Debug and zeroized on drop.  The
-/// Runtime keeps only the Runtime response signer; Controller and tenure
-/// private authority remain outside this facade after provisioning.
+/// Controller and tenure authority cross this boundary only as verification
+/// keys. The sole retained private capability is the Runtime response signing
+/// seed, which is redacted from Debug and zeroized on drop.
 pub struct RuntimeDeveloperLocalIdentityV1 {
     refs: RuntimeDeveloperLocalIdentityRefsV1,
-    seeds: RuntimeDeveloperLocalSigningSeedsV1,
+    controller_request_verification_key: [u8; 32],
+    tenure_verification_key: [u8; 32],
+    runtime_response_signing_seed: Zeroizing<[u8; 32]>,
 }
 
 impl fmt::Debug for RuntimeDeveloperLocalIdentityV1 {
@@ -154,36 +157,14 @@ impl fmt::Debug for RuntimeDeveloperLocalIdentityV1 {
 }
 
 impl RuntimeDeveloperLocalIdentityV1 {
+    /// Compatibility constructor for the original three-seed DeveloperLocal
+    /// boundary. External role seeds are validated, converted immediately to
+    /// verification keys, and never retained by the resulting Runtime config.
     pub fn try_new(
         refs: RuntimeDeveloperLocalIdentityRefsV1,
         seeds: RuntimeDeveloperLocalSigningSeedsV1,
     ) -> Result<Self, RuntimeDeveloperLocalError> {
-        let identities = [
-            refs.installation_id,
-            refs.target,
-            refs.source_scope,
-            refs.writer,
-            refs.runtime_principal,
-            refs.controller_principal,
-            refs.authority_principal,
-            refs.controller_request_key_ref,
-            refs.runtime_response_key_ref,
-            refs.tenure_authority_ref,
-            refs.tenure_key_ref,
-        ];
-        if identities
-            .iter()
-            .any(|identity| identity.iter().all(|byte| *byte == 0))
-            || identities.iter().enumerate().any(|(index, identity)| {
-                identities[index + 1..]
-                    .iter()
-                    .any(|other| other == identity)
-            })
-        {
-            return Err(RuntimeDeveloperLocalError::InvalidConfiguration(
-                "DeveloperLocal identities must be nonzero and pairwise distinct",
-            ));
-        }
+        validate_developer_local_identity_refs(&refs)?;
         let seed_values = [seeds.controller, seeds.authority, seeds.runtime_response];
         if seed_values
             .iter()
@@ -196,7 +177,66 @@ impl RuntimeDeveloperLocalIdentityV1 {
                 "DeveloperLocal signing seeds must be nonzero and distinct",
             ));
         }
-        Ok(Self { refs, seeds })
+        let controller_request_verification_key = SigningKey::from_bytes(&seeds.controller)
+            .verifying_key()
+            .to_bytes();
+        let tenure_verification_key = SigningKey::from_bytes(&seeds.authority)
+            .verifying_key()
+            .to_bytes();
+        let runtime_response_signing_seed = Zeroizing::new(seeds.runtime_response);
+        Self::try_new_with_verification_keys(
+            refs,
+            controller_request_verification_key,
+            tenure_verification_key,
+            runtime_response_signing_seed,
+        )
+    }
+
+    /// Constructs the DeveloperLocal Runtime boundary from external role
+    /// verification keys and the one Runtime-owned response signing seed.
+    pub fn try_new_with_verification_keys(
+        refs: RuntimeDeveloperLocalIdentityRefsV1,
+        controller_request_verification_key: [u8; 32],
+        tenure_verification_key: [u8; 32],
+        runtime_response_signing_seed: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, RuntimeDeveloperLocalError> {
+        validate_developer_local_identity_refs(&refs)?;
+        if runtime_response_signing_seed
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return Err(RuntimeDeveloperLocalError::InvalidConfiguration(
+                "DeveloperLocal Runtime response signing seed must be nonzero",
+            ));
+        }
+        let controller_key = VerifyingKey::from_bytes(&controller_request_verification_key)
+            .map_err(|_| {
+                RuntimeDeveloperLocalError::InvalidConfiguration(
+                    "DeveloperLocal verification keys must be valid, non-weak, and role-distinct",
+                )
+            })?;
+        let tenure_key = VerifyingKey::from_bytes(&tenure_verification_key).map_err(|_| {
+            RuntimeDeveloperLocalError::InvalidConfiguration(
+                "DeveloperLocal verification keys must be valid, non-weak, and role-distinct",
+            )
+        })?;
+        let response_key = SigningKey::from_bytes(&runtime_response_signing_seed).verifying_key();
+        if controller_key.is_weak()
+            || tenure_key.is_weak()
+            || controller_key == tenure_key
+            || controller_key == response_key
+            || tenure_key == response_key
+        {
+            return Err(RuntimeDeveloperLocalError::InvalidConfiguration(
+                "DeveloperLocal verification keys must be valid, non-weak, and role-distinct",
+            ));
+        }
+        Ok(Self {
+            refs,
+            controller_request_verification_key,
+            tenure_verification_key,
+            runtime_response_signing_seed,
+        })
     }
 
     fn facts(&self) -> RuntimeDeveloperLocalIdentityFactsV1 {
@@ -225,17 +265,49 @@ impl RuntimeDeveloperLocalIdentityV1 {
             controller_request_key_ref: ApplyAuthKeyRef::from_bytes(
                 self.refs.controller_request_key_ref,
             ),
-            controller_signing_seed: self.seeds.controller,
+            controller_request_verification_key: self.controller_request_verification_key,
             runtime_response_key_ref: ApplyAuthKeyRef::from_bytes(
                 self.refs.runtime_response_key_ref,
             ),
-            runtime_response_signing_seed: self.seeds.runtime_response,
+            runtime_response_signing_seed: Zeroizing::new(*self.runtime_response_signing_seed),
             authority_principal: PrincipalRef::from_bytes(self.refs.authority_principal),
             tenure_authority_ref: TenureAuthorityRef::from_bytes(self.refs.tenure_authority_ref),
             tenure_key_ref: TenureKeyRef::from_bytes(self.refs.tenure_key_ref),
-            tenure_signing_seed: self.seeds.authority,
+            tenure_verification_key: self.tenure_verification_key,
         }
     }
+}
+
+fn validate_developer_local_identity_refs(
+    refs: &RuntimeDeveloperLocalIdentityRefsV1,
+) -> Result<(), RuntimeDeveloperLocalError> {
+    let identities = [
+        refs.installation_id,
+        refs.target,
+        refs.source_scope,
+        refs.writer,
+        refs.runtime_principal,
+        refs.controller_principal,
+        refs.authority_principal,
+        refs.controller_request_key_ref,
+        refs.runtime_response_key_ref,
+        refs.tenure_authority_ref,
+        refs.tenure_key_ref,
+    ];
+    if identities
+        .iter()
+        .any(|identity| identity.iter().all(|byte| *byte == 0))
+        || identities.iter().enumerate().any(|(index, identity)| {
+            identities[index + 1..]
+                .iter()
+                .any(|other| other == identity)
+        })
+    {
+        return Err(RuntimeDeveloperLocalError::InvalidConfiguration(
+            "DeveloperLocal identities must be nonzero and pairwise distinct",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1309,12 +1381,14 @@ mod tests {
         },
         wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim},
     };
+    use zeroize::Zeroizing;
 
     use super::{
         RuntimeDeveloperLocalConfigV1, RuntimeDeveloperLocalDistributedAgentStackConfigV1,
         RuntimeDeveloperLocalError, RuntimeDeveloperLocalIdentityRefsV1,
         RuntimeDeveloperLocalIdentityV1, RuntimeDeveloperLocalReadyV1,
-        RuntimeDeveloperLocalSigningSeedsV1, start_runtime_developer_local_v1,
+        RuntimeDeveloperLocalSigningSeedsV1, RuntimeProvisioningV1,
+        start_runtime_developer_local_v1,
     };
     use crate::admission::{ED25519_ALGORITHM, ED25519_ALGORITHM_VERSION};
     use crate::distributed_fabric_runtime::{
@@ -1481,22 +1555,28 @@ mod tests {
             .unwrap_or_else(|error| panic!("test directory chmod failed: {error}"));
     }
 
+    fn identity_refs() -> RuntimeDeveloperLocalIdentityRefsV1 {
+        RuntimeDeveloperLocalIdentityRefsV1 {
+            installation_id: [1; 16],
+            target: [2; 16],
+            source_scope: [3; 16],
+            writer: [4; 16],
+            runtime_principal: [5; 16],
+            controller_principal: [6; 16],
+            authority_principal: [7; 16],
+            controller_request_key_ref: [8; 16],
+            runtime_response_key_ref: [9; 16],
+            tenure_authority_ref: [10; 16],
+            tenure_key_ref: [11; 16],
+        }
+    }
+
     fn identity() -> RuntimeDeveloperLocalIdentityV1 {
-        RuntimeDeveloperLocalIdentityV1::try_new(
-            RuntimeDeveloperLocalIdentityRefsV1 {
-                installation_id: [1; 16],
-                target: [2; 16],
-                source_scope: [3; 16],
-                writer: [4; 16],
-                runtime_principal: [5; 16],
-                controller_principal: [6; 16],
-                authority_principal: [7; 16],
-                controller_request_key_ref: [8; 16],
-                runtime_response_key_ref: [9; 16],
-                tenure_authority_ref: [10; 16],
-                tenure_key_ref: [11; 16],
-            },
-            RuntimeDeveloperLocalSigningSeedsV1::new([21; 32], [22; 32], [23; 32]),
+        RuntimeDeveloperLocalIdentityV1::try_new_with_verification_keys(
+            identity_refs(),
+            SigningKey::from_bytes(&[21; 32]).verifying_key().to_bytes(),
+            SigningKey::from_bytes(&[22; 32]).verifying_key().to_bytes(),
+            Zeroizing::new([23; 32]),
         )
         .unwrap_or_else(|error| panic!("identity rejected: {error}"))
     }
@@ -1651,6 +1731,98 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("PXFR authentication failed: {error}"));
         response
+    }
+
+    #[test]
+    fn split_trust_constructor_matches_legacy_provisioning() {
+        let layout = TestLayout::new();
+        let legacy_identity = RuntimeDeveloperLocalIdentityV1::try_new(
+            identity_refs(),
+            RuntimeDeveloperLocalSigningSeedsV1::new([21; 32], [22; 32], [23; 32]),
+        )
+        .unwrap_or_else(|error| panic!("legacy identity rejected: {error}"));
+        let legacy = RuntimeProvisioningV1::try_new_developer_local(
+            legacy_identity.provisioning_input(layout.socket.clone()),
+        )
+        .unwrap_or_else(|error| panic!("legacy provisioning rejected: {error}"));
+        let split = RuntimeProvisioningV1::try_new_developer_local(
+            identity().provisioning_input(layout.socket.clone()),
+        )
+        .unwrap_or_else(|error| panic!("split provisioning rejected: {error}"));
+
+        assert_eq!(legacy.controller_key(), split.controller_key());
+        assert_eq!(
+            legacy.runtime_response_public_key(),
+            split.runtime_response_public_key()
+        );
+        assert_eq!(
+            legacy.owner_target_fingerprint(),
+            split.owner_target_fingerprint()
+        );
+        assert_eq!(
+            legacy.admission_policy_fingerprint(),
+            split.admission_policy_fingerprint()
+        );
+        assert_eq!(
+            legacy.channel_policy_fingerprint(),
+            split.channel_policy_fingerprint()
+        );
+        assert_eq!(
+            legacy.controller_key_fingerprint(),
+            split.controller_key_fingerprint()
+        );
+    }
+
+    #[test]
+    fn split_trust_constructor_rejects_weak_aliased_or_missing_key_material() {
+        let controller_key = SigningKey::from_bytes(&[21; 32]).verifying_key().to_bytes();
+        let tenure_key = SigningKey::from_bytes(&[22; 32]).verifying_key().to_bytes();
+        let response_key = SigningKey::from_bytes(&[23; 32]).verifying_key().to_bytes();
+        let mut weak_key = [0_u8; 32];
+        weak_key[0] = 1;
+        assert!(
+            VerifyingKey::from_bytes(&weak_key)
+                .unwrap_or_else(|error| panic!("weak test key did not parse: {error}"))
+                .is_weak()
+        );
+
+        for result in [
+            RuntimeDeveloperLocalIdentityV1::try_new_with_verification_keys(
+                identity_refs(),
+                weak_key,
+                tenure_key,
+                Zeroizing::new([23; 32]),
+            ),
+            RuntimeDeveloperLocalIdentityV1::try_new_with_verification_keys(
+                identity_refs(),
+                controller_key,
+                controller_key,
+                Zeroizing::new([23; 32]),
+            ),
+            RuntimeDeveloperLocalIdentityV1::try_new_with_verification_keys(
+                identity_refs(),
+                controller_key,
+                tenure_key,
+                Zeroizing::new([0; 32]),
+            ),
+            RuntimeDeveloperLocalIdentityV1::try_new_with_verification_keys(
+                identity_refs(),
+                response_key,
+                tenure_key,
+                Zeroizing::new([23; 32]),
+            ),
+            RuntimeDeveloperLocalIdentityV1::try_new_with_verification_keys(
+                identity_refs(),
+                controller_key,
+                response_key,
+                Zeroizing::new([23; 32]),
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(RuntimeDeveloperLocalError::InvalidConfiguration(_))
+            ));
+        }
     }
 
     #[test]

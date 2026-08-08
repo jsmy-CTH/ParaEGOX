@@ -2,12 +2,12 @@
 
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -71,7 +71,7 @@ use paraegox_runtime::{
     RuntimeAgentProviderResolveError, RuntimeAgentProviderResolverV1,
     RuntimeDeveloperLocalConfigV1, RuntimeDeveloperLocalDistributedAgentStackConfigV1,
     RuntimeDeveloperLocalIdentityRefsV1, RuntimeDeveloperLocalIdentityV1,
-    RuntimeDeveloperLocalLifecycleV1, RuntimeDeveloperLocalSigningSeedsV1,
+    RuntimeDeveloperLocalLifecycleV1,
     RuntimeFabricCredentialRequirementV1, RuntimeFabricCredentialResolveErrorV2,
     RuntimeFabricCredentialResolverV2, RuntimeModelBackendResolveError,
     RuntimeModelBackendResolverV1, RuntimeResolvedAgentProviderV1,
@@ -82,7 +82,8 @@ use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     DistributedFabricCredentialRefV1, DistributedFabricPeerAuthenticationRequirementV1,
     DistributedFabricPeerIdentityRefV1, DistributedFabricPeerPlanV1,
     DistributedFabricTlsEndpointV1, DistributedFabricTopologyV1, DistributedFabricTrustAnchorRefV1,
-    DistributedFabricTrustDomainRefV1, RestrictedRuntimeApplyTransportProfileFieldsV1,
+    DistributedFabricTrustDomainRefV1, RestrictedRuntimeApplyCarrierBindingFieldsV1,
+    RestrictedRuntimeApplyCarrierBindingV1, RestrictedRuntimeApplyTransportProfileFieldsV1,
     RestrictedRuntimeApplyTransportProfileV1,
 };
 use paraegox_runtime_contracts::managed_agent_stack_plan::{
@@ -96,7 +97,11 @@ use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
 use paraegox_runtime_contracts::managed_service::{
     ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
 };
+use paraegox_runtime_contracts::reference_control::ed25519_control_key_fingerprint;
+use paraegox_runtime_contracts::wire::ApplyAuthKeyRef;
 use sha2::{Digest as _, Sha256};
+use tokio::signal::unix::{Signal as TokioSignal, SignalKind, signal};
+use tokio::time::{MissedTickBehavior, interval};
 use zeroize::Zeroizing;
 
 #[cfg(test)]
@@ -106,8 +111,9 @@ use crate::config::{
 };
 use crate::config::{
     DeveloperDistributedFixtureConfigV1, DeveloperDistributedTargetConfigV1,
-    DeveloperFixtureConfigV1, DeveloperLocalProfileV1, DeveloperProvisionedConfigV1,
-    ProviderProfileV1, ProvisionedProviderConfigV1, ProvisionedSecretRefV1,
+    DeveloperFixtureConfigV1, DeveloperLocalProfileV1, DeveloperNodeConfigV1,
+    DeveloperProvisionedConfigV1, ProviderProfileV1, ProvisionedProviderConfigV1,
+    ProvisionedSecretRefV1,
 };
 use crate::error::LocalProcessError;
 use crate::inspection::{
@@ -171,6 +177,161 @@ const LOCAL_DETERMINISTIC_ECHO_ADAPTER_DESCRIPTOR_V1: ModelAdapterDescriptorV1 =
 pub(crate) fn run(config: DeveloperFixtureConfigV1) -> Result<(), LocalProcessError> {
     let peer = current_developer_local_peer()?;
     run_with_runner(config, peer, &mut ChildProcessConversationRunner)
+}
+
+/// Runs the public host-local Node substrate. This deliberately starts only
+/// the split-trust Runtime restricted listener and one feature-only
+/// NodeDaemon; it never activates Authority, Deployment, Fabric, Model, Agent,
+/// Evidence, Inspection, or Textual owners.
+pub(crate) fn run_node(config: DeveloperNodeConfigV1) -> Result<(), LocalProcessError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| LocalProcessError::SignalHandling)?;
+    runtime.block_on(async move {
+        // Register both handlers before validating credentials or touching
+        // durable state so the parent never has a default-terminate window
+        // after an owner has started.
+        let mut interrupt =
+            signal(SignalKind::interrupt()).map_err(|_| LocalProcessError::SignalHandling)?;
+        let mut terminate =
+            signal(SignalKind::terminate()).map_err(|_| LocalProcessError::SignalHandling)?;
+        run_node_with_signals(config, &mut interrupt, &mut terminate).await
+    })
+}
+
+async fn run_node_with_signals(
+    config: DeveloperNodeConfigV1,
+    interrupt: &mut TokioSignal,
+    terminate: &mut TokioSignal,
+) -> Result<(), LocalProcessError> {
+    if Uid::effective().is_root() || Gid::effective().as_raw() == 0 {
+        return Err(LocalProcessError::UnsafeExecutionIdentity);
+    }
+    identity::validate_node_tls_files(&config)
+        .map_err(|_| LocalProcessError::NodeCredentialFiles)?;
+    let manifest = identity::load_or_create_node(&config)
+        .map_err(|_| LocalProcessError::IdentityManifest)?;
+    let layout = layout::prepare_node(&config, &manifest)
+        .map_err(|_| LocalProcessError::LayoutPreparation)?;
+    let control = config.control();
+    let runtime_response_verification_key =
+        SigningKey::from_bytes(manifest.runtime_response_signing_seed())
+            .verifying_key()
+            .to_bytes();
+    let runtime_identity = RuntimeDeveloperLocalIdentityV1::try_new_with_verification_keys(
+        RuntimeDeveloperLocalIdentityRefsV1 {
+            installation_id: control.installation_id(),
+            target: control.target(),
+            source_scope: control.source_scope(),
+            writer: control.writer(),
+            runtime_principal: control.runtime_principal(),
+            controller_principal: control.controller_principal(),
+            authority_principal: control.authority_principal(),
+            controller_request_key_ref: control.controller_request_key_ref(),
+            runtime_response_key_ref: control.runtime_response_key_ref(),
+            tenure_authority_ref: control.tenure_authority_ref(),
+            tenure_key_ref: control.tenure_key_ref(),
+        },
+        control.controller_request_verification_key(),
+        control.tenure_verification_key(),
+        Zeroizing::new(*manifest.runtime_response_signing_seed()),
+    )
+    .map_err(|_| LocalProcessError::RuntimeStartup)?;
+    let restricted = config.restricted_runtime_apply();
+    let transport_profile = restricted.transport_profile().clone();
+    let expected_carrier = RestrictedRuntimeApplyCarrierBindingV1::try_new(
+        RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+            target: RuntimeHostId::from_bytes(control.target()),
+            runtime_principal: PrincipalRef::from_bytes(control.runtime_principal()),
+            controller_principal: PrincipalRef::from_bytes(control.controller_principal()),
+            endpoint_ref: transport_profile.endpoint_ref(),
+            endpoint_generation: transport_profile.endpoint_generation(),
+            route: transport_profile.route(),
+            controller_request_key: ApplyAuthKeyRef::from_bytes(
+                control.controller_request_key_ref(),
+            ),
+            controller_request_key_fingerprint: ed25519_control_key_fingerprint(
+                &control.controller_request_verification_key(),
+            )
+            .map_err(|_| LocalProcessError::RuntimeStartup)?,
+            runtime_response_key: ApplyAuthKeyRef::from_bytes(
+                control.runtime_response_key_ref(),
+            ),
+            runtime_response_key_fingerprint: ed25519_control_key_fingerprint(
+                &runtime_response_verification_key,
+            )
+            .map_err(|_| LocalProcessError::RuntimeStartup)?,
+            control_transport_profile_ref: restricted.control_transport_profile_ref(),
+            control_transport_profile_digest: transport_profile.profile_digest(),
+        },
+    )
+    .map_err(|_| LocalProcessError::RuntimeStartup)?;
+    let listener_identity = ResolvedRemoteMtlsIdentityFiles::try_new(
+        restricted.runtime_listener_certificate_file().to_path_buf(),
+        restricted.runtime_listener_private_key_file().to_path_buf(),
+    )
+    .map_err(|_| LocalProcessError::NodeCredentialFiles)?;
+    let runtime_config = RuntimeDeveloperLocalConfigV1::try_new_with_restricted_runtime_apply_endpoint(
+        layout.runtime_state_directory().to_path_buf(),
+        layout.runtime_socket_path().to_path_buf(),
+        runtime_identity,
+        transport_profile,
+        restricted.control_transport_profile_ref(),
+        expected_carrier,
+        (
+            restricted.root_ca_certificate_file().to_path_buf(),
+            listener_identity,
+        ),
+    )
+    .map_err(|_| LocalProcessError::RuntimeStartup)?;
+    let runtime = start_runtime_developer_local_v1(runtime_config)
+        .map_err(|_| LocalProcessError::RuntimeStartup)?;
+    let mut owners = RunningNodeOwners::new(runtime);
+    let (node_bootstrap, node_status) =
+        prepare_public_developer_node_v1(&config, &layout, &manifest)?;
+    owners.node = Some(RunningNodeDaemon::start(
+        layout.pxnb_bootstrap_path(),
+        node_bootstrap,
+        node_status,
+    )?);
+    drop(manifest);
+    write_node_ready(&mut io::stdout().lock())?;
+
+    let wait_result = wait_for_node_shutdown(&mut owners, interrupt, terminate).await;
+    let cleanup_result = owners.shutdown();
+    wait_result.and(cleanup_result)
+}
+
+fn write_node_ready(output: &mut impl Write) -> Result<(), LocalProcessError> {
+    writeln!(output, "paraegox: node ready")
+        .and_then(|()| output.flush())
+        .map_err(|_| LocalProcessError::NodeStartup)
+}
+
+async fn wait_for_node_shutdown(
+    owners: &mut RunningNodeOwners,
+    interrupt: &mut TokioSignal,
+    terminate: &mut TokioSignal,
+) -> Result<(), LocalProcessError> {
+    let mut child_poll = interval(DEVELOPER_NODE_POLL_INTERVAL);
+    child_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            signal = interrupt.recv() => {
+                return signal.map(|()| ()).ok_or(LocalProcessError::SignalHandling);
+            }
+            signal = terminate.recv() => {
+                return signal.map(|()| ()).ok_or(LocalProcessError::SignalHandling);
+            }
+            _ = child_poll.tick() => {
+                if owners.node_mut().poll_exit()?.is_some() {
+                    return Err(LocalProcessError::NodeChild);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn run_distributed(
@@ -543,9 +704,9 @@ fn run_prepared(
 
     let runtime_identity = runtime_developer_local_identity(
         identities,
-        *manifest.controller_signing_seed(),
-        *manifest.authority_signing_seed(),
-        *manifest.runtime_signing_seed(),
+        controller_verification_key,
+        authority_verification_key,
+        Zeroizing::new(*manifest.runtime_signing_seed()),
     )?;
     let CompositionProvider {
         deployment: deployment_provider,
@@ -623,11 +784,11 @@ fn run_prepared(
 
 fn runtime_developer_local_identity(
     identities: DeveloperFixtureDerivedIdentityV1,
-    controller_signing_seed: [u8; 32],
-    authority_signing_seed: [u8; 32],
-    runtime_signing_seed: [u8; 32],
+    controller_verification_key: [u8; 32],
+    tenure_verification_key: [u8; 32],
+    runtime_signing_seed: Zeroizing<[u8; 32]>,
 ) -> Result<RuntimeDeveloperLocalIdentityV1, LocalProcessError> {
-    RuntimeDeveloperLocalIdentityV1::try_new(
+    RuntimeDeveloperLocalIdentityV1::try_new_with_verification_keys(
         RuntimeDeveloperLocalIdentityRefsV1 {
             installation_id: identities.installation_id(),
             target: identities.runtime_target(),
@@ -641,11 +802,9 @@ fn runtime_developer_local_identity(
             tenure_authority_ref: identities.authority_ref(),
             tenure_key_ref: identities.authority_key_ref(),
         },
-        RuntimeDeveloperLocalSigningSeedsV1::new(
-            controller_signing_seed,
-            authority_signing_seed,
-            runtime_signing_seed,
-        ),
+        controller_verification_key,
+        tenure_verification_key,
+        runtime_signing_seed,
     )
     .map_err(|_| LocalProcessError::RuntimeStartup)
 }
@@ -863,9 +1022,9 @@ fn distributed_runtime_config_v1(
     let target_identity = manifest.target(target);
     let identity = runtime_developer_local_identity(
         prepared.identities,
-        *manifest.controller_signing_seed(),
-        *manifest.authority_signing_seed(),
-        *target_identity.runtime_response_signing_seed(),
+        signing_verification_key(manifest.controller_signing_seed()),
+        signing_verification_key(manifest.authority_signing_seed()),
+        Zeroizing::new(*target_identity.runtime_response_signing_seed()),
     )
     .map_err(|_| failure)?;
     let evidence_store_epoch =
@@ -1862,6 +2021,122 @@ fn write_distributed_runtime_observation_bootstrap_v1(
         .map_err(|_| LocalProcessError::NodeBootstrap)
 }
 
+fn prepare_public_developer_node_v1(
+    config: &DeveloperNodeConfigV1,
+    layout: &layout::DeveloperNodeLayoutV1,
+    manifest: &identity::DeveloperNodeIdentityManifestV1,
+) -> Result<(DeveloperLocalReferenceBootstrapV1, NodeStatusV1), LocalProcessError> {
+    let node_id =
+        NodeId::try_from_bytes(*manifest.node_id()).map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let node_incarnation = NodeIncarnation::try_from_bytes(*manifest.node_incarnation())
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let management_endpoint_ref = NodeManagementEndpointRefV1::try_from_bytes(
+        *manifest.node_management_endpoint_ref(),
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let identity = NodeIdentityV1::try_new(
+        node_id,
+        PrincipalRef::from_bytes(*manifest.node_principal()),
+        EnrollmentIssuerRefV1::try_from_bytes(config.control().enrollment_issuer_ref())
+            .map_err(|_| LocalProcessError::NodeBootstrap)?,
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let tenure = NodeRegistrationTenureV1::try_new(
+        node_id,
+        DEVELOPER_NODE_REGISTRATION_EPOCH,
+        node_incarnation,
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let initial_feature_report = public_developer_node_feature_report(
+        node_id,
+        node_incarnation,
+        config.control().installation_id(),
+    )?;
+    let expected = DeveloperLocalReferenceBootstrapV1::try_new(
+        DeveloperLocalReferenceBootstrapInputV1 {
+            expected_uid: Uid::effective().as_raw(),
+            expected_gid: Gid::effective().as_raw(),
+            generation_token: *manifest.pxnb_reference_token(),
+            identity,
+            tenure,
+            management_endpoint_ref,
+            initial_feature_report,
+            state_root: layout.node_state_directory().to_path_buf(),
+            socket_path: layout.node_management_socket_path().to_path_buf(),
+        },
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let bootstrap = match fs::symlink_metadata(layout.pxnb_bootstrap_path()) {
+        Ok(_) => DeveloperLocalReferenceBootstrapV1::read_owner_private_file(
+            layout.pxnb_bootstrap_path(),
+        )
+        .map_err(|_| LocalProcessError::NodeBootstrap)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            expected
+                .write_owner_private_file(layout.pxnb_bootstrap_path())
+                .map_err(|_| LocalProcessError::NodeBootstrap)?;
+            DeveloperLocalReferenceBootstrapV1::read_owner_private_file(
+                layout.pxnb_bootstrap_path(),
+            )
+            .map_err(|_| LocalProcessError::NodeBootstrap)?
+        }
+        Err(_) => return Err(LocalProcessError::NodeBootstrap),
+    };
+    let expected_wire = expected
+        .canonical_wire()
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let actual_wire = bootstrap
+        .canonical_wire()
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    if expected_wire.as_slice() != actual_wire.as_slice() {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+
+    let mut owner = DurableNodeDaemonV1::open(
+        bootstrap.state_root(),
+        bootstrap.identity(),
+        bootstrap.tenure(),
+        bootstrap.management_endpoint_ref(),
+        bootstrap.initial_feature_report(),
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    if owner
+        .current_status()
+        .is_some_and(|status| !status.runtime_hosts().is_empty())
+    {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+    let status = owner
+        .publish_status(MAX_NODE_STATUS_FRESHNESS_NANOS)
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    if !status.runtime_hosts().is_empty() {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+    drop(owner);
+    Ok((bootstrap, status))
+}
+
+fn public_developer_node_feature_report(
+    node_id: NodeId,
+    node_incarnation: NodeIncarnation,
+    installation_id: [u8; 16],
+) -> Result<NodeFeatureReportV1, LocalProcessError> {
+    let (operating_system, architecture) = developer_node_platform()?;
+    NodeFeatureReportV1::try_new(NodeFeatureReportInputV1 {
+        node_id,
+        node_incarnation,
+        report_sequence: DEVELOPER_NODE_FEATURE_SEQUENCE,
+        operating_system,
+        architecture,
+        platform_profile_digest: developer_node_platform_digest_for_installation(
+            installation_id,
+        ),
+        runtime_contract_version: DEVELOPER_NODE_RUNTIME_CONTRACT_VERSION,
+        fabric_contract_version: DEVELOPER_NODE_FABRIC_CONTRACT_VERSION,
+    })
+    .map_err(|_| LocalProcessError::NodeBootstrap)
+}
+
 fn prepare_developer_local_node_v1(
     layout: &layout::DeveloperLocalLayoutV1,
     identities: DeveloperFixtureDerivedIdentityV1,
@@ -2032,11 +2307,15 @@ fn developer_node_feature_report(
 }
 
 fn developer_node_platform_digest(identities: DeveloperFixtureDerivedIdentityV1) -> Digest32 {
+    developer_node_platform_digest_for_installation(identities.installation_id())
+}
+
+fn developer_node_platform_digest_for_installation(installation_id: [u8; 16]) -> Digest32 {
     let (operating_system, architecture) = developer_node_platform()
         .expect("DeveloperLocal configuration already rejects unsupported platforms");
     let mut digest = Sha256::new();
     digest.update(DEVELOPER_NODE_PLATFORM_DOMAIN);
-    digest.update(identities.installation_id());
+    digest.update(installation_id);
     digest.update([operating_system as u8]);
     digest.update([architecture as u8]);
     digest.update(DEVELOPER_NODE_RUNTIME_CONTRACT_VERSION.to_be_bytes());
@@ -2172,6 +2451,19 @@ impl RunningNodeDaemon {
         self.status_observed_at
     }
 
+    fn poll_exit(&mut self) -> Result<Option<ExitStatus>, LocalProcessError> {
+        let status = self
+            .child
+            .as_mut()
+            .ok_or(LocalProcessError::NodeChild)?
+            .try_wait()
+            .map_err(|_| LocalProcessError::NodeChild)?;
+        if status.is_some() {
+            self.child.take();
+        }
+        Ok(status)
+    }
+
     fn wait_until_ready(
         &mut self,
         bootstrap: DeveloperLocalReferenceBootstrapV1,
@@ -2304,6 +2596,50 @@ impl Drop for RunningNodeDaemon {
     fn drop(&mut self) {
         let _ = self.shutdown_inner();
         let _ = self.cleanup_observation_bootstrap();
+    }
+}
+
+struct RunningNodeOwners {
+    runtime: Option<RuntimeDeveloperLocalLifecycleV1>,
+    node: Option<RunningNodeDaemon>,
+}
+
+impl RunningNodeOwners {
+    const fn new(runtime: RuntimeDeveloperLocalLifecycleV1) -> Self {
+        Self {
+            runtime: Some(runtime),
+            node: None,
+        }
+    }
+
+    fn node_mut(&mut self) -> &mut RunningNodeDaemon {
+        self.node
+            .as_mut()
+            .expect("NodeDaemon exists after successful startup")
+    }
+
+    fn shutdown(mut self) -> Result<(), LocalProcessError> {
+        let node_result = self
+            .node
+            .take()
+            .map_or(Ok(()), RunningNodeDaemon::shutdown_and_join);
+        let runtime_result = self
+            .runtime
+            .take()
+            .map_or(Ok(()), |runtime| runtime.shutdown_and_join())
+            .map_err(|_| LocalProcessError::JoinedShutdown);
+        node_result.and(runtime_result)
+    }
+}
+
+impl Drop for RunningNodeOwners {
+    fn drop(&mut self) {
+        if let Some(node) = self.node.take() {
+            let _ = node.shutdown_and_join();
+        }
+        if let Some(runtime) = self.runtime.take() {
+            let _ = runtime.shutdown_and_join();
+        }
     }
 }
 
@@ -2461,6 +2797,70 @@ mod tests {
     const INSPECTION_PROBE_BOOTSTRAP_ENVIRONMENT: &str = "PARAEGOX_TEST_INSPECTION_BOOTSTRAP";
     const IPC_PROBE_TEST_NAME: &str = "composition::tests::runtime_ipc_subprocess_probe";
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Default)]
+    struct FlushProbe {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FlushProbe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn public_node_ready_marker_is_exact_and_flushed() {
+        let mut output = FlushProbe::default();
+        write_node_ready(&mut output).expect("node readiness marker");
+        assert_eq!(output.bytes, b"paraegox: node ready\n");
+        assert_eq!(output.flushes, 1);
+    }
+
+    #[test]
+    fn public_node_bootstrap_reopens_stably_and_publishes_feature_only_status() {
+        let state_root = fresh_state_root("public-node-bootstrap");
+        let mut cleanup = TestCleanup {
+            state_root: state_root.clone(),
+            socket_directory: None,
+        };
+        let config = crate::config::developer_node_config_for_test(&state_root);
+        let manifest = crate::identity::load_or_create_node(&config).expect("node identity");
+        let layout = crate::layout::prepare_node(&config, &manifest).expect("node layout");
+        cleanup.socket_directory = Some(layout.socket_directory().to_path_buf());
+
+        let (first_bootstrap, first_status) =
+            prepare_public_developer_node_v1(&config, &layout, &manifest)
+                .expect("first node bootstrap");
+        let first_wire = first_bootstrap
+            .canonical_wire()
+            .expect("first node bootstrap wire");
+        assert!(first_status.runtime_hosts().is_empty());
+
+        let (reopened_bootstrap, reopened_status) =
+            prepare_public_developer_node_v1(&config, &layout, &manifest)
+                .expect("reopened node bootstrap");
+        assert_eq!(
+            reopened_bootstrap
+                .canonical_wire()
+                .expect("reopened node bootstrap wire")
+                .as_slice(),
+            first_wire.as_slice()
+        );
+        assert!(reopened_status.runtime_hosts().is_empty());
+        assert_eq!(reopened_status.node_id(), first_status.node_id());
+        assert_eq!(
+            reopened_status.status_sequence(),
+            first_status.status_sequence() + 1
+        );
+    }
 
     #[test]
     fn console_command_passes_private_bootstraps_and_removes_provider_secrets() {
@@ -3424,7 +3824,8 @@ mod tests {
             .expect("fixture composition config")
         {
             crate::config::Command::DeveloperFixtureV1(config) => config,
-            crate::config::Command::DeveloperDistributedFixtureV1(_)
+            crate::config::Command::DeveloperNodeV1(_)
+            | crate::config::Command::DeveloperDistributedFixtureV1(_)
             | crate::config::Command::DeveloperProvisionedV1(_)
             | crate::config::Command::Help => panic!("unexpected command"),
         }
@@ -3445,7 +3846,8 @@ mod tests {
             .expect("provisioned composition config")
         {
             crate::config::Command::DeveloperProvisionedV1(config) => config,
-            crate::config::Command::DeveloperFixtureV1(_)
+            crate::config::Command::DeveloperNodeV1(_)
+            | crate::config::Command::DeveloperFixtureV1(_)
             | crate::config::Command::DeveloperDistributedFixtureV1(_)
             | crate::config::Command::Help => panic!("unexpected command"),
         }
