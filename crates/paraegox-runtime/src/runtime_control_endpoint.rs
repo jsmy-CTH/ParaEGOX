@@ -66,7 +66,6 @@ use paraegox_runtime_contracts::{
         MANAGED_AGENT_STACK_APPLY_REQUEST_VERSION, MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES,
         MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedAgentStackApplyRequestV1,
         ManagedAgentStackPlanError, ManagedAgentStackProjectionV1,
-        ManagedAgentStackTerminalReceiptV1,
     },
     managed_fabric_plan::{
         MANAGED_FABRIC_APPLY_REQUEST_VERSION, MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES,
@@ -1858,20 +1857,27 @@ impl ManagedFabricControlService {
                 let inner = request
                     .managed_agent_stack_apply_request()
                     .ok_or(RuntimeControlRequestError::Rejected)?;
-                let terminal_wire = self.handle_apply(inner.canonical_wire()).await?;
-                let terminal = ManagedAgentStackTerminalReceiptV1::decode(&terminal_wire).map_err(
-                    |error| {
-                        RuntimeControlRequestError::Internal(
-                            RuntimeBootstrapEndpointError::ManagedAgentStackContract(error),
+                match self
+                    .handle_managed_agent_stack_apply(inner.canonical_wire())
+                    .await?
+                {
+                    ManagedAgentStackApplyOutcome::Committed(receipt)
+                    | ManagedAgentStackApplyOutcome::Replayed(receipt) => {
+                        RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
+                            authenticated,
+                            receipt,
+                            self.channel,
+                            auth_claim,
                         )
-                    },
-                )?;
-                RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
-                    authenticated,
-                    terminal,
-                    self.channel,
-                    auth_claim,
-                )
+                    }
+                    ManagedAgentStackApplyOutcome::HistoricalReplayed(verified) => {
+                        RuntimeAgentControlReceiptDraftV1::try_historical_managed_agent_stack_apply(
+                            authenticated,
+                            verified,
+                            auth_claim,
+                        )
+                    }
+                }
             }
             RuntimeAgentControlKindV1::DescribeConversationPort => {
                 let exported = self
@@ -2068,7 +2074,15 @@ impl ManagedFabricControlService {
             MANAGED_AGENT_STACK_APPLY_REQUEST_VERSION
                 if self.model_stack.is_none() && self.distributed.is_none() =>
             {
-                self.handle_managed_agent_stack_apply(frame).await
+                match self.handle_managed_agent_stack_apply(frame).await? {
+                    ManagedAgentStackApplyOutcome::Committed(receipt)
+                    | ManagedAgentStackApplyOutcome::Replayed(receipt) => {
+                        managed_agent_stack_terminal_response_wire(&receipt)
+                    }
+                    ManagedAgentStackApplyOutcome::HistoricalReplayed(verified) => {
+                        managed_agent_stack_terminal_response_wire(verified.receipt())
+                    }
+                }
             }
             MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION
                 if self.stack.is_none() && self.distributed.is_none() =>
@@ -2132,7 +2146,7 @@ impl ManagedFabricControlService {
     async fn handle_managed_agent_stack_apply(
         &mut self,
         frame: &[u8],
-    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    ) -> Result<ManagedAgentStackApplyOutcome, RuntimeControlRequestError> {
         if frame.len() > MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES {
             return Err(RuntimeControlRequestError::Rejected);
         }
@@ -2144,7 +2158,7 @@ impl ManagedFabricControlService {
             .map_err(|_| RuntimeControlRequestError::Rejected)?;
         if let Some(stack) = self.stack.as_ref() {
             match stack.authenticated_terminal_replay(&request, self.channel) {
-                Ok(Some(receipt)) => return managed_agent_stack_terminal_response_wire(&receipt),
+                Ok(Some(outcome)) => return Ok(outcome),
                 Ok(None) => {}
                 Err(error) => return Err(map_managed_agent_stack_error(error)),
             }
@@ -2188,12 +2202,7 @@ impl ManagedFabricControlService {
                 outcome
             }
         };
-        match outcome {
-            ManagedAgentStackApplyOutcome::Committed(receipt)
-            | ManagedAgentStackApplyOutcome::Replayed(receipt) => {
-                managed_agent_stack_terminal_response_wire(&receipt)
-            }
-        }
+        Ok(outcome)
     }
 
     async fn handle_managed_model_agent_stack_apply(
@@ -7982,6 +7991,179 @@ mod tests {
         assert!(control.stack.is_some());
         assert!(control.distributed.is_none());
         (state_directory, control, stack_request)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pxar7_restart_rotates_live_channel_and_replays_historical_pxst_in_current_pxah() {
+        let socket_directory = TestSocketDirectory::create();
+        let (state_directory, started) =
+            managed_started_service(socket_directory.socket_path.clone());
+        let (listener_a, guard_a) = bind_control_socket(&started.provisioning)
+            .unwrap_or_else(|error| panic!("channel A bind failed: {error}"));
+        let channel_a = live_runtime_channel(&started.provisioning, &guard_a)
+            .unwrap_or_else(|error| panic!("channel A derivation failed: {error}"));
+        let mut control = recover_managed_control_for_existing_channel(started, channel_a)
+            .await
+            .unwrap_or_else(|error| panic!("channel A recovery failed: {error}"));
+        let fabric_projection = control
+            .stack_projection
+            .managed_fabric_projection()
+            .clone();
+        let fabric_request = managed_fabric_active_request(
+            fabric_projection.clone(),
+            managed_available_port(),
+            control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("channel A Fabric clock failed: {error}"))
+                .generation(),
+        );
+        control
+            .handle_request(fabric_request.canonical_wire(), channel_a)
+            .await
+            .unwrap_or_else(|error| panic!("channel A Fabric apply failed: {error:?}"));
+        let stack_request = managed_stack_active_request(
+            &fabric_request,
+            control.stack_projection.clone(),
+            control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("channel A stack clock failed: {error}"))
+                .generation(),
+        );
+        let historical_pxst_wire = control
+            .handle_request(stack_request.canonical_wire(), channel_a)
+            .await
+            .unwrap_or_else(|error| panic!("channel A stack apply failed: {error:?}"));
+        let historical_pxst = ManagedAgentStackTerminalReceiptV1::decode(&historical_pxst_wire)
+            .unwrap_or_else(|error| panic!("channel A PXST decode failed: {error}"));
+        let completion_epoch = historical_pxst
+            .facts()
+            .evidence()
+            .fields()
+            .completion_runtime_host_epoch;
+        assert_eq!(completion_epoch, control.core.runtime_host_epoch());
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("channel A shutdown failed: {error}"));
+        drop(control);
+
+        // Unlink the old named socket but retain its open listener until B is
+        // bound. The still-live inode makes channel rotation deterministic.
+        drop(guard_a);
+        assert!(!socket_directory.socket_path.exists());
+        let projection_digest = transition_projection_digest(&fabric_projection)
+            .unwrap_or_else(|error| panic!("restart projection digest failed: {error}"));
+        let restart_provisioning = provisioning(socket_directory.socket_path.clone());
+        let reopened_store = ManagedFabricStore::open_fixture(
+            state_directory.path(),
+            STORE_INSTANCE_ID,
+            restart_provisioning.owner_target_fingerprint(),
+            projection_digest,
+        )
+        .unwrap_or_else(|error| panic!("restart store reopen failed: {error}"));
+        let restarted = StartedManagedFabricService::try_start_from_store(
+            state_directory.path(),
+            STORE_INSTANCE_ID,
+            compiled_facts(),
+            restart_provisioning,
+            reopened_store,
+            deterministic_fixture_service_dependencies(),
+        )
+        .unwrap_or_else(|error| panic!("restart owner open failed: {error}"));
+        let current_epoch = restarted.core.runtime_host_epoch();
+        assert!(current_epoch > completion_epoch);
+        let (listener_b, guard_b) = bind_control_socket(&restarted.provisioning)
+            .unwrap_or_else(|error| panic!("channel B bind failed: {error}"));
+        let channel_b = live_runtime_channel(&restarted.provisioning, &guard_b)
+            .unwrap_or_else(|error| panic!("channel B derivation failed: {error}"));
+        assert_ne!(
+            channel_b.binding_digest(),
+            channel_a.binding_digest(),
+            "a real socket rebind must rotate the Runtime-local channel",
+        );
+        drop(listener_a);
+        let mut restarted_control =
+            recover_managed_control_for_existing_channel(restarted, channel_b)
+                .await
+                .unwrap_or_else(|error| panic!("channel B recovery failed: {error}"));
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let carrier = restricted_carrier_for_profile(&profile, RESTRICTED_PROFILE_REF);
+        let current_pxag = signed_runtime_agent_stack_apply(
+            carrier.clone(),
+            stack_request.clone(),
+            current_epoch,
+        );
+        let pre_replay_sequence = restarted_control
+            .core
+            .recovered_observation()
+            .unwrap_or_else(|error| panic!("pre-replay observation failed: {error}"))
+            .successor_snapshot_sequence;
+        let current_pxah_wire = restarted_control
+            .handle_restricted_runtime_control_frame_v1(
+                current_pxag.canonical_wire(),
+                &carrier,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("historical PXST replay failed: {error:?}"));
+        let current_pxah = RuntimeAgentControlReceiptV1::decode(&current_pxah_wire)
+            .unwrap_or_else(|error| panic!("current PXAH decode failed: {error}"));
+        assert_eq!(current_pxah.runtime_host_epoch(), current_epoch);
+        assert_eq!(current_pxah.carrier(), &carrier);
+        assert_eq!(
+            current_pxah
+                .managed_agent_stack_receipt()
+                .unwrap_or_else(|| panic!("current PXAH lost historical PXST"))
+                .canonical_wire(),
+            historical_pxst_wire.as_ref(),
+            "restart replay must not re-sign or re-commit PXST",
+        );
+        current_pxah
+            .verify_runtime_apply_receipt(
+                &current_pxag,
+                channel_a,
+                &carrier,
+                verify_runtime_agent_response_signature,
+            )
+            .unwrap_or_else(|error| {
+                panic!("historical PXST/current PXAH verification failed: {error}")
+            });
+        assert!(
+            current_pxah
+                .validate_apply_against_request(&current_pxag, channel_b)
+                .is_err(),
+            "consumer correlation must not reinterpret B as the historical PXST channel",
+        );
+        assert_eq!(
+            restarted_control
+                .core
+                .recovered_observation()
+                .unwrap_or_else(|error| panic!("post-replay observation failed: {error}"))
+                .successor_snapshot_sequence,
+            pre_replay_sequence,
+            "historical replay must not commit a new successor transition",
+        );
+        shutdown_managed_successor_chain(
+            &mut restarted_control.distributed,
+            &mut restarted_control.model_stack,
+            &mut restarted_control.stack,
+            &mut restarted_control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("channel B shutdown failed: {error}"));
+        drop(restarted_control);
+        drop(listener_b);
+        drop(guard_b);
     }
 
     struct MockStore {

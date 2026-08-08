@@ -11,7 +11,7 @@ use core::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey};
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_kernel::time::ClockReading;
 use paraegox_runtime_contracts::apply::ExpectedActive;
@@ -31,11 +31,16 @@ use paraegox_runtime_contracts::managed_agent_stack_plan::{
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
     ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptV1,
 };
+use paraegox_runtime_contracts::managed_serving_bootstrap::{
+    RuntimeVerifiedHistoricalManagedAgentStackReceiptV1,
+};
 use paraegox_runtime_contracts::managed_service::ManagedServiceGeneration;
 use paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1;
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
-use crate::admission::VerifiedManagedAgentStackApplyIngressV1;
+use crate::admission::{
+    ED25519_ALGORITHM, ED25519_ALGORITHM_VERSION, VerifiedManagedAgentStackApplyIngressV1,
+};
 use crate::managed_agent_runtime::{
     ManagedAgentAssembly, ManagedAgentAssemblyConfig, ManagedAgentAssemblyError,
     RuntimeAgentConversationHandle,
@@ -319,6 +324,7 @@ pub(crate) struct ManagedAgentStackDistributedCutoverObservation {
 pub(crate) enum ManagedAgentStackApplyOutcome {
     Committed(ManagedAgentStackTerminalReceiptV1),
     Replayed(ManagedAgentStackTerminalReceiptV1),
+    HistoricalReplayed(RuntimeVerifiedHistoricalManagedAgentStackReceiptV1),
 }
 
 /// One bootstrap-only snapshot of the exact currently published Agent port.
@@ -821,9 +827,51 @@ impl ManagedAgentStackRuntimeCore {
         &self,
         request: &ManagedAgentStackApplyRequestV1,
         response_channel: ReferenceChannelBindingV1,
-    ) -> Result<Option<ManagedAgentStackTerminalReceiptV1>, ManagedAgentStackRuntimeError> {
+    ) -> Result<Option<ManagedAgentStackApplyOutcome>, ManagedAgentStackRuntimeError> {
         self.validate_request(request, response_channel)?;
-        self.lookup_terminal(request, response_channel)
+        let Some(record) = self.terminal_record(request)? else {
+            return Ok(None);
+        };
+        let completion_runtime_host_epoch = record
+            .receipt
+            .facts()
+            .evidence()
+            .fields()
+            .completion_runtime_host_epoch;
+        if completion_runtime_host_epoch == self.runtime_host_epoch
+            && record
+                .receipt
+                .validate_against_request(request, response_channel)
+                .is_ok()
+        {
+            return Ok(Some(ManagedAgentStackApplyOutcome::Replayed(
+                record.receipt.clone(),
+            )));
+        }
+        let verified = RuntimeVerifiedHistoricalManagedAgentStackReceiptV1::try_verify(
+            request,
+            self.runtime_host_epoch,
+            record.receipt.clone(),
+            |key, algorithm, version, transcript, signature| {
+                if key != self.response_key_ref
+                    || algorithm.value() != ED25519_ALGORITHM
+                    || version != ED25519_ALGORITHM_VERSION
+                {
+                    return false;
+                }
+                let Ok(signature) = Signature::from_slice(signature) else {
+                    return false;
+                };
+                self.response_signer
+                    .verifying_key()
+                    .verify_strict(transcript, &signature)
+                    .is_ok()
+            },
+        )
+        .map_err(|_| ManagedAgentStackRuntimeError::TerminalCorrelation)?;
+        Ok(Some(ManagedAgentStackApplyOutcome::HistoricalReplayed(
+            verified,
+        )))
     }
 
     pub(crate) async fn apply(
@@ -1180,6 +1228,20 @@ impl ManagedAgentStackRuntimeCore {
         request: &ManagedAgentStackApplyRequestV1,
         response_channel: ReferenceChannelBindingV1,
     ) -> Result<Option<ManagedAgentStackTerminalReceiptV1>, ManagedAgentStackRuntimeError> {
+        let Some(record) = self.terminal_record(request)? else {
+            return Ok(None);
+        };
+        record
+            .receipt
+            .validate_against_request(request, response_channel)
+            .map_err(|_| ManagedAgentStackRuntimeError::TerminalCorrelation)?;
+        Ok(Some(record.receipt.clone()))
+    }
+
+    fn terminal_record(
+        &self,
+        request: &ManagedAgentStackApplyRequestV1,
+    ) -> Result<Option<&ManagedAgentStackTerminalRecord>, ManagedAgentStackRuntimeError> {
         let source_scope = request.provenance().source_scope();
         let operation_id = request.operation_id();
         let Some(record) = self.snapshot.terminals.iter().find(|record| {
@@ -1190,11 +1252,7 @@ impl ManagedAgentStackRuntimeCore {
         if record.request_digest != request.envelope_request_digest() {
             return Err(ManagedAgentStackRuntimeError::OperationConflict);
         }
-        record
-            .receipt
-            .validate_against_request(request, response_channel)
-            .map_err(|_| ManagedAgentStackRuntimeError::TerminalCorrelation)?;
-        Ok(Some(record.receipt.clone()))
+        Ok(Some(record))
     }
 
     fn admit_transition(
