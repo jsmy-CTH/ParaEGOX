@@ -1430,6 +1430,10 @@ impl RuntimeAgentControlReceiptPayloadV1 {
 }
 
 /// Signature-independent Runtime producer for one PXAH receipt.
+///
+/// Every public producer constructor requires a marker issued by
+/// [`RuntimeAgentControlRequestV1::verify_controller_request`], so Runtime
+/// code cannot mint a PXAH from a merely decoded, unauthenticated PXAG.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeAgentControlReceiptDraftV1 {
     request_id: RuntimeAgentControlRequestIdV1,
@@ -1456,11 +1460,12 @@ impl RuntimeAgentControlReceiptDraftV1 {
     /// `current_channel` is used only by PXFT correlation. It is not encoded
     /// into PXAH and is never interpreted as the PXCB/TLS binding.
     pub fn try_managed_fabric_apply(
-        request: &RuntimeAgentControlRequestV1,
+        authenticated_request: ControllerAuthenticatedRuntimeAgentControlRequestV1<'_>,
         receipt: ManagedFabricApplyTerminalReceiptV1,
         current_channel: ReferenceChannelBindingV1,
         auth_claim: RuntimeAgentControlResponseAuthClaimV1,
     ) -> Result<Self, ManagedServingBootstrapError> {
+        let request = authenticated_request.request();
         let inner = request
             .managed_fabric_apply_request()
             .ok_or(ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
@@ -1482,11 +1487,12 @@ impl RuntimeAgentControlReceiptDraftV1 {
     /// `current_channel` is correlation input only and never becomes a public
     /// transport or access claim.
     pub fn try_managed_agent_stack_apply(
-        request: &RuntimeAgentControlRequestV1,
+        authenticated_request: ControllerAuthenticatedRuntimeAgentControlRequestV1<'_>,
         receipt: ManagedAgentStackTerminalReceiptV1,
         current_channel: ReferenceChannelBindingV1,
         auth_claim: RuntimeAgentControlResponseAuthClaimV1,
     ) -> Result<Self, ManagedServingBootstrapError> {
+        let request = authenticated_request.request();
         let inner = request
             .managed_agent_stack_apply_request()
             .ok_or(ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
@@ -1510,12 +1516,13 @@ impl RuntimeAgentControlReceiptDraftV1 {
     /// physical generation. This receipt is not a TLS authorization, access
     /// grant, session, capability, discovery result, or retry authority.
     pub fn try_conversation_port_descriptor(
-        request: &RuntimeAgentControlRequestV1,
+        authenticated_request: ControllerAuthenticatedRuntimeAgentControlRequestV1<'_>,
         descriptor: &[u8],
         fabric_generation: ManagedServiceGeneration,
         agent_generation: ManagedServiceGeneration,
         auth_claim: RuntimeAgentControlResponseAuthClaimV1,
     ) -> Result<Self, ManagedServingBootstrapError> {
+        let request = authenticated_request.request();
         Self::try_new(
             request,
             RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(descriptor.into()),
@@ -1810,7 +1817,13 @@ impl RuntimeAgentControlReceiptV1 {
         Ok(())
     }
 
-    /// Verifies an Apply PXAH, including the independently signed inner receipt.
+    /// Verifies an Apply PXAH outer signature after revalidating the inner
+    /// receipt's exact request and current-channel correlation.
+    ///
+    /// This method does not cryptographically verify the independently signed
+    /// PXFT/PXST payload. A caller that relies on the inner signature must also
+    /// verify its signing transcript and authentication signature against the
+    /// applicable inner response-key policy.
     pub fn verify_runtime_apply_receipt<'a, Verify>(
         &'a self,
         request: &RuntimeAgentControlRequestV1,
@@ -4114,6 +4127,25 @@ mod tests {
         .expect("Agent-control response auth")
     }
 
+    fn authenticate_agent_control_request<'a>(
+        request: &'a RuntimeAgentControlRequestV1,
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        expected_signature: &[u8],
+    ) -> ControllerAuthenticatedRuntimeAgentControlRequestV1<'a> {
+        request
+            .verify_controller_request(
+                carrier,
+                |principal, key, fingerprint, transcript, signature| {
+                    principal == carrier.controller_principal()
+                        && key == carrier.controller_request_key()
+                        && fingerprint == carrier.controller_request_key_fingerprint()
+                        && !transcript.is_empty()
+                        && signature == expected_signature
+                },
+            )
+            .expect("Controller-authenticated PXAG")
+    }
+
     fn channel(target: RuntimeHostId) -> ReferenceChannelBindingV1 {
         ReferenceChannelBindingV1::try_new(
             target,
@@ -4597,7 +4629,7 @@ mod tests {
 
         let descriptor = b"PXAP\0\x01opaque";
         let receipt = RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
-            &request,
+            authenticated,
             descriptor,
             ManagedServiceGeneration::try_new(17).expect("Fabric generation"),
             ManagedServiceGeneration::try_new(19).expect("Agent generation"),
@@ -4748,8 +4780,13 @@ mod tests {
                 + fabric_request.canonical_wire().len()
                 + 64
         );
-        let fabric_pxah = RuntimeAgentControlReceiptDraftV1::try_managed_fabric_apply(
+        let authenticated_fabric_outer = authenticate_agent_control_request(
             &fabric_outer,
+            &fabric_carrier,
+            &[0xa2; 64],
+        );
+        let fabric_pxah = RuntimeAgentControlReceiptDraftV1::try_managed_fabric_apply(
+            authenticated_fabric_outer,
             fabric_terminal.clone(),
             fabric_channel,
             agent_control_response_auth(&fabric_carrier),
@@ -4825,8 +4862,13 @@ mod tests {
                 .canonical_wire(),
             agent_request.canonical_wire()
         );
-        let agent_pxah = RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
+        let authenticated_agent_outer = authenticate_agent_control_request(
             &agent_outer,
+            &agent_carrier,
+            &[0xa5; 64],
+        );
+        let agent_pxah = RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
+            authenticated_agent_outer,
             agent_terminal.clone(),
             agent_channel,
             agent_control_response_auth(&agent_carrier),
@@ -4925,9 +4967,11 @@ mod tests {
         .expect("epoch is an outer expectation")
         .finalize(&[0xb3; 64])
         .expect("PXAG");
+        let authenticated_outer =
+            authenticate_agent_control_request(&outer, &carrier, &[0xb3; 64]);
         assert_eq!(
             RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
-                &outer,
+                authenticated_outer,
                 terminal,
                 channel,
                 agent_control_response_auth(&carrier),
@@ -4974,9 +5018,14 @@ mod tests {
         .expect("Describe")
         .finalize(&[0xb9; 64])
         .expect("PXAG Describe");
+        let authenticated_describe = authenticate_agent_control_request(
+            &describe,
+            &describe_carrier,
+            &[0xb9; 64],
+        );
         assert_eq!(
             RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
-                &describe,
+                authenticated_describe,
                 &vec![0; MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES + 1],
                 ManagedServiceGeneration::try_new(1).expect("generation"),
                 ManagedServiceGeneration::try_new(2).expect("generation"),
