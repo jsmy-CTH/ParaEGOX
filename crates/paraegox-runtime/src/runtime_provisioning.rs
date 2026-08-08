@@ -946,10 +946,15 @@ mod tests {
         let provisioning = RuntimeProvisioningV1::try_new_developer_local(input)
             .unwrap_or_else(|error| panic!("DeveloperLocal provisioning rejected: {error}"));
 
-        assert_eq!(provisioning.controller_key().to_bytes(), controller_public_key);
+        assert_eq!(
+            provisioning.controller_key().to_bytes(),
+            controller_public_key
+        );
         assert_eq!(
             provisioning.runtime_response_public_key(),
-            SigningKey::from_bytes(&RESPONSE_SEED).verifying_key().to_bytes()
+            SigningKey::from_bytes(&RESPONSE_SEED)
+                .verifying_key()
+                .to_bytes()
         );
         assert_eq!(
             provisioning.admission_policy_fingerprint(),

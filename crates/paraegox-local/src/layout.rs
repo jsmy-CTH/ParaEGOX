@@ -9,7 +9,9 @@ use std::path::{Component, Path, PathBuf};
 
 use nix::unistd::{Gid, Uid, chown};
 
-use crate::config::{DeveloperFixtureConfigV1, DeveloperNodeConfigV1, DeveloperProvisionedConfigV1};
+use crate::config::{
+    DeveloperFixtureConfigV1, DeveloperNodeConfigV1, DeveloperProvisionedConfigV1,
+};
 use crate::identity::{
     DeveloperNodeIdentityManifestV1, DistributedDeveloperLocalIdentityManifestV1,
     DistributedDeveloperLocalTargetV1, IdentityManifestV1,
@@ -726,19 +728,13 @@ impl DeveloperNodeLayoutV1 {
 
     fn validate(&self, uid: u32, gid: u32) -> Result<(), DeveloperLocalLayoutError> {
         validate_canonical_path_chain(self.canonical_state_root())?;
-        for directory in [
-            self.runtime_state_directory(),
-            self.node_owner_directory(),
-        ] {
+        for directory in [self.runtime_state_directory(), self.node_owner_directory()] {
             validate_existing_child_directory(directory, self.canonical_state_root())?;
         }
         if self.runtime_state_directory() == self.node_owner_directory() {
             return Err(DeveloperLocalLayoutError::OverlappingPath);
         }
-        for directory in [
-            self.node_state_directory(),
-            self.node_bootstrap_directory(),
-        ] {
+        for directory in [self.node_state_directory(), self.node_bootstrap_directory()] {
             validate_existing_child_directory(directory, self.node_owner_directory())?;
         }
         if self.node_state_directory() == self.node_bootstrap_directory() {
@@ -769,13 +765,18 @@ impl DeveloperNodeLayoutV1 {
             self.node_socket_directory(),
         )?;
         validate_reserved_path(self.pxnb_bootstrap_path(), self.node_bootstrap_directory())?;
-        for path in [self.runtime_socket_path(), self.node_management_socket_path()] {
+        for path in [
+            self.runtime_socket_path(),
+            self.node_management_socket_path(),
+        ] {
             if path.as_os_str().as_bytes().len() > MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES {
                 return Err(DeveloperLocalLayoutError::SocketPathTooLong);
             }
         }
         if self.runtime_socket_path() == self.node_management_socket_path()
-            || self.pxnb_bootstrap_path().starts_with(self.node_state_directory())
+            || self
+                .pxnb_bootstrap_path()
+                .starts_with(self.node_state_directory())
         {
             return Err(DeveloperLocalLayoutError::OverlappingPath);
         }
@@ -1456,7 +1457,10 @@ mod tests {
             first.node_state_directory(),
             first.node_bootstrap_directory(),
         ] {
-            assert_eq!(fs::canonicalize(path).expect("canonical node directory"), path);
+            assert_eq!(
+                fs::canonicalize(path).expect("canonical node directory"),
+                path
+            );
             assert_eq!(
                 fs::symlink_metadata(path)
                     .expect("node directory metadata")
@@ -1474,12 +1478,24 @@ mod tests {
         ] {
             assert!(!first.canonical_state_root().join(absent).exists());
         }
-        assert!(!first.socket_directory().join(AGENT_IPC_SOCKET_FILE).exists());
-        assert!(!first.socket_directory().join(INSPECTION_IPC_SOCKET_FILE).exists());
-        assert!(!first
-            .node_bootstrap_directory()
-            .join(DISTRIBUTED_PXOB_BOOTSTRAP_FILE)
-            .exists());
+        assert!(
+            !first
+                .socket_directory()
+                .join(AGENT_IPC_SOCKET_FILE)
+                .exists()
+        );
+        assert!(
+            !first
+                .socket_directory()
+                .join(INSPECTION_IPC_SOCKET_FILE)
+                .exists()
+        );
+        assert!(
+            !first
+                .node_bootstrap_directory()
+                .join(DISTRIBUTED_PXOB_BOOTSTRAP_FILE)
+                .exists()
+        );
         let second = prepare_node(&config, &identities).expect("stable node-only reopen");
         assert_eq!(first.owned_paths(), second.owned_paths());
         drop(second);

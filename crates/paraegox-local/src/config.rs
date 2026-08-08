@@ -7,17 +7,17 @@ use std::{
     time::Duration,
 };
 
+use ed25519_dalek::VerifyingKey;
+use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_model_adapters::{
     DeepSeekChatCompletionsProviderConfigV1, DeepSeekChatModelV1, MAX_OPENAI_RESPONSES_MODEL_BYTES,
     OpenAiResponsesProviderConfigV1,
 };
-use ed25519_dalek::VerifyingKey;
-use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     DistributedFabricCredentialRefV1, DistributedFabricTlsEndpointV1,
     DistributedFabricTrustAnchorRefV1, DistributedFabricTrustDomainRefV1,
-    RestrictedRuntimeApplyTransportProfileFieldsV1, RestrictedRuntimeApplyTransportProfileV1,
-    MAX_RESTRICTED_RUNTIME_APPLY_ROUTE_BYTES,
+    MAX_RESTRICTED_RUNTIME_APPLY_ROUTE_BYTES, RestrictedRuntimeApplyTransportProfileFieldsV1,
+    RestrictedRuntimeApplyTransportProfileV1,
 };
 use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentProviderRefV1;
 use serde::Deserialize;
@@ -34,8 +34,7 @@ const DEEPSEEK_SECRET_REF: &str = "env:DEEPSEEK_API_KEY";
 const CHAT_CONFIG_SCHEMA_VERSION: u16 = 1;
 const NODE_CONFIG_SCHEMA_VERSION: u16 = 1;
 const MAX_CHAT_CONFIG_BYTES: u64 = 64 * 1024;
-const NODE_CONFIG_COMMITMENT_DOMAIN: &[u8] =
-    b"paraegox.local.developer-node-config.sha256.v1";
+const NODE_CONFIG_COMMITMENT_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v1";
 const DEVELOPER_NODE_OPERATION_TIMEOUT_NANOS: u64 = 30_000_000_000;
 // In-progress two-target composition is intentionally not a public CLI. Keep
 // its parser reachable only through the same double-underscore convention as
@@ -1471,9 +1470,7 @@ fn parse_node_config_document(
         runtime_principal: parse_node_ref(&control_document.runtime_principal)?,
         controller_principal: parse_node_ref(&control_document.controller_principal)?,
         authority_principal: parse_node_ref(&control_document.authority_principal)?,
-        controller_request_key_ref: parse_node_ref(
-            &control_document.controller_request_key_ref,
-        )?,
+        controller_request_key_ref: parse_node_ref(&control_document.controller_request_key_ref)?,
         runtime_response_key_ref: parse_node_ref(&control_document.runtime_response_key_ref)?,
         tenure_authority_ref: parse_node_ref(&control_document.tenure_authority_ref)?,
         tenure_key_ref: parse_node_ref(&control_document.tenure_key_ref)?,
@@ -1481,16 +1478,14 @@ fn parse_node_config_document(
         controller_request_verification_key: parse_verification_key(
             &control_document.controller_request_verification_key,
         )?,
-        tenure_verification_key: parse_verification_key(
-            &control_document.tenure_verification_key,
-        )?,
+        tenure_verification_key: parse_verification_key(&control_document.tenure_verification_key)?,
     };
     let runtime_refs = control.runtime_identity_refs();
-    if runtime_refs.iter().enumerate().any(|(index, value)| {
-        runtime_refs[index + 1..]
-            .iter()
-            .any(|other| value == other)
-    }) || control.controller_request_verification_key == control.tenure_verification_key
+    if runtime_refs
+        .iter()
+        .enumerate()
+        .any(|(index, value)| runtime_refs[index + 1..].iter().any(|other| value == other))
+        || control.controller_request_verification_key == control.tenure_verification_key
     {
         return Err(ConfigError::InvalidNodeConfiguration);
     }
@@ -1532,9 +1527,7 @@ fn parse_node_config_document(
     .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
     let restricted_runtime_apply = DeveloperNodeRestrictedRuntimeApplyConfigV1 {
         transport_profile,
-        control_transport_profile_ref: parse_node_ref(
-            &restricted.control_transport_profile_ref,
-        )?,
+        control_transport_profile_ref: parse_node_ref(&restricted.control_transport_profile_ref)?,
         root_ca_certificate_file: parse_tls_file_path(restricted.root_ca_certificate_file)?,
         runtime_listener_certificate_file: parse_tls_file_path(
             restricted.runtime_listener_certificate_file,
@@ -1543,11 +1536,8 @@ fn parse_node_config_document(
             restricted.runtime_listener_private_key_file,
         )?,
     };
-    let config_commitment = developer_node_config_commitment(
-        &state_root,
-        &control,
-        &restricted_runtime_apply,
-    );
+    let config_commitment =
+        developer_node_config_commitment(&state_root, &control, &restricted_runtime_apply);
     Ok(Command::DeveloperNodeV1(Box::new(DeveloperNodeConfigV1 {
         state_root,
         control,
@@ -1569,8 +1559,8 @@ fn parse_verification_key(value: &str) -> Result<[u8; 32], ConfigError> {
         decoded[index] = (hex_nibble(pair[0]).ok_or(ConfigError::InvalidNodeConfiguration)? << 4)
             | hex_nibble(pair[1]).ok_or(ConfigError::InvalidNodeConfiguration)?;
     }
-    let key = VerifyingKey::from_bytes(&decoded)
-        .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let key =
+        VerifyingKey::from_bytes(&decoded).map_err(|_| ConfigError::InvalidNodeConfiguration)?;
     if key.is_weak() {
         return Err(ConfigError::InvalidNodeConfiguration);
     }
@@ -2208,7 +2198,10 @@ mod tests {
     fn exact_node_config_selects_only_split_trust_host_local_inputs() {
         let document = node_document("/var/tmp/paraegox-node-test");
         let config = parse_node_fixture(&document);
-        assert_eq!(config.state_root(), Path::new("/var/tmp/paraegox-node-test"));
+        assert_eq!(
+            config.state_root(),
+            Path::new("/var/tmp/paraegox-node-test")
+        );
         assert_eq!(config.control().target(), [0x02; 16]);
         assert_eq!(config.control().controller_request_key_ref(), [0x08; 16]);
         assert_eq!(config.control().runtime_response_key_ref(), [0x09; 16]);
@@ -2266,7 +2259,9 @@ mod tests {
         );
 
         let first = parse_node_fixture(&valid);
-        let changed = parse_node_fixture(&valid.replace("endpoint_generation = 1", "endpoint_generation = 2"));
+        let changed = parse_node_fixture(
+            &valid.replace("endpoint_generation = 1", "endpoint_generation = 2"),
+        );
         assert_ne!(first.config_commitment(), changed.config_commitment());
     }
 

@@ -14,8 +14,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use nix::unistd::{Gid, Uid, chown};
 use ed25519_dalek::SigningKey;
+use nix::unistd::{Gid, Uid, chown};
 use paraegox_deployment::{DeveloperFixtureDerivedIdentityV1, DeveloperFixtureIdentitySeedV1};
 use paraegox_fabric::restricted_runtime_apply_peer_certificate_common_name_v1;
 use paraegox_kernel::identity::PrincipalRef;
@@ -95,7 +95,8 @@ const NODE_MANIFEST_FIELD_COUNT: u16 = 8;
 const NODE_MANIFEST_FLAGS: u16 = 0;
 const NODE_IDENTITY_FIELD_COUNT: usize = 5;
 const NODE_MANIFEST_PAYLOAD_BYTES: usize = (2 * 32) + (NODE_IDENTITY_FIELD_COUNT * 16) + 32;
-const NODE_MANIFEST_CHECKSUM_OFFSET: usize = NODE_MANIFEST_HEADER_BYTES + NODE_MANIFEST_PAYLOAD_BYTES;
+const NODE_MANIFEST_CHECKSUM_OFFSET: usize =
+    NODE_MANIFEST_HEADER_BYTES + NODE_MANIFEST_PAYLOAD_BYTES;
 const NODE_MANIFEST_WIRE_BYTES: usize = NODE_MANIFEST_CHECKSUM_OFFSET + CHECKSUM_BYTES;
 const NODE_FRESH_ENTROPY_BYTES: usize = (2 * 32) + (NODE_IDENTITY_FIELD_COUNT * 16);
 
@@ -143,13 +144,11 @@ impl IdentityProviderProfileV1 {
                 DEEPSEEK_IDENTITY_DIRECTORY_NAME,
                 NODE_IDENTITY_DIRECTORY_NAME,
             ],
-            Self::DeepSeekChatCompletions => {
-                [
-                    IDENTITY_DIRECTORY_NAME,
-                    OPENAI_IDENTITY_DIRECTORY_NAME,
-                    NODE_IDENTITY_DIRECTORY_NAME,
-                ]
-            }
+            Self::DeepSeekChatCompletions => [
+                IDENTITY_DIRECTORY_NAME,
+                OPENAI_IDENTITY_DIRECTORY_NAME,
+                NODE_IDENTITY_DIRECTORY_NAME,
+            ],
         }
     }
 
@@ -759,16 +758,13 @@ pub(crate) fn validate_node_tls_files(
     if parent != canonical_state_root.join("credentials") {
         return Err(IdentityManifestError::InsecureCredentialFile);
     }
-    if files[1..]
-        .iter()
-        .any(|path| path.parent() != Some(parent))
-    {
+    if files[1..].iter().any(|path| path.parent() != Some(parent)) {
         return Err(IdentityManifestError::InsecureCredentialFile);
     }
     validate_existing_path_chain(parent)
         .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
-    let parent_before = fs::symlink_metadata(parent)
-        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let parent_before =
+        fs::symlink_metadata(parent).map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
     validate_node_tls_parent_metadata(&parent_before)?;
     let parent_handle = OpenOptions::new()
         .read(true)
@@ -785,8 +781,8 @@ pub(crate) fn validate_node_tls_files(
     validate_node_tls_file(files[0], false)?;
     validate_node_tls_file(files[1], false)?;
     validate_node_tls_file(files[2], true)?;
-    let parent_after = fs::symlink_metadata(parent)
-        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let parent_after =
+        fs::symlink_metadata(parent).map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
     validate_node_tls_parent_metadata(&parent_after)?;
     if !same_file(&parent_opened, &parent_after) {
         return Err(IdentityManifestError::InsecureCredentialFile);
@@ -797,8 +793,8 @@ pub(crate) fn validate_node_tls_files(
 fn validate_node_tls_file(path: &Path, private_key: bool) -> Result<(), IdentityManifestError> {
     validate_existing_path_chain(path)
         .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
-    let before = fs::symlink_metadata(path)
-        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let before =
+        fs::symlink_metadata(path).map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
     validate_node_tls_file_metadata(&before, private_key)?;
     let file = OpenOptions::new()
         .read(true)
@@ -808,21 +804,17 @@ fn validate_node_tls_file(path: &Path, private_key: bool) -> Result<(), Identity
     let opened = file
         .metadata()
         .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
-    let after = fs::symlink_metadata(path)
-        .map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
+    let after =
+        fs::symlink_metadata(path).map_err(|_| IdentityManifestError::InsecureCredentialFile)?;
     validate_node_tls_file_metadata(&opened, private_key)?;
     validate_node_tls_file_metadata(&after, private_key)?;
-    if !same_file(&before, &opened)
-        || !same_file(&opened, &after)
-    {
+    if !same_file(&before, &opened) || !same_file(&opened, &after) {
         return Err(IdentityManifestError::InsecureCredentialFile);
     }
     Ok(())
 }
 
-fn validate_node_tls_parent_metadata(
-    metadata: &fs::Metadata,
-) -> Result<(), IdentityManifestError> {
+fn validate_node_tls_parent_metadata(metadata: &fs::Metadata) -> Result<(), IdentityManifestError> {
     if !metadata.is_dir()
         || metadata.uid() != Uid::effective().as_raw()
         || metadata.gid() != Gid::effective().as_raw()
@@ -1729,14 +1721,12 @@ impl DeveloperNodeIdentityManifestV1 {
         {
             return Err(IdentityManifestError::InvalidManifestHeader);
         }
-        let expected_checksum =
-            node_manifest_checksum(&bytes[..NODE_MANIFEST_CHECKSUM_OFFSET]);
+        let expected_checksum = node_manifest_checksum(&bytes[..NODE_MANIFEST_CHECKSUM_OFFSET]);
         if bytes[NODE_MANIFEST_CHECKSUM_OFFSET..] != expected_checksum {
             return Err(IdentityManifestError::ManifestChecksumMismatch);
         }
-        let mut cursor = ByteCursor::new(
-            &bytes[NODE_MANIFEST_HEADER_BYTES..NODE_MANIFEST_CHECKSUM_OFFSET],
-        );
+        let mut cursor =
+            ByteCursor::new(&bytes[NODE_MANIFEST_HEADER_BYTES..NODE_MANIFEST_CHECKSUM_OFFSET]);
         let manifest = Self {
             runtime_response_signing_seed: cursor.array(),
             pxnb_reference_token: cursor.array(),
@@ -1769,10 +1759,9 @@ impl DeveloperNodeIdentityManifestV1 {
             self.runtime_response_signing_seed(),
             self.pxnb_reference_token(),
         ];
-        let runtime_verification_key =
-            SigningKey::from_bytes(self.runtime_response_signing_seed())
-                .verifying_key()
-                .to_bytes();
+        let runtime_verification_key = SigningKey::from_bytes(self.runtime_response_signing_seed())
+            .verifying_key()
+            .to_bytes();
         if !all_nonzero_and_distinct(&secrets)
             || !all_nonzero_and_distinct(&self.identity_fields())
             || bytes_are_zero(self.config_commitment())
@@ -3145,7 +3134,10 @@ mod tests {
             | crate::config::Command::DeveloperProvisionedV1(_)
             | crate::config::Command::Help => panic!("unexpected changed node command"),
         };
-        assert_ne!(changed_config.config_commitment(), config.config_commitment());
+        assert_ne!(
+            changed_config.config_commitment(),
+            config.config_commitment()
+        );
         assert_eq!(
             load_or_create_node_with_entropy(&changed_config, &mut FailingEntropy).unwrap_err(),
             IdentityManifestError::InvalidManifestField
@@ -3177,7 +3169,10 @@ mod tests {
         ensure_state_root(&directory.path).expect("private node state root");
         let credentials = directory.path.join("credentials");
         let mut builder = DirBuilder::new();
-        builder.mode(0o700).create(&credentials).expect("credentials directory");
+        builder
+            .mode(0o700)
+            .create(&credentials)
+            .expect("credentials directory");
         fs::set_permissions(&credentials, fs::Permissions::from_mode(0o700))
             .expect("credentials directory mode");
         let restricted = config.restricted_runtime_apply();

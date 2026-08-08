@@ -201,10 +201,7 @@ impl RuntimeDeveloperLocalIdentityV1 {
         runtime_response_signing_seed: Zeroizing<[u8; 32]>,
     ) -> Result<Self, RuntimeDeveloperLocalError> {
         validate_developer_local_identity_refs(&refs)?;
-        if runtime_response_signing_seed
-            .iter()
-            .all(|byte| *byte == 0)
-        {
+        if runtime_response_signing_seed.iter().all(|byte| *byte == 0) {
             return Err(RuntimeDeveloperLocalError::InvalidConfiguration(
                 "DeveloperLocal Runtime response signing seed must be nonzero",
             ));

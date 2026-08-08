@@ -89,9 +89,7 @@ impl LocalProcessError {
             Self::AuthorityStartup => "DeveloperLocal tenure Authority failed to start",
             Self::RuntimeStartup => "DeveloperLocal Runtime failed to start",
             Self::NodeBootstrap => "DeveloperLocal Node registration bootstrap failed closed",
-            Self::NodeCredentialFiles => {
-                "DeveloperLocal Node TLS credential files failed closed"
-            }
+            Self::NodeCredentialFiles => "DeveloperLocal Node TLS credential files failed closed",
             Self::NodeStartup => "DeveloperLocal NodeDaemon failed to start",
             Self::DeploymentActivation => {
                 "DeploymentController failed to activate the Fabric and Agent stack"

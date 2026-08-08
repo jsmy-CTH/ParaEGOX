@@ -71,10 +71,9 @@ use paraegox_runtime::{
     RuntimeAgentProviderResolveError, RuntimeAgentProviderResolverV1,
     RuntimeDeveloperLocalConfigV1, RuntimeDeveloperLocalDistributedAgentStackConfigV1,
     RuntimeDeveloperLocalIdentityRefsV1, RuntimeDeveloperLocalIdentityV1,
-    RuntimeDeveloperLocalLifecycleV1,
-    RuntimeFabricCredentialRequirementV1, RuntimeFabricCredentialResolveErrorV2,
-    RuntimeFabricCredentialResolverV2, RuntimeModelBackendResolveError,
-    RuntimeModelBackendResolverV1, RuntimeResolvedAgentProviderV1,
+    RuntimeDeveloperLocalLifecycleV1, RuntimeFabricCredentialRequirementV1,
+    RuntimeFabricCredentialResolveErrorV2, RuntimeFabricCredentialResolverV2,
+    RuntimeModelBackendResolveError, RuntimeModelBackendResolverV1, RuntimeResolvedAgentProviderV1,
     RuntimeResolvedFabricPeerCredentialV2, RuntimeResolvedModelBackendV1,
     start_runtime_agent_developer_local_ipc_v1, start_runtime_developer_local_v1,
 };
@@ -210,8 +209,8 @@ async fn run_node_with_signals(
     }
     identity::validate_node_tls_files(&config)
         .map_err(|_| LocalProcessError::NodeCredentialFiles)?;
-    let manifest = identity::load_or_create_node(&config)
-        .map_err(|_| LocalProcessError::IdentityManifest)?;
+    let manifest =
+        identity::load_or_create_node(&config).map_err(|_| LocalProcessError::IdentityManifest)?;
     let layout = layout::prepare_node(&config, &manifest)
         .map_err(|_| LocalProcessError::LayoutPreparation)?;
     let control = config.control();
@@ -255,9 +254,7 @@ async fn run_node_with_signals(
                 &control.controller_request_verification_key(),
             )
             .map_err(|_| LocalProcessError::RuntimeStartup)?,
-            runtime_response_key: ApplyAuthKeyRef::from_bytes(
-                control.runtime_response_key_ref(),
-            ),
+            runtime_response_key: ApplyAuthKeyRef::from_bytes(control.runtime_response_key_ref()),
             runtime_response_key_fingerprint: ed25519_control_key_fingerprint(
                 &runtime_response_verification_key,
             )
@@ -272,19 +269,20 @@ async fn run_node_with_signals(
         restricted.runtime_listener_private_key_file().to_path_buf(),
     )
     .map_err(|_| LocalProcessError::NodeCredentialFiles)?;
-    let runtime_config = RuntimeDeveloperLocalConfigV1::try_new_with_restricted_runtime_apply_endpoint(
-        layout.runtime_state_directory().to_path_buf(),
-        layout.runtime_socket_path().to_path_buf(),
-        runtime_identity,
-        transport_profile,
-        restricted.control_transport_profile_ref(),
-        expected_carrier,
-        (
-            restricted.root_ca_certificate_file().to_path_buf(),
-            listener_identity,
-        ),
-    )
-    .map_err(|_| LocalProcessError::RuntimeStartup)?;
+    let runtime_config =
+        RuntimeDeveloperLocalConfigV1::try_new_with_restricted_runtime_apply_endpoint(
+            layout.runtime_state_directory().to_path_buf(),
+            layout.runtime_socket_path().to_path_buf(),
+            runtime_identity,
+            transport_profile,
+            restricted.control_transport_profile_ref(),
+            expected_carrier,
+            (
+                restricted.root_ca_certificate_file().to_path_buf(),
+                listener_identity,
+            ),
+        )
+        .map_err(|_| LocalProcessError::RuntimeStartup)?;
     let runtime = start_runtime_developer_local_v1(runtime_config)
         .map_err(|_| LocalProcessError::RuntimeStartup)?;
     let mut owners = RunningNodeOwners::new(runtime);
@@ -320,10 +318,10 @@ async fn wait_for_node_shutdown(
         tokio::select! {
             biased;
             signal = interrupt.recv() => {
-                return signal.map(|()| ()).ok_or(LocalProcessError::SignalHandling);
+                return signal.ok_or(LocalProcessError::SignalHandling);
             }
             signal = terminate.recv() => {
-                return signal.map(|()| ()).ok_or(LocalProcessError::SignalHandling);
+                return signal.ok_or(LocalProcessError::SignalHandling);
             }
             _ = child_poll.tick() => {
                 if owners.node_mut().poll_exit()?.is_some() {
@@ -2026,14 +2024,13 @@ fn prepare_public_developer_node_v1(
     layout: &layout::DeveloperNodeLayoutV1,
     manifest: &identity::DeveloperNodeIdentityManifestV1,
 ) -> Result<(DeveloperLocalReferenceBootstrapV1, NodeStatusV1), LocalProcessError> {
-    let node_id =
-        NodeId::try_from_bytes(*manifest.node_id()).map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let node_id = NodeId::try_from_bytes(*manifest.node_id())
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
     let node_incarnation = NodeIncarnation::try_from_bytes(*manifest.node_incarnation())
         .map_err(|_| LocalProcessError::NodeBootstrap)?;
-    let management_endpoint_ref = NodeManagementEndpointRefV1::try_from_bytes(
-        *manifest.node_management_endpoint_ref(),
-    )
-    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let management_endpoint_ref =
+        NodeManagementEndpointRefV1::try_from_bytes(*manifest.node_management_endpoint_ref())
+            .map_err(|_| LocalProcessError::NodeBootstrap)?;
     let identity = NodeIdentityV1::try_new(
         node_id,
         PrincipalRef::from_bytes(*manifest.node_principal()),
@@ -2052,8 +2049,8 @@ fn prepare_public_developer_node_v1(
         node_incarnation,
         config.control().installation_id(),
     )?;
-    let expected = DeveloperLocalReferenceBootstrapV1::try_new(
-        DeveloperLocalReferenceBootstrapInputV1 {
+    let expected =
+        DeveloperLocalReferenceBootstrapV1::try_new(DeveloperLocalReferenceBootstrapInputV1 {
             expected_uid: Uid::effective().as_raw(),
             expected_gid: Gid::effective().as_raw(),
             generation_token: *manifest.pxnb_reference_token(),
@@ -2063,9 +2060,8 @@ fn prepare_public_developer_node_v1(
             initial_feature_report,
             state_root: layout.node_state_directory().to_path_buf(),
             socket_path: layout.node_management_socket_path().to_path_buf(),
-        },
-    )
-    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+        })
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
     let bootstrap = match fs::symlink_metadata(layout.pxnb_bootstrap_path()) {
         Ok(_) => DeveloperLocalReferenceBootstrapV1::read_owner_private_file(
             layout.pxnb_bootstrap_path(),
@@ -2128,9 +2124,7 @@ fn public_developer_node_feature_report(
         report_sequence: DEVELOPER_NODE_FEATURE_SEQUENCE,
         operating_system,
         architecture,
-        platform_profile_digest: developer_node_platform_digest_for_installation(
-            installation_id,
-        ),
+        platform_profile_digest: developer_node_platform_digest_for_installation(installation_id),
         runtime_contract_version: DEVELOPER_NODE_RUNTIME_CONTRACT_VERSION,
         fabric_contract_version: DEVELOPER_NODE_FABRIC_CONTRACT_VERSION,
     })
