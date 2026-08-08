@@ -4374,9 +4374,7 @@ impl ControllerRemoteConnectorResumeProjectionV1 {
         self.node_target
     }
 
-    pub(crate) const fn runtime_describe_request(
-        &self,
-    ) -> Option<&RuntimeControlCarrierRequestV1> {
+    pub(crate) const fn runtime_describe_request(&self) -> Option<&RuntimeControlCarrierRequestV1> {
         self.runtime_describe_request.as_ref()
     }
 
@@ -5069,6 +5067,7 @@ impl ControllerRemoteConnectorStateV1 {
                             {
                                 return Err(ControllerJournalError::InvalidRemoteConnectorState);
                             }
+                            runtime_describe_request = Some(request.as_ref().clone());
                             if let Some(response_wire) = exchange.response_wire.as_deref() {
                                 let response =
                                     RuntimeControlDescribeReadyResponseV1::decode(response_wire)
@@ -5089,7 +5088,6 @@ impl ControllerRemoteConnectorStateV1 {
                                         ControllerJournalError::InvalidRemoteConnectorState,
                                     );
                                 }
-                                runtime_describe_request = Some(request.as_ref().clone());
                                 runtime_describe_response = Some(response);
                                 runtime_describe_facts = Some(facts);
                             }
@@ -7915,15 +7913,49 @@ pub(crate) mod tests {
         ControllerPublicKeyFingerprint, MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
     };
     use ed25519_dalek::{Signer, SigningKey};
-    use paraegox_kernel::digest::Digest32;
+    use paraegox_kernel::digest::{Digest32, Digest32Builder};
     use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
-    use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
+    use paraegox_kernel::time::{
+        BoundedDuration, ClockDomainRef, ClockGeneration, ClockReading, MonotonicInstant,
+    };
     #[cfg(unix)]
-    use paraegox_node::protocol::NodeControlCarrierRequestDraftV1;
+    use paraegox_node::observation::{
+        RuntimeObservationAckV1, RuntimeObservationEndpointRefV1,
+        RuntimeObservationRequestInputV1, RuntimeObservationRequestV1,
+    };
+    #[cfg(unix)]
+    use paraegox_node::protocol::{
+        NodeControlCarrierRequestDraftV1, NodeControlCarrierRequestV1,
+        NodeControlDescribeResponseDraftV1, NodeControlObservationChallengeFieldsV1,
+        NodeControlObservationChallengeV1, NodeManagementRequestV1, NodeManagementResponseV1,
+        NodeManagementTargetV1,
+    };
+    #[cfg(unix)]
+    use paraegox_node::{
+        EnrollmentIssuerRefV1, NodeArchitectureV1, NodeDaemonV1, NodeFeatureReportInputV1,
+        NodeFeatureReportV1, NodeId, NodeIdentityV1, NodeIncarnation,
+        NodeManagementEndpointRefV1, NodeOperatingSystemV1, NodeRegistrationTenureV1,
+        RuntimeApplyEndpointDescriptorV1, RuntimeApplyEndpointRefV1, RuntimeHostLivenessV1,
+        RuntimeHostStatusV1,
+    };
     use paraegox_runtime_contracts::apply::{
         ApplyOperationId, ExpectedActive, PlanWriterContext, PlanWriterEpoch, RuntimeApplyControl,
         TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm, TenureProofAuthority,
         WriterTenureClaim, WriterTenureProof, WriterTenureSigningTranscript,
+    };
+    #[cfg(unix)]
+    use paraegox_runtime_contracts::distributed_agent_stack_plan::{
+        RestrictedRuntimeApplyCarrierBindingFieldsV1, RestrictedRuntimeApplyCarrierBindingV1,
+    };
+    #[cfg(unix)]
+    use paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricManifestProjectionV1;
+    #[cfg(unix)]
+    use paraegox_runtime_contracts::managed_serving_bootstrap::{
+        ManagedServingBootstrapFactsV1, ManagedServingBootstrapRequestIdV1,
+        ManagedServingBootstrapResponseAuthClaimV1, RuntimeControlCarrierRequestDraftV1,
+        RuntimeControlCarrierRequestV1, RuntimeControlDescribeReadyFactsV1,
+        RuntimeControlDescribeReadyPhaseV1, RuntimeControlDescribeReadyResponseDraftV1,
+        RuntimeControlDescribeReadyResponseV1,
     };
     use paraegox_runtime_contracts::provenance::{
         PlanProvenance, SourcePlanDigest, SourcePlanRef, SourcePlanRevision, SourceScopeRef,
@@ -8071,6 +8103,459 @@ pub(crate) mod tests {
             .expect("remote Describe")
             .canonical_wire()
             .into()
+    }
+
+    #[cfg(unix)]
+    fn remote_connector_auth_claim(nonce: &[u8]) -> ApplyRequestAuthClaim {
+        ApplyRequestAuthClaim::try_new(
+            PrincipalRef::from_bytes([0x91; 16]),
+            ApplyAuthKeyRef::from_bytes([0x92; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("remote algorithm"),
+            1,
+            nonce,
+        )
+        .expect("remote auth claim")
+    }
+
+    #[cfg(unix)]
+    fn finalize_remote_node_request(
+        draft: NodeControlCarrierRequestDraftV1,
+    ) -> NodeControlCarrierRequestV1 {
+        draft.finalize(&[0x93; 64]).expect("remote Node request")
+    }
+
+    #[cfg(unix)]
+    fn remote_observation_ack(
+        request: &RuntimeObservationRequestV1,
+        status_digest: Digest32,
+        runtime_status_digest: Digest32,
+    ) -> RuntimeObservationAckV1 {
+        const ACK_BYTES: usize = 160;
+        let mut wire = [0_u8; ACK_BYTES];
+        wire[..4].copy_from_slice(b"PXNA");
+        wire[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        wire[6..8].copy_from_slice(&(ACK_BYTES as u16).to_be_bytes());
+        wire[8..12].copy_from_slice(&(ACK_BYTES as u32).to_be_bytes());
+        wire[12] = 1;
+        wire[16..24].copy_from_slice(&request.intended_status_sequence().to_be_bytes());
+        wire[24..56].copy_from_slice(status_digest.as_bytes());
+        wire[56..88].copy_from_slice(runtime_status_digest.as_bytes());
+        wire[88..120].copy_from_slice(request.request_digest().as_bytes());
+        let mut builder = Digest32Builder::try_new(
+            b"paraegox.node.runtime-observation-ack.v1",
+        )
+        .expect("PXNA digest domain");
+        builder.field_bytes(&wire).expect("PXNA digest input");
+        wire[128..].copy_from_slice(builder.finish().as_bytes());
+        RuntimeObservationAckV1::decode(&wire).expect("canonical PXNA")
+    }
+
+    #[cfg(unix)]
+    struct RemoteConnectorProjectionFixtureV1 {
+        target: RuntimeHostId,
+        node_target: NodeManagementTargetV1,
+        node_describe_request: Box<[u8]>,
+        node_describe_response: Box<[u8]>,
+        runtime_describe_request: RuntimeControlCarrierRequestV1,
+        runtime_describe_response: RuntimeControlDescribeReadyResponseV1,
+        runtime_describe_facts: RuntimeControlDescribeReadyFactsV1,
+        node_challenge_request: Box<[u8]>,
+        node_challenge_response: Box<[u8]>,
+        challenge: NodeControlObservationChallengeV1,
+        runtime_query_request: Box<[u8]>,
+        query_request: ReferenceQueryRequestV1,
+        query_response: ReferenceQueryResponseV1,
+        node_publish_request: Box<[u8]>,
+        observation_request: RuntimeObservationRequestV1,
+        observation_ack: RuntimeObservationAckV1,
+        node_latest_request: Box<[u8]>,
+        latest_response: NodeManagementResponseV1,
+    }
+
+    #[cfg(unix)]
+    fn remote_connector_projection_fixture() -> RemoteConnectorProjectionFixtureV1 {
+        let target = TARGET;
+        let node_id = NodeId::try_from_bytes([0x71; 16]).expect("Node id");
+        let node_incarnation =
+            NodeIncarnation::try_from_bytes([0x72; 16]).expect("Node incarnation");
+        let management_endpoint = NodeManagementEndpointRefV1::try_from_bytes([0x73; 16])
+            .expect("Node management endpoint");
+        let node_target = NodeManagementTargetV1::try_new(
+            node_id,
+            management_endpoint,
+            node_incarnation,
+            1,
+        )
+        .expect("Node target");
+
+        let node_describe_request = remote_node_describe_wire(0x10);
+        let decoded_node_describe = NodeControlCarrierRequestV1::decode(&node_describe_request)
+            .expect("Node Describe request");
+        let node_describe_response = NodeControlDescribeResponseDraftV1::try_describe(
+            &decoded_node_describe,
+            node_target,
+        )
+        .and_then(NodeControlDescribeResponseDraftV1::finalize)
+        .expect("Node Describe response")
+        .canonical_wire()
+        .into();
+
+        let manifest = super::controller_test_manifest(target);
+        let projection = ManagedFabricManifestProjectionV1::try_from_verified_legacy_manifest(
+            manifest.verified_manifest(),
+        )
+        .expect("managed-fabric projection");
+        let controller = SigningKey::from_bytes(&[0x41; 32]);
+        let runtime = SigningKey::from_bytes(&[0x51; 32]);
+        let carrier = RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target,
+                runtime_principal: PrincipalRef::from_bytes([0x81; 16]),
+                controller_principal: PrincipalRef::from_bytes([0x91; 16]),
+                endpoint_ref: [0x82; 16],
+                endpoint_generation: 3,
+                route: "paraegox/runtime-a/apply",
+                controller_request_key: ApplyAuthKeyRef::from_bytes([0x92; 16]),
+                controller_request_key_fingerprint: digest(0x83),
+                runtime_response_key: ApplyAuthKeyRef::from_bytes([0x84; 16]),
+                runtime_response_key_fingerprint: digest(0x85),
+                control_transport_profile_ref: [0x86; 16],
+                control_transport_profile_digest: digest(0x87),
+            },
+        )
+        .expect("Runtime carrier");
+        let runtime_describe_draft = RuntimeControlCarrierRequestDraftV1::try_describe(
+            ManagedServingBootstrapRequestIdV1::try_from_bytes([0x20; 16])
+                .expect("Runtime Describe id"),
+            carrier.clone(),
+            remote_connector_auth_claim(&[0x20; 32]),
+        )
+        .expect("Runtime Describe draft");
+        let runtime_describe_signature = controller.sign(
+            runtime_describe_draft
+                .signing_transcript()
+                .expect("Runtime Describe transcript")
+                .as_bytes(),
+        );
+        let runtime_describe_request = runtime_describe_draft
+            .finalize(&runtime_describe_signature.to_bytes())
+            .expect("Runtime Describe request");
+        let serving = ManagedServingBootstrapFactsV1::try_recovered_ready(
+            target,
+            [0x55; 32],
+            projection,
+            3,
+            5,
+            ClockReading::new(
+                ClockDomainRef::from_bytes([0x56; 16]),
+                ClockGeneration::try_new(3).expect("clock generation"),
+                MonotonicInstant::from_ticks(5),
+            ),
+        )
+        .expect("Runtime serving facts");
+        let channel = paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1::try_new(
+            target,
+            carrier.runtime_principal(),
+            digest(0x57),
+            digest(0x58),
+        )
+        .expect("Runtime channel");
+        let runtime_describe_facts = RuntimeControlDescribeReadyFactsV1::try_new(
+            RuntimeControlDescribeReadyPhaseV1::LegacyReady,
+            serving,
+            channel,
+        )
+        .expect("Runtime Describe facts");
+        let runtime_describe_auth = ManagedServingBootstrapResponseAuthClaimV1::try_new(
+            channel,
+            carrier.runtime_response_key(),
+            ApplyAuthAlgorithm::try_new(1).expect("Runtime response algorithm"),
+            1,
+        )
+        .expect("Runtime Describe response auth");
+        let runtime_describe_response_draft = RuntimeControlDescribeReadyResponseDraftV1::try_new(
+            &runtime_describe_request,
+            runtime_describe_facts.clone(),
+            runtime_describe_auth,
+        )
+        .expect("Runtime Describe response draft");
+        let runtime_describe_response_signature = runtime.sign(
+            runtime_describe_response_draft
+                .signing_transcript()
+                .expect("Runtime Describe response transcript")
+                .as_bytes(),
+        );
+        let runtime_describe_response = runtime_describe_response_draft
+            .finalize(&runtime_describe_response_signature.to_bytes())
+            .expect("Runtime Describe response");
+
+        let challenge = NodeControlObservationChallengeV1::try_new(
+            NodeControlObservationChallengeFieldsV1 {
+                observation_endpoint_ref: RuntimeObservationEndpointRefV1::try_from_bytes([
+                    0x31; 16
+                ])
+                .expect("observation endpoint"),
+                runtime_host_id: target,
+                authority_digest: digest(0x32),
+                intended_status_sequence: 1,
+                freshness_budget_nanos: 100,
+                issued_at_unix_nanos: 1_000,
+                expires_at_unix_nanos: 1_050,
+                query_nonce: digest(0x33),
+            },
+        )
+        .expect("Node challenge");
+        let node_challenge = finalize_remote_node_request(
+            NodeControlCarrierRequestDraftV1::try_observation_challenge(
+                [0x30; 16],
+                node_target,
+                target,
+                challenge.freshness_budget_nanos(),
+                remote_connector_auth_claim(&[0x30; 32]),
+            )
+            .expect("Node challenge request draft"),
+        );
+        let node_challenge_response =
+            NodeControlDescribeResponseDraftV1::try_observation_challenge(
+                &node_challenge,
+                challenge,
+            )
+            .and_then(NodeControlDescribeResponseDraftV1::finalize)
+            .expect("Node challenge response")
+            .canonical_wire()
+            .into();
+        let node_challenge_request = node_challenge.canonical_wire().into();
+
+        let query_selector = ReferenceQuerySelectorV1::try_new(
+            ReferenceQueryIdV1::from_bytes([0x41; 16]),
+            target,
+            SourceScopeRef::from_bytes([0x42; 16]),
+            runtime_describe_facts
+                .serving()
+                .runtime_store_instance_id(),
+            ApplyOperationId::from_bytes([0x43; 16]),
+            None,
+        )
+        .expect("query selector");
+        let query_draft = ReferenceQueryRequestDraftV1::try_new(
+            query_selector,
+            remote_connector_auth_claim(challenge.query_nonce().as_bytes()),
+            u32::try_from(paraegox_runtime_contracts::reference_control::MAX_REFERENCE_QUERY_RESPONSE_BYTES)
+                .expect("query response bound"),
+        )
+        .expect("query request draft");
+        let query_signature = controller.sign(
+            query_draft
+                .signing_transcript()
+                .expect("query request transcript")
+                .as_bytes(),
+        );
+        let query_request = query_draft
+            .finalize(&query_signature.to_bytes())
+            .expect("query request");
+        let runtime_query_draft = RuntimeControlCarrierRequestDraftV1::try_reference_query(
+            ManagedServingBootstrapRequestIdV1::try_from_bytes([0x40; 16])
+                .expect("Runtime query id"),
+            carrier.clone(),
+            query_request.clone(),
+            remote_connector_auth_claim(&[0x40; 32]),
+        )
+        .expect("Runtime query carrier draft");
+        let runtime_query_signature = controller.sign(
+            runtime_query_draft
+                .signing_transcript()
+                .expect("Runtime query carrier transcript")
+                .as_bytes(),
+        );
+        let runtime_query = runtime_query_draft
+            .finalize(&runtime_query_signature.to_bytes())
+            .expect("Runtime query carrier");
+        let runtime_query_request = runtime_query.canonical_wire().into();
+        let query_serving = ReferenceBootstrapServingIdentityV1::try_new(
+            target,
+            runtime_describe_facts
+                .serving()
+                .runtime_store_instance_id(),
+            runtime_describe_facts.serving().snapshot_sequence(),
+            runtime_describe_facts.serving().runtime_host_epoch(),
+            runtime_describe_facts.serving().clock_domain(),
+            runtime_describe_facts.serving().clock_generation(),
+        )
+        .expect("query serving baseline");
+        let query_operation = ReferenceQueryOperationStateV1::try_new(
+            ReferenceQueryOwnerStateV1::Operational,
+            None,
+            ReferenceQueryOperationLookupV1::Unknown,
+        )
+        .expect("query operation facts");
+        let query_desired = ReferenceQueryDesiredStateV1::try_new(
+            ReferenceQueryDesiredHeadV1::None,
+            SourcePlanRevision::new(0),
+        )
+        .expect("query desired facts");
+        let query_live = ReferenceQueryLiveFactsV1::try_new(
+            ReferenceQueryLiveStateV1::ExactZero,
+            0,
+            runtime_describe_facts.serving().snapshot_sequence(),
+            digest(0x44),
+        )
+        .expect("query live facts");
+        let query_facts = ReferenceQueryFactsV1::try_new(
+            query_serving,
+            query_operation,
+            query_desired,
+            query_live,
+        )
+        .expect("query facts");
+        let query_response_auth = ReferenceQueryResponseAuthClaimV1::try_new(
+            channel,
+            carrier.runtime_response_key(),
+            ApplyAuthAlgorithm::try_new(1).expect("query response algorithm"),
+            1,
+        )
+        .expect("query response auth");
+        let query_response_draft = ReferenceQueryResponseDraftV1::try_new(
+            &query_request,
+            query_facts,
+            channel,
+            query_response_auth,
+        )
+        .expect("query response draft");
+        let query_response_signature = runtime.sign(
+            query_response_draft
+                .signing_transcript()
+                .expect("query response transcript")
+                .as_bytes(),
+        );
+        let query_response = query_response_draft
+            .finalize(&query_response_signature.to_bytes())
+            .expect("query response");
+
+        let observation_request = RuntimeObservationRequestV1::try_new(
+            RuntimeObservationRequestInputV1 {
+                intended_status_sequence: challenge.intended_status_sequence(),
+                freshness_budget_nanos: challenge.freshness_budget_nanos(),
+                runtime_host_id: target,
+                authority_digest: challenge.authority_digest(),
+                challenge_issued_at_unix_nanos: challenge.issued_at_unix_nanos(),
+                challenge_expires_at_unix_nanos: challenge.expires_at_unix_nanos(),
+                query_request: query_request.clone(),
+                query_response: query_response.clone(),
+            },
+        )
+        .expect("Runtime observation request");
+        let node_publish = finalize_remote_node_request(
+            NodeControlCarrierRequestDraftV1::try_publish_runtime_observation(
+                [0x50; 16],
+                node_target,
+                observation_request.clone(),
+                remote_connector_auth_claim(&[0x50; 32]),
+            )
+            .expect("Node publish draft"),
+        );
+        let node_publish_request = node_publish.canonical_wire().into();
+
+        let runtime_endpoint = RuntimeApplyEndpointDescriptorV1::try_new(
+            RuntimeApplyEndpointRefV1::try_from_bytes([0x74; 16])
+                .expect("Runtime endpoint ref"),
+            target,
+            3,
+            "paraegox/runtime-a/apply",
+            *carrier.runtime_response_key().as_bytes(),
+            runtime.verifying_key().to_bytes(),
+        )
+        .expect("Runtime endpoint");
+        let runtime_status = RuntimeHostStatusV1::try_new(
+            runtime_describe_facts.serving().runtime_host_epoch(),
+            1,
+            RuntimeHostLivenessV1::Live,
+            runtime_endpoint,
+        )
+        .expect("Runtime status");
+        let identity = NodeIdentityV1::try_new(
+            node_id,
+            PrincipalRef::from_bytes([0x75; 16]),
+            EnrollmentIssuerRefV1::try_from_bytes([0x76; 16]).expect("enrollment issuer"),
+        )
+        .expect("Node identity");
+        let tenure = NodeRegistrationTenureV1::try_new(node_id, 1, node_incarnation)
+            .expect("Node tenure");
+        let feature = NodeFeatureReportV1::try_new(NodeFeatureReportInputV1 {
+            node_id,
+            node_incarnation,
+            report_sequence: 1,
+            operating_system: NodeOperatingSystemV1::Linux,
+            architecture: NodeArchitectureV1::X86_64,
+            platform_profile_digest: digest(0x77),
+            runtime_contract_version: 1,
+            fabric_contract_version: 1,
+        })
+        .expect("Node feature report");
+        let mut daemon = NodeDaemonV1::try_new(identity, tenure, management_endpoint, feature)
+            .expect("Node daemon");
+        daemon
+            .observe_runtime_host(runtime_status.clone())
+            .expect("Runtime observation");
+        let status = daemon
+            .publish_status(challenge.freshness_budget_nanos())
+            .expect("Node status");
+        let observation_ack = remote_observation_ack(
+            &observation_request,
+            status.status_digest(),
+            runtime_status.status_digest(),
+        );
+
+        let latest_management = NodeManagementRequestV1::try_latest([0x60; 16], node_target)
+            .expect("Latest request");
+        let node_latest = finalize_remote_node_request(
+            NodeControlCarrierRequestDraftV1::try_latest(
+                [0x60; 16],
+                node_target,
+                latest_management.clone(),
+                remote_connector_auth_claim(&[0x60; 32]),
+            )
+            .expect("Latest carrier draft"),
+        );
+        let latest_response = daemon
+            .answer_read_only_v1(&latest_management)
+            .expect("Latest response");
+
+        RemoteConnectorProjectionFixtureV1 {
+            target,
+            node_target,
+            node_describe_request,
+            node_describe_response,
+            runtime_describe_request,
+            runtime_describe_response,
+            runtime_describe_facts,
+            node_challenge_request,
+            node_challenge_response,
+            challenge,
+            runtime_query_request,
+            query_request,
+            query_response,
+            node_publish_request,
+            observation_request,
+            observation_ack,
+            node_latest_request: node_latest.canonical_wire().into(),
+            latest_response,
+        }
+    }
+
+    #[cfg(unix)]
+    fn remote_connector_response_durable(
+        snapshot: &ControllerJournalSnapshot,
+        step: super::ControllerRemoteConnectorStepV1,
+        request_wire: &[u8],
+        response_wire: &[u8],
+    ) -> ControllerJournalSnapshot {
+        snapshot
+            .try_prepare_remote_connector_request(step, request_wire)
+            .and_then(|prepared| prepared.try_claim_remote_connector_attempt(step))
+            .and_then(|in_flight| {
+                in_flight.try_record_remote_connector_response(step, response_wire)
+            })
+            .expect("remote connector response must become durable")
     }
 
     fn tenure_request(writer: u8, operation: [u8; 16], nonce: &[u8]) -> AcquireTenureRequestV1 {
@@ -11860,8 +12345,14 @@ pub(crate) mod tests {
             .expect("remote extension must exist");
         assert_eq!(initialized_projection.configuration_digest(), digest(0xa1));
         assert_eq!(initialized_projection.target(), TARGET);
-        assert_eq!(initialized_projection.successor_store_instance_id(), [0xa2; 32]);
-        assert_eq!(initialized_projection.authority_store_instance_id(), [0xa3; 32]);
+        assert_eq!(
+            initialized_projection.successor_store_instance_id(),
+            [0xa2; 32]
+        );
+        assert_eq!(
+            initialized_projection.authority_store_instance_id(),
+            [0xa3; 32]
+        );
         assert!(initialized_projection.exchanges().is_empty());
         assert_eq!(
             initialized_projection.next_request_step(),
@@ -11900,7 +12391,10 @@ pub(crate) mod tests {
         let prepared_exchange = prepared_projection
             .current_exchange()
             .expect("prepared exchange must exist");
-        assert_eq!(prepared_exchange.step(), ControllerRemoteConnectorStepV1::NodeDescribe);
+        assert_eq!(
+            prepared_exchange.step(),
+            ControllerRemoteConnectorStepV1::NodeDescribe
+        );
         assert_eq!(
             prepared_exchange.phase(),
             ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
@@ -11987,6 +12481,367 @@ pub(crate) mod tests {
             fresh_projection.exchanges()[1].request_wire(),
             second_wire.as_ref()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_connector_partial_resume_projection_replays_every_stage_and_valid_round_abandon() {
+        use super::{
+            ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorStepV1,
+        };
+
+        let fixture = remote_connector_projection_fixture();
+        let initialized = initial_snapshot()
+            .try_initialize_remote_connector(
+                digest(0xa1),
+                fixture.target,
+                [0xa2; 32],
+                [0xa3; 32],
+            )
+            .expect("remote connector identity");
+        let node_described = remote_connector_response_durable(
+            &initialized,
+            ControllerRemoteConnectorStepV1::NodeDescribe,
+            &fixture.node_describe_request,
+            &fixture.node_describe_response,
+        );
+        let node_projection = node_described
+            .remote_connector_resume_projection()
+            .expect("Node Describe projection")
+            .expect("remote extension");
+        assert_eq!(node_projection.node_target(), Some(fixture.node_target));
+        assert_eq!(
+            node_projection.next_request_step(),
+            Some(ControllerRemoteConnectorStepV1::RuntimeDescribe)
+        );
+
+        let runtime_prepared = node_described
+            .try_prepare_remote_connector_request(
+                ControllerRemoteConnectorStepV1::RuntimeDescribe,
+                fixture.runtime_describe_request.canonical_wire(),
+            )
+            .expect("Runtime Describe request durable");
+        let prepared_projection = runtime_prepared
+            .remote_connector_resume_projection()
+            .expect("Runtime Describe prepared projection")
+            .expect("remote extension");
+        assert_eq!(
+            prepared_projection.runtime_describe_request(),
+            Some(&fixture.runtime_describe_request),
+            "a durable typed request must not wait for a response"
+        );
+        assert_eq!(prepared_projection.runtime_describe_response(), None);
+        assert_eq!(
+            prepared_projection
+                .current_exchange()
+                .expect("Runtime Describe exchange")
+                .phase(),
+            ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
+        );
+
+        let runtime_in_flight = runtime_prepared
+            .try_claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::RuntimeDescribe)
+            .expect("Runtime Describe in flight");
+        let in_flight_projection = runtime_in_flight
+            .remote_connector_resume_projection()
+            .expect("Runtime Describe in-flight projection")
+            .expect("remote extension");
+        assert_eq!(
+            in_flight_projection.runtime_describe_request(),
+            Some(&fixture.runtime_describe_request)
+        );
+        assert_eq!(
+            in_flight_projection
+                .current_exchange()
+                .expect("Runtime Describe exchange")
+                .phase(),
+            ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+        );
+
+        let runtime_closed = runtime_in_flight
+            .try_close_remote_connector_attempt(
+                ControllerRemoteConnectorStepV1::RuntimeDescribe,
+                ControllerRemoteConnectorAttemptPhaseV1::NotSent,
+            )
+            .expect("Runtime Describe known-unsent closure");
+        let closed_projection = runtime_closed
+            .remote_connector_resume_projection()
+            .expect("Runtime Describe closure projection")
+            .expect("remote extension");
+        assert_eq!(
+            closed_projection.runtime_describe_request(),
+            Some(&fixture.runtime_describe_request)
+        );
+        assert_eq!(closed_projection.runtime_describe_response(), None);
+        assert_eq!(
+            closed_projection.next_request_step(),
+            Some(ControllerRemoteConnectorStepV1::RuntimeDescribe)
+        );
+
+        let runtime_described = runtime_in_flight
+            .try_record_remote_connector_response(
+                ControllerRemoteConnectorStepV1::RuntimeDescribe,
+                fixture.runtime_describe_response.canonical_wire(),
+            )
+            .expect("Runtime Describe response durable");
+        let runtime_projection = runtime_described
+            .remote_connector_resume_projection()
+            .expect("Runtime Describe projection")
+            .expect("remote extension");
+        assert_eq!(
+            runtime_projection.runtime_describe_request(),
+            Some(&fixture.runtime_describe_request)
+        );
+        assert_eq!(
+            runtime_projection.runtime_describe_response(),
+            Some(&fixture.runtime_describe_response)
+        );
+        assert_eq!(
+            runtime_projection.runtime_describe_facts(),
+            Some(&fixture.runtime_describe_facts)
+        );
+
+        let challenged = remote_connector_response_durable(
+            &runtime_described,
+            ControllerRemoteConnectorStepV1::NodeChallenge,
+            &fixture.node_challenge_request,
+            &fixture.node_challenge_response,
+        );
+        let challenge_projection = challenged
+            .remote_connector_resume_projection()
+            .expect("Node challenge projection")
+            .expect("remote extension");
+        assert_eq!(challenge_projection.challenge(), Some(fixture.challenge));
+        assert_eq!(
+            challenge_projection.next_request_step(),
+            Some(ControllerRemoteConnectorStepV1::RuntimeQuery)
+        );
+
+        let abandoned = challenged
+            .try_abandon_remote_connector_challenge_round()
+            .expect("a response-durable challenge round may be abandoned");
+        let abandoned_projection = abandoned
+            .remote_connector_resume_projection()
+            .expect("abandoned round projection")
+            .expect("remote extension");
+        assert!(
+            abandoned_projection
+                .current_exchange()
+                .expect("abandoned exchange")
+                .round_abandoned()
+        );
+        assert_eq!(
+            abandoned_projection
+                .current_exchange()
+                .expect("abandoned exchange")
+                .request_wire(),
+            fixture.node_challenge_request.as_ref()
+        );
+        assert_eq!(
+            abandoned_projection
+                .current_exchange()
+                .expect("abandoned exchange")
+                .response_wire(),
+            Some(fixture.node_challenge_response.as_ref())
+        );
+        assert_eq!(
+            abandoned_projection.next_request_step(),
+            Some(ControllerRemoteConnectorStepV1::NodeDescribe)
+        );
+        assert_eq!(abandoned_projection.node_target(), None);
+        assert_eq!(abandoned_projection.runtime_describe_request(), None);
+        assert_eq!(abandoned_projection.runtime_describe_response(), None);
+        assert_eq!(abandoned_projection.runtime_describe_facts(), None);
+        assert_eq!(abandoned_projection.challenge(), None);
+
+        let runtime_query_prepared = challenged
+            .try_prepare_remote_connector_request(
+                ControllerRemoteConnectorStepV1::RuntimeQuery,
+                &fixture.runtime_query_request,
+            )
+            .expect("PXQR carrier request durable");
+        let query_prepared_projection = runtime_query_prepared
+            .remote_connector_resume_projection()
+            .expect("PXQR prepared projection")
+            .expect("remote extension");
+        assert_eq!(
+            query_prepared_projection.query_request(),
+            Some(&fixture.query_request)
+        );
+        assert_eq!(query_prepared_projection.query_response(), None);
+        let runtime_queried = runtime_query_prepared
+            .try_claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::RuntimeQuery)
+            .and_then(|in_flight| {
+                in_flight.try_record_remote_connector_response(
+                    ControllerRemoteConnectorStepV1::RuntimeQuery,
+                    fixture.query_response.canonical_wire(),
+                )
+            })
+            .expect("PXQS response durable");
+        let query_projection = runtime_queried
+            .remote_connector_resume_projection()
+            .expect("PXQS projection")
+            .expect("remote extension");
+        assert_eq!(query_projection.query_request(), Some(&fixture.query_request));
+        assert_eq!(
+            query_projection.query_response(),
+            Some(&fixture.query_response)
+        );
+
+        let publish_prepared = runtime_queried
+            .try_prepare_remote_connector_request(
+                ControllerRemoteConnectorStepV1::NodePublish,
+                &fixture.node_publish_request,
+            )
+            .expect("PXNO request durable");
+        let publish_prepared_projection = publish_prepared
+            .remote_connector_resume_projection()
+            .expect("PXNO prepared projection")
+            .expect("remote extension");
+        assert_eq!(
+            publish_prepared_projection.observation_request(),
+            Some(&fixture.observation_request)
+        );
+        assert_eq!(publish_prepared_projection.observation_ack(), None);
+        let published = publish_prepared
+            .try_claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodePublish)
+            .and_then(|in_flight| {
+                in_flight.try_record_remote_connector_response(
+                    ControllerRemoteConnectorStepV1::NodePublish,
+                    fixture.observation_ack.canonical_wire(),
+                )
+            })
+            .expect("PXNA response durable");
+        let publish_projection = published
+            .remote_connector_resume_projection()
+            .expect("PXNA projection")
+            .expect("remote extension");
+        assert_eq!(
+            publish_projection.observation_request(),
+            Some(&fixture.observation_request)
+        );
+        assert_eq!(
+            publish_projection.observation_ack(),
+            Some(&fixture.observation_ack)
+        );
+
+        let latest_prepared = published
+            .try_prepare_remote_connector_request(
+                ControllerRemoteConnectorStepV1::NodeLatest,
+                &fixture.node_latest_request,
+            )
+            .expect("Latest request durable");
+        let latest_prepared_projection = latest_prepared
+            .remote_connector_resume_projection()
+            .expect("Latest prepared projection")
+            .expect("remote extension");
+        assert_eq!(latest_prepared_projection.latest_response(), None);
+        let terminal = latest_prepared
+            .try_claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeLatest)
+            .and_then(|in_flight| {
+                in_flight.try_record_remote_connector_response(
+                    ControllerRemoteConnectorStepV1::NodeLatest,
+                    fixture.latest_response.canonical_wire(),
+                )
+            })
+            .expect("Latest response durable");
+        let terminal_projection = terminal
+            .remote_connector_resume_projection()
+            .expect("terminal projection")
+            .expect("remote extension");
+        assert_eq!(terminal_projection.exchanges().len(), 6);
+        assert_eq!(
+            terminal_projection.latest_response(),
+            Some(&fixture.latest_response)
+        );
+        assert_eq!(terminal_projection.next_request_step(), None);
+        assert!(
+            terminal
+                .remote_connector_cutover_ready_facts()
+                .expect("terminal cutover replay")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_connector_partial_resume_projection_rejects_each_stage_tamper() {
+        use super::{ControllerRemoteConnectorStepV1, ControllerRemoteConnectorStateV1};
+
+        let fixture = remote_connector_projection_fixture();
+        let mut terminal = initial_snapshot()
+            .try_initialize_remote_connector(
+                digest(0xb1),
+                fixture.target,
+                [0xb2; 32],
+                [0xb3; 32],
+            )
+            .expect("remote connector identity");
+        for (step, request, response) in [
+            (
+                ControllerRemoteConnectorStepV1::NodeDescribe,
+                fixture.node_describe_request.as_ref(),
+                fixture.node_describe_response.as_ref(),
+            ),
+            (
+                ControllerRemoteConnectorStepV1::RuntimeDescribe,
+                fixture.runtime_describe_request.canonical_wire(),
+                fixture.runtime_describe_response.canonical_wire(),
+            ),
+            (
+                ControllerRemoteConnectorStepV1::NodeChallenge,
+                fixture.node_challenge_request.as_ref(),
+                fixture.node_challenge_response.as_ref(),
+            ),
+            (
+                ControllerRemoteConnectorStepV1::RuntimeQuery,
+                fixture.runtime_query_request.as_ref(),
+                fixture.query_response.canonical_wire(),
+            ),
+            (
+                ControllerRemoteConnectorStepV1::NodePublish,
+                fixture.node_publish_request.as_ref(),
+                fixture.observation_ack.canonical_wire(),
+            ),
+            (
+                ControllerRemoteConnectorStepV1::NodeLatest,
+                fixture.node_latest_request.as_ref(),
+                fixture.latest_response.canonical_wire(),
+            ),
+        ] {
+            terminal = remote_connector_response_durable(&terminal, step, request, response);
+        }
+        let remote = terminal
+            .remote_connector
+            .as_ref()
+            .expect("terminal remote state")
+            .clone();
+        assert!(remote.validated_resume_projection().is_ok());
+        for index in 0..remote.exchanges.len() {
+            let mut tampered_request: ControllerRemoteConnectorStateV1 = remote.clone();
+            let mut exchanges = tampered_request.exchanges.to_vec();
+            exchanges[index].request_wire[0] ^= 1;
+            tampered_request.exchanges = exchanges.into_boxed_slice();
+            assert_eq!(
+                tampered_request.validated_resume_projection(),
+                Err(ControllerJournalError::InvalidRemoteConnectorState),
+                "stage {index} request tamper must fail strict replay"
+            );
+
+            let mut tampered_response: ControllerRemoteConnectorStateV1 = remote.clone();
+            let mut exchanges = tampered_response.exchanges.to_vec();
+            let response_wire = exchanges[index]
+                .response_wire
+                .as_mut()
+                .expect("terminal response");
+            response_wire[0] ^= 1;
+            tampered_response.exchanges = exchanges.into_boxed_slice();
+            assert_eq!(
+                tampered_response.validated_resume_projection(),
+                Err(ControllerJournalError::InvalidRemoteConnectorState),
+                "stage {index} response tamper must fail strict replay"
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -308,6 +308,20 @@ impl RemoteNodeControlAdapterV1 {
         }
     }
 
+    /// Restores the adapter only from a target already replayed and verified
+    /// by PXJR's canonical restart projection. This grants no transport
+    /// authority and performs no additional Describe exchange.
+    #[must_use]
+    pub(crate) const fn from_verified_target(
+        transport: RemoteNodeControlTransportPinV1,
+        target: NodeManagementTargetV1,
+    ) -> Self {
+        Self {
+            transport,
+            target: Some(target),
+        }
+    }
+
     #[must_use]
     pub(crate) const fn target(&self) -> Option<NodeManagementTargetV1> {
         self.target
@@ -4400,6 +4414,17 @@ mod tests {
         ));
         assert_eq!(rejected_calls.load(Ordering::Relaxed), 1);
         assert_eq!(rejected.target(), None);
+    }
+
+    #[test]
+    fn remote_adapter_restores_only_the_typed_verified_target_without_transport() {
+        let node = NodeHarness::new(0x30);
+        let (_, transport) = remote_transport(node.carrier_binding);
+        let adapter = RemoteNodeControlAdapterV1::from_verified_target(
+            transport,
+            node.management_target,
+        );
+        assert_eq!(adapter.target(), Some(node.management_target));
     }
 
     #[tokio::test(flavor = "current_thread")]

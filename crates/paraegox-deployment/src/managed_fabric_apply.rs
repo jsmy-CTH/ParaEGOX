@@ -1184,10 +1184,8 @@ impl ManagedServingDescribeSendActionV1 {
 #[derive(Debug)]
 pub(crate) struct ManagedServingDescribeRemoteExchangeOutcomeV1 {
     action: ManagedServingDescribeSendActionV1,
-    response: Result<
-        RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
-        ManagedServingControllerError,
-    >,
+    response:
+        Result<RuntimeManagedServingDescribeMtlsExchangeSuccessV1, ManagedServingControllerError>,
 }
 
 impl ManagedServingDescribeRemoteExchangeOutcomeV1 {
@@ -1195,10 +1193,7 @@ impl ManagedServingDescribeRemoteExchangeOutcomeV1 {
         self,
     ) -> (
         ManagedServingDescribeSendActionV1,
-        Result<
-            RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
-            ManagedServingControllerError,
-        >,
+        Result<RuntimeManagedServingDescribeMtlsExchangeSuccessV1, ManagedServingControllerError>,
     ) {
         (self.action, self.response)
     }
@@ -1896,9 +1891,11 @@ impl ManagedFabricApplyJournalV1 {
                 provisioning.describe(),
                 previous,
                 &transport,
-            )?;
+        )?;
         if ready.ingress().request_wire() != action.request.canonical_wire() {
-            return Err(ManagedFabricApplyControllerError::ServingDescribeResponseCorrelationMismatch);
+            return Err(
+                ManagedFabricApplyControllerError::ServingDescribeResponseCorrelationMismatch,
+            );
         }
         let mut next = self.state.clone();
         next.sequence = next_sequence(next.sequence)?;
@@ -2658,8 +2655,8 @@ pub(crate) mod tests {
         ManagedServingControllerError, ManagedServingDescribeIngressV1,
         ManagedServingDescribeReconcileDecodeV1, ManagedServingDescribeReconcilePhaseV1,
         ManagedServingDescribeVerifierV1, RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
-        RuntimeManagedServingDescribeTransportErrorV1,
-        RuntimeManagedServingMtlsExchangeSuccessV1, RuntimeManagedServingTransportErrorV1,
+        RuntimeManagedServingDescribeTransportErrorV1, RuntimeManagedServingMtlsExchangeSuccessV1,
+        RuntimeManagedServingTransportErrorV1,
     };
 
     const TARGET: RuntimeHostId = RuntimeHostId::from_bytes([0x31; 16]);
@@ -3430,7 +3427,11 @@ pub(crate) mod tests {
             0
         );
         assert_eq!(
-            u32::from_be_bytes(frame[117..121].try_into().expect("Describe response length")),
+            u32::from_be_bytes(
+                frame[117..121]
+                    .try_into()
+                    .expect("Describe response length")
+            ),
             0
         );
         let mut body = frame[..frame.len() - STATE_CHECKSUM_BYTES].to_vec();
@@ -3799,12 +3800,9 @@ pub(crate) mod tests {
         assert_eq!(&exact_describe_request[..4], b"PXCC");
 
         let action = journal
-            .claim_remote_managed_ready_describe_with(
-                prepared_describe,
-                &remote,
-                &ingress,
-                |_| Ok(()),
-            )
+            .claim_remote_managed_ready_describe_with(prepared_describe, &remote, &ingress, |_| {
+                Ok(())
+            })
             .expect("Describe one-shot action");
         assert_eq!(
             journal.state().serving_describe_reconcile_phase(),
@@ -3873,11 +3871,13 @@ pub(crate) mod tests {
         )
         .expect("well-shaped wrong Describe peer");
         assert_eq!(
-            remote.describe().try_accept_managed_ready_describe_response(
-                &ingress,
-                action.request().clone(),
-                &wrong_peer,
-            ),
+            remote
+                .describe()
+                .try_accept_managed_ready_describe_response(
+                    &ingress,
+                    action.request().clone(),
+                    &wrong_peer,
+                ),
             Err(ManagedServingControllerError::ManagedReadyDescribeTransportPinMismatch)
         );
         let legacy_response = post_bootstrap_describe_response(
@@ -3892,11 +3892,13 @@ pub(crate) mod tests {
         )
         .expect("authenticated LegacyReady PXDR");
         assert_eq!(
-            remote.describe().try_accept_managed_ready_describe_response(
-                &ingress,
-                action.request().clone(),
-                &legacy_transport,
-            ),
+            remote
+                .describe()
+                .try_accept_managed_ready_describe_response(
+                    &ingress,
+                    action.request().clone(),
+                    &legacy_transport,
+                ),
             Err(ManagedServingControllerError::ManagedReadyDescribeRequired)
         );
         let mut forged_response = exact_describe_response.clone();
@@ -3998,7 +4000,10 @@ pub(crate) mod tests {
                 |_| Ok(()),
             )
             .expect("ManagedReady PXDR durable");
-        assert_eq!(ready.request_wire(), journal.state().serving.describe_request_wire());
+        assert_eq!(
+            ready.request_wire(),
+            journal.state().serving.describe_request_wire()
+        );
         assert_eq!(ready.response_wire(), exact_describe_response);
         assert_eq!(
             journal.state().serving_describe_reconcile_phase(),
@@ -4028,7 +4033,10 @@ pub(crate) mod tests {
         )
         .expect("exact PXFB/PXFR/PXCC/PXDR state reopens");
         assert_eq!(&reopened, persisted);
-        let encoded = journal.state().encode().expect("PXFJ v6 encodes Ready facts");
+        let encoded = journal
+            .state()
+            .encode()
+            .expect("PXFJ v6 encodes Ready facts");
         assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), STATE_VERSION);
         assert!(
             encoded
@@ -4169,12 +4177,9 @@ pub(crate) mod tests {
             )
             .expect("uncertain PXFB permits only fresh Describe reconciliation");
         let describe_action = journal
-            .claim_remote_managed_ready_describe_with(
-                prepared_describe,
-                &remote,
-                &ingress,
-                |_| Ok(()),
-            )
+            .claim_remote_managed_ready_describe_with(prepared_describe, &remote, &ingress, |_| {
+                Ok(())
+            })
             .expect("claim one read-only Describe");
         let first_describe_wire = describe_action.canonical_request_bytes().to_vec();
         let outcome = describe_action
@@ -4186,9 +4191,11 @@ pub(crate) mod tests {
         let (describe_action, response) = outcome.into_parts();
         assert_eq!(
             response,
-            Err(ManagedServingControllerError::ManagedReadyDescribeTransport(
-                RuntimeManagedServingDescribeTransportErrorV1::Uncertain
-            ))
+            Err(
+                ManagedServingControllerError::ManagedReadyDescribeTransport(
+                    RuntimeManagedServingDescribeTransportErrorV1::Uncertain
+                )
+            )
         );
         let spent = describe_action
             .exchange_remote_once(|_| async {
@@ -4233,12 +4240,9 @@ pub(crate) mod tests {
             )
             .expect("explicit fresh read-only reconciliation");
         let describe_action = journal
-            .claim_remote_managed_ready_describe_with(
-                prepared_describe,
-                &remote,
-                &ingress,
-                |_| Ok(()),
-            )
+            .claim_remote_managed_ready_describe_with(prepared_describe, &remote, &ingress, |_| {
+                Ok(())
+            })
             .expect("claim second fresh Describe");
         let describe_response = post_bootstrap_describe_response(
             describe_action.request(),
@@ -4266,8 +4270,7 @@ pub(crate) mod tests {
             .expect("ManagedReady state is durable");
         assert_eq!(
             journal.state().serving_phase(),
-            crate::managed_serving_client::ManagedServingBootstrapPhaseV1::
-                AttemptClosedNoResponse,
+            crate::managed_serving_client::ManagedServingBootstrapPhaseV1::AttemptClosedNoResponse,
             "fresh Describe must not synthesize a missing PXFR"
         );
         assert_eq!(

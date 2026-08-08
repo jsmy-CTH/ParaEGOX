@@ -130,6 +130,13 @@ pub struct DeveloperLocalTenureAuthorityConfigV1 {
     peer: DeveloperLocalPeerIdentityV1,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeveloperLocalTenureAuthorityPublicPinsV1 {
+    pub(crate) identities: DeveloperLocalTenureAuthorityIdentityBytesV1,
+    pub(crate) authority_verification_key: [u8; 32],
+    pub(crate) controller_public_key_fingerprint: [u8; 32],
+}
+
 impl fmt::Debug for DeveloperLocalTenureAuthorityConfigV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -188,6 +195,21 @@ impl DeveloperLocalTenureAuthorityConfigV1 {
             controller_verification_key,
             expected_store_instance_id,
             peer,
+        })
+    }
+
+    pub(crate) fn public_pins(
+        &self,
+    ) -> Result<DeveloperLocalTenureAuthorityPublicPinsV1, DeveloperLocalTenureAuthorityError> {
+        let controller_public_key_fingerprint =
+            ControllerPublicKeyFingerprint::for_ed25519_key(&self.controller_verification_key)
+                .map_err(|_| DeveloperLocalTenureAuthorityError::InvalidConfiguration)?;
+        Ok(DeveloperLocalTenureAuthorityPublicPinsV1 {
+            identities: self.identities,
+            authority_verification_key: SigningKey::from_bytes(&self.authority_seed)
+                .verifying_key()
+                .to_bytes(),
+            controller_public_key_fingerprint: *controller_public_key_fingerprint.as_bytes(),
         })
     }
 }

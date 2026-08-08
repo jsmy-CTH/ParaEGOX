@@ -84,9 +84,9 @@ pub use deployment_process::{DeploymentdProcessError, run_deploymentd_process};
 #[cfg(unix)]
 pub use deployment_process::{
     DeveloperDeploymentEnrollmentFactsFieldsV1, DeveloperDeploymentEnrollmentFactsV1,
-    DeveloperDeploymentErrorV1, DeveloperDeploymentOwnerV1, DeveloperDeploymentStartFieldsV1,
-    DeveloperDeploymentStartInputV1, DeveloperDeploymentStartModeV1,
-    DeveloperDeploymentReadyV1, DeveloperDeploymentStartOutcomeV1,
+    DeveloperDeploymentErrorV1, DeveloperDeploymentOwnerV1, DeveloperDeploymentReadyV1,
+    DeveloperDeploymentStartFieldsV1, DeveloperDeploymentStartInputV1,
+    DeveloperDeploymentStartModeV1, DeveloperDeploymentStartOutcomeV1,
     start_developer_deployment_v1,
 };
 #[cfg(unix)]

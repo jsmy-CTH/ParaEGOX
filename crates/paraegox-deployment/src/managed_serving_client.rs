@@ -1092,9 +1092,7 @@ impl ManagedServingDescribeReconcilePhaseV1 {
         }
     }
 
-    pub(crate) const fn try_from_wire(
-        value: u8,
-    ) -> Result<Self, ManagedServingControllerError> {
+    pub(crate) const fn try_from_wire(value: u8) -> Result<Self, ManagedServingControllerError> {
         match value {
             1 => Ok(Self::Idle),
             2 => Ok(Self::RequestDurable),
@@ -1161,8 +1159,10 @@ impl ManagedServingDescribeReconcileStateV1 {
                 if request_wire.is_empty() || !response_wire.is_empty() {
                     return Err(ManagedServingControllerError::InvalidStateEncoding);
                 }
-                let verifier = verifier.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
-                let previous = previous.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
+                let verifier =
+                    verifier.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
+                let previous =
+                    previous.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
                 let request = RuntimeControlCarrierRequestV1::decode(request_wire)?;
                 verify_fresh_describe_request(verifier, previous, &request)?;
                 Ok(Self {
@@ -1175,8 +1175,10 @@ impl ManagedServingDescribeReconcileStateV1 {
                 if request_wire.is_empty() || response_wire.is_empty() {
                     return Err(ManagedServingControllerError::InvalidStateEncoding);
                 }
-                let verifier = verifier.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
-                let previous = previous.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
+                let verifier =
+                    verifier.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
+                let previous =
+                    previous.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
                 let ingress = ManagedServingDescribeIngressV1::decode(
                     verifier,
                     Some(previous),
@@ -1223,7 +1225,9 @@ impl ManagedServingDescribeReconcileStateV1 {
         })
     }
 
-    fn try_claim(&self) -> Result<(Self, RuntimeControlCarrierRequestV1), ManagedServingControllerError> {
+    fn try_claim(
+        &self,
+    ) -> Result<(Self, RuntimeControlCarrierRequestV1), ManagedServingControllerError> {
         if self.phase != ManagedServingDescribeReconcilePhaseV1::RequestDurable
             || self.response.is_some()
         {
@@ -1272,11 +1276,8 @@ impl ManagedServingDescribeReconcileStateV1 {
             .request
             .clone()
             .ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
-        let ready = verifier.try_accept_managed_ready_describe_response(
-            previous,
-            request,
-            transport,
-        )?;
+        let ready =
+            verifier.try_accept_managed_ready_describe_response(previous, request, transport)?;
         Ok((
             Self {
                 phase: ManagedServingDescribeReconcilePhaseV1::ResponseDurable,
@@ -1372,9 +1373,7 @@ impl ManagedServingBootstrapStateV1 {
     }
 
     #[must_use]
-    pub(crate) const fn describe_reconcile_phase(
-        &self,
-    ) -> ManagedServingDescribeReconcilePhaseV1 {
+    pub(crate) const fn describe_reconcile_phase(&self) -> ManagedServingDescribeReconcilePhaseV1 {
         self.describe_reconcile.phase
     }
 
@@ -1535,8 +1534,9 @@ impl ManagedServingBootstrapStateV1 {
         };
         if describe.phase == ManagedServingDescribeReconcilePhaseV1::ResponseDurable {
             let verifier = verifier.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
-            let previous =
-                describe.previous.ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
+            let previous = describe
+                .previous
+                .ok_or(ManagedServingControllerError::InvalidStateEncoding)?;
             let ready = state
                 .describe_reconcile
                 .verified_ready(verifier, previous)?;
@@ -1705,12 +1705,9 @@ impl ManagedServingBootstrapStateV1 {
             return Err(ManagedServingControllerError::InvalidPhase);
         }
         previous.revalidate(verifier)?;
-        let describe_reconcile = self.describe_reconcile.try_prepare(
-            verifier,
-            previous,
-            fresh,
-            controller_signer,
-        )?;
+        let describe_reconcile =
+            self.describe_reconcile
+                .try_prepare(verifier, previous, fresh, controller_signer)?;
         Ok(Self {
             describe_reconcile,
             ..self.clone()
@@ -1746,9 +1743,9 @@ impl ManagedServingBootstrapStateV1 {
         previous: &ManagedServingDescribeIngressV1,
         transport: &RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
     ) -> Result<(Self, VerifiedManagedServingReadyV1), ManagedServingControllerError> {
-        let (describe_reconcile, ready) =
-            self.describe_reconcile
-                .try_accept_response(verifier, previous, transport)?;
+        let (describe_reconcile, ready) = self
+            .describe_reconcile
+            .try_accept_response(verifier, previous, transport)?;
         self.validate_ready_against_bootstrap_terminal(&ready)?;
         Ok((
             Self {
@@ -1764,9 +1761,7 @@ impl ManagedServingBootstrapStateV1 {
         verifier: &ManagedServingDescribeVerifierV1,
         previous: &ManagedServingDescribeIngressV1,
     ) -> Result<VerifiedManagedServingReadyV1, ManagedServingControllerError> {
-        let ready = self
-            .describe_reconcile
-            .verified_ready(verifier, previous)?;
+        let ready = self.describe_reconcile.verified_ready(verifier, previous)?;
         self.validate_ready_against_bootstrap_terminal(&ready)?;
         Ok(ready)
     }
