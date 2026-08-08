@@ -11,10 +11,11 @@ ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). 
 > presentation path; the retired Rust reference frontend has been removed. Ubuntu r33 commit
 > `7618f6a51c5eb5731874d2cdf3231603e3a824f7` additionally validates the public G1 host-local
 > `paraegox node` substrate. The current source additively wires the G2 host-side node profile and
-> the public `paraegox deployment` Controller composition described below. Ubuntu r73 exact ref
-> `96bbb26f1d8013d2a3ca4020e88b0faf3135fbff` is the latest validated code ref for that composition;
-> its real cross-host process smoke is still pending. ParaEGOX is adopting a Rust-first core with
-> polyglot managed workloads; no stable release is currently available.
+> the public `paraegox deployment` Controller composition described below. Ubuntu r86 exact ref
+> `66aa4e58c0c2b3dc6ddf12d7de3fcae74d88b1bc` is the latest validated ref for that composition;
+> its bounded single-host public process smoke is now complete, while two-host execution and remote
+> Agent conversation remain unproved. ParaEGOX is adopting a Rust-first core with polyglot managed
+> workloads; no stable release is currently available.
 
 ## Runnable DeveloperLocal slice
 
@@ -143,6 +144,8 @@ observation was published, or a desired Agent stack was applied. Neither schema 
 DeploymentController, managed Fabric, Model, Agent, Inspection, Textual, or the chat chain. The
 separate public Controller command described below now exists, but there is still no end-to-end
 two-host process proof, remote Agent conversation path, remote TUI, or partition/reconnect policy.
+The later single-Ubuntu-host smoke exercises the semantic Controller sequence, but does not widen
+the meaning of this Node-local marker.
 
 Start from [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml). Copy it to an
 absolute regular-file path, replace both documentation-only `192.0.2.10` listener addresses with
@@ -229,15 +232,32 @@ cannot synthesize readiness; the command joins its owners and exits nonzero with
 error instead. The process performs one bounded non-retrying attempt and is not a continuous
 reconciler.
 
-Ubuntu validated exact r73 ref `96bbb26f1d8013d2a3ca4020e88b0faf3135fbff` with workspace
-`cargo fmt --all --check`, locked workspace all-target checking, and warnings-denied locked workspace
-all-target Clippy. The complete prebuilt `paraegox-local` test binary passed 129/129 and the complete
-prebuilt `paraegox-deployment` test binary passed 387/387 as `nobody`, with
-`RUST_MIN_STACK=16777216` and `--test-threads=1`. This is compile, lint, and unit evidence. A real
-Mac-to-Ubuntu public-process smoke—including PXEA transfer/pinning, full semantic exchange, Ready,
-signals, Authority-owner failure, and restart seams—has not yet run, so r73 is not presented as two-machine
-execution evidence. It also supplies no target-scoped remote Agent descriptor, remote conversation,
-remote TUI, or reconnect policy.
+Ubuntu validated exact r86 ref `66aa4e58c0c2b3dc6ddf12d7de3fcae74d88b1bc` with workspace
+`cargo fmt --all -- --check`, the complete governance checker, locked workspace all-target checking,
+and warnings-denied locked workspace all-target Clippy. Its production Rust tree is unchanged from
+r85 `83a020890a9098852d5ff60dbad0cc1cf77be702`, whose complete non-root Node, Local, and Deployment
+suites passed 28/28, 129/129, and 387/387 respectively.
+
+The r86 prebuilt-binary public process smoke passed 1/1 in 20.39 seconds. On one Ubuntu host, every
+ParaEGOX process used the same `nobody` UID/GID and real non-loopback mTLS. It covered a fresh Node
+Ready and PXEA publication, an isolated fresh-state wrong-SHA rejection before success, fresh
+Deployment Ready and clean SIGTERM, clean same-state Node restart, Deployment Resume Ready and clean
+SIGTERM, and an independent correct-config Node-unavailable failure with no Ready marker and socket
+cleanup. The runner actually used pytest 9.0.1 and cryptography 46.0.3; the `uv.lock` versions are
+pytest 9.1.1 and cryptography 46.0.7. This smoke is therefore process evidence, not exact-lock
+Python toolchain evidence.
+
+Separate r84 ref `74e349aa2d117da416f816a840f0fe79768b4a7a` process evidence using the same binary
+crossed the real 60-second observation deadline: PXND converged from
+`next=3, visible=1, replay=1, validity=1` to
+`next=4, visible=0, replay=0, validity=0`, the Node reached Ready and exited cleanly, and Node plus
+Deployment subsequently resumed to Ready and exited cleanly. R85 added only the corresponding fence
+tests, and r86 added governance/harness registration without changing production Rust.
+
+These results do not cover an Authority-owner failure, distinct service accounts, two hosts, peer
+liveness after Ready, a remote Agent conversation/TUI, or reconnect behavior. The next bounded slice
+is a target-scoped Agent descriptor that yields only an opaque local conversation handle; bounded
+reconnect and remote TUI remain later work.
 
 A Unix-only `paraegox-noded developer-local-reference-v1` process can also reopen one externally
 authorized exact tenure and serve its last committed status through a same-user, token-bound local socket.

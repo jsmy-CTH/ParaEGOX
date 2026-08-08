@@ -10,10 +10,10 @@ ParaEGOX 基于 [PhanthyMotus](https://github.com/4paradigm/phanthymotus) 构建
 > 现在是唯一 DeveloperLocal 展示路径；旧 Rust reference frontend 已删除。Ubuntu r33 commit
 > `7618f6a51c5eb5731874d2cdf3231603e3a824f7` 还验证了公开 G1 host-local
 > `paraegox node` 系统基座。当前源码又增量接入了下文所述的 G2 host-side Node profile 与公开
-> `paraegox deployment` Controller composition。Ubuntu r73 精确 ref
-> `96bbb26f1d8013d2a3ca4020e88b0faf3135fbff` 是该 composition 当前最新已验证代码 ref；真实跨主机
-> process smoke 仍待完成。生产核心机制优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未
-> 提供稳定版本。
+> `paraegox deployment` Controller composition。Ubuntu r86 精确 ref
+> `66aa4e58c0c2b3dc6ddf12d7de3fcae74d88b1bc` 是该 composition 当前最新已验证 ref；有界单 Ubuntu
+> 主机 public process smoke 已完成，但双主机执行与 remote Agent conversation 仍未获证明。生产核心机制
+> 优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
 
 ## 当前可运行切片
 
@@ -123,7 +123,8 @@ listener、durable owner 与 bridge，但不会把 Controller 偷塞进 Node 进
 不证明 Controller 已连接、PXFB cutover 已完成、Runtime observation 已发布，或目标 Agent stack 已
 apply。两种模式都不启动 Authority、DeploymentController、managed Fabric、Model、Agent、Inspection、
 Textual 或 chat 链。下文所述的独立公开 Controller 命令现在已经存在，但仍没有端到端双主机 process
-proof、remote Agent conversation 路径、remote TUI 或 partition/reconnect policy。
+proof、remote Agent conversation 路径、remote TUI 或 partition/reconnect policy。后续单 Ubuntu 主机
+smoke 已执行 semantic Controller sequence，但不会扩大这个 Node-local marker 的含义。
 
 从 [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml) 开始。把它复制到绝对普通
 文件路径，将两处仅用于文档的 `192.0.2.10` listener 地址替换为宿主机真实拥有的 IPv4，并同步修改
@@ -199,14 +200,29 @@ terminal 已 durable `ResponseDurable`，且 fresh post-PXFR PXDR Describe 已�
 PXFR 的 ManagedReady Describe 都不能合成 readiness；命令会 joined 关闭 owner，并用稳定 Deployment
 错误非零退出。这个 process 只执行一次有界、无重试 attempt，不是 continuous reconciler。
 
-Ubuntu 已在精确 r73 ref `96bbb26f1d8013d2a3ca4020e88b0faf3135fbff` 通过 workspace
-`cargo fmt --all --check`、locked workspace all-target check 与 warnings-denied locked workspace
-all-target Clippy。完整预编译 `paraegox-local` test binary 以 `nobody`、
-`RUST_MIN_STACK=16777216`、`--test-threads=1` 运行时 129/129 通过；完整预编译
-`paraegox-deployment` test binary 在同样条件下 387/387 通过。这是 compile、lint 与 unit evidence。
-真实 Mac→Ubuntu public-process smoke（包括 PXEA transfer/pinning、完整 semantic exchange、Ready、signal、
-Authority owner failure 与 restart seams）尚未运行，因此不能把 r73 写成双机 execution 证据。它也尚未提供
-target-scoped remote Agent descriptor、remote conversation、remote TUI 或 reconnect policy。
+Ubuntu 已在精确 r86 ref `66aa4e58c0c2b3dc6ddf12d7de3fcae74d88b1bc` 通过 workspace
+`cargo fmt --all -- --check`、完整 governance checker、locked workspace all-target check 与
+warnings-denied locked workspace all-target Clippy。其 production Rust tree 与 r85
+`83a020890a9098852d5ff60dbad0cc1cf77be702` 相同；r85 的完整非 root Node、Local、Deployment suites
+分别以 28/28、129/129、387/387 通过。
+
+r86 的预编译 public binary process smoke 以 1/1、20.39 秒通过。所有 ParaEGOX 进程在同一 Ubuntu
+主机、同一个 `nobody` UID/GID 下运行，并使用真实 non-loopback mTLS；它覆盖 fresh Node Ready 与 PXEA
+发布、隔离 fresh state 的 wrong-SHA 拒绝、fresh Deployment Ready 与 SIGTERM clean exit、同 state Node
+clean restart、Deployment Resume Ready 与 SIGTERM clean exit，以及独立 correct-config Node-unavailable
+非零退出（无 Ready，socket 已清理）。runner 实际使用 pytest 9.0.1 与 cryptography 46.0.3，而
+`uv.lock` 固定 pytest 9.1.1 与 cryptography 46.0.7；因此这是 process evidence，不是 exact-lock Python
+toolchain evidence。
+
+另有 r84 ref `74e349aa2d117da416f816a840f0fe79768b4a7a` 的真实截止时间 process evidence：同一 binary 等待
+超过 60 秒 observation deadline 后，PXND 从 `next=3, visible=1, replay=1, validity=1` 收敛到
+`next=4, visible=0, replay=0, validity=0`；Node 到达 Ready 并 clean exit，随后 Node 与 Deployment
+均从原 state Resume 到 Ready 并 clean exit。r85 只增加对应 fence tests，r86 只增加治理/harness
+登记，没有修改 production Rust。
+
+这些结果没有覆盖 Authority-owner failure、独立 service account、双主机、Ready 后 peer liveness、
+remote Agent conversation/TUI 或 reconnect。下一有界切片是 target-scoped Agent descriptor，并只向
+本地交付 opaque conversation handle；bounded reconnect 与 remote TUI 后置。
 
 Unix-only `paraegox-noded developer-local-reference-v1` 也能独立重开一份由外部授权的 exact tenure，
 并通过 same-user、token-bound 本地 socket 返回最后一次已提交状态。新增的
