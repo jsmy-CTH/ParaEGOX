@@ -68,6 +68,11 @@ const TERMINAL_RESULT_REF_DOMAIN: &[u8] =
 const TERMINAL_RECEIPT_SIGNING_MAGIC: &[u8] = b"ParaEGOX\0managed-agent-stack-terminal-signing";
 const TERMINAL_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"paraegox.runtime.managed-agent-stack-terminal-receipt.sha256.v1";
+const TARGET_SCOPED_SUBMIT_BINDING_DOMAIN: &[u8] =
+    b"paraegox.runtime.managed-agent-port.submit-binding.sha256.v1";
+const TARGET_SCOPED_CONTROL_BINDING_DOMAIN: &[u8] =
+    b"paraegox.runtime.managed-agent-port.control-binding.sha256.v1";
+const TARGET_SCOPED_AGENT_ROUTE_PREFIX: &[u8] = b"paraegox/agent/v1/";
 
 /// Exact projection version for the fixed Fabric→Agent successor.
 pub const MANAGED_AGENT_STACK_PROJECTION_VERSION: u16 = 1;
@@ -400,6 +405,43 @@ pub struct ManagedAgentPortPlanV1 {
 }
 
 impl ManagedAgentPortPlanV1 {
+    /// Deterministically derives the two target-local binding identities and
+    /// canonical routes for one Agent service.
+    ///
+    /// The lane-specific digest domains prevent submit/control identity reuse.
+    /// The legacy [`Self::try_new`] constructor remains the only entry point for
+    /// callers that intentionally carry pre-existing binding IDs or routes.
+    pub fn try_new_target_scoped(
+        target: RuntimeHostId,
+        service_id: ManagedServiceId,
+        ingress_limits: ManagedAgentIngressLimitsV1,
+    ) -> Result<Self, ManagedAgentStackPlanError> {
+        if bytes_are_zero(target.as_bytes()) || bytes_are_zero(service_id.as_bytes()) {
+            return Err(ManagedAgentStackPlanError::InvalidBinding);
+        }
+        let submit_binding_id = derive_target_scoped_binding_id(
+            TARGET_SCOPED_SUBMIT_BINDING_DOMAIN,
+            target,
+            service_id,
+        )?;
+        let control_binding_id = derive_target_scoped_binding_id(
+            TARGET_SCOPED_CONTROL_BINDING_DOMAIN,
+            target,
+            service_id,
+        )?;
+        let submit_key_expression =
+            target_scoped_agent_route(target, service_id, b"submit")?;
+        let control_key_expression =
+            target_scoped_agent_route(target, service_id, b"control")?;
+        Self::try_new(
+            submit_binding_id,
+            control_binding_id,
+            &submit_key_expression,
+            &control_key_expression,
+            ingress_limits,
+        )
+    }
+
     /// Validates both physical lanes as one atomic logical desired value.
     pub fn try_new(
         submit_binding_id: BindingId,
@@ -451,6 +493,48 @@ impl ManagedAgentPortPlanV1 {
     #[must_use]
     pub const fn ingress_limits(&self) -> ManagedAgentIngressLimitsV1 {
         self.ingress_limits
+    }
+}
+
+fn derive_target_scoped_binding_id(
+    domain: &[u8],
+    target: RuntimeHostId,
+    service_id: ManagedServiceId,
+) -> Result<BindingId, ManagedAgentStackPlanError> {
+    let mut builder = Digest32Builder::try_new(domain)?;
+    builder.field_bytes(target.as_bytes())?;
+    builder.field_bytes(service_id.as_bytes())?;
+    let digest = builder.finish();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    if bytes_are_zero(&bytes) {
+        return Err(ManagedAgentStackPlanError::InvalidBinding);
+    }
+    Ok(BindingId::from_bytes(bytes))
+}
+
+fn target_scoped_agent_route(
+    target: RuntimeHostId,
+    service_id: ManagedServiceId,
+    lane: &[u8],
+) -> Result<String, ManagedAgentStackPlanError> {
+    let mut route = Vec::with_capacity(
+        TARGET_SCOPED_AGENT_ROUTE_PREFIX.len() + 32 + 1 + 32 + 1 + lane.len(),
+    );
+    route.extend_from_slice(TARGET_SCOPED_AGENT_ROUTE_PREFIX);
+    append_lower_hex(&mut route, target.as_bytes());
+    route.push(b'/');
+    append_lower_hex(&mut route, service_id.as_bytes());
+    route.push(b'/');
+    route.extend_from_slice(lane);
+    String::from_utf8(route).map_err(|_| ManagedAgentStackPlanError::InvalidKeyExpression)
+}
+
+fn append_lower_hex(output: &mut Vec<u8>, bytes: &[u8]) {
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        output.push(LOWER_HEX[usize::from(byte >> 4)]);
+        output.push(LOWER_HEX[usize::from(byte & 0x0f)]);
     }
 }
 
@@ -2627,6 +2711,68 @@ mod tests {
         .expect("stack request draft must build")
         .finalize(predecessor.authentication().signature())
         .expect("stack request must finalize")
+    }
+
+    #[test]
+    fn target_scoped_agent_port_derives_exact_distinct_bounded_lanes() {
+        let target = RuntimeHostId::from_bytes([0x11; 16]);
+        let service_id = ManagedServiceId::from_bytes([0x22; 16]);
+        let first = ManagedAgentPortPlanV1::try_new_target_scoped(
+            target,
+            service_id,
+            ingress(),
+        )
+        .expect("target-scoped port");
+        let second = ManagedAgentPortPlanV1::try_new_target_scoped(
+            target,
+            service_id,
+            ingress(),
+        )
+        .expect("deterministic target-scoped port");
+        assert_eq!(first, second);
+        assert_eq!(
+            first.submit_binding_id().as_bytes(),
+            &[
+                0x57, 0x22, 0xf7, 0xae, 0xdf, 0xf8, 0x94, 0x82, 0x53, 0x5d, 0xe7, 0x7a,
+                0x0d, 0x37, 0x9b, 0x58,
+            ]
+        );
+        assert_eq!(
+            first.control_binding_id().as_bytes(),
+            &[
+                0x17, 0x27, 0x45, 0xe5, 0xa0, 0x41, 0xec, 0x64, 0x81, 0x7d, 0x41, 0xde,
+                0x25, 0x2d, 0x0a, 0xe0,
+            ]
+        );
+        assert_ne!(first.submit_binding_id(), first.control_binding_id());
+        assert_eq!(
+            first.submit_key_expression(),
+            "paraegox/agent/v1/11111111111111111111111111111111/22222222222222222222222222222222/submit"
+        );
+        assert_eq!(
+            first.control_key_expression(),
+            "paraegox/agent/v1/11111111111111111111111111111111/22222222222222222222222222222222/control"
+        );
+        assert_eq!(first.submit_key_expression().len(), 90);
+        assert_eq!(first.control_key_expression().len(), 91);
+        assert!(first.submit_key_expression().len() <= MAX_MANAGED_AGENT_KEY_EXPRESSION_BYTES);
+        assert!(first.control_key_expression().len() <= MAX_MANAGED_AGENT_KEY_EXPRESSION_BYTES);
+        assert_eq!(
+            ManagedAgentPortPlanV1::try_new_target_scoped(
+                RuntimeHostId::from_bytes([0; 16]),
+                service_id,
+                ingress(),
+            ),
+            Err(ManagedAgentStackPlanError::InvalidBinding)
+        );
+        assert_eq!(
+            ManagedAgentPortPlanV1::try_new_target_scoped(
+                target,
+                ManagedServiceId::from_bytes([0; 16]),
+                ingress(),
+            ),
+            Err(ManagedAgentStackPlanError::InvalidBinding)
+        );
     }
 
     #[test]

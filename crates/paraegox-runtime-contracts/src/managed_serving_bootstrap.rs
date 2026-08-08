@@ -1,9 +1,15 @@
-//! Authenticated read-only observation of one recovered managed Runtime serving epoch.
+//! Authenticated Runtime-control bootstrap contracts.
 //!
 //! PXFB/PXFR v1 is additive to, and semantically distinct from, the legacy
 //! PXBR/PXBS compatibility bootstrap. It proves current successor projection,
 //! journal, process epoch, clock generation, and live channel facts without
 //! mutating Runtime state. Only a recovered-ready response exists in v1.
+//!
+//! PXAG/PXAH v1 is an independent additive target-scoped Agent-control carrier.
+//! It can transport exact frozen PXAR/PXFT/PXST bytes and a bounded opaque PXAP
+//! bootstrap descriptor over the public PXCB binding. PXCC/PXDR v1 bytes,
+//! kinds, and semantics remain frozen. A descriptor receipt is not a TLS
+//! authorization, access grant, live session, capability, or retry authority.
 
 use core::fmt;
 
@@ -14,9 +20,18 @@ use paraegox_kernel::time::{ClockDomainRef, ClockGeneration, ClockReading, Monot
 use crate::distributed_agent_stack_plan::{
     MAX_RESTRICTED_RUNTIME_APPLY_CARRIER_BINDING_BYTES, RestrictedRuntimeApplyCarrierBindingV1,
 };
-use crate::managed_fabric_plan::{
-    MANAGED_FABRIC_PROJECTION_BYTES, ManagedFabricManifestProjectionV1, ManagedFabricPlanError,
+use crate::managed_agent_stack_plan::{
+    MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES,
+    MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedAgentStackApplyRequestV1,
+    ManagedAgentStackTerminalReceiptV1,
 };
+use crate::managed_fabric_plan::{
+    MANAGED_FABRIC_PROJECTION_BYTES, MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES,
+    MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES, ManagedFabricApplyRequestV1,
+    ManagedFabricApplyTerminalReceiptV1, ManagedFabricManifestProjectionV1,
+    ManagedFabricPlanError,
+};
+use crate::managed_service::ManagedServiceGeneration;
 use crate::provenance::SourceScopeRef;
 use crate::reference_control::{
     MAX_REFERENCE_QUERY_REQUEST_BYTES, ReferenceChannelBindingV1, ReferenceControlError,
@@ -47,10 +62,28 @@ const CONTROL_CARRIER_REQUEST_DIGEST_DOMAIN: &[u8] =
     b"paraegox.runtime.control-carrier.request.sha256.v1";
 const CONTROL_DESCRIBE_READY_DIGEST_DOMAIN: &[u8] =
     b"paraegox.runtime.control-describe-ready.sha256.v1";
+/// Exact independent Runtime Agent-control request magic.
+pub const RUNTIME_AGENT_CONTROL_REQUEST_MAGIC: &[u8; 4] = b"PXAG";
+/// Exact independent Runtime Agent-control receipt magic.
+pub const RUNTIME_AGENT_CONTROL_RECEIPT_MAGIC: &[u8; 4] = b"PXAH";
+const AGENT_CONTROL_REQUEST_TRANSCRIPT_MAGIC: &[u8] =
+    b"ParaEGOX\0runtime-agent-control-request-signing";
+const AGENT_CONTROL_RECEIPT_TRANSCRIPT_MAGIC: &[u8] =
+    b"ParaEGOX\0runtime-agent-control-receipt-signing";
+const AGENT_CONTROL_REQUEST_PAYLOAD_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.agent-control.request-payload.sha256.v1";
+const AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.agent-control.receipt-payload.sha256.v1";
+const AGENT_CONTROL_REQUEST_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.agent-control.request.sha256.v1";
+const AGENT_CONTROL_RECEIPT_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.agent-control.receipt.sha256.v1";
 const REQUEST_FIXED_BYTES: usize = 226;
 const RESPONSE_FIXED_BYTES: usize = 324;
 const CONTROL_CARRIER_REQUEST_FIXED_BYTES: usize = 136;
 const CONTROL_DESCRIBE_READY_FIXED_BYTES: usize = 362;
+const AGENT_CONTROL_REQUEST_FIXED_BYTES: usize = 240;
+const AGENT_CONTROL_RECEIPT_FIXED_BYTES: usize = 320;
 const MAX_RUNTIME_CONTROL_CARRIER_PAYLOAD_BYTES: usize =
     if MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES > MAX_REFERENCE_QUERY_REQUEST_BYTES {
         MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES
@@ -87,6 +120,50 @@ pub const MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES: usize =
         + MANAGED_FABRIC_PROJECTION_BYTES
         + MAX_APPLY_AUTH_NONCE_BYTES
         + MAX_APPLY_AUTH_SIGNATURE_BYTES;
+/// Independent additive PXAG/PXAH Agent-control protocol version.
+pub const RUNTIME_AGENT_CONTROL_VERSION: u16 = 1;
+/// Exact PXAG Controller signing-transcript version.
+pub const RUNTIME_AGENT_CONTROL_REQUEST_SIGNING_VERSION: u16 = 1;
+/// Exact PXAH Runtime signing-transcript version.
+pub const RUNTIME_AGENT_CONTROL_RECEIPT_SIGNING_VERSION: u16 = 1;
+/// Maximum opaque PXAP bootstrap descriptor bytes carried by PXAH.
+pub const MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES: usize = 2_048;
+const MAX_RUNTIME_AGENT_CONTROL_REQUEST_PAYLOAD_BYTES: usize =
+    if MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES > MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES {
+        MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES
+    } else {
+        MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES
+    };
+const MAX_RUNTIME_AGENT_CONTROL_RECEIPT_PAYLOAD_BYTES: usize =
+    if MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES
+        > MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES
+    {
+        if MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES
+            > MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES
+        {
+            MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES
+        } else {
+            MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES
+        }
+    } else if MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES
+        > MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES
+    {
+        MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES
+    } else {
+        MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES
+    };
+/// Maximum canonical PXAG request bytes.
+pub const MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES: usize = AGENT_CONTROL_REQUEST_FIXED_BYTES
+    + MAX_APPLY_AUTH_NONCE_BYTES
+    + MAX_RESTRICTED_RUNTIME_APPLY_CARRIER_BINDING_BYTES
+    + MAX_RUNTIME_AGENT_CONTROL_REQUEST_PAYLOAD_BYTES
+    + MAX_APPLY_AUTH_SIGNATURE_BYTES;
+/// Maximum canonical PXAH receipt bytes.
+pub const MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES: usize = AGENT_CONTROL_RECEIPT_FIXED_BYTES
+    + MAX_APPLY_AUTH_NONCE_BYTES
+    + MAX_RESTRICTED_RUNTIME_APPLY_CARRIER_BINDING_BYTES
+    + MAX_RUNTIME_AGENT_CONTROL_RECEIPT_PAYLOAD_BYTES
+    + MAX_APPLY_AUTH_SIGNATURE_BYTES;
 
 /// Nonzero identity of one explicit Controller observation invocation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -790,6 +867,1165 @@ impl ManagedServingBootstrapResponseV1 {
             auth_claim: self.auth_claim,
         }
         .signing_transcript()
+    }
+}
+
+/// Nonzero identity of one target-scoped Agent-control invocation.
+///
+/// Apply requests additionally require these bytes to equal the wrapped PXAR
+/// operation identity, avoiding two independently meaningful request IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RuntimeAgentControlRequestIdV1([u8; 16]);
+
+impl RuntimeAgentControlRequestIdV1 {
+    pub const fn try_from_bytes(
+        bytes: [u8; 16],
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        if bytes_are_zero(&bytes) {
+            return Err(ManagedServingBootstrapError::InvalidIdentity);
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+/// Operation admitted by the independent Controller-signed PXAG carrier.
+///
+/// This is deliberately not a PXCC v1 extension. Apply kinds preserve one
+/// byte-identical independently signed PXAR request; Describe carries no
+/// payload and only requests a target-scoped bootstrap descriptor.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u16)]
+pub enum RuntimeAgentControlKindV1 {
+    ApplyManagedFabric = 1,
+    ApplyManagedAgentStack = 2,
+    DescribeConversationPort = 3,
+}
+
+impl RuntimeAgentControlKindV1 {
+    fn decode(value: u16) -> Result<Self, ManagedServingBootstrapError> {
+        match value {
+            1 => Ok(Self::ApplyManagedFabric),
+            2 => Ok(Self::ApplyManagedAgentStack),
+            3 => Ok(Self::DescribeConversationPort),
+            _ => Err(ManagedServingBootstrapError::UnsupportedAgentControlKind),
+        }
+    }
+}
+
+/// Shared target and signer fields used to construct one PXAG request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeAgentControlRequestFieldsV1 {
+    pub request_id: RuntimeAgentControlRequestIdV1,
+    pub carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    pub target: RuntimeHostId,
+    pub expected_runtime_store_instance_id: [u8; 32],
+    pub expected_runtime_host_epoch: u64,
+    pub auth_claim: ApplyRequestAuthClaim,
+}
+
+/// Exact Controller or Runtime signing bytes for PXAG/PXAH.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeAgentControlSigningTranscriptV1(Box<[u8]>);
+
+impl RuntimeAgentControlSigningTranscriptV1 {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Signature-independent producer for one Controller PXAG request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeAgentControlRequestDraftV1 {
+    request_id: RuntimeAgentControlRequestIdV1,
+    kind: RuntimeAgentControlKindV1,
+    carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    target: RuntimeHostId,
+    expected_runtime_store_instance_id: [u8; 32],
+    expected_runtime_host_epoch: u64,
+    expected_active_pxst_digest: Digest32,
+    intended_client: PrincipalRef,
+    managed_fabric_apply_request: Option<ManagedFabricApplyRequestV1>,
+    managed_agent_stack_apply_request: Option<ManagedAgentStackApplyRequestV1>,
+    payload_wire_digest: Digest32,
+    auth_claim: ApplyRequestAuthClaim,
+}
+
+impl RuntimeAgentControlRequestDraftV1 {
+    /// Wraps one byte-identical PXAR v6 request.
+    pub fn try_apply_managed_fabric(
+        fields: RuntimeAgentControlRequestFieldsV1,
+        request: ManagedFabricApplyRequestV1,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        Self::try_new(
+            fields,
+            RuntimeAgentControlKindV1::ApplyManagedFabric,
+            Digest32::from_bytes([0; 32]),
+            PrincipalRef::from_bytes([0; 16]),
+            Some(request),
+            None,
+        )
+    }
+
+    /// Wraps one byte-identical PXAR v7 request.
+    pub fn try_apply_managed_agent_stack(
+        fields: RuntimeAgentControlRequestFieldsV1,
+        request: ManagedAgentStackApplyRequestV1,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        Self::try_new(
+            fields,
+            RuntimeAgentControlKindV1::ApplyManagedAgentStack,
+            Digest32::from_bytes([0; 32]),
+            PrincipalRef::from_bytes([0; 16]),
+            None,
+            Some(request),
+        )
+    }
+
+    /// Requests a PXAP bootstrap descriptor for the current exact PXST root.
+    ///
+    /// The intended client is an audience binding, not an access grant. This
+    /// request creates no TLS authorization, session, capability, or retry
+    /// authority and has no inner payload.
+    pub fn try_describe_conversation_port(
+        fields: RuntimeAgentControlRequestFieldsV1,
+        expected_active_pxst_digest: Digest32,
+        intended_client: PrincipalRef,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        Self::try_new(
+            fields,
+            RuntimeAgentControlKindV1::DescribeConversationPort,
+            expected_active_pxst_digest,
+            intended_client,
+            None,
+            None,
+        )
+    }
+
+    fn try_new(
+        fields: RuntimeAgentControlRequestFieldsV1,
+        kind: RuntimeAgentControlKindV1,
+        expected_active_pxst_digest: Digest32,
+        intended_client: PrincipalRef,
+        managed_fabric_apply_request: Option<ManagedFabricApplyRequestV1>,
+        managed_agent_stack_apply_request: Option<ManagedAgentStackApplyRequestV1>,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        validate_runtime_agent_control_request_fields(
+            &fields,
+            kind,
+            expected_active_pxst_digest,
+            intended_client,
+            managed_fabric_apply_request.as_ref(),
+            managed_agent_stack_apply_request.as_ref(),
+        )?;
+        let payload_wire_digest = match (
+            managed_fabric_apply_request.as_ref(),
+            managed_agent_stack_apply_request.as_ref(),
+        ) {
+            (Some(request), None) => digest(
+                AGENT_CONTROL_REQUEST_PAYLOAD_DIGEST_DOMAIN,
+                request.canonical_wire(),
+            )?,
+            (None, Some(request)) => digest(
+                AGENT_CONTROL_REQUEST_PAYLOAD_DIGEST_DOMAIN,
+                request.canonical_wire(),
+            )?,
+            (None, None) => Digest32::from_bytes([0; 32]),
+            (Some(_), Some(_)) => {
+                return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
+            }
+        };
+        Ok(Self {
+            request_id: fields.request_id,
+            kind,
+            carrier: fields.carrier,
+            target: fields.target,
+            expected_runtime_store_instance_id: fields.expected_runtime_store_instance_id,
+            expected_runtime_host_epoch: fields.expected_runtime_host_epoch,
+            expected_active_pxst_digest,
+            intended_client,
+            managed_fabric_apply_request,
+            managed_agent_stack_apply_request,
+            payload_wire_digest,
+            auth_claim: fields.auth_claim,
+        })
+    }
+
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<RuntimeAgentControlSigningTranscriptV1, ManagedServingBootstrapError> {
+        let mut transcript = build_runtime_agent_control_request_base(
+            self,
+            AGENT_CONTROL_REQUEST_TRANSCRIPT_MAGIC,
+            RUNTIME_AGENT_CONTROL_REQUEST_SIGNING_VERSION,
+        )?;
+        append_runtime_agent_control_request_values(&mut transcript, self);
+        Ok(RuntimeAgentControlSigningTranscriptV1(
+            transcript.into_boxed_slice(),
+        ))
+    }
+
+    pub fn finalize(
+        self,
+        signature: &[u8],
+    ) -> Result<RuntimeAgentControlRequestV1, ManagedServingBootstrapError> {
+        let authentication =
+            ApplyRequestAuthentication::try_new(self.auth_claim.clone(), signature)?;
+        RuntimeAgentControlRequestV1::try_new(self, authentication)
+    }
+}
+
+/// Strict Controller-signed PXAG request on one exact PXCB binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeAgentControlRequestV1 {
+    request_id: RuntimeAgentControlRequestIdV1,
+    kind: RuntimeAgentControlKindV1,
+    carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    target: RuntimeHostId,
+    expected_runtime_store_instance_id: [u8; 32],
+    expected_runtime_host_epoch: u64,
+    expected_active_pxst_digest: Digest32,
+    intended_client: PrincipalRef,
+    managed_fabric_apply_request: Option<ManagedFabricApplyRequestV1>,
+    managed_agent_stack_apply_request: Option<ManagedAgentStackApplyRequestV1>,
+    payload_wire_digest: Digest32,
+    authentication: ApplyRequestAuthentication,
+    canonical_wire: Box<[u8]>,
+    request_digest: Digest32,
+}
+
+impl RuntimeAgentControlRequestV1 {
+    fn try_new(
+        draft: RuntimeAgentControlRequestDraftV1,
+        authentication: ApplyRequestAuthentication,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        if authentication.claim() != &draft.auth_claim {
+            return Err(ManagedServingBootstrapError::AuthenticationMismatch);
+        }
+        let canonical_wire = build_runtime_agent_control_request_wire(&draft, &authentication)?;
+        if canonical_wire.len() > MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES {
+            return Err(ManagedServingBootstrapError::FrameTooLarge);
+        }
+        let request_digest = digest(AGENT_CONTROL_REQUEST_DIGEST_DOMAIN, &canonical_wire)?;
+        Ok(Self {
+            request_id: draft.request_id,
+            kind: draft.kind,
+            carrier: draft.carrier,
+            target: draft.target,
+            expected_runtime_store_instance_id: draft.expected_runtime_store_instance_id,
+            expected_runtime_host_epoch: draft.expected_runtime_host_epoch,
+            expected_active_pxst_digest: draft.expected_active_pxst_digest,
+            intended_client: draft.intended_client,
+            managed_fabric_apply_request: draft.managed_fabric_apply_request,
+            managed_agent_stack_apply_request: draft.managed_agent_stack_apply_request,
+            payload_wire_digest: draft.payload_wire_digest,
+            authentication,
+            canonical_wire: canonical_wire.into_boxed_slice(),
+            request_digest,
+        })
+    }
+
+    /// Strictly decodes one bounded canonical PXAG v1 frame.
+    pub fn decode(frame: &[u8]) -> Result<Self, ManagedServingBootstrapError> {
+        if frame.len() > MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES {
+            return Err(ManagedServingBootstrapError::FrameTooLarge);
+        }
+        if frame.len() < AGENT_CONTROL_REQUEST_FIXED_BYTES {
+            return Err(ManagedServingBootstrapError::Truncated);
+        }
+        let mut cursor = Cursor::new(frame);
+        if cursor.array::<4>()? != *RUNTIME_AGENT_CONTROL_REQUEST_MAGIC
+            || cursor.u16()? != RUNTIME_AGENT_CONTROL_VERSION
+        {
+            return Err(ManagedServingBootstrapError::UnsupportedWire);
+        }
+        let kind = RuntimeAgentControlKindV1::decode(cursor.u16()?)?;
+        if cursor.u16()? != 0 {
+            return Err(ManagedServingBootstrapError::NonCanonicalFrame);
+        }
+        let carrier_length = cursor.usize_u16()?;
+        let payload_length = cursor.usize_u32()?;
+        let request_id = RuntimeAgentControlRequestIdV1::try_from_bytes(cursor.array()?)?;
+        let carrier_digest = Digest32::from_bytes(cursor.array()?);
+        let target = RuntimeHostId::from_bytes(cursor.array()?);
+        let expected_runtime_store_instance_id = cursor.array()?;
+        let expected_runtime_host_epoch = cursor.u64()?;
+        let expected_active_pxst_digest = Digest32::from_bytes(cursor.array()?);
+        let intended_client = PrincipalRef::from_bytes(cursor.array()?);
+        let payload_wire_digest = Digest32::from_bytes(cursor.array()?);
+        let auth_claim = decode_request_claim(&mut cursor)?;
+        let signature_length = cursor.usize_u16()?;
+        validate_runtime_agent_control_request_lengths(
+            kind,
+            carrier_length,
+            payload_length,
+            signature_length,
+            expected_active_pxst_digest,
+            intended_client,
+        )?;
+        let carrier = RestrictedRuntimeApplyCarrierBindingV1::decode(cursor.take(carrier_length)?)
+            .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlBinding)?;
+        if carrier.binding_digest() != carrier_digest {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlBinding);
+        }
+        let payload = cursor.take(payload_length)?;
+        let (managed_fabric_apply_request, managed_agent_stack_apply_request) = match kind {
+            RuntimeAgentControlKindV1::ApplyManagedFabric => (
+                Some(
+                    ManagedFabricApplyRequestV1::decode(payload)
+                        .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlPayload)?,
+                ),
+                None,
+            ),
+            RuntimeAgentControlKindV1::ApplyManagedAgentStack => (
+                None,
+                Some(
+                    ManagedAgentStackApplyRequestV1::decode(payload)
+                        .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlPayload)?,
+                ),
+            ),
+            RuntimeAgentControlKindV1::DescribeConversationPort => (None, None),
+        };
+        if (payload.is_empty() && !digest_is_zero(payload_wire_digest))
+            || (!payload.is_empty()
+                && digest(AGENT_CONTROL_REQUEST_PAYLOAD_DIGEST_DOMAIN, payload)?
+                    != payload_wire_digest)
+        {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
+        }
+        let signature = cursor.take(signature_length)?;
+        cursor.finish()?;
+        let fields = RuntimeAgentControlRequestFieldsV1 {
+            request_id,
+            carrier,
+            target,
+            expected_runtime_store_instance_id,
+            expected_runtime_host_epoch,
+            auth_claim,
+        };
+        let draft = RuntimeAgentControlRequestDraftV1::try_new(
+            fields,
+            kind,
+            expected_active_pxst_digest,
+            intended_client,
+            managed_fabric_apply_request,
+            managed_agent_stack_apply_request,
+        )?;
+        if draft.payload_wire_digest != payload_wire_digest {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
+        }
+        let decoded = draft.finalize(signature)?;
+        if decoded.canonical_wire() != frame {
+            return Err(ManagedServingBootstrapError::NonCanonicalFrame);
+        }
+        Ok(decoded)
+    }
+
+    /// Verifies the outer Controller signature against the exact PXCB pins.
+    pub fn verify_controller_request<Verify>(
+        &self,
+        expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        verify: Verify,
+    ) -> Result<ControllerAuthenticatedRuntimeAgentControlRequestV1<'_>, ManagedServingBootstrapError>
+    where
+        Verify: FnOnce(PrincipalRef, ApplyAuthKeyRef, Digest32, &[u8], &[u8]) -> bool,
+    {
+        if &self.carrier != expected_carrier {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlBinding);
+        }
+        let transcript = self.signing_transcript()?;
+        if !verify(
+            self.carrier.controller_principal(),
+            self.carrier.controller_request_key(),
+            self.carrier.controller_request_key_fingerprint(),
+            transcript.as_bytes(),
+            self.authentication.signature(),
+        ) {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlAuthentication);
+        }
+        Ok(ControllerAuthenticatedRuntimeAgentControlRequestV1 { request: self })
+    }
+
+    #[must_use]
+    pub const fn request_id(&self) -> RuntimeAgentControlRequestIdV1 {
+        self.request_id
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RuntimeAgentControlKindV1 {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn carrier(&self) -> &RestrictedRuntimeApplyCarrierBindingV1 {
+        &self.carrier
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn expected_runtime_store_instance_id(&self) -> [u8; 32] {
+        self.expected_runtime_store_instance_id
+    }
+
+    #[must_use]
+    pub const fn expected_runtime_host_epoch(&self) -> u64 {
+        self.expected_runtime_host_epoch
+    }
+
+    #[must_use]
+    pub const fn expected_active_pxst_digest(&self) -> Digest32 {
+        self.expected_active_pxst_digest
+    }
+
+    #[must_use]
+    pub const fn intended_client(&self) -> PrincipalRef {
+        self.intended_client
+    }
+
+    #[must_use]
+    pub const fn managed_fabric_apply_request(&self) -> Option<&ManagedFabricApplyRequestV1> {
+        self.managed_fabric_apply_request.as_ref()
+    }
+
+    #[must_use]
+    pub const fn managed_agent_stack_apply_request(
+        &self,
+    ) -> Option<&ManagedAgentStackApplyRequestV1> {
+        self.managed_agent_stack_apply_request.as_ref()
+    }
+
+    #[must_use]
+    pub const fn payload_wire_digest(&self) -> Digest32 {
+        self.payload_wire_digest
+    }
+
+    #[must_use]
+    pub const fn authentication(&self) -> &ApplyRequestAuthentication {
+        &self.authentication
+    }
+
+    #[must_use]
+    pub fn canonical_wire(&self) -> &[u8] {
+        &self.canonical_wire
+    }
+
+    #[must_use]
+    pub const fn request_digest(&self) -> Digest32 {
+        self.request_digest
+    }
+
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<RuntimeAgentControlSigningTranscriptV1, ManagedServingBootstrapError> {
+        RuntimeAgentControlRequestDraftV1 {
+            request_id: self.request_id,
+            kind: self.kind,
+            carrier: self.carrier.clone(),
+            target: self.target,
+            expected_runtime_store_instance_id: self.expected_runtime_store_instance_id,
+            expected_runtime_host_epoch: self.expected_runtime_host_epoch,
+            expected_active_pxst_digest: self.expected_active_pxst_digest,
+            intended_client: self.intended_client,
+            managed_fabric_apply_request: self.managed_fabric_apply_request.clone(),
+            managed_agent_stack_apply_request: self.managed_agent_stack_apply_request.clone(),
+            payload_wire_digest: self.payload_wire_digest,
+            auth_claim: self.authentication.claim().clone(),
+        }
+        .signing_transcript()
+    }
+}
+
+/// Marker issued only after caller-owned verification accepts PXAG and PXCB.
+#[derive(Clone, Copy, Debug)]
+pub struct ControllerAuthenticatedRuntimeAgentControlRequestV1<'a> {
+    request: &'a RuntimeAgentControlRequestV1,
+}
+
+impl<'a> ControllerAuthenticatedRuntimeAgentControlRequestV1<'a> {
+    #[must_use]
+    pub const fn request(self) -> &'a RuntimeAgentControlRequestV1 {
+        self.request
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> RuntimeAgentControlKindV1 {
+        self.request.kind()
+    }
+}
+
+/// Runtime response signer bound to the exact public PXCB, not to the inner
+/// Runtime-local UDS channel carried by PXFT/PXST.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RuntimeAgentControlResponseAuthClaimV1 {
+    runtime_principal: PrincipalRef,
+    key: ApplyAuthKeyRef,
+    algorithm: ApplyAuthAlgorithm,
+    algorithm_version: u16,
+    carrier_binding_digest: Digest32,
+}
+
+impl RuntimeAgentControlResponseAuthClaimV1 {
+    pub fn try_new(
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        key: ApplyAuthKeyRef,
+        algorithm: ApplyAuthAlgorithm,
+        algorithm_version: u16,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        let claim = Self {
+            runtime_principal: carrier.runtime_principal(),
+            key,
+            algorithm,
+            algorithm_version,
+            carrier_binding_digest: carrier.binding_digest(),
+        };
+        validate_runtime_agent_control_response_auth(claim, carrier)?;
+        Ok(claim)
+    }
+
+    #[must_use]
+    pub const fn runtime_principal(self) -> PrincipalRef {
+        self.runtime_principal
+    }
+
+    #[must_use]
+    pub const fn key(self) -> ApplyAuthKeyRef {
+        self.key
+    }
+
+    #[must_use]
+    pub const fn algorithm(self) -> ApplyAuthAlgorithm {
+        self.algorithm
+    }
+
+    #[must_use]
+    pub const fn algorithm_version(self) -> u16 {
+        self.algorithm_version
+    }
+
+    #[must_use]
+    pub const fn carrier_binding_digest(self) -> Digest32 {
+        self.carrier_binding_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeAgentControlReceiptPayloadV1 {
+    ManagedFabric(Box<ManagedFabricApplyTerminalReceiptV1>),
+    ManagedAgentStack(Box<ManagedAgentStackTerminalReceiptV1>),
+    ConversationPortDescriptor(Box<[u8]>),
+}
+
+impl RuntimeAgentControlReceiptPayloadV1 {
+    fn canonical_wire(&self) -> &[u8] {
+        match self {
+            Self::ManagedFabric(receipt) => receipt.canonical_wire(),
+            Self::ManagedAgentStack(receipt) => receipt.canonical_wire(),
+            Self::ConversationPortDescriptor(descriptor) => descriptor,
+        }
+    }
+}
+
+/// Signature-independent Runtime producer for one PXAH receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeAgentControlReceiptDraftV1 {
+    request_id: RuntimeAgentControlRequestIdV1,
+    request_digest: Digest32,
+    request_nonce: Box<[u8]>,
+    kind: RuntimeAgentControlKindV1,
+    carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    target: RuntimeHostId,
+    runtime_store_instance_id: [u8; 32],
+    runtime_host_epoch: u64,
+    expected_active_pxst_digest: Digest32,
+    intended_client: PrincipalRef,
+    payload: RuntimeAgentControlReceiptPayloadV1,
+    payload_wire_digest: Digest32,
+    fabric_generation: Option<ManagedServiceGeneration>,
+    agent_generation: Option<ManagedServiceGeneration>,
+    auth_claim: RuntimeAgentControlResponseAuthClaimV1,
+}
+
+impl RuntimeAgentControlReceiptDraftV1 {
+    /// Wraps one byte-identical PXFT after validating it against the exact
+    /// inner PXAR v6 and its current Runtime-local channel.
+    ///
+    /// `current_channel` is used only by PXFT correlation. It is not encoded
+    /// into PXAH and is never interpreted as the PXCB/TLS binding.
+    pub fn try_managed_fabric_apply(
+        request: &RuntimeAgentControlRequestV1,
+        receipt: ManagedFabricApplyTerminalReceiptV1,
+        current_channel: ReferenceChannelBindingV1,
+        auth_claim: RuntimeAgentControlResponseAuthClaimV1,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        let inner = request
+            .managed_fabric_apply_request()
+            .ok_or(ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
+        receipt
+            .validate_against_request(inner, current_channel)
+            .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
+        Self::try_new(
+            request,
+            RuntimeAgentControlReceiptPayloadV1::ManagedFabric(Box::new(receipt)),
+            None,
+            None,
+            auth_claim,
+        )
+    }
+
+    /// Wraps one byte-identical PXST after validating it against the exact
+    /// inner PXAR v7 and its current Runtime-local channel.
+    ///
+    /// `current_channel` is correlation input only and never becomes a public
+    /// transport or access claim.
+    pub fn try_managed_agent_stack_apply(
+        request: &RuntimeAgentControlRequestV1,
+        receipt: ManagedAgentStackTerminalReceiptV1,
+        current_channel: ReferenceChannelBindingV1,
+        auth_claim: RuntimeAgentControlResponseAuthClaimV1,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        let inner = request
+            .managed_agent_stack_apply_request()
+            .ok_or(ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
+        receipt
+            .validate_against_request(inner, current_channel)
+            .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
+        Self::try_new(
+            request,
+            RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(Box::new(receipt)),
+            None,
+            None,
+            auth_claim,
+        )
+    }
+
+    /// Binds one opaque PXAP bootstrap descriptor to the current live owner.
+    ///
+    /// The expected PXST digest is the broker's current byte-exact capability
+    /// root. Fabric/Agent generations are separate current live facts, so a
+    /// normal Runtime recovery may retain PXST bytes while advancing either
+    /// physical generation. This receipt is not a TLS authorization, access
+    /// grant, session, capability, discovery result, or retry authority.
+    pub fn try_conversation_port_descriptor(
+        request: &RuntimeAgentControlRequestV1,
+        descriptor: &[u8],
+        fabric_generation: ManagedServiceGeneration,
+        agent_generation: ManagedServiceGeneration,
+        auth_claim: RuntimeAgentControlResponseAuthClaimV1,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        Self::try_new(
+            request,
+            RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(descriptor.into()),
+            Some(fabric_generation),
+            Some(agent_generation),
+            auth_claim,
+        )
+    }
+
+    fn try_new(
+        request: &RuntimeAgentControlRequestV1,
+        payload: RuntimeAgentControlReceiptPayloadV1,
+        fabric_generation: Option<ManagedServiceGeneration>,
+        agent_generation: Option<ManagedServiceGeneration>,
+        auth_claim: RuntimeAgentControlResponseAuthClaimV1,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        let payload_wire_digest = digest(
+            AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN,
+            payload.canonical_wire(),
+        )?;
+        let draft = Self {
+            request_id: request.request_id,
+            request_digest: request.request_digest,
+            request_nonce: request.authentication.claim().nonce().into(),
+            kind: request.kind,
+            carrier: request.carrier.clone(),
+            target: request.target,
+            runtime_store_instance_id: request.expected_runtime_store_instance_id,
+            runtime_host_epoch: request.expected_runtime_host_epoch,
+            expected_active_pxst_digest: request.expected_active_pxst_digest,
+            intended_client: request.intended_client,
+            payload,
+            payload_wire_digest,
+            fabric_generation,
+            agent_generation,
+            auth_claim,
+        };
+        validate_runtime_agent_control_receipt_draft(&draft)?;
+        validate_runtime_agent_control_receipt_against_request(&draft, request)?;
+        Ok(draft)
+    }
+
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<RuntimeAgentControlSigningTranscriptV1, ManagedServingBootstrapError> {
+        let mut transcript = build_runtime_agent_control_receipt_base(
+            self,
+            AGENT_CONTROL_RECEIPT_TRANSCRIPT_MAGIC,
+            RUNTIME_AGENT_CONTROL_RECEIPT_SIGNING_VERSION,
+        )?;
+        append_runtime_agent_control_receipt_values(&mut transcript, self);
+        Ok(RuntimeAgentControlSigningTranscriptV1(
+            transcript.into_boxed_slice(),
+        ))
+    }
+
+    pub fn finalize(
+        self,
+        signature: &[u8],
+    ) -> Result<RuntimeAgentControlReceiptV1, ManagedServingBootstrapError> {
+        if signature.is_empty() || signature.len() > MAX_APPLY_AUTH_SIGNATURE_BYTES {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlAuthentication);
+        }
+        RuntimeAgentControlReceiptV1::try_new(self, signature)
+    }
+}
+
+/// Strict Runtime-signed PXAH response to one exact PXAG request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeAgentControlReceiptV1 {
+    request_id: RuntimeAgentControlRequestIdV1,
+    request_digest: Digest32,
+    request_nonce: Box<[u8]>,
+    kind: RuntimeAgentControlKindV1,
+    carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    target: RuntimeHostId,
+    runtime_store_instance_id: [u8; 32],
+    runtime_host_epoch: u64,
+    expected_active_pxst_digest: Digest32,
+    intended_client: PrincipalRef,
+    payload: RuntimeAgentControlReceiptPayloadV1,
+    payload_wire_digest: Digest32,
+    fabric_generation: Option<ManagedServiceGeneration>,
+    agent_generation: Option<ManagedServiceGeneration>,
+    auth_claim: RuntimeAgentControlResponseAuthClaimV1,
+    signature: Box<[u8]>,
+    canonical_wire: Box<[u8]>,
+    receipt_digest: Digest32,
+}
+
+impl RuntimeAgentControlReceiptV1 {
+    fn try_new(
+        draft: RuntimeAgentControlReceiptDraftV1,
+        signature: &[u8],
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        let canonical_wire = build_runtime_agent_control_receipt_wire(&draft, signature)?;
+        if canonical_wire.len() > MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES {
+            return Err(ManagedServingBootstrapError::FrameTooLarge);
+        }
+        let receipt_digest = digest(AGENT_CONTROL_RECEIPT_DIGEST_DOMAIN, &canonical_wire)?;
+        Ok(Self {
+            request_id: draft.request_id,
+            request_digest: draft.request_digest,
+            request_nonce: draft.request_nonce,
+            kind: draft.kind,
+            carrier: draft.carrier,
+            target: draft.target,
+            runtime_store_instance_id: draft.runtime_store_instance_id,
+            runtime_host_epoch: draft.runtime_host_epoch,
+            expected_active_pxst_digest: draft.expected_active_pxst_digest,
+            intended_client: draft.intended_client,
+            payload: draft.payload,
+            payload_wire_digest: draft.payload_wire_digest,
+            fabric_generation: draft.fabric_generation,
+            agent_generation: draft.agent_generation,
+            auth_claim: draft.auth_claim,
+            signature: signature.into(),
+            canonical_wire: canonical_wire.into_boxed_slice(),
+            receipt_digest,
+        })
+    }
+
+    /// Strictly decodes one bounded canonical PXAH v1 frame.
+    pub fn decode(frame: &[u8]) -> Result<Self, ManagedServingBootstrapError> {
+        if frame.len() > MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES {
+            return Err(ManagedServingBootstrapError::FrameTooLarge);
+        }
+        if frame.len() < AGENT_CONTROL_RECEIPT_FIXED_BYTES {
+            return Err(ManagedServingBootstrapError::Truncated);
+        }
+        let mut cursor = Cursor::new(frame);
+        if cursor.array::<4>()? != *RUNTIME_AGENT_CONTROL_RECEIPT_MAGIC
+            || cursor.u16()? != RUNTIME_AGENT_CONTROL_VERSION
+        {
+            return Err(ManagedServingBootstrapError::UnsupportedWire);
+        }
+        let kind = RuntimeAgentControlKindV1::decode(cursor.u16()?)?;
+        if cursor.u16()? != 0 {
+            return Err(ManagedServingBootstrapError::NonCanonicalFrame);
+        }
+        let carrier_length = cursor.usize_u16()?;
+        let payload_length = cursor.usize_u32()?;
+        let nonce_length = cursor.usize_u16()?;
+        let request_id = RuntimeAgentControlRequestIdV1::try_from_bytes(cursor.array()?)?;
+        let request_digest = Digest32::from_bytes(cursor.array()?);
+        let carrier_digest = Digest32::from_bytes(cursor.array()?);
+        let target = RuntimeHostId::from_bytes(cursor.array()?);
+        let runtime_store_instance_id = cursor.array()?;
+        let runtime_host_epoch = cursor.u64()?;
+        let expected_active_pxst_digest = Digest32::from_bytes(cursor.array()?);
+        let intended_client = PrincipalRef::from_bytes(cursor.array()?);
+        let payload_wire_digest = Digest32::from_bytes(cursor.array()?);
+        let fabric_generation = decode_optional_managed_generation(cursor.u64()?)?;
+        let agent_generation = decode_optional_managed_generation(cursor.u64()?)?;
+        let auth_claim = decode_runtime_agent_control_response_auth(&mut cursor)?;
+        let signature_length = cursor.usize_u16()?;
+        validate_runtime_agent_control_receipt_lengths(
+            kind,
+            carrier_length,
+            payload_length,
+            nonce_length,
+            signature_length,
+        )?;
+        let request_nonce: Box<[u8]> = cursor.take(nonce_length)?.into();
+        let carrier = RestrictedRuntimeApplyCarrierBindingV1::decode(cursor.take(carrier_length)?)
+            .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlBinding)?;
+        if carrier.binding_digest() != carrier_digest {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlBinding);
+        }
+        let payload_wire = cursor.take(payload_length)?;
+        if digest(AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN, payload_wire)?
+            != payload_wire_digest
+        {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
+        }
+        let payload = match kind {
+            RuntimeAgentControlKindV1::ApplyManagedFabric => {
+                RuntimeAgentControlReceiptPayloadV1::ManagedFabric(Box::new(
+                    ManagedFabricApplyTerminalReceiptV1::decode(payload_wire)
+                        .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlPayload)?,
+                ))
+            }
+            RuntimeAgentControlKindV1::ApplyManagedAgentStack => {
+                RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(Box::new(
+                    ManagedAgentStackTerminalReceiptV1::decode(payload_wire)
+                        .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlPayload)?,
+                ))
+            }
+            RuntimeAgentControlKindV1::DescribeConversationPort => {
+                validate_runtime_agent_port_descriptor(payload_wire)?;
+                RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(
+                    payload_wire.into(),
+                )
+            }
+        };
+        let signature = cursor.take(signature_length)?;
+        cursor.finish()?;
+        let draft = RuntimeAgentControlReceiptDraftV1 {
+            request_id,
+            request_digest,
+            request_nonce,
+            kind,
+            carrier,
+            target,
+            runtime_store_instance_id,
+            runtime_host_epoch,
+            expected_active_pxst_digest,
+            intended_client,
+            payload,
+            payload_wire_digest,
+            fabric_generation,
+            agent_generation,
+            auth_claim,
+        };
+        validate_runtime_agent_control_receipt_draft(&draft)?;
+        let decoded = draft.finalize(signature)?;
+        if decoded.canonical_wire() != frame {
+            return Err(ManagedServingBootstrapError::NonCanonicalFrame);
+        }
+        Ok(decoded)
+    }
+
+    fn validate_common_against_request(
+        &self,
+        request: &RuntimeAgentControlRequestV1,
+    ) -> Result<(), ManagedServingBootstrapError> {
+        let draft = RuntimeAgentControlReceiptDraftV1 {
+            request_id: self.request_id,
+            request_digest: self.request_digest,
+            request_nonce: self.request_nonce.clone(),
+            kind: self.kind,
+            carrier: self.carrier.clone(),
+            target: self.target,
+            runtime_store_instance_id: self.runtime_store_instance_id,
+            runtime_host_epoch: self.runtime_host_epoch,
+            expected_active_pxst_digest: self.expected_active_pxst_digest,
+            intended_client: self.intended_client,
+            payload: self.payload.clone(),
+            payload_wire_digest: self.payload_wire_digest,
+            fabric_generation: self.fabric_generation,
+            agent_generation: self.agent_generation,
+            auth_claim: self.auth_claim,
+        };
+        validate_runtime_agent_control_receipt_against_request(&draft, request)
+    }
+
+    /// Revalidates an Apply receipt against the exact inner request and the
+    /// supplied current Runtime-local channel. The channel is never compared
+    /// with, or reinterpreted as, the public PXCB/TLS binding.
+    pub fn validate_apply_against_request(
+        &self,
+        request: &RuntimeAgentControlRequestV1,
+        current_channel: ReferenceChannelBindingV1,
+    ) -> Result<(), ManagedServingBootstrapError> {
+        self.validate_common_against_request(request)?;
+        match (&self.payload, request.kind) {
+            (
+                RuntimeAgentControlReceiptPayloadV1::ManagedFabric(receipt),
+                RuntimeAgentControlKindV1::ApplyManagedFabric,
+            ) => {
+                let inner = request
+                    .managed_fabric_apply_request()
+                    .ok_or(ManagedServingBootstrapError::AgentControlCorrelationMismatch)?;
+                receipt
+                    .validate_against_request(inner, current_channel)
+                    .map_err(|_| ManagedServingBootstrapError::AgentControlCorrelationMismatch)?;
+            }
+            (
+                RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(receipt),
+                RuntimeAgentControlKindV1::ApplyManagedAgentStack,
+            ) => {
+                let inner = request
+                    .managed_agent_stack_apply_request()
+                    .ok_or(ManagedServingBootstrapError::AgentControlCorrelationMismatch)?;
+                receipt
+                    .validate_against_request(inner, current_channel)
+                    .map_err(|_| ManagedServingBootstrapError::AgentControlCorrelationMismatch)?;
+            }
+            _ => return Err(ManagedServingBootstrapError::AgentControlCorrelationMismatch),
+        }
+        Ok(())
+    }
+
+    /// Validates one bootstrap-only Describe receipt with no local channel.
+    pub fn validate_descriptor_against_request(
+        &self,
+        request: &RuntimeAgentControlRequestV1,
+    ) -> Result<(), ManagedServingBootstrapError> {
+        self.validate_common_against_request(request)?;
+        if self.kind != RuntimeAgentControlKindV1::DescribeConversationPort
+            || self.conversation_port_descriptor().is_none()
+        {
+            return Err(ManagedServingBootstrapError::AgentControlCorrelationMismatch);
+        }
+        Ok(())
+    }
+
+    /// Verifies an Apply PXAH, including the independently signed inner receipt.
+    pub fn verify_runtime_apply_receipt<'a, Verify>(
+        &'a self,
+        request: &RuntimeAgentControlRequestV1,
+        current_channel: ReferenceChannelBindingV1,
+        expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        verify: Verify,
+    ) -> Result<RuntimeAuthenticatedAgentControlReceiptV1<'a>, ManagedServingBootstrapError>
+    where
+        Verify: FnOnce(PrincipalRef, ApplyAuthKeyRef, Digest32, &[u8], &[u8]) -> bool,
+    {
+        self.validate_apply_against_request(request, current_channel)?;
+        if &self.carrier != expected_carrier {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlBinding);
+        }
+        let transcript = self.signing_transcript()?;
+        if !verify(
+            self.carrier.runtime_principal(),
+            self.carrier.runtime_response_key(),
+            self.carrier.runtime_response_key_fingerprint(),
+            transcript.as_bytes(),
+            &self.signature,
+        ) {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlAuthentication);
+        }
+        Ok(RuntimeAuthenticatedAgentControlReceiptV1 { receipt: self })
+    }
+
+    /// Verifies a bootstrap-only descriptor PXAH without a local-channel input.
+    pub fn verify_runtime_descriptor_receipt<'a, Verify>(
+        &'a self,
+        request: &RuntimeAgentControlRequestV1,
+        expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        verify: Verify,
+    ) -> Result<RuntimeAuthenticatedAgentControlReceiptV1<'a>, ManagedServingBootstrapError>
+    where
+        Verify: FnOnce(PrincipalRef, ApplyAuthKeyRef, Digest32, &[u8], &[u8]) -> bool,
+    {
+        self.validate_descriptor_against_request(request)?;
+        if &self.carrier != expected_carrier {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlBinding);
+        }
+        let transcript = self.signing_transcript()?;
+        if !verify(
+            self.carrier.runtime_principal(),
+            self.carrier.runtime_response_key(),
+            self.carrier.runtime_response_key_fingerprint(),
+            transcript.as_bytes(),
+            &self.signature,
+        ) {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlAuthentication);
+        }
+        Ok(RuntimeAuthenticatedAgentControlReceiptV1 { receipt: self })
+    }
+
+    #[must_use]
+    pub const fn request_id(&self) -> RuntimeAgentControlRequestIdV1 {
+        self.request_id
+    }
+
+    #[must_use]
+    pub const fn request_digest(&self) -> Digest32 {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub fn request_nonce(&self) -> &[u8] {
+        &self.request_nonce
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RuntimeAgentControlKindV1 {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn carrier(&self) -> &RestrictedRuntimeApplyCarrierBindingV1 {
+        &self.carrier
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn runtime_store_instance_id(&self) -> [u8; 32] {
+        self.runtime_store_instance_id
+    }
+
+    #[must_use]
+    pub const fn runtime_host_epoch(&self) -> u64 {
+        self.runtime_host_epoch
+    }
+
+    #[must_use]
+    pub const fn expected_active_pxst_digest(&self) -> Digest32 {
+        self.expected_active_pxst_digest
+    }
+
+    #[must_use]
+    pub const fn intended_client(&self) -> PrincipalRef {
+        self.intended_client
+    }
+
+    #[must_use]
+    pub fn managed_fabric_receipt(
+        &self,
+    ) -> Option<&ManagedFabricApplyTerminalReceiptV1> {
+        match &self.payload {
+            RuntimeAgentControlReceiptPayloadV1::ManagedFabric(receipt) => {
+                Some(receipt.as_ref())
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn managed_agent_stack_receipt(
+        &self,
+    ) -> Option<&ManagedAgentStackTerminalReceiptV1> {
+        match &self.payload {
+            RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(receipt) => {
+                Some(receipt.as_ref())
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn conversation_port_descriptor(&self) -> Option<&[u8]> {
+        match &self.payload {
+            RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(descriptor) => {
+                Some(descriptor)
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn payload_wire_digest(&self) -> Digest32 {
+        self.payload_wire_digest
+    }
+
+    #[must_use]
+    pub const fn fabric_generation(&self) -> Option<ManagedServiceGeneration> {
+        self.fabric_generation
+    }
+
+    #[must_use]
+    pub const fn agent_generation(&self) -> Option<ManagedServiceGeneration> {
+        self.agent_generation
+    }
+
+    #[must_use]
+    pub const fn authentication(&self) -> RuntimeAgentControlResponseAuthClaimV1 {
+        self.auth_claim
+    }
+
+    #[must_use]
+    pub fn authentication_signature(&self) -> &[u8] {
+        &self.signature
+    }
+
+    #[must_use]
+    pub fn canonical_wire(&self) -> &[u8] {
+        &self.canonical_wire
+    }
+
+    #[must_use]
+    pub const fn receipt_digest(&self) -> Digest32 {
+        self.receipt_digest
+    }
+
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<RuntimeAgentControlSigningTranscriptV1, ManagedServingBootstrapError> {
+        RuntimeAgentControlReceiptDraftV1 {
+            request_id: self.request_id,
+            request_digest: self.request_digest,
+            request_nonce: self.request_nonce.clone(),
+            kind: self.kind,
+            carrier: self.carrier.clone(),
+            target: self.target,
+            runtime_store_instance_id: self.runtime_store_instance_id,
+            runtime_host_epoch: self.runtime_host_epoch,
+            expected_active_pxst_digest: self.expected_active_pxst_digest,
+            intended_client: self.intended_client,
+            payload: self.payload.clone(),
+            payload_wire_digest: self.payload_wire_digest,
+            fabric_generation: self.fabric_generation,
+            agent_generation: self.agent_generation,
+            auth_claim: self.auth_claim,
+        }
+        .signing_transcript()
+    }
+}
+
+/// Marker issued after exact PXAH correlation and Runtime signature checks.
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeAuthenticatedAgentControlReceiptV1<'a> {
+    receipt: &'a RuntimeAgentControlReceiptV1,
+}
+
+impl<'a> RuntimeAuthenticatedAgentControlReceiptV1<'a> {
+    #[must_use]
+    pub const fn receipt(self) -> &'a RuntimeAgentControlReceiptV1 {
+        self.receipt
     }
 }
 
@@ -1645,6 +2881,491 @@ impl<'a> RuntimeAuthenticatedControlDescribeReadyV1<'a> {
     }
 }
 
+fn validate_runtime_agent_control_request_fields(
+    fields: &RuntimeAgentControlRequestFieldsV1,
+    kind: RuntimeAgentControlKindV1,
+    expected_active_pxst_digest: Digest32,
+    intended_client: PrincipalRef,
+    managed_fabric_apply_request: Option<&ManagedFabricApplyRequestV1>,
+    managed_agent_stack_apply_request: Option<&ManagedAgentStackApplyRequestV1>,
+) -> Result<(), ManagedServingBootstrapError> {
+    if bytes_are_zero(fields.request_id.as_bytes())
+        || bytes_are_zero(fields.target.as_bytes())
+        || bytes_are_zero(&fields.expected_runtime_store_instance_id)
+        || fields.expected_runtime_host_epoch == 0
+        || fields.carrier.target() != fields.target
+        || fields.auth_claim.principal() != fields.carrier.controller_principal()
+        || fields.auth_claim.key() != fields.carrier.controller_request_key()
+        || fields.auth_claim.algorithm_version() == 0
+        || fields.auth_claim.nonce().is_empty()
+        || fields.auth_claim.nonce().iter().all(|byte| *byte == 0)
+    {
+        return Err(ManagedServingBootstrapError::InvalidAgentControlRequest);
+    }
+    match (
+        kind,
+        managed_fabric_apply_request,
+        managed_agent_stack_apply_request,
+    ) {
+        (RuntimeAgentControlKindV1::ApplyManagedFabric, Some(request), None) => {
+            if !digest_is_zero(expected_active_pxst_digest)
+                || !bytes_are_zero(intended_client.as_bytes())
+                || fields.request_id.as_bytes() != request.operation_id().as_bytes()
+                || request.target() != fields.target
+                || request.expected_runtime_store_instance_id()
+                    != fields.expected_runtime_store_instance_id
+                || request.authentication().claim().principal()
+                    != fields.carrier.controller_principal()
+                || request.authentication().claim().key()
+                    != fields.carrier.controller_request_key()
+                || request.authentication().claim().nonce() == fields.auth_claim.nonce()
+            {
+                return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
+            }
+        }
+        (RuntimeAgentControlKindV1::ApplyManagedAgentStack, None, Some(request)) => {
+            if !digest_is_zero(expected_active_pxst_digest)
+                || !bytes_are_zero(intended_client.as_bytes())
+                || fields.request_id.as_bytes() != request.operation_id().as_bytes()
+                || request.target() != fields.target
+                || request.expected_runtime_store_instance_id()
+                    != fields.expected_runtime_store_instance_id
+                || request.authentication().claim().principal()
+                    != fields.carrier.controller_principal()
+                || request.authentication().claim().key()
+                    != fields.carrier.controller_request_key()
+                || request.authentication().claim().nonce() == fields.auth_claim.nonce()
+            {
+                return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
+            }
+        }
+        (RuntimeAgentControlKindV1::DescribeConversationPort, None, None) => {
+            if digest_is_zero(expected_active_pxst_digest)
+                || bytes_are_zero(intended_client.as_bytes())
+            {
+                return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
+            }
+        }
+        _ => return Err(ManagedServingBootstrapError::InvalidAgentControlPayload),
+    }
+    Ok(())
+}
+
+fn validate_runtime_agent_control_request_lengths(
+    kind: RuntimeAgentControlKindV1,
+    carrier_length: usize,
+    payload_length: usize,
+    signature_length: usize,
+    expected_active_pxst_digest: Digest32,
+    intended_client: PrincipalRef,
+) -> Result<(), ManagedServingBootstrapError> {
+    if carrier_length == 0
+        || carrier_length > MAX_RESTRICTED_RUNTIME_APPLY_CARRIER_BINDING_BYTES
+        || signature_length == 0
+        || signature_length > MAX_APPLY_AUTH_SIGNATURE_BYTES
+    {
+        return Err(ManagedServingBootstrapError::InvalidLength);
+    }
+    let valid = match kind {
+        RuntimeAgentControlKindV1::ApplyManagedFabric => {
+            payload_length != 0
+                && payload_length <= MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES
+                && digest_is_zero(expected_active_pxst_digest)
+                && bytes_are_zero(intended_client.as_bytes())
+        }
+        RuntimeAgentControlKindV1::ApplyManagedAgentStack => {
+            payload_length != 0
+                && payload_length <= MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES
+                && digest_is_zero(expected_active_pxst_digest)
+                && bytes_are_zero(intended_client.as_bytes())
+        }
+        RuntimeAgentControlKindV1::DescribeConversationPort => {
+            payload_length == 0
+                && !digest_is_zero(expected_active_pxst_digest)
+                && !bytes_are_zero(intended_client.as_bytes())
+        }
+    };
+    if !valid {
+        return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
+    }
+    Ok(())
+}
+
+fn build_runtime_agent_control_request_base(
+    draft: &RuntimeAgentControlRequestDraftV1,
+    magic: &[u8],
+    version: u16,
+) -> Result<Vec<u8>, ManagedServingBootstrapError> {
+    let carrier_length = u16::try_from(draft.carrier.canonical_wire().len())
+        .map_err(|_| ManagedServingBootstrapError::InvalidLength)?;
+    let payload_length = u32::try_from(
+        draft
+            .managed_fabric_apply_request
+            .as_ref()
+            .map(|request| request.canonical_wire().len())
+            .or_else(|| {
+                draft
+                    .managed_agent_stack_apply_request
+                    .as_ref()
+                    .map(|request| request.canonical_wire().len())
+            })
+            .unwrap_or(0),
+    )
+    .map_err(|_| ManagedServingBootstrapError::InvalidLength)?;
+    let nonce_length = u16::try_from(draft.auth_claim.nonce().len())
+        .map_err(|_| ManagedServingBootstrapError::InvalidLength)?;
+    let mut wire = Vec::new();
+    wire.extend_from_slice(magic);
+    wire.extend_from_slice(&version.to_be_bytes());
+    wire.extend_from_slice(&(draft.kind as u16).to_be_bytes());
+    wire.extend_from_slice(&0_u16.to_be_bytes());
+    wire.extend_from_slice(&carrier_length.to_be_bytes());
+    wire.extend_from_slice(&payload_length.to_be_bytes());
+    wire.extend_from_slice(draft.request_id.as_bytes());
+    wire.extend_from_slice(draft.carrier.binding_digest().as_bytes());
+    wire.extend_from_slice(draft.target.as_bytes());
+    wire.extend_from_slice(&draft.expected_runtime_store_instance_id);
+    wire.extend_from_slice(&draft.expected_runtime_host_epoch.to_be_bytes());
+    wire.extend_from_slice(draft.expected_active_pxst_digest.as_bytes());
+    wire.extend_from_slice(draft.intended_client.as_bytes());
+    wire.extend_from_slice(draft.payload_wire_digest.as_bytes());
+    encode_request_claim(&mut wire, &draft.auth_claim, nonce_length);
+    Ok(wire)
+}
+
+fn append_runtime_agent_control_request_values(
+    wire: &mut Vec<u8>,
+    draft: &RuntimeAgentControlRequestDraftV1,
+) {
+    wire.extend_from_slice(draft.carrier.canonical_wire());
+    if let Some(request) = draft.managed_fabric_apply_request.as_ref() {
+        wire.extend_from_slice(request.canonical_wire());
+    }
+    if let Some(request) = draft.managed_agent_stack_apply_request.as_ref() {
+        wire.extend_from_slice(request.canonical_wire());
+    }
+}
+
+fn build_runtime_agent_control_request_wire(
+    draft: &RuntimeAgentControlRequestDraftV1,
+    authentication: &ApplyRequestAuthentication,
+) -> Result<Vec<u8>, ManagedServingBootstrapError> {
+    let signature_length = u16::try_from(authentication.signature().len())
+        .map_err(|_| ManagedServingBootstrapError::InvalidLength)?;
+    let mut wire = build_runtime_agent_control_request_base(
+        draft,
+        RUNTIME_AGENT_CONTROL_REQUEST_MAGIC,
+        RUNTIME_AGENT_CONTROL_VERSION,
+    )?;
+    wire.extend_from_slice(&signature_length.to_be_bytes());
+    append_runtime_agent_control_request_values(&mut wire, draft);
+    wire.extend_from_slice(authentication.signature());
+    Ok(wire)
+}
+
+fn validate_runtime_agent_control_response_auth(
+    claim: RuntimeAgentControlResponseAuthClaimV1,
+    carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+) -> Result<(), ManagedServingBootstrapError> {
+    if bytes_are_zero(claim.runtime_principal.as_bytes())
+        || bytes_are_zero(claim.key.as_bytes())
+        || claim.algorithm_version == 0
+        || digest_is_zero(claim.carrier_binding_digest)
+        || claim.runtime_principal != carrier.runtime_principal()
+        || claim.key != carrier.runtime_response_key()
+        || claim.carrier_binding_digest != carrier.binding_digest()
+    {
+        return Err(ManagedServingBootstrapError::InvalidAgentControlAuthentication);
+    }
+    Ok(())
+}
+
+fn decode_runtime_agent_control_response_auth(
+    cursor: &mut Cursor<'_>,
+) -> Result<RuntimeAgentControlResponseAuthClaimV1, ManagedServingBootstrapError> {
+    let claim = RuntimeAgentControlResponseAuthClaimV1 {
+        runtime_principal: PrincipalRef::from_bytes(cursor.array()?),
+        key: ApplyAuthKeyRef::from_bytes(cursor.array()?),
+        algorithm: ApplyAuthAlgorithm::try_new(cursor.u16()?)?,
+        algorithm_version: cursor.u16()?,
+        carrier_binding_digest: Digest32::from_bytes(cursor.array()?),
+    };
+    if bytes_are_zero(claim.runtime_principal.as_bytes())
+        || bytes_are_zero(claim.key.as_bytes())
+        || claim.algorithm_version == 0
+        || digest_is_zero(claim.carrier_binding_digest)
+    {
+        return Err(ManagedServingBootstrapError::InvalidAgentControlAuthentication);
+    }
+    Ok(claim)
+}
+
+fn decode_optional_managed_generation(
+    value: u64,
+) -> Result<Option<ManagedServiceGeneration>, ManagedServingBootstrapError> {
+    if value == 0 {
+        Ok(None)
+    } else {
+        ManagedServiceGeneration::try_new(value)
+            .map(Some)
+            .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlReceipt)
+    }
+}
+
+fn validate_runtime_agent_port_descriptor(
+    descriptor: &[u8],
+) -> Result<(), ManagedServingBootstrapError> {
+    if descriptor.len() < 6
+        || descriptor.len() > MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES
+        || &descriptor[..4] != b"PXAP"
+        || u16::from_be_bytes([descriptor[4], descriptor[5]]) != 1
+    {
+        return Err(ManagedServingBootstrapError::InvalidAgentControlDescriptor);
+    }
+    Ok(())
+}
+
+fn validate_runtime_agent_control_receipt_draft(
+    draft: &RuntimeAgentControlReceiptDraftV1,
+) -> Result<(), ManagedServingBootstrapError> {
+    if digest_is_zero(draft.request_digest)
+        || draft.request_nonce.is_empty()
+        || draft.request_nonce.len() > MAX_APPLY_AUTH_NONCE_BYTES
+        || draft.request_nonce.iter().all(|byte| *byte == 0)
+        || draft.carrier.target() != draft.target
+        || bytes_are_zero(draft.target.as_bytes())
+        || bytes_are_zero(&draft.runtime_store_instance_id)
+        || draft.runtime_host_epoch == 0
+        || digest_is_zero(draft.payload_wire_digest)
+    {
+        return Err(ManagedServingBootstrapError::InvalidAgentControlReceipt);
+    }
+    validate_runtime_agent_control_response_auth(draft.auth_claim, &draft.carrier)?;
+    let valid = match (&draft.payload, draft.kind) {
+        (
+            RuntimeAgentControlReceiptPayloadV1::ManagedFabric(receipt),
+            RuntimeAgentControlKindV1::ApplyManagedFabric,
+        ) => {
+            receipt.target() == draft.target
+                && receipt.runtime_store_instance_id() == draft.runtime_store_instance_id
+                && receipt.facts().completion_runtime_host_epoch() == draft.runtime_host_epoch
+                && digest_is_zero(draft.expected_active_pxst_digest)
+                && bytes_are_zero(draft.intended_client.as_bytes())
+                && draft.fabric_generation.is_none()
+                && draft.agent_generation.is_none()
+        }
+        (
+            RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(receipt),
+            RuntimeAgentControlKindV1::ApplyManagedAgentStack,
+        ) => {
+            let facts = receipt.facts();
+            facts.target() == draft.target
+                && facts.runtime_store_instance_id() == draft.runtime_store_instance_id
+                && facts.evidence().fields().completion_runtime_host_epoch
+                    == draft.runtime_host_epoch
+                && digest_is_zero(draft.expected_active_pxst_digest)
+                && bytes_are_zero(draft.intended_client.as_bytes())
+                && draft.fabric_generation.is_none()
+                && draft.agent_generation.is_none()
+        }
+        (
+            RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(descriptor),
+            RuntimeAgentControlKindV1::DescribeConversationPort,
+        ) => {
+            !digest_is_zero(draft.expected_active_pxst_digest)
+                && !bytes_are_zero(draft.intended_client.as_bytes())
+                && draft.fabric_generation.is_some()
+                && draft.agent_generation.is_some()
+                && validate_runtime_agent_port_descriptor(descriptor).is_ok()
+        }
+        _ => false,
+    };
+    if !valid
+        || digest(
+            AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN,
+            draft.payload.canonical_wire(),
+        )? != draft.payload_wire_digest
+    {
+        return Err(ManagedServingBootstrapError::InvalidAgentControlReceipt);
+    }
+    Ok(())
+}
+
+fn validate_runtime_agent_control_receipt_against_request(
+    draft: &RuntimeAgentControlReceiptDraftV1,
+    request: &RuntimeAgentControlRequestV1,
+) -> Result<(), ManagedServingBootstrapError> {
+    if draft.request_id != request.request_id
+        || draft.request_digest != request.request_digest
+        || draft.request_nonce.as_ref() != request.authentication.claim().nonce()
+        || draft.kind != request.kind
+        || draft.carrier != request.carrier
+        || draft.target != request.target
+        || draft.runtime_store_instance_id != request.expected_runtime_store_instance_id
+        || draft.runtime_host_epoch != request.expected_runtime_host_epoch
+        || draft.expected_active_pxst_digest != request.expected_active_pxst_digest
+        || draft.intended_client != request.intended_client
+    {
+        return Err(ManagedServingBootstrapError::AgentControlCorrelationMismatch);
+    }
+    let correlated = match (&draft.payload, request.kind) {
+        (
+            RuntimeAgentControlReceiptPayloadV1::ManagedFabric(receipt),
+            RuntimeAgentControlKindV1::ApplyManagedFabric,
+        ) => request.managed_fabric_apply_request.as_ref().is_some_and(|inner| {
+            receipt.target() == inner.target()
+                && receipt.runtime_store_instance_id()
+                    == inner.expected_runtime_store_instance_id()
+                && receipt.provenance() == inner.provenance()
+                && receipt.operation_id() == inner.operation_id()
+                && receipt.request_digest() == inner.envelope_request_digest()
+                && receipt.request_nonce() == inner.authentication().claim().nonce()
+                && receipt.target_slice_digest() == inner.target_slice_digest()
+                && receipt.assignment_digest() == inner.assignment_digest()
+        }),
+        (
+            RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(receipt),
+            RuntimeAgentControlKindV1::ApplyManagedAgentStack,
+        ) => request
+            .managed_agent_stack_apply_request
+            .as_ref()
+            .is_some_and(|inner| {
+                let facts = receipt.facts();
+                facts.target() == inner.target()
+                    && facts.runtime_store_instance_id()
+                        == inner.expected_runtime_store_instance_id()
+                    && facts.source_scope() == inner.provenance().source_scope()
+                    && facts.operation_id() == inner.operation_id()
+                    && facts.request_digest() == inner.envelope_request_digest()
+                    && facts.target_slice_digest() == inner.target_slice_digest()
+                    && facts.assignment_digest() == inner.assignment_digest()
+                    && facts.request_mode() == inner.target_execution().mode()
+            }),
+        (
+            RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(_),
+            RuntimeAgentControlKindV1::DescribeConversationPort,
+        ) => {
+            request.managed_fabric_apply_request.is_none()
+                && request.managed_agent_stack_apply_request.is_none()
+        }
+        _ => false,
+    };
+    if !correlated {
+        return Err(ManagedServingBootstrapError::AgentControlCorrelationMismatch);
+    }
+    Ok(())
+}
+
+fn validate_runtime_agent_control_receipt_lengths(
+    kind: RuntimeAgentControlKindV1,
+    carrier_length: usize,
+    payload_length: usize,
+    nonce_length: usize,
+    signature_length: usize,
+) -> Result<(), ManagedServingBootstrapError> {
+    if carrier_length == 0
+        || carrier_length > MAX_RESTRICTED_RUNTIME_APPLY_CARRIER_BINDING_BYTES
+        || nonce_length == 0
+        || nonce_length > MAX_APPLY_AUTH_NONCE_BYTES
+        || signature_length == 0
+        || signature_length > MAX_APPLY_AUTH_SIGNATURE_BYTES
+    {
+        return Err(ManagedServingBootstrapError::InvalidLength);
+    }
+    let valid = match kind {
+        RuntimeAgentControlKindV1::ApplyManagedFabric => {
+            payload_length != 0
+                && payload_length <= MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES
+        }
+        RuntimeAgentControlKindV1::ApplyManagedAgentStack => {
+            payload_length != 0
+                && payload_length <= MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES
+        }
+        RuntimeAgentControlKindV1::DescribeConversationPort => {
+            (6..=MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES).contains(&payload_length)
+        }
+    };
+    if !valid {
+        return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
+    }
+    Ok(())
+}
+
+fn build_runtime_agent_control_receipt_base(
+    draft: &RuntimeAgentControlReceiptDraftV1,
+    magic: &[u8],
+    version: u16,
+) -> Result<Vec<u8>, ManagedServingBootstrapError> {
+    validate_runtime_agent_control_receipt_draft(draft)?;
+    let carrier_length = u16::try_from(draft.carrier.canonical_wire().len())
+        .map_err(|_| ManagedServingBootstrapError::InvalidLength)?;
+    let payload_length = u32::try_from(draft.payload.canonical_wire().len())
+        .map_err(|_| ManagedServingBootstrapError::InvalidLength)?;
+    let nonce_length = u16::try_from(draft.request_nonce.len())
+        .map_err(|_| ManagedServingBootstrapError::InvalidLength)?;
+    let mut wire = Vec::new();
+    wire.extend_from_slice(magic);
+    wire.extend_from_slice(&version.to_be_bytes());
+    wire.extend_from_slice(&(draft.kind as u16).to_be_bytes());
+    wire.extend_from_slice(&0_u16.to_be_bytes());
+    wire.extend_from_slice(&carrier_length.to_be_bytes());
+    wire.extend_from_slice(&payload_length.to_be_bytes());
+    wire.extend_from_slice(&nonce_length.to_be_bytes());
+    wire.extend_from_slice(draft.request_id.as_bytes());
+    wire.extend_from_slice(draft.request_digest.as_bytes());
+    wire.extend_from_slice(draft.carrier.binding_digest().as_bytes());
+    wire.extend_from_slice(draft.target.as_bytes());
+    wire.extend_from_slice(&draft.runtime_store_instance_id);
+    wire.extend_from_slice(&draft.runtime_host_epoch.to_be_bytes());
+    wire.extend_from_slice(draft.expected_active_pxst_digest.as_bytes());
+    wire.extend_from_slice(draft.intended_client.as_bytes());
+    wire.extend_from_slice(draft.payload_wire_digest.as_bytes());
+    wire.extend_from_slice(
+        &draft
+            .fabric_generation
+            .map_or(0, ManagedServiceGeneration::value)
+            .to_be_bytes(),
+    );
+    wire.extend_from_slice(
+        &draft
+            .agent_generation
+            .map_or(0, ManagedServiceGeneration::value)
+            .to_be_bytes(),
+    );
+    wire.extend_from_slice(draft.auth_claim.runtime_principal.as_bytes());
+    wire.extend_from_slice(draft.auth_claim.key.as_bytes());
+    wire.extend_from_slice(&draft.auth_claim.algorithm.value().to_be_bytes());
+    wire.extend_from_slice(&draft.auth_claim.algorithm_version.to_be_bytes());
+    wire.extend_from_slice(draft.auth_claim.carrier_binding_digest.as_bytes());
+    Ok(wire)
+}
+
+fn append_runtime_agent_control_receipt_values(
+    wire: &mut Vec<u8>,
+    draft: &RuntimeAgentControlReceiptDraftV1,
+) {
+    wire.extend_from_slice(&draft.request_nonce);
+    wire.extend_from_slice(draft.carrier.canonical_wire());
+    wire.extend_from_slice(draft.payload.canonical_wire());
+}
+
+fn build_runtime_agent_control_receipt_wire(
+    draft: &RuntimeAgentControlReceiptDraftV1,
+    signature: &[u8],
+) -> Result<Vec<u8>, ManagedServingBootstrapError> {
+    let signature_length =
+        u16::try_from(signature.len()).map_err(|_| ManagedServingBootstrapError::InvalidLength)?;
+    let mut wire = build_runtime_agent_control_receipt_base(
+        draft,
+        RUNTIME_AGENT_CONTROL_RECEIPT_MAGIC,
+        RUNTIME_AGENT_CONTROL_VERSION,
+    )?;
+    wire.extend_from_slice(&signature_length.to_be_bytes());
+    append_runtime_agent_control_receipt_values(&mut wire, draft);
+    wire.extend_from_slice(signature);
+    Ok(wire)
+}
+
 fn validate_runtime_control_carrier_fields(
     request_id: ManagedServingBootstrapRequestIdV1,
     kind: RuntimeControlCarrierKindV1,
@@ -2129,7 +3850,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Strict PXFB/PXFR construction and decoding failures.
+/// Strict PXFB/PXFR, PXCC/PXDR, and PXAG/PXAH contract failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedServingBootstrapError {
     /// A required opaque identity is zero.
@@ -2152,6 +3873,22 @@ pub enum ManagedServingBootstrapError {
     InvalidControlCarrierPayload,
     /// PXCC/PXDR signer selection, nonce or signature verification failed.
     InvalidControlCarrierAuthentication,
+    /// PXAG carried an unknown or reserved operation kind.
+    UnsupportedAgentControlKind,
+    /// PXAG target/store/epoch/request identity or nonce facts conflict.
+    InvalidAgentControlRequest,
+    /// PXAG/PXAH did not retain the exact selected PXCB value.
+    InvalidAgentControlBinding,
+    /// The kind-specific PXAG/PXAH payload is absent, unexpected or invalid.
+    InvalidAgentControlPayload,
+    /// PXAH outer facts or inner terminal shape are invalid.
+    InvalidAgentControlReceipt,
+    /// PXAP bootstrap bytes are absent, oversized or use another wire.
+    InvalidAgentControlDescriptor,
+    /// PXAG/PXAH request, payload, target/store/epoch or audience facts differ.
+    AgentControlCorrelationMismatch,
+    /// PXAG/PXAH signer selection, PXCB pins, nonce or signature are invalid.
+    InvalidAgentControlAuthentication,
     /// PXDR carried an unknown or reserved Runtime serving phase.
     UnsupportedControlReadyPhase,
     /// PXDR serving, channel, projection or phase facts conflict.
@@ -2228,6 +3965,8 @@ mod tests {
 
     const FABRIC_FIXTURE: &str =
         include_str!("../../../tests/fixtures/wire/s7_managed_fabric_successor_v1.json");
+    const AGENT_STACK_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/wire/s7_managed_agent_stack_successor_v1.json");
 
     fn hex_nibble(byte: u8) -> u8 {
         match byte {
@@ -2250,6 +3989,144 @@ mod tests {
             .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
             .collect();
         ManagedFabricManifestProjectionV1::decode(&bytes).expect("projection decodes")
+    }
+
+    fn fixture_hex_after(fixture: &str, section: &str, key: &str) -> Vec<u8> {
+        let section_start = fixture.find(section).expect("fixture section");
+        let key_start = fixture[section_start..]
+            .find(key)
+            .map(|offset| section_start + offset + key.len())
+            .expect("fixture key");
+        let quote_start = fixture[key_start..]
+            .find('"')
+            .map(|offset| key_start + offset + 1)
+            .expect("fixture quote");
+        let quote_end = fixture[quote_start..]
+            .find('"')
+            .map(|offset| quote_start + offset)
+            .expect("fixture quote end");
+        fixture.as_bytes()[quote_start..quote_end]
+            .chunks_exact(2)
+            .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
+            .collect()
+    }
+
+    fn managed_fabric_apply_fixture() -> (
+        ManagedFabricApplyRequestV1,
+        ManagedFabricApplyTerminalReceiptV1,
+        ReferenceChannelBindingV1,
+    ) {
+        let request = ManagedFabricApplyRequestV1::decode(&fixture_hex_after(
+            FABRIC_FIXTURE,
+            "\"one_managed_fabric_service\"",
+            "\"outer_v6_hex\"",
+        ))
+        .expect("PXAR v6 fixture");
+        let receipt = ManagedFabricApplyTerminalReceiptV1::decode(&fixture_hex_after(
+            FABRIC_FIXTURE,
+            "\"active_ready\"",
+            "\"wire_hex\"",
+        ))
+        .expect("PXFT fixture");
+        let channel = ReferenceChannelBindingV1::try_new(
+            request.target(),
+            PrincipalRef::from_bytes([0xe1; 16]),
+            Digest32::from_bytes([0xe3; 32]),
+            Digest32::from_bytes([0xe4; 32]),
+        )
+        .expect("PXFT fixture channel");
+        (request, receipt, channel)
+    }
+
+    fn managed_agent_apply_fixture() -> (
+        ManagedAgentStackApplyRequestV1,
+        ManagedAgentStackTerminalReceiptV1,
+        ReferenceChannelBindingV1,
+    ) {
+        let request = ManagedAgentStackApplyRequestV1::decode(&fixture_hex_after(
+            AGENT_STACK_FIXTURE,
+            "\"fabric_and_agent\"",
+            "\"outer_v7_hex\"",
+        ))
+        .expect("PXAR v7 fixture");
+        let receipt = ManagedAgentStackTerminalReceiptV1::decode(&fixture_hex_after(
+            AGENT_STACK_FIXTURE,
+            "\"fabric_and_agent\"",
+            "\"wire_hex\"",
+        ))
+        .expect("PXST fixture");
+        let channel = ReferenceChannelBindingV1::try_new(
+            request.target(),
+            PrincipalRef::from_bytes([0x71; 16]),
+            Digest32::from_bytes([0x72; 32]),
+            Digest32::from_bytes([0x73; 32]),
+        )
+        .expect("PXST fixture channel");
+        (request, receipt, channel)
+    }
+
+    fn agent_control_carrier(
+        target: RuntimeHostId,
+        controller_principal: PrincipalRef,
+        controller_key: ApplyAuthKeyRef,
+        runtime_principal: PrincipalRef,
+        runtime_key: ApplyAuthKeyRef,
+    ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+        RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target,
+                runtime_principal,
+                controller_principal,
+                endpoint_ref: [0x81; 16],
+                endpoint_generation: 7,
+                route: "paraegox/runtime/control/v1/apply",
+                controller_request_key: controller_key,
+                controller_request_key_fingerprint: Digest32::from_bytes([0x82; 32]),
+                runtime_response_key: runtime_key,
+                runtime_response_key_fingerprint: Digest32::from_bytes([0x83; 32]),
+                control_transport_profile_ref: [0x84; 16],
+                control_transport_profile_digest: Digest32::from_bytes([0x85; 32]),
+            },
+        )
+        .expect("Agent-control PXCB")
+    }
+
+    fn agent_control_fields(
+        request_id: [u8; 16],
+        target: RuntimeHostId,
+        store: [u8; 32],
+        epoch: u64,
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        nonce: &[u8],
+    ) -> RuntimeAgentControlRequestFieldsV1 {
+        RuntimeAgentControlRequestFieldsV1 {
+            request_id: RuntimeAgentControlRequestIdV1::try_from_bytes(request_id)
+                .expect("Agent-control request id"),
+            target,
+            expected_runtime_store_instance_id: store,
+            expected_runtime_host_epoch: epoch,
+            auth_claim: ApplyRequestAuthClaim::try_new(
+                carrier.controller_principal(),
+                carrier.controller_request_key(),
+                ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+                1,
+                nonce,
+            )
+            .expect("Agent-control auth"),
+            carrier,
+        }
+    }
+
+    fn agent_control_response_auth(
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> RuntimeAgentControlResponseAuthClaimV1 {
+        RuntimeAgentControlResponseAuthClaimV1::try_new(
+            carrier,
+            carrier.runtime_response_key(),
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+        )
+        .expect("Agent-control response auth")
     }
 
     fn channel(target: RuntimeHostId) -> ReferenceChannelBindingV1 {
@@ -2674,6 +4551,464 @@ mod tests {
         assert_eq!(
             RuntimeControlCarrierRequestV1::decode(&apply_magic),
             Err(ManagedServingBootstrapError::UnsupportedWire)
+        );
+    }
+
+    #[test]
+    fn pxag_describe_and_pxah_descriptor_round_trip_verify_and_lock_lengths() {
+        let target = projection().target();
+        let carrier = control_carrier(target);
+        let request = RuntimeAgentControlRequestDraftV1::try_describe_conversation_port(
+            agent_control_fields(
+                [0x90; 16],
+                target,
+                [0x39; 32],
+                9,
+                carrier.clone(),
+                &[0x91; 32],
+            ),
+            Digest32::from_bytes([0x92; 32]),
+            PrincipalRef::from_bytes([0x93; 16]),
+        )
+        .expect("PXAG Describe draft")
+        .finalize(&[0x94; 64])
+        .expect("PXAG Describe");
+        assert_eq!(&request.canonical_wire()[..6], b"PXAG\0\x01");
+        assert_eq!(request.canonical_wire().len(), 597);
+        assert_eq!(
+            RuntimeAgentControlRequestV1::decode(request.canonical_wire())
+                .expect("strict PXAG Describe"),
+            request
+        );
+        let mut controller_signature_tamper = request.canonical_wire().to_vec();
+        *controller_signature_tamper
+            .last_mut()
+            .expect("Controller signature byte") ^= 1;
+        let opaque_controller_signature =
+            RuntimeAgentControlRequestV1::decode(&controller_signature_tamper)
+                .expect("opaque Controller signature remains structurally canonical");
+        assert_eq!(
+            opaque_controller_signature
+                .verify_controller_request(&carrier, |_, _, _, _, _| false)
+                .err(),
+            Some(ManagedServingBootstrapError::InvalidAgentControlAuthentication)
+        );
+        let authenticated = request
+            .verify_controller_request(
+                &carrier,
+                |principal, key, fingerprint, transcript, signature| {
+                    assert_eq!(principal, carrier.controller_principal());
+                    assert_eq!(key, carrier.controller_request_key());
+                    assert_eq!(
+                        fingerprint,
+                        carrier.controller_request_key_fingerprint()
+                    );
+                    assert!(!transcript.is_empty());
+                    signature == [0x94; 64]
+                },
+            )
+            .expect("Controller-authenticated PXAG");
+        assert_eq!(
+            authenticated.kind(),
+            RuntimeAgentControlKindV1::DescribeConversationPort
+        );
+
+        let descriptor = b"PXAP\0\x01opaque";
+        let receipt = RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
+            &request,
+            descriptor,
+            ManagedServiceGeneration::try_new(17).expect("Fabric generation"),
+            ManagedServiceGeneration::try_new(19).expect("Agent generation"),
+            agent_control_response_auth(&carrier),
+        )
+        .expect("PXAH descriptor draft")
+        .finalize(&[0x95; 64])
+        .expect("PXAH descriptor");
+        assert_eq!(&receipt.canonical_wire()[..6], b"PXAH\0\x01");
+        assert_eq!(receipt.canonical_wire().len(), 689);
+        assert_eq!(
+            receipt.conversation_port_descriptor(),
+            Some(&descriptor[..])
+        );
+        assert_eq!(
+            receipt.fabric_generation().map(ManagedServiceGeneration::value),
+            Some(17)
+        );
+        assert_eq!(
+            receipt.agent_generation().map(ManagedServiceGeneration::value),
+            Some(19)
+        );
+        assert_eq!(receipt.expected_active_pxst_digest(), request.expected_active_pxst_digest());
+        assert_eq!(receipt.intended_client(), request.intended_client());
+        let decoded = RuntimeAgentControlReceiptV1::decode(receipt.canonical_wire())
+            .expect("strict PXAH descriptor");
+        assert_eq!(decoded, receipt);
+        decoded
+            .verify_runtime_descriptor_receipt(
+                &request,
+                &carrier,
+                |principal, key, fingerprint, transcript, signature| {
+                    assert_eq!(principal, carrier.runtime_principal());
+                    assert_eq!(key, carrier.runtime_response_key());
+                    assert_eq!(fingerprint, carrier.runtime_response_key_fingerprint());
+                    assert!(!transcript.is_empty());
+                    signature == [0x95; 64]
+                },
+            )
+            .expect("Runtime-authenticated PXAH descriptor");
+
+        let mut runtime_signature_tamper = receipt.canonical_wire().to_vec();
+        *runtime_signature_tamper
+            .last_mut()
+            .expect("Runtime signature byte") ^= 1;
+        let opaque_runtime_signature =
+            RuntimeAgentControlReceiptV1::decode(&runtime_signature_tamper)
+                .expect("opaque Runtime signature remains structurally canonical");
+        assert_eq!(
+            opaque_runtime_signature
+                .verify_runtime_descriptor_receipt(&request, &carrier, |_, _, _, _, _| false)
+                .err(),
+            Some(ManagedServingBootstrapError::InvalidAgentControlAuthentication)
+        );
+
+        let mut request_digest_tamper = receipt.canonical_wire().to_vec();
+        request_digest_tamper[34] ^= 1;
+        let wrong_request_digest =
+            RuntimeAgentControlReceiptV1::decode(&request_digest_tamper)
+                .expect("opaque signature permits correlation check after decode");
+        assert_eq!(
+            wrong_request_digest
+                .validate_descriptor_against_request(&request)
+                .err(),
+            Some(ManagedServingBootstrapError::AgentControlCorrelationMismatch)
+        );
+        let mut request_nonce_tamper = receipt.canonical_wire().to_vec();
+        request_nonce_tamper[AGENT_CONTROL_RECEIPT_FIXED_BYTES] ^= 1;
+        let wrong_request_nonce = RuntimeAgentControlReceiptV1::decode(&request_nonce_tamper)
+            .expect("opaque signature permits nonce correlation check after decode");
+        assert_eq!(
+            wrong_request_nonce
+                .validate_descriptor_against_request(&request)
+                .err(),
+            Some(ManagedServingBootstrapError::AgentControlCorrelationMismatch)
+        );
+
+        let mut payload_tamper = receipt.canonical_wire().to_vec();
+        let payload_offset = AGENT_CONTROL_RECEIPT_FIXED_BYTES
+            + receipt.request_nonce().len()
+            + receipt.carrier().canonical_wire().len();
+        payload_tamper[payload_offset + 6] ^= 1;
+        assert_eq!(
+            RuntimeAgentControlReceiptV1::decode(&payload_tamper),
+            Err(ManagedServingBootstrapError::InvalidAgentControlPayload)
+        );
+        let mut cross_kind = receipt.canonical_wire().to_vec();
+        cross_kind[6..8]
+            .copy_from_slice(&(RuntimeAgentControlKindV1::ApplyManagedFabric as u16).to_be_bytes());
+        assert!(RuntimeAgentControlReceiptV1::decode(&cross_kind).is_err());
+        let mut unknown = receipt.canonical_wire().to_vec();
+        unknown[6..8].copy_from_slice(&99_u16.to_be_bytes());
+        assert_eq!(
+            RuntimeAgentControlReceiptV1::decode(&unknown),
+            Err(ManagedServingBootstrapError::UnsupportedAgentControlKind)
+        );
+        let mut old_magic = receipt.canonical_wire().to_vec();
+        old_magic[..4].copy_from_slice(b"PXDR");
+        assert_eq!(
+            RuntimeAgentControlReceiptV1::decode(&old_magic),
+            Err(ManagedServingBootstrapError::UnsupportedWire)
+        );
+    }
+
+    #[test]
+    fn pxag_apply_kinds_preserve_exact_inner_bytes_and_pxah_revalidates_channel() {
+        let (fabric_request, fabric_terminal, fabric_channel) = managed_fabric_apply_fixture();
+        let fabric_epoch = fabric_terminal.facts().completion_runtime_host_epoch();
+        let fabric_carrier = agent_control_carrier(
+            fabric_request.target(),
+            fabric_request.authentication().claim().principal(),
+            fabric_request.authentication().claim().key(),
+            fabric_channel.runtime_peer(),
+            fabric_terminal.authentication_key(),
+        );
+        let fabric_outer = RuntimeAgentControlRequestDraftV1::try_apply_managed_fabric(
+            agent_control_fields(
+                *fabric_request.operation_id().as_bytes(),
+                fabric_request.target(),
+                fabric_request.expected_runtime_store_instance_id(),
+                fabric_epoch,
+                fabric_carrier.clone(),
+                &[0xa1; 32],
+            ),
+            fabric_request.clone(),
+        )
+        .expect("PXAG PXAR6 draft")
+        .finalize(&[0xa2; 64])
+        .expect("PXAG PXAR6");
+        assert_eq!(
+            fabric_outer
+                .managed_fabric_apply_request()
+                .expect("PXAR6")
+                .canonical_wire(),
+            fabric_request.canonical_wire()
+        );
+        assert_eq!(
+            fabric_outer.canonical_wire().len(),
+            AGENT_CONTROL_REQUEST_FIXED_BYTES
+                + 32
+                + fabric_carrier.canonical_wire().len()
+                + fabric_request.canonical_wire().len()
+                + 64
+        );
+        let fabric_pxah = RuntimeAgentControlReceiptDraftV1::try_managed_fabric_apply(
+            &fabric_outer,
+            fabric_terminal.clone(),
+            fabric_channel,
+            agent_control_response_auth(&fabric_carrier),
+        )
+        .expect("PXAH PXFT draft")
+        .finalize(&[0xa3; 64])
+        .expect("PXAH PXFT");
+        assert_eq!(
+            fabric_pxah
+                .managed_fabric_receipt()
+                .expect("PXFT")
+                .canonical_wire(),
+            fabric_terminal.canonical_wire()
+        );
+        assert_eq!(
+            RuntimeAgentControlReceiptV1::decode(fabric_pxah.canonical_wire())
+                .expect("PXAH PXFT round trip"),
+            fabric_pxah
+        );
+        fabric_pxah
+            .verify_runtime_apply_receipt(
+                &fabric_outer,
+                fabric_channel,
+                &fabric_carrier,
+                |_, _, _, transcript, signature| {
+                    !transcript.is_empty() && signature == [0xa3; 64]
+                },
+            )
+            .expect("PXFT outer and inner correlation");
+        let wrong_fabric_channel = ReferenceChannelBindingV1::try_new(
+            fabric_outer.target(),
+            fabric_channel.runtime_peer(),
+            Digest32::from_bytes([0xcc; 32]),
+            Digest32::from_bytes([0xcd; 32]),
+        )
+        .expect("wrong local channel");
+        assert_eq!(
+            fabric_pxah
+                .validate_apply_against_request(&fabric_outer, wrong_fabric_channel)
+                .err(),
+            Some(ManagedServingBootstrapError::AgentControlCorrelationMismatch)
+        );
+
+        let (agent_request, agent_terminal, agent_channel) = managed_agent_apply_fixture();
+        let agent_epoch = agent_terminal
+            .facts()
+            .evidence()
+            .fields()
+            .completion_runtime_host_epoch;
+        let agent_carrier = agent_control_carrier(
+            agent_request.target(),
+            agent_request.authentication().claim().principal(),
+            agent_request.authentication().claim().key(),
+            agent_channel.runtime_peer(),
+            agent_terminal.authentication_key(),
+        );
+        let agent_outer = RuntimeAgentControlRequestDraftV1::try_apply_managed_agent_stack(
+            agent_control_fields(
+                *agent_request.operation_id().as_bytes(),
+                agent_request.target(),
+                agent_request.expected_runtime_store_instance_id(),
+                agent_epoch,
+                agent_carrier.clone(),
+                &[0xa4; 32],
+            ),
+            agent_request.clone(),
+        )
+        .expect("PXAG PXAR7 draft")
+        .finalize(&[0xa5; 64])
+        .expect("PXAG PXAR7");
+        assert_eq!(
+            agent_outer
+                .managed_agent_stack_apply_request()
+                .expect("PXAR7")
+                .canonical_wire(),
+            agent_request.canonical_wire()
+        );
+        let agent_pxah = RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
+            &agent_outer,
+            agent_terminal.clone(),
+            agent_channel,
+            agent_control_response_auth(&agent_carrier),
+        )
+        .expect("PXAH PXST draft")
+        .finalize(&[0xa6; 64])
+        .expect("PXAH PXST");
+        assert_eq!(
+            agent_pxah
+                .managed_agent_stack_receipt()
+                .expect("PXST")
+                .canonical_wire(),
+            agent_terminal.canonical_wire()
+        );
+        agent_pxah
+            .verify_runtime_apply_receipt(
+                &agent_outer,
+                agent_channel,
+                &agent_carrier,
+                |_, _, _, transcript, signature| {
+                    !transcript.is_empty() && signature == [0xa6; 64]
+                },
+            )
+            .expect("PXST outer and inner correlation");
+
+        let mut cross_kind = fabric_outer.canonical_wire().to_vec();
+        cross_kind[6..8].copy_from_slice(
+            &(RuntimeAgentControlKindV1::ApplyManagedAgentStack as u16).to_be_bytes(),
+        );
+        assert!(RuntimeAgentControlRequestV1::decode(&cross_kind).is_err());
+        let mut inner_tamper = agent_outer.canonical_wire().to_vec();
+        let payload_offset = AGENT_CONTROL_REQUEST_FIXED_BYTES
+            + agent_outer.authentication().claim().nonce().len()
+            + agent_outer.carrier().canonical_wire().len();
+        inner_tamper[payload_offset + 10] ^= 1;
+        assert_eq!(
+            RuntimeAgentControlRequestV1::decode(&inner_tamper),
+            Err(ManagedServingBootstrapError::InvalidAgentControlPayload)
+        );
+    }
+
+    #[test]
+    fn agent_control_rejects_dual_identity_nonce_epoch_auth_and_descriptor_weakening() {
+        let (inner, terminal, channel) = managed_agent_apply_fixture();
+        let epoch = terminal
+            .facts()
+            .evidence()
+            .fields()
+            .completion_runtime_host_epoch;
+        let carrier = agent_control_carrier(
+            inner.target(),
+            inner.authentication().claim().principal(),
+            inner.authentication().claim().key(),
+            channel.runtime_peer(),
+            terminal.authentication_key(),
+        );
+        let wrong_id = RuntimeAgentControlRequestDraftV1::try_apply_managed_agent_stack(
+            agent_control_fields(
+                [0xfe; 16],
+                inner.target(),
+                inner.expected_runtime_store_instance_id(),
+                epoch,
+                carrier.clone(),
+                &[0xb1; 32],
+            ),
+            inner.clone(),
+        );
+        assert_eq!(
+            wrong_id.err(),
+            Some(ManagedServingBootstrapError::InvalidAgentControlPayload)
+        );
+        let same_nonce = RuntimeAgentControlRequestDraftV1::try_apply_managed_agent_stack(
+            agent_control_fields(
+                *inner.operation_id().as_bytes(),
+                inner.target(),
+                inner.expected_runtime_store_instance_id(),
+                epoch,
+                carrier.clone(),
+                inner.authentication().claim().nonce(),
+            ),
+            inner.clone(),
+        );
+        assert_eq!(
+            same_nonce.err(),
+            Some(ManagedServingBootstrapError::InvalidAgentControlPayload)
+        );
+        let outer = RuntimeAgentControlRequestDraftV1::try_apply_managed_agent_stack(
+            agent_control_fields(
+                *inner.operation_id().as_bytes(),
+                inner.target(),
+                inner.expected_runtime_store_instance_id(),
+                epoch + 1,
+                carrier.clone(),
+                &[0xb2; 32],
+            ),
+            inner,
+        )
+        .expect("epoch is an outer expectation")
+        .finalize(&[0xb3; 64])
+        .expect("PXAG");
+        assert_eq!(
+            RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
+                &outer,
+                terminal,
+                channel,
+                agent_control_response_auth(&carrier),
+            )
+            .err(),
+            Some(ManagedServingBootstrapError::InvalidAgentControlReceipt)
+        );
+
+        let target = projection().target();
+        let describe_carrier = control_carrier(target);
+        let fields = || {
+            agent_control_fields(
+                [0xb4; 16],
+                target,
+                [0xb5; 32],
+                23,
+                describe_carrier.clone(),
+                &[0xb6; 32],
+            )
+        };
+        assert_eq!(
+            RuntimeAgentControlRequestDraftV1::try_describe_conversation_port(
+                fields(),
+                Digest32::from_bytes([0; 32]),
+                PrincipalRef::from_bytes([0xb7; 16]),
+            )
+            .err(),
+            Some(ManagedServingBootstrapError::InvalidAgentControlPayload)
+        );
+        assert_eq!(
+            RuntimeAgentControlRequestDraftV1::try_describe_conversation_port(
+                fields(),
+                Digest32::from_bytes([0xb8; 32]),
+                PrincipalRef::from_bytes([0; 16]),
+            )
+            .err(),
+            Some(ManagedServingBootstrapError::InvalidAgentControlPayload)
+        );
+        let describe = RuntimeAgentControlRequestDraftV1::try_describe_conversation_port(
+            fields(),
+            Digest32::from_bytes([0xb8; 32]),
+            PrincipalRef::from_bytes([0xb7; 16]),
+        )
+        .expect("Describe")
+        .finalize(&[0xb9; 64])
+        .expect("PXAG Describe");
+        assert_eq!(
+            RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
+                &describe,
+                &vec![0; MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES + 1],
+                ManagedServiceGeneration::try_new(1).expect("generation"),
+                ManagedServiceGeneration::try_new(2).expect("generation"),
+                agent_control_response_auth(&describe_carrier),
+            )
+            .err(),
+            Some(ManagedServingBootstrapError::InvalidAgentControlReceipt)
+        );
+        assert_eq!(
+            RuntimeAgentControlResponseAuthClaimV1::try_new(
+                &describe_carrier,
+                ApplyAuthKeyRef::from_bytes([0xff; 16]),
+                ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+                1,
+            ),
+            Err(ManagedServingBootstrapError::InvalidAgentControlAuthentication)
         );
     }
 }
