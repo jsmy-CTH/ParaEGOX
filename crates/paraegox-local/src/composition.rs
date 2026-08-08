@@ -20,6 +20,9 @@ use nix::unistd::{Gid, Pid, Uid};
 use paraegox_agent_contracts::{AgentConversationDeckRunId, AgentConversationSessionId};
 use paraegox_agent_service::AgentConversationModelServiceProviderV1;
 use paraegox_deployment::{
+    DeveloperDeploymentAgentBootstrapStartFieldsV1,
+    DeveloperDeploymentAgentBootstrapStartInputV1,
+    DeveloperDeploymentAgentBootstrapStartOutcomeV1,
     DeveloperDeploymentEnrollmentFactsFieldsV1, DeveloperDeploymentEnrollmentFactsV1,
     DeveloperDeploymentOwnerV1, DeveloperDeploymentStartFieldsV1, DeveloperDeploymentStartInputV1,
     DeveloperDeploymentStartModeV1, DeveloperDeploymentStartOutcomeV1,
@@ -35,7 +38,7 @@ use paraegox_deployment::{
     complete_developer_fixture_distributed_agent_stack_v1,
     prepare_developer_fixture_distributed_agent_stack_v1,
     run_developer_fixture_model_agent_stack_v1, run_developer_provisioned_model_agent_stack_v1,
-    start_developer_deployment_v1,
+    start_developer_deployment_agent_bootstrap_v1, start_developer_deployment_v1,
 };
 use paraegox_evidence::EvidenceRetentionPolicyV1;
 use paraegox_evidence::{EvidenceOwnerRefV1, EvidenceStoreEpochV1};
@@ -133,10 +136,12 @@ use crate::config::{
     DEVELOPER_PROVISIONED_MAX_RESPONSE_BODY_BYTES, DEVELOPER_PROVISIONED_PROVIDER_TIMEOUT_NANOS,
 };
 use crate::config::{
-    DeveloperDeploymentConfigV1, DeveloperDistributedFixtureConfigV1,
-    DeveloperDistributedTargetConfigV1, DeveloperFixtureConfigV1, DeveloperLocalProfileV1,
-    DeveloperNodeConfigSchemaV1, DeveloperNodeConfigV1, DeveloperProvisionedConfigV1,
-    ProviderProfileV1, ProvisionedProviderConfigV1, ProvisionedSecretRefV1,
+    DeveloperDeploymentAgentBootstrapLimitsProfileV1, DeveloperDeploymentConfigSchemaV1,
+    DeveloperDeploymentConfigV1, DeveloperDeploymentResolvedPartsV1,
+    DeveloperDistributedFixtureConfigV1, DeveloperDistributedTargetConfigV1,
+    DeveloperFixtureConfigV1, DeveloperLocalProfileV1, DeveloperNodeConfigSchemaV1,
+    DeveloperNodeConfigV1, DeveloperProvisionedConfigV1, ProviderProfileV1,
+    ProvisionedProviderConfigV1, ProvisionedSecretRefV1,
 };
 use crate::error::LocalProcessError;
 use crate::inspection::{
@@ -247,19 +252,83 @@ async fn run_deployment_with_signals(
     let authority_verification_key = SigningKey::from_bytes(&parts.authority_signing_seed)
         .verifying_key()
         .to_bytes();
-    let enrollment = identity::decode_pinned_node_enrollment_artifact_v1(
-        &parts.enrollment_artifact,
-        config.enrollment_artifact_sha256(),
-        controller_verification_key,
-        authority_verification_key,
-    )
-    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+
+    match config.schema() {
+        DeveloperDeploymentConfigSchemaV1::EnrollmentV1 => {
+            let enrollment = identity::decode_pinned_node_enrollment_artifact_v1(
+                &parts.enrollment_artifact,
+                config.enrollment_artifact_sha256(),
+                controller_verification_key,
+                authority_verification_key,
+            )
+            .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+            let input = prepare_developer_deployment_start_input(
+                &config,
+                peer,
+                parts,
+                &enrollment,
+            )?;
+            run_enrollment_deployment_with_signals(input, interrupt, terminate).await
+        }
+        DeveloperDeploymentConfigSchemaV1::ManagedAgentBootstrapV2 => {
+            let enrollment = identity::decode_pinned_node_enrollment_artifact_v2(
+                &parts.enrollment_artifact,
+                config.enrollment_artifact_sha256(),
+                controller_verification_key,
+                authority_verification_key,
+            )
+            .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+            let desired = config
+                .managed_agent_bootstrap()
+                .ok_or(LocalProcessError::DeploymentPreparation)?;
+            if desired.limits_profile()
+                != DeveloperDeploymentAgentBootstrapLimitsProfileV1::DeveloperAgentBootstrapV1
+            {
+                return Err(LocalProcessError::DeploymentPreparation);
+            }
+            let fabric_service_id = desired.fabric_service_id();
+            let agent_service_id = desired.agent_service_id();
+            let fabric_listen_endpoint = desired.fabric_listen().clone();
+            let provider = enrollment.managed_agent_provider_selection();
+            let base = prepare_developer_deployment_start_input(
+                &config,
+                peer,
+                parts,
+                enrollment.common(),
+            )?;
+            let input = DeveloperDeploymentAgentBootstrapStartInputV1::try_new(
+                DeveloperDeploymentAgentBootstrapStartFieldsV1 {
+                    base,
+                    provider,
+                    fabric_service_id,
+                    agent_service_id,
+                    fabric_listen_endpoint,
+                },
+            )
+            .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+            run_agent_bootstrap_deployment_with_signals(input, interrupt, terminate).await
+        }
+    }
+}
+
+fn prepare_developer_deployment_start_input(
+    config: &DeveloperDeploymentConfigV1,
+    peer: DeveloperLocalPeerIdentityV1,
+    parts: DeveloperDeploymentResolvedPartsV1,
+    enrollment: &identity::DeveloperNodeEnrollmentArtifactV1,
+) -> Result<DeveloperDeploymentStartInputV1, LocalProcessError> {
+    let controller_verification_key = SigningKey::from_bytes(&parts.controller_signing_seed)
+        .verifying_key()
+        .to_bytes();
+    let authority_verification_key = SigningKey::from_bytes(&parts.authority_signing_seed)
+        .verifying_key()
+        .to_bytes();
     let verified_manifest = verify_immutable_manifest_ingress(
         enrollment.runtime_manifest_wire(),
         enrollment.runtime_manifest_digest(),
     )
     .map_err(|_| LocalProcessError::DeploymentPreparation)?;
-    let prepared_layout = layout::prepare_deployment(&config)
+    let prepared_layout = layout::prepare_deployment(config)
         .map_err(|_| LocalProcessError::DeploymentPreparation)?;
     let mode = deployment_start_mode(&prepared_layout, config.authority_state_directory())?;
 
@@ -359,7 +428,7 @@ async fn run_deployment_with_signals(
             authority_verification_key,
         })
         .map_err(|_| LocalProcessError::DeploymentPreparation)?;
-    let input = DeveloperDeploymentStartInputV1::try_new(DeveloperDeploymentStartFieldsV1 {
+    DeveloperDeploymentStartInputV1::try_new(DeveloperDeploymentStartFieldsV1 {
         mode,
         controller_store_directory: prepared_layout
             .controller_store_state_directory()
@@ -373,7 +442,14 @@ async fn run_deployment_with_signals(
         runtime_client,
         node_client,
     })
-    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    .map_err(|_| LocalProcessError::DeploymentPreparation)
+}
+
+async fn run_enrollment_deployment_with_signals(
+    input: DeveloperDeploymentStartInputV1,
+    interrupt: &mut TokioSignal,
+    terminate: &mut TokioSignal,
+) -> Result<(), LocalProcessError> {
     let outcome = start_developer_deployment_v1(input)
         .await
         .map_err(|_| LocalProcessError::DeploymentStartup)?;
@@ -397,6 +473,47 @@ async fn run_deployment_with_signals(
         }
         DeveloperDeploymentStartOutcomeV1::ReconcileRequired(owner) => {
             owner
+                .shutdown_and_join()
+                .await
+                .map_err(|_| LocalProcessError::DeploymentJoinedShutdown)?;
+            Err(LocalProcessError::DeploymentReconcileRequired)
+        }
+    }
+}
+
+async fn run_agent_bootstrap_deployment_with_signals(
+    input: DeveloperDeploymentAgentBootstrapStartInputV1,
+    interrupt: &mut TokioSignal,
+    terminate: &mut TokioSignal,
+) -> Result<(), LocalProcessError> {
+    let outcome = start_developer_deployment_agent_bootstrap_v1(input)
+        .await
+        .map_err(|_| LocalProcessError::DeploymentStartup)?;
+    match outcome {
+        DeveloperDeploymentAgentBootstrapStartOutcomeV1::Ready {
+            owner,
+            ready: _facade_ready,
+        } => {
+            let mut owner = *owner;
+            let process_result = match owner.try_poll_exit() {
+                Ok(false) => {
+                    match write_deployment_agent_bootstrap_ready(&mut io::stdout().lock()) {
+                        Ok(()) => {
+                            wait_for_deployment_shutdown(&mut owner, interrupt, terminate).await
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Ok(true) | Err(_) => Err(LocalProcessError::DeploymentOwnerExit),
+            };
+            let cleanup_result = owner
+                .shutdown_and_join()
+                .await
+                .map_err(|_| LocalProcessError::DeploymentJoinedShutdown);
+            process_result.and(cleanup_result)
+        }
+        DeveloperDeploymentAgentBootstrapStartOutcomeV1::ReconcileRequired(owner) => {
+            (*owner)
                 .shutdown_and_join()
                 .await
                 .map_err(|_| LocalProcessError::DeploymentJoinedShutdown)?;
@@ -451,6 +568,15 @@ fn derive_deployment_authority_owner(
 fn write_deployment_ready(output: &mut impl Write) -> Result<(), LocalProcessError> {
     output
         .write_all(b"paraegox: deployment ready\n")
+        .and_then(|()| output.flush())
+        .map_err(|_| LocalProcessError::DeploymentReadyOutput)
+}
+
+fn write_deployment_agent_bootstrap_ready(
+    output: &mut impl Write,
+) -> Result<(), LocalProcessError> {
+    output
+        .write_all(b"paraegox: deployment agent bootstrap ready\n")
         .and_then(|()| output.flush())
         .map_err(|_| LocalProcessError::DeploymentReadyOutput)
 }
@@ -3860,11 +3986,20 @@ mod tests {
     }
 
     #[test]
-    fn public_deployment_ready_marker_is_exact_and_flushed() {
-        let mut output = FlushProbe::default();
-        write_deployment_ready(&mut output).expect("Deployment readiness marker");
-        assert_eq!(output.bytes, b"paraegox: deployment ready\n");
-        assert_eq!(output.flushes, 1);
+    fn public_deployment_ready_markers_are_distinct_exact_and_flushed() {
+        let mut enrollment_output = FlushProbe::default();
+        write_deployment_ready(&mut enrollment_output).expect("Deployment v1 readiness marker");
+        assert_eq!(enrollment_output.bytes, b"paraegox: deployment ready\n");
+        assert_eq!(enrollment_output.flushes, 1);
+
+        let mut agent_bootstrap_output = FlushProbe::default();
+        write_deployment_agent_bootstrap_ready(&mut agent_bootstrap_output)
+            .expect("Deployment v2 Agent-bootstrap readiness marker");
+        assert_eq!(
+            agent_bootstrap_output.bytes,
+            b"paraegox: deployment agent bootstrap ready\n"
+        );
+        assert_eq!(agent_bootstrap_output.flushes, 1);
     }
 
     #[test]
@@ -3884,25 +4019,94 @@ mod tests {
         let local_ready_constructor = concat!("DeveloperDeploymentReadyV1", "::");
         assert!(!source.contains(local_ready_struct_literal));
         assert!(!source.contains(local_ready_constructor));
-        let ready_branch = source
+        let handler_start = source
+            .find("async fn run_enrollment_deployment_with_signals")
+            .expect("v1 outcome handler");
+        let handler_end = source
+            .find("async fn run_agent_bootstrap_deployment_with_signals")
+            .expect("v2 outcome handler");
+        let handler = &source[handler_start..handler_end];
+        let ready_branch = handler
             .find("DeveloperDeploymentStartOutcomeV1::Ready")
             .expect("typed facade Ready branch");
-        let marker_call = source
+        let marker_call = handler
             .find("write_deployment_ready(&mut io::stdout().lock())")
             .expect("Ready marker call");
-        let reconcile_branch = source
+        let reconcile_branch = handler
             .find("DeveloperDeploymentStartOutcomeV1::ReconcileRequired")
             .expect("typed facade ReconcileRequired branch");
-        let outcome_end = source
-            .find("fn deployment_start_mode")
-            .expect("end of outcome handling");
-        let ready_arm = &source[ready_branch..reconcile_branch];
-        let reconcile_arm = &source[reconcile_branch..outcome_end];
-        assert!(source[ready_branch..marker_call].contains("ready: _facade_ready"));
+        let ready_arm = &handler[ready_branch..reconcile_branch];
+        let reconcile_arm = &handler[reconcile_branch..];
+        assert!(handler[ready_branch..marker_call].contains("ready: _facade_ready"));
         assert!(ready_branch < marker_call && marker_call < reconcile_branch);
         assert_eq!(ready_arm.matches(".shutdown_and_join()").count(), 1);
         assert_eq!(reconcile_arm.matches(".shutdown_and_join()").count(), 1);
         assert!(!reconcile_arm.contains("write_deployment_ready"));
+    }
+
+    #[test]
+    fn deployment_agent_bootstrap_ready_is_authorized_only_by_its_facade_ready_variant() {
+        let source = include_str!("composition.rs");
+        let tests_start = source
+            .rfind("\n#[cfg(test)]\nmod tests {")
+            .expect("composition test module");
+        assert_eq!(
+            source[..tests_start]
+                .matches("write_deployment_agent_bootstrap_ready(")
+                .count(),
+            2,
+            "production has exactly one Agent-bootstrap Ready call plus its function definition"
+        );
+        let local_ready_struct_literal =
+            concat!("DeveloperDeploymentAgentBootstrapReadyV1", " {");
+        let local_ready_constructor = concat!("DeveloperDeploymentAgentBootstrapReadyV1", "::");
+        assert!(!source.contains(local_ready_struct_literal));
+        assert!(!source.contains(local_ready_constructor));
+        let handler_start = source
+            .find("async fn run_agent_bootstrap_deployment_with_signals")
+            .expect("v2 outcome handler");
+        let handler_end = source
+            .find("fn deployment_start_mode")
+            .expect("end of v2 outcome handler");
+        let handler = &source[handler_start..handler_end];
+        let ready_branch = handler
+            .find("DeveloperDeploymentAgentBootstrapStartOutcomeV1::Ready")
+            .expect("typed Agent-bootstrap Ready branch");
+        let marker_call = handler
+            .find("write_deployment_agent_bootstrap_ready(&mut io::stdout().lock())")
+            .expect("Agent-bootstrap Ready marker call");
+        let reconcile_branch = handler
+            .find("DeveloperDeploymentAgentBootstrapStartOutcomeV1::ReconcileRequired")
+            .expect("typed Agent-bootstrap ReconcileRequired branch");
+        let ready_arm = &handler[ready_branch..reconcile_branch];
+        let reconcile_arm = &handler[reconcile_branch..];
+        assert!(handler[ready_branch..marker_call].contains("ready: _facade_ready"));
+        assert!(ready_branch < marker_call && marker_call < reconcile_branch);
+        assert_eq!(ready_arm.matches(".shutdown_and_join()").count(), 1);
+        assert_eq!(reconcile_arm.matches(".shutdown_and_join()").count(), 1);
+        assert!(!reconcile_arm.contains("write_deployment_agent_bootstrap_ready"));
+    }
+
+    #[test]
+    fn deployment_schema_dispatch_keeps_provider_and_desired_authority_disjoint() {
+        let source = include_str!("composition.rs");
+        let dispatch_start = source
+            .find("async fn run_deployment_with_signals")
+            .expect("Deployment schema dispatcher");
+        let dispatch_end = source
+            .find("fn prepare_developer_deployment_start_input")
+            .expect("shared T0 input projection");
+        let dispatch = &source[dispatch_start..dispatch_end];
+        assert!(dispatch.contains("match config.schema()"));
+        assert!(dispatch.contains("decode_pinned_node_enrollment_artifact_v1"));
+        assert!(dispatch.contains("decode_pinned_node_enrollment_artifact_v2"));
+        assert!(dispatch.contains("let provider = enrollment.managed_agent_provider_selection();"));
+        assert!(dispatch.contains("let desired = config"));
+        assert!(dispatch.contains(".managed_agent_bootstrap()"));
+        assert!(dispatch.contains("enrollment.common()"));
+        assert!(!dispatch.contains("try_deterministic_fixture"));
+        assert!(!dispatch.contains("write_deployment_ready"));
+        assert!(!dispatch.contains("write_deployment_agent_bootstrap_ready"));
     }
 
     #[test]

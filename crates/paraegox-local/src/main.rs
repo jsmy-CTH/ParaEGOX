@@ -252,17 +252,24 @@ inputs nor persisted in the versioned configuration.
 node starts one split-trust local Runtime and one NodeDaemon. Node config
 schema v1 retains the G1 host-local feature-only profile. Additive schema v2
 starts the G2 host-side Runtime-control listener and authenticated Node-control
-ingress/observation bridge. Both schemas contain verification keys, opaque
+ingress/observation bridge. Additive schema v3 also installs the exact
+deterministic Agent-provider projection without activating an Agent. All
+schemas contain verification keys, opaque
 references, and credential file paths, never Controller or Authority private
 keys. This command does not run Controller, Authority, the managed Fabric
 CoreService, Agent, Model, Inspection, or Textual.
 
 deployment consumes one independently SHA-256-pinned enrollment artifact and
 starts the single DeploymentController, tenure Authority, Runtime-control
-connector, and Node-control connector owner graph. It prints readiness only
-after the durable managed-successor reconciliation reports ManagedReady. This
-bounded command is not evidence of a two-host system proof, remote Agent
-conversation, remote TUI, or reconnect policy."
+connector, and Node-control connector owner graph. Config schema v1 prints its
+original readiness marker only after the durable managed-successor
+reconciliation reports ManagedReady. Schema v2 additionally consumes its
+enrollment-pinned Agent-provider projection plus config-owned Fabric/Agent
+service identities, loopback listener, and fixed limits profile. It prints a
+distinct Agent-bootstrap readiness marker only after the complete durable
+bootstrap facade reports Ready. This bounded command is not evidence of a
+two-host system proof, remote Agent conversation, remote TUI, or reconnect
+policy."
 }
 
 #[cfg(test)]
@@ -420,14 +427,20 @@ mod tests {
         assert!(text.contains("schema v1 retains the G1 host-local feature-only profile"));
         assert!(text.contains("schema v2\nstarts the G2 host-side Runtime-control listener"));
         assert!(text.contains("authenticated Node-control\ningress/observation bridge"));
+        assert!(text.contains("schema v3 also installs the exact\ndeterministic Agent-provider"));
+        assert!(text.contains("without activating an Agent"));
         assert!(text.contains("never Controller or Authority private\nkeys"));
         assert!(text.contains("does not run Controller, Authority"));
         assert!(text.contains("independently SHA-256-pinned enrollment artifact"));
         assert!(text.contains("single DeploymentController"));
-        assert!(text.contains("It prints readiness only\nafter the durable managed-successor"));
+        assert!(text.contains("Config schema v1 prints its\noriginal readiness marker only"));
         assert!(text.contains("reports ManagedReady"));
+        assert!(text.contains("Schema v2 additionally consumes its\nenrollment-pinned Agent-provider"));
+        assert!(text.contains("config-owned Fabric/Agent\nservice identities"));
+        assert!(text.contains("distinct Agent-bootstrap readiness marker"));
+        assert!(text.contains("complete durable\nbootstrap facade reports Ready"));
         assert!(text.contains("not evidence of a two-host system proof"));
-        assert!(text.contains("remote Agent\nconversation, remote TUI"));
+        assert!(text.contains("remote Agent conversation, remote TUI"));
         assert!(text.contains("remote TUI"));
         assert!(text.contains("reconnect policy"));
         assert!(text.contains("absolute versioned configuration"));
