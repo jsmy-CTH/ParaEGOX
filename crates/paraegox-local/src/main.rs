@@ -71,9 +71,7 @@ fn dispatch(arguments: impl IntoIterator<Item = OsString>) -> Result<(), LocalPr
     }
 }
 
-fn compose_real_deployment(
-    config: DeveloperDeploymentConfigV1,
-) -> Result<(), LocalProcessError> {
+fn compose_real_deployment(config: DeveloperDeploymentConfigV1) -> Result<(), LocalProcessError> {
     #[cfg(unix)]
     {
         composition::run_deployment(config)
@@ -417,9 +415,7 @@ mod tests {
         );
         assert!(text.contains("paraegox chat --config <absolute-paraegox.toml>"));
         assert!(text.contains("paraegox node --config <absolute-paraegox-node.toml>"));
-        assert!(
-            text.contains("paraegox deployment --config <absolute-paraegox-deployment.toml>")
-        );
+        assert!(text.contains("paraegox deployment --config <absolute-paraegox-deployment.toml>"));
         assert!(text.contains("split-trust local Runtime and one NodeDaemon"));
         assert!(text.contains("schema v1 retains the G1 host-local feature-only profile"));
         assert!(text.contains("schema v2\nstarts the G2 host-side Runtime-control listener"));

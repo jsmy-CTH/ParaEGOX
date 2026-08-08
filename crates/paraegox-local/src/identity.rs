@@ -20,24 +20,29 @@ use paraegox_deployment::{DeveloperFixtureDerivedIdentityV1, DeveloperFixtureIde
 use paraegox_fabric::{
     RemoteTlsEndpoint, restricted_runtime_apply_peer_certificate_common_name_v1,
 };
-use paraegox_kernel::{
-    digest::Digest32,
-    identity::{PrincipalRef, RuntimeHostId},
-};
+use paraegox_kernel::{digest::Digest32, identity::PrincipalRef};
+#[cfg(test)]
+use paraegox_kernel::identity::RuntimeHostId;
 use paraegox_node::observation::RuntimeObservationEndpointRefV1;
 use paraegox_node::protocol::NodeManagementTargetV1;
-use paraegox_node::{EnrollmentIssuerRefV1, NodeId, NodeIncarnation, NodeManagementEndpointRefV1};
+#[cfg(test)]
+use paraegox_node::EnrollmentIssuerRefV1;
+use paraegox_node::{NodeId, NodeIncarnation, NodeManagementEndpointRefV1};
 use paraegox_runtime::RuntimeDeveloperLocalReadyV1;
 use paraegox_runtime_contracts::apply::{PlanWriterRef, TenureAuthorityRef, TenureKeyRef};
+#[cfg(test)]
 use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     DistributedFabricCredentialRefV1, DistributedFabricTrustAnchorRefV1,
-    DistributedFabricTrustDomainRefV1, RestrictedRuntimeApplyCarrierBindingV1,
-    RestrictedRuntimeApplyTransportProfileV1,
+    DistributedFabricTrustDomainRefV1,
+};
+use paraegox_runtime_contracts::distributed_agent_stack_plan::{
+    RestrictedRuntimeApplyCarrierBindingV1, RestrictedRuntimeApplyTransportProfileV1,
 };
 use paraegox_runtime_contracts::installation::verify_immutable_manifest_ingress;
 use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentProviderRefV1;
 use paraegox_runtime_contracts::provenance::SourceScopeRef;
 use paraegox_runtime_contracts::reference_control::ed25519_control_key_fingerprint;
+#[cfg(test)]
 use paraegox_runtime_contracts::wire::ApplyAuthKeyRef;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -2889,6 +2894,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_wire(&self) -> &[u8] {
         &self.canonical_wire
     }
@@ -2897,6 +2903,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         Digest32::from_bytes(self.node_config_commitment)
     }
 
+    #[cfg(test)]
     pub(crate) fn target(&self) -> RuntimeHostId {
         self.runtime_transport_profile().target()
     }
@@ -2909,6 +2916,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         Digest32::from_bytes(self.runtime_manifest_digest)
     }
 
+    #[cfg(test)]
     pub(crate) const fn runtime_response_key_ref(&self) -> ApplyAuthKeyRef {
         ApplyAuthKeyRef::from_bytes(self.runtime_response_key_ref)
     }
@@ -2937,6 +2945,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         TenureKeyRef::from_bytes(self.tenure_key_ref)
     }
 
+    #[cfg(test)]
     pub(crate) const fn tenure_verification_key(&self) -> [u8; 32] {
         self.tenure_verification_key
     }
@@ -2950,6 +2959,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         self.runtime_transport_profile_ref
     }
 
+    #[cfg(test)]
     pub(crate) const fn runtime_transport_profile_digest(&self) -> Digest32 {
         Digest32::from_bytes(self.runtime_transport_profile_digest)
     }
@@ -2959,14 +2969,17 @@ impl DeveloperNodeEnrollmentArtifactV1 {
             .expect("PXEA decoder retained a canonical Runtime carrier binding")
     }
 
+    #[cfg(test)]
     pub(crate) const fn runtime_carrier_binding_digest(&self) -> Digest32 {
         Digest32::from_bytes(self.runtime_carrier_binding_digest)
     }
 
+    #[cfg(test)]
     pub(crate) const fn node_control_endpoint_ref(&self) -> [u8; 16] {
         self.node_control_endpoint_ref
     }
 
+    #[cfg(test)]
     pub(crate) const fn node_control_endpoint_generation(&self) -> u64 {
         self.node_control_endpoint_generation
     }
@@ -2987,16 +3000,19 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         Digest32::from_bytes(self.node_route_config_digest)
     }
 
+    #[cfg(test)]
     pub(crate) fn node_trust_domain_ref(&self) -> DistributedFabricTrustDomainRefV1 {
         DistributedFabricTrustDomainRefV1::try_from_bytes(self.node_trust_domain_ref)
             .expect("PXEA decoder retained a nonzero Node trust domain")
     }
 
+    #[cfg(test)]
     pub(crate) fn node_trust_anchor_ref(&self) -> DistributedFabricTrustAnchorRefV1 {
         DistributedFabricTrustAnchorRefV1::try_from_bytes(self.node_trust_anchor_ref)
             .expect("PXEA decoder retained a nonzero Node trust anchor")
     }
 
+    #[cfg(test)]
     pub(crate) fn node_controller_connector_credential_ref(
         &self,
     ) -> DistributedFabricCredentialRefV1 {
@@ -3006,11 +3022,13 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         .expect("PXEA decoder retained a nonzero Node Controller credential")
     }
 
+    #[cfg(test)]
     pub(crate) fn node_listener_credential_ref(&self) -> DistributedFabricCredentialRefV1 {
         DistributedFabricCredentialRefV1::try_from_bytes(self.node_listener_credential_ref)
             .expect("PXEA decoder retained a nonzero Node listener credential")
     }
 
+    #[cfg(test)]
     pub(crate) const fn node_control_transport_profile_ref(&self) -> [u8; 16] {
         self.node_control_transport_profile_ref
     }
@@ -3033,6 +3051,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
             .expect("PXEA decoder retained a nonzero Runtime observation endpoint")
     }
 
+    #[cfg(test)]
     pub(crate) fn enrollment_issuer_ref(&self) -> EnrollmentIssuerRefV1 {
         EnrollmentIssuerRefV1::try_from_bytes(self.enrollment_issuer_ref)
             .expect("PXEA decoder retained a nonzero enrollment issuer")
@@ -4600,6 +4619,9 @@ mod tests {
                 crate::config::Command::DeveloperDistributedFixtureV1(_) => {
                     panic!("unexpected distributed fixture command")
                 }
+                crate::config::Command::DeveloperDeploymentV1(_) => {
+                    panic!("unexpected Deployment command")
+                }
                 crate::config::Command::Help => panic!("unexpected help"),
             }
         }
@@ -4624,6 +4646,9 @@ mod tests {
                 }
                 crate::config::Command::DeveloperDistributedFixtureV1(_) => {
                     panic!("unexpected distributed fixture command")
+                }
+                crate::config::Command::DeveloperDeploymentV1(_) => {
+                    panic!("unexpected Deployment command")
                 }
                 crate::config::Command::Help => panic!("unexpected help"),
             }
@@ -4765,6 +4790,9 @@ mod tests {
                 crate::config::Command::DeveloperProvisionedV1(_) => {
                     panic!("unexpected provisioned command")
                 }
+                crate::config::Command::DeveloperDeploymentV1(_) => {
+                    panic!("unexpected Deployment command")
+                }
                 crate::config::Command::Help => panic!("unexpected help"),
             }
         }
@@ -4895,6 +4923,7 @@ mod tests {
             crate::config::Command::DeveloperFixtureV1(_)
             | crate::config::Command::DeveloperDistributedFixtureV1(_)
             | crate::config::Command::DeveloperProvisionedV1(_)
+            | crate::config::Command::DeveloperDeploymentV1(_)
             | crate::config::Command::Help => panic!("unexpected changed node command"),
         };
         assert_ne!(
@@ -5001,6 +5030,7 @@ mod tests {
             crate::config::Command::DeveloperFixtureV1(_)
             | crate::config::Command::DeveloperDistributedFixtureV1(_)
             | crate::config::Command::DeveloperProvisionedV1(_)
+            | crate::config::Command::DeveloperDeploymentV1(_)
             | crate::config::Command::Help => panic!("unexpected changed command"),
         };
         assert_eq!(
@@ -5483,6 +5513,9 @@ mod tests {
                 }
                 crate::config::Command::DeveloperDistributedFixtureV1(_) => {
                     panic!("unexpected distributed fixture command")
+                }
+                crate::config::Command::DeveloperDeploymentV1(_) => {
+                    panic!("unexpected Deployment command")
                 }
                 crate::config::Command::Help => panic!("unexpected help"),
             };

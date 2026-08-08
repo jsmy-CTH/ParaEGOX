@@ -21,9 +21,8 @@ use paraegox_agent_contracts::{AgentConversationDeckRunId, AgentConversationSess
 use paraegox_agent_service::AgentConversationModelServiceProviderV1;
 use paraegox_deployment::{
     DeveloperDeploymentEnrollmentFactsFieldsV1, DeveloperDeploymentEnrollmentFactsV1,
-    DeveloperDeploymentOwnerV1, DeveloperDeploymentStartFieldsV1,
-    DeveloperDeploymentStartInputV1, DeveloperDeploymentStartModeV1,
-    DeveloperDeploymentStartOutcomeV1,
+    DeveloperDeploymentOwnerV1, DeveloperDeploymentStartFieldsV1, DeveloperDeploymentStartInputV1,
+    DeveloperDeploymentStartModeV1, DeveloperDeploymentStartOutcomeV1,
     DeveloperFixtureAgentStackInputV1, DeveloperFixtureControllerCredentialsV1,
     DeveloperFixtureDerivedIdentityV1, DeveloperFixtureDistributedAgentStackInputV1,
     DeveloperFixtureDistributedCoordinatorV1, DeveloperFixtureDistributedNodeV1,
@@ -215,9 +214,7 @@ pub(crate) fn run(config: DeveloperFixtureConfigV1) -> Result<(), LocalProcessEr
 /// Runs the public, single-owner DeploymentController composition. The
 /// current-user identity and both signal handlers are established before any
 /// configured path is resolved or any durable owner is started.
-pub(crate) fn run_deployment(
-    config: DeveloperDeploymentConfigV1,
-) -> Result<(), LocalProcessError> {
+pub(crate) fn run_deployment(config: DeveloperDeploymentConfigV1) -> Result<(), LocalProcessError> {
     let peer = DeveloperLocalPeerIdentityV1::current()
         .map_err(|_| LocalProcessError::UnsafeExecutionIdentity)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -262,8 +259,8 @@ async fn run_deployment_with_signals(
         enrollment.runtime_manifest_digest(),
     )
     .map_err(|_| LocalProcessError::DeploymentPreparation)?;
-    let prepared_layout =
-        layout::prepare_deployment(&config).map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let prepared_layout = layout::prepare_deployment(&config)
+        .map_err(|_| LocalProcessError::DeploymentPreparation)?;
     let mode = deployment_start_mode(&prepared_layout, config.authority_state_directory())?;
 
     let runtime_transport_profile = enrollment.runtime_transport_profile();
@@ -341,8 +338,8 @@ async fn run_deployment_with_signals(
         peer,
     )
     .map_err(|_| LocalProcessError::DeploymentPreparation)?;
-    let enrollment_facts = DeveloperDeploymentEnrollmentFactsV1::try_new(
-        DeveloperDeploymentEnrollmentFactsFieldsV1 {
+    let enrollment_facts =
+        DeveloperDeploymentEnrollmentFactsV1::try_new(DeveloperDeploymentEnrollmentFactsFieldsV1 {
             configuration_digest: enrollment.node_config_commitment(),
             verified_manifest,
             runtime_transport_profile_ref: enrollment.runtime_transport_profile_ref(),
@@ -360,9 +357,8 @@ async fn run_deployment_with_signals(
             authority_ref: enrollment.tenure_authority_ref(),
             authority_key_ref: enrollment.tenure_key_ref(),
             authority_verification_key,
-        },
-    )
-    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+        })
+        .map_err(|_| LocalProcessError::DeploymentPreparation)?;
     let input = DeveloperDeploymentStartInputV1::try_new(DeveloperDeploymentStartFieldsV1 {
         mode,
         controller_store_directory: prepared_layout
@@ -3902,7 +3898,9 @@ mod tests {
         );
 
         fs::write(
-            prepared.controller_store_state_directory().join("controller.lock"),
+            prepared
+                .controller_store_state_directory()
+                .join("controller.lock"),
             [],
         )
         .expect("existing Controller evidence");

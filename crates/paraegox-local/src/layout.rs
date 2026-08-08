@@ -1522,6 +1522,7 @@ mod tests {
             crate::config::Command::DeveloperNodeV1(_)
             | crate::config::Command::DeveloperDistributedFixtureV1(_)
             | crate::config::Command::DeveloperProvisionedV1(_)
+            | crate::config::Command::DeveloperDeploymentV1(_)
             | crate::config::Command::Help => panic!("unexpected fixture command"),
         }
     }

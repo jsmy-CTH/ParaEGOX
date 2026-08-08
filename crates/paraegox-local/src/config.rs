@@ -646,6 +646,7 @@ impl DeveloperDeploymentConfigV1 {
     /// Revalidates owner, mode, inode and independently pinned artifact bytes
     /// immediately before a future composition resolves any Secret or opens a
     /// connector. Parsing alone never turns paths into authority.
+    #[cfg(test)]
     #[cfg(unix)]
     pub(crate) fn validate_current_user_files(&self) -> Result<(), ConfigError> {
         self.resolve_current_user_inputs().map(drop)
@@ -4597,7 +4598,8 @@ client_private_key_file = {:?}
         assert_eq!(
             parse(deployment_config_arguments(vec![
                 b'x';
-                MAX_CONFIG_BYTES as usize + 1
+                MAX_CONFIG_BYTES as usize
+                    + 1
             ])),
             Err(ConfigError::ConfigFileTooLarge)
         );
@@ -5217,10 +5219,7 @@ client_private_key_file = {:?}
             Err(ConfigError::InvalidProviderConfiguration)
         );
         assert_eq!(
-            parse(config_arguments(vec![
-                b'x';
-                MAX_CONFIG_BYTES as usize + 1
-            ])),
+            parse(config_arguments(vec![b'x'; MAX_CONFIG_BYTES as usize + 1])),
             Err(ConfigError::ConfigFileTooLarge)
         );
 

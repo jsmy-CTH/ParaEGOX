@@ -238,14 +238,21 @@ mod tests {
         let mut codes = std::collections::BTreeSet::new();
         for stage in stages {
             assert!(stage.code().starts_with("PXLC-DEPLOYMENT-"));
-            assert!(codes.insert(stage.code()), "duplicate Deployment stage code");
+            assert!(
+                codes.insert(stage.code()),
+                "duplicate Deployment stage code"
+            );
             assert_eq!(stage.exit_code(), 1);
         }
-        assert!(!LocalProcessError::DeploymentReconcileRequired
-            .message()
-            .contains("is ready"));
-        assert!(!LocalProcessError::DeploymentOwnerExit
-            .message()
-            .contains("is ready"));
+        assert!(
+            !LocalProcessError::DeploymentReconcileRequired
+                .message()
+                .contains("is ready")
+        );
+        assert!(
+            !LocalProcessError::DeploymentOwnerExit
+                .message()
+                .contains("is ready")
+        );
     }
 }

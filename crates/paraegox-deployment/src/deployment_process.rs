@@ -751,7 +751,7 @@ mod platform {
 
     enum DeveloperDeploymentDurableOwnerV1 {
         Controller(ControllerStore),
-        Successor(ManagedFabricSuccessorStoreV1),
+        Successor(Box<ManagedFabricSuccessorStoreV1>),
     }
 
     /// Stable non-sensitive failure for the developer deployment boundary.
@@ -845,7 +845,7 @@ mod platform {
             Ok(DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(durable)) => {
                 let (controller_store, successor_store) = match durable {
                     DeveloperDeploymentDurableOwnerV1::Controller(store) => (Some(store), None),
-                    DeveloperDeploymentDurableOwnerV1::Successor(store) => (None, Some(store)),
+                    DeveloperDeploymentDurableOwnerV1::Successor(store) => (None, Some(*store)),
                 };
                 Ok(DeveloperDeploymentStartOutcomeV1::ReconcileRequired(
                     DeveloperDeploymentOwnerV1 {
@@ -1125,7 +1125,7 @@ mod platform {
                 ready,
             },
             None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
-                DeveloperDeploymentDurableOwnerV1::Successor(successor),
+                DeveloperDeploymentDurableOwnerV1::Successor(Box::new(successor)),
             ),
         })
     }
@@ -1189,7 +1189,7 @@ mod platform {
                     ready,
                 },
                 None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
-                    DeveloperDeploymentDurableOwnerV1::Successor(successor),
+                    DeveloperDeploymentDurableOwnerV1::Successor(Box::new(successor)),
                 ),
             });
         }
@@ -1288,7 +1288,7 @@ mod platform {
                 ready,
             },
             None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
-                DeveloperDeploymentDurableOwnerV1::Successor(successor),
+                DeveloperDeploymentDurableOwnerV1::Successor(Box::new(successor)),
             ),
         })
     }
@@ -1396,10 +1396,10 @@ mod platform {
                 && current.step() == ControllerRemoteConnectorStepV1::NodePublish
                 && current.phase() != ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable
             {
-                if current.phase() == ControllerRemoteConnectorAttemptPhaseV1::NotSent {
-                    if store.abandon_remote_connector_challenge_round().is_ok() {
-                        continue;
-                    }
+                if current.phase() == ControllerRemoteConnectorAttemptPhaseV1::NotSent
+                    && store.abandon_remote_connector_challenge_round().is_ok()
+                {
+                    continue;
                 }
                 return Ok(DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
                     DeveloperDeploymentDurableOwnerV1::Controller(store),
@@ -1432,7 +1432,7 @@ mod platform {
                         ready,
                     },
                     None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
-                        DeveloperDeploymentDurableOwnerV1::Successor(successor),
+                        DeveloperDeploymentDurableOwnerV1::Successor(Box::new(successor)),
                     ),
                 });
             }
@@ -9327,6 +9327,21 @@ mod platform {
         use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
         use zeroize::Zeroizing;
 
+        use super::{
+            APPLY_ENTROPY_BYTES, BootstrapArguments, CommonArguments, DeveloperTenurePinsV1,
+            DistributedAgentStackRolloutStatusV1, DistributedCoordinatorCapabilityV1,
+            DistributedLocalCapabilityV1, DistributedNodeCapabilityV1,
+            DistributedPredecessorCapabilityV1,
+            DistributedRestrictedControllerConnectorCapabilityV1, DurableTenureRequest,
+            FileLengthPolicy, FileRole, FreshControllerApplyRequestV1, ManagedServingArguments,
+            ProcessCommand, ProcessErrorKind, TENURE_ENTROPY_BYTES, TenureRequestProfile,
+            acquire_developer_tenure_once, build_empty_commit_receipt, build_reference_candidate,
+            build_reference_empty_candidate, commit_reference_empty_in_store,
+            distributed_owner_terminal_runtime_observation_is_admissible,
+            fresh_apply_request_from_entropy, fresh_tenure_request_from_entropy, parse_arguments,
+            parse_nonzero_hex, read_pinned_file, recover_tenure_request,
+            select_durable_tenure_request, validate_committed_empty_state,
+        };
         use crate::controller_initializer::{
             ControllerInitializationInput, initialize_controller_store_developer_local,
         };
@@ -9350,21 +9365,6 @@ mod platform {
         use crate::tenure_protocol::{
             ControllerAcquireKeyRef, ControllerPublicKeyFingerprint,
             MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
-        };
-        use super::{
-            APPLY_ENTROPY_BYTES, BootstrapArguments, CommonArguments, DeveloperTenurePinsV1,
-            DistributedAgentStackRolloutStatusV1, DistributedCoordinatorCapabilityV1,
-            DistributedLocalCapabilityV1, DistributedNodeCapabilityV1,
-            DistributedPredecessorCapabilityV1,
-            DistributedRestrictedControllerConnectorCapabilityV1, DurableTenureRequest,
-            FileLengthPolicy, FileRole, FreshControllerApplyRequestV1, ManagedServingArguments,
-            ProcessCommand, ProcessErrorKind, TENURE_ENTROPY_BYTES, TenureRequestProfile,
-            acquire_developer_tenure_once, build_empty_commit_receipt, build_reference_candidate,
-            build_reference_empty_candidate, commit_reference_empty_in_store,
-            distributed_owner_terminal_runtime_observation_is_admissible,
-            fresh_apply_request_from_entropy, fresh_tenure_request_from_entropy, parse_arguments,
-            parse_nonzero_hex, read_pinned_file, recover_tenure_request,
-            select_durable_tenure_request, validate_committed_empty_state,
         };
 
         static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(1);
