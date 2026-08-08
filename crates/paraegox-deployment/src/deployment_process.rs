@@ -608,9 +608,9 @@ mod platform {
         }
     }
 
-    /// The real owner graph after PXFS and terminal PXFR are durable. It is
-    /// deliberately not reported Ready until a later durable ManagedReady
-    /// Describe reconciliation seam exists.
+    /// The real deployment owner graph. A `Ready` outcome is emitted only
+    /// after terminal PXFR and a fresh ManagedReady Describe response are both
+    /// durably committed.
     pub struct DeveloperDeploymentOwnerV1 {
         authority: Option<DeveloperLocalTenureAuthorityV1>,
         node_client: Option<RestrictedNodeControlClientV1>,
@@ -743,14 +743,14 @@ mod platform {
 
     enum DeveloperDeploymentPipelineOutcomeV1 {
         Ready {
-            store: ManagedFabricSuccessorStoreV1,
+            store: Box<ManagedFabricSuccessorStoreV1>,
             ready: DeveloperDeploymentReadyV1,
         },
         ReconcileRequired(DeveloperDeploymentDurableOwnerV1),
     }
 
     enum DeveloperDeploymentDurableOwnerV1 {
-        Controller(ControllerStore),
+        Controller(Box<ControllerStore>),
         Successor(Box<ManagedFabricSuccessorStoreV1>),
     }
 
@@ -837,14 +837,14 @@ mod platform {
                         node_client: Some(node_client),
                         runtime_client: Some(runtime_client),
                         controller_store: None,
-                        successor_store: Some(store),
+                        successor_store: Some(*store),
                     },
                     ready,
                 })
             }
             Ok(DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(durable)) => {
                 let (controller_store, successor_store) = match durable {
-                    DeveloperDeploymentDurableOwnerV1::Controller(store) => (Some(store), None),
+                    DeveloperDeploymentDurableOwnerV1::Controller(store) => (Some(*store), None),
                     DeveloperDeploymentDurableOwnerV1::Successor(store) => (None, Some(*store)),
                 };
                 Ok(DeveloperDeploymentStartOutcomeV1::ReconcileRequired(
@@ -1121,7 +1121,7 @@ mod platform {
         .await?;
         Ok(match ready {
             Some(ready) => DeveloperDeploymentPipelineOutcomeV1::Ready {
-                store: successor,
+                store: Box::new(successor),
                 ready,
             },
             None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
@@ -1185,7 +1185,7 @@ mod platform {
             .await?;
             return Ok(match ready {
                 Some(ready) => DeveloperDeploymentPipelineOutcomeV1::Ready {
-                    store: successor,
+                    store: Box::new(successor),
                     ready,
                 },
                 None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
@@ -1284,7 +1284,7 @@ mod platform {
         .await?;
         Ok(match ready {
             Some(ready) => DeveloperDeploymentPipelineOutcomeV1::Ready {
-                store: successor,
+                store: Box::new(successor),
                 ready,
             },
             None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
@@ -1370,7 +1370,7 @@ mod platform {
                 }
                 ControllerRemoteConnectorRestartRequirementV1::PublishReconcileRequired => {
                     return Ok(DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
-                        DeveloperDeploymentDurableOwnerV1::Controller(store),
+                        DeveloperDeploymentDurableOwnerV1::Controller(Box::new(store)),
                     ));
                 }
                 ControllerRemoteConnectorRestartRequirementV1::None => {}
@@ -1402,7 +1402,7 @@ mod platform {
                     continue;
                 }
                 return Ok(DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(
-                    DeveloperDeploymentDurableOwnerV1::Controller(store),
+                    DeveloperDeploymentDurableOwnerV1::Controller(Box::new(store)),
                 ));
             }
             if projection.latest_response().is_some() {
@@ -1428,7 +1428,7 @@ mod platform {
                 .await?;
                 return Ok(match ready {
                     Some(ready) => DeveloperDeploymentPipelineOutcomeV1::Ready {
-                        store: successor,
+                        store: Box::new(successor),
                         ready,
                     },
                     None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(

@@ -20,13 +20,13 @@ use paraegox_deployment::{DeveloperFixtureDerivedIdentityV1, DeveloperFixtureIde
 use paraegox_fabric::{
     RemoteTlsEndpoint, restricted_runtime_apply_peer_certificate_common_name_v1,
 };
-use paraegox_kernel::{digest::Digest32, identity::PrincipalRef};
 #[cfg(test)]
 use paraegox_kernel::identity::RuntimeHostId;
-use paraegox_node::observation::RuntimeObservationEndpointRefV1;
-use paraegox_node::protocol::NodeManagementTargetV1;
+use paraegox_kernel::{digest::Digest32, identity::PrincipalRef};
 #[cfg(test)]
 use paraegox_node::EnrollmentIssuerRefV1;
+use paraegox_node::observation::RuntimeObservationEndpointRefV1;
+use paraegox_node::protocol::NodeManagementTargetV1;
 use paraegox_node::{NodeId, NodeIncarnation, NodeManagementEndpointRefV1};
 use paraegox_runtime::RuntimeDeveloperLocalReadyV1;
 use paraegox_runtime_contracts::apply::{PlanWriterRef, TenureAuthorityRef, TenureKeyRef};
