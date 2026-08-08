@@ -39,7 +39,9 @@ use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     RestrictedRuntimeApplyCarrierBindingV1, RestrictedRuntimeApplyTransportProfileV1,
 };
 use paraegox_runtime_contracts::installation::verify_immutable_manifest_ingress;
-use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentProviderRefV1;
+use paraegox_runtime_contracts::managed_agent_stack_plan::{
+    ManagedAgentProviderProfileV1, ManagedAgentProviderRefV1, ManagedAgentProviderSelectionV1,
+};
 use paraegox_runtime_contracts::provenance::SourceScopeRef;
 use paraegox_runtime_contracts::reference_control::ed25519_control_key_fingerprint;
 #[cfg(test)]
@@ -49,6 +51,8 @@ use sha2::{Digest as _, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{
+    derive_developer_node_managed_agent_provider_ref,
+    deterministic_fixture_provider_configuration_digest,
     DeveloperDistributedFixtureActionV1, DeveloperDistributedFixtureConfigV1,
     DeveloperFixtureConfigV1, DeveloperNodeConfigSchemaV1, DeveloperNodeConfigV1,
     DeveloperProvisionedConfigV1, ProviderProfileV1,
@@ -61,6 +65,7 @@ const LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME: &str = "developer-distributed-
 const DISTRIBUTED_IDENTITY_DIRECTORY_NAME: &str = "developer-distributed-identity-v2";
 const NODE_IDENTITY_DIRECTORY_NAME: &str = "developer-node-identity-v1";
 const NODE_V2_IDENTITY_DIRECTORY_NAME: &str = "developer-node-identity-v2";
+const NODE_V3_IDENTITY_DIRECTORY_NAME: &str = "developer-node-identity-v3";
 const MANIFEST_FILE_NAME: &str = "identity-manifest-v1.pxli";
 const MANIFEST_TEMP_FILE_NAME: &str = ".identity-manifest-v1.pxli.tmp";
 const OPENAI_MANIFEST_FILE_NAME: &str = "identity-manifest-v1.pxoi";
@@ -73,8 +78,11 @@ const NODE_MANIFEST_FILE_NAME: &str = "identity-manifest-v1.pxni";
 const NODE_MANIFEST_TEMP_FILE_NAME: &str = ".identity-manifest-v1.pxni.tmp";
 const NODE_V2_MANIFEST_FILE_NAME: &str = "identity-manifest-v2.pxni";
 const NODE_V2_MANIFEST_TEMP_FILE_NAME: &str = ".identity-manifest-v2.pxni.tmp";
+const NODE_V3_MANIFEST_FILE_NAME: &str = "identity-manifest-v3.pxni";
+const NODE_V3_MANIFEST_TEMP_FILE_NAME: &str = ".identity-manifest-v3.pxni.tmp";
 const WRITER_LOCK_FILE_NAME: &str = ".writer.lock";
 const NODE_ENROLLMENT_ARTIFACT_TEMP_FILE_NAME: &str = ".enrollment-v1.pxea.next";
+const NODE_V2_ENROLLMENT_ARTIFACT_TEMP_FILE_NAME: &str = ".enrollment-v2.pxea.next";
 
 const MANIFEST_MAGIC: &[u8; 4] = b"PXLI";
 const OPENAI_MANIFEST_MAGIC: &[u8; 4] = b"PXOI";
@@ -143,6 +151,21 @@ const NODE_V2_MANIFEST_WIRE_BYTES: usize = NODE_V2_MANIFEST_CHECKSUM_OFFSET + CH
 const NODE_V2_FRESH_ENTROPY_BYTES: usize =
     (NODE_V2_SECRET_FIELD_COUNT * 32) + (NODE_V2_RANDOM_IDENTITY_FIELD_COUNT * 16);
 
+const NODE_V3_MANIFEST_VERSION: u16 = 3;
+const NODE_V3_MANIFEST_HEADER_BYTES: usize = 16;
+const NODE_V3_MANIFEST_FIELD_COUNT: u16 = 10;
+const NODE_V3_MANIFEST_FLAGS: u16 = 0;
+const NODE_V3_IDENTITY_FIELD_COUNT: usize = 6;
+const NODE_V3_SECRET_FIELD_COUNT: usize = 3;
+const NODE_V3_RANDOM_IDENTITY_FIELD_COUNT: usize = 5;
+const NODE_V3_MANIFEST_PAYLOAD_BYTES: usize =
+    (NODE_V3_SECRET_FIELD_COUNT * 32) + (NODE_V3_IDENTITY_FIELD_COUNT * 16) + 32;
+const NODE_V3_MANIFEST_CHECKSUM_OFFSET: usize =
+    NODE_V3_MANIFEST_HEADER_BYTES + NODE_V3_MANIFEST_PAYLOAD_BYTES;
+const NODE_V3_MANIFEST_WIRE_BYTES: usize = NODE_V3_MANIFEST_CHECKSUM_OFFSET + CHECKSUM_BYTES;
+const NODE_V3_FRESH_ENTROPY_BYTES: usize =
+    (NODE_V3_SECRET_FIELD_COUNT * 32) + (NODE_V3_RANDOM_IDENTITY_FIELD_COUNT * 16);
+
 const MANIFEST_CHECKSUM_DOMAIN: &[u8] =
     b"paraegox.local.developer-identity-manifest.checksum.sha256.v1";
 const OPENAI_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
@@ -155,9 +178,8 @@ const NODE_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
     b"paraegox.local.developer-node-identity-manifest.checksum.sha256.v1";
 const NODE_V2_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
     b"paraegox.local.developer-node-identity-manifest.checksum.sha256.v2";
-const DETERMINISTIC_PROVIDER_CONFIG_DOMAIN: &[u8] =
-    b"paraegox.local.developer-fixture-provider.config.sha256.v1";
-const DETERMINISTIC_PROVIDER_PROFILE: &[u8] = b"deterministic-fixture-v1";
+const NODE_V3_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
+    b"paraegox.local.developer-node-identity-manifest.checksum.sha256.v3";
 const DISTRIBUTED_ENROLLMENT_PLAN_SCHEMA: &str =
     "paraegox.developer-distributed-certificate-enrollment.v1";
 const NODE_ENROLLMENT_ARTIFACT_MAGIC: &[u8; 4] = b"PXEA";
@@ -173,6 +195,14 @@ const NODE_ENROLLMENT_ARTIFACT_SIGNATURE_DOMAIN: &[u8] =
     b"paraegox.local.developer-node-enrollment-artifact.ed25519.v1";
 const NODE_ENROLLMENT_ARTIFACT_FRAME_DIGEST_DOMAIN: &[u8] =
     b"paraegox.local.developer-node-enrollment-artifact.frame.sha256.v1";
+const NODE_ENROLLMENT_ARTIFACT_V2_VERSION: u16 = 2;
+const NODE_ENROLLMENT_ARTIFACT_V2_FIELD_COUNT: u16 = 38;
+const NODE_ENROLLMENT_ARTIFACT_V2_FIXED_PAYLOAD_BYTES: usize =
+    NODE_ENROLLMENT_ARTIFACT_FIXED_PAYLOAD_BYTES + 2 + 16 + 32;
+const NODE_ENROLLMENT_ARTIFACT_V2_SIGNATURE_DOMAIN: &[u8] =
+    b"paraegox.local.developer-node-enrollment-artifact.ed25519.v2";
+const NODE_ENROLLMENT_ARTIFACT_V2_FRAME_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.local.developer-node-enrollment-artifact.frame.sha256.v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdentityProviderProfileV1 {
@@ -190,25 +220,28 @@ impl IdentityProviderProfileV1 {
         }
     }
 
-    const fn conflicting_identity_directories(self) -> [&'static str; 4] {
+    const fn conflicting_identity_directories(self) -> [&'static str; 5] {
         match self {
             Self::DeterministicFixture => [
                 OPENAI_IDENTITY_DIRECTORY_NAME,
                 DEEPSEEK_IDENTITY_DIRECTORY_NAME,
                 NODE_IDENTITY_DIRECTORY_NAME,
                 NODE_V2_IDENTITY_DIRECTORY_NAME,
+                NODE_V3_IDENTITY_DIRECTORY_NAME,
             ],
             Self::OpenAiResponses => [
                 IDENTITY_DIRECTORY_NAME,
                 DEEPSEEK_IDENTITY_DIRECTORY_NAME,
                 NODE_IDENTITY_DIRECTORY_NAME,
                 NODE_V2_IDENTITY_DIRECTORY_NAME,
+                NODE_V3_IDENTITY_DIRECTORY_NAME,
             ],
             Self::DeepSeekChatCompletions => [
                 IDENTITY_DIRECTORY_NAME,
                 OPENAI_IDENTITY_DIRECTORY_NAME,
                 NODE_IDENTITY_DIRECTORY_NAME,
                 NODE_V2_IDENTITY_DIRECTORY_NAME,
+                NODE_V3_IDENTITY_DIRECTORY_NAME,
             ],
         }
     }
@@ -414,8 +447,10 @@ impl Drop for IdentityManifestV1 {
 /// PXNI v1 retains exactly its original Runtime response seed, PXNB bearer
 /// token and five local identities. PXNI v2 adds only the Node-local PXOB
 /// bearer token and observation endpoint ref; the Node certificate principal
-/// is copied from strict non-secret config rather than generated. Controller
-/// and Authority signing seeds and mTLS private keys are absent in both.
+/// is copied from strict non-secret config rather than generated. PXNI v3 keeps
+/// that exact private shape under a new version/checksum domain; provider and
+/// desired-service fields remain absent. Controller and Authority signing seeds
+/// and mTLS private keys are absent in every version.
 pub(crate) struct DeveloperNodeIdentityManifestV1 {
     schema: DeveloperNodeConfigSchemaV1,
     runtime_response_signing_seed: [u8; 32],
@@ -435,6 +470,7 @@ pub(crate) struct DeveloperNodeIdentityManifestV1 {
 /// signing seed, private-key bytes or private-key path.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct DeveloperNodeEnrollmentArtifactV1 {
+    wire_version: u16,
     node_config_commitment: [u8; 32],
     runtime_manifest_wire: Box<[u8]>,
     runtime_manifest_digest: [u8; 32],
@@ -468,6 +504,7 @@ pub(crate) struct DeveloperNodeEnrollmentArtifactV1 {
     node_management_endpoint_ref: [u8; 16],
     runtime_observation_endpoint_ref: [u8; 16],
     enrollment_issuer_ref: [u8; 16],
+    managed_agent_provider: Option<ManagedAgentProviderSelectionV1>,
     signature: [u8; NODE_ENROLLMENT_ARTIFACT_SIGNATURE_BYTES],
     frame_digest: [u8; NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES],
     canonical_wire: Box<[u8]>,
@@ -477,11 +514,32 @@ impl fmt::Debug for DeveloperNodeEnrollmentArtifactV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DeveloperNodeEnrollmentArtifactV1")
-            .field("version", &NODE_ENROLLMENT_ARTIFACT_VERSION)
+            .field("version", &self.wire_version)
             .field("node_config_commitment", &"<digest>")
             .field("runtime_manifest", &"<canonical-wire-and-digest>")
             .field("runtime_control", &"<public-pins>")
             .field("node_control", &"<public-pins>")
+            .field("signature", &"<ed25519-signature>")
+            .finish()
+    }
+}
+
+/// Strict PXEA v2 token. The private inner carrier shares canonical field
+/// validation with v1, while this wrapper prevents a v2 decode from entering a
+/// v1-only call path.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DeveloperNodeEnrollmentArtifactV2(DeveloperNodeEnrollmentArtifactV1);
+
+impl fmt::Debug for DeveloperNodeEnrollmentArtifactV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeveloperNodeEnrollmentArtifactV2")
+            .field("version", &self.0.wire_version)
+            .field("node_config_commitment", &"<digest>")
+            .field("runtime_manifest", &"<canonical-wire-and-digest>")
+            .field("runtime_control", &"<public-pins>")
+            .field("node_control", &"<public-pins>")
+            .field("managed_agent_provider", &"<public-provider-selection>")
             .field("signature", &"<ed25519-signature>")
             .finish()
     }
@@ -516,6 +574,11 @@ struct DeveloperNodeEnrollmentArtifactInputV1<'a> {
     node_target: NodeManagementTargetV1,
     runtime_observation_endpoint_ref: RuntimeObservationEndpointRefV1,
     enrollment_issuer_ref: [u8; 16],
+}
+
+struct DeveloperNodeEnrollmentArtifactInputV2<'a> {
+    base: DeveloperNodeEnrollmentArtifactInputV1<'a>,
+    managed_agent_provider: ManagedAgentProviderSelectionV1,
 }
 
 impl fmt::Debug for DeveloperNodeIdentityManifestV1 {
@@ -807,6 +870,38 @@ impl Drop for SensitiveNodeV2Wire {
     }
 }
 
+struct SensitiveNodeV3Entropy([u8; NODE_V3_FRESH_ENTROPY_BYTES]);
+
+impl SensitiveNodeV3Entropy {
+    const fn zeroed() -> Self {
+        Self([0; NODE_V3_FRESH_ENTROPY_BYTES])
+    }
+}
+
+impl Drop for SensitiveNodeV3Entropy {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+struct SensitiveNodeV3Wire([u8; NODE_V3_MANIFEST_WIRE_BYTES]);
+
+impl SensitiveNodeV3Wire {
+    const fn zeroed() -> Self {
+        Self([0; NODE_V3_MANIFEST_WIRE_BYTES])
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SensitiveNodeV3Wire {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 trait EntropySource {
     fn fill(&mut self, destination: &mut [u8]) -> Result<(), IdentityManifestError>;
 }
@@ -880,6 +975,15 @@ impl IdentityPaths {
             NODE_V2_IDENTITY_DIRECTORY_NAME,
             NODE_V2_MANIFEST_FILE_NAME,
             NODE_V2_MANIFEST_TEMP_FILE_NAME,
+        )
+    }
+
+    fn node_v3(state_root: &Path) -> Self {
+        Self::from_state_root_with_names(
+            state_root,
+            NODE_V3_IDENTITY_DIRECTORY_NAME,
+            NODE_V3_MANIFEST_FILE_NAME,
+            NODE_V3_MANIFEST_TEMP_FILE_NAME,
         )
     }
 
@@ -1032,6 +1136,93 @@ pub(crate) fn publish_or_reopen_node_enrollment_artifact_v1(
     publish_or_reopen_enrollment_artifact(path, &expected)
 }
 
+/// Publishes the strict PXEA v2 successor for Node schema v3. The additional
+/// provider selection is derived from the committed Node configuration; no
+/// desired service, endpoint, limits or Secret is admitted here.
+pub(crate) fn publish_or_reopen_node_enrollment_artifact_v2(
+    path: &Path,
+    config: &DeveloperNodeConfigV1,
+    identities: &DeveloperNodeIdentityManifestV1,
+    ready: &RuntimeDeveloperLocalReadyV1,
+    runtime_carrier_binding: &RestrictedRuntimeApplyCarrierBindingV1,
+    node_target: NodeManagementTargetV1,
+    runtime_observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+) -> Result<(), IdentityManifestError> {
+    let managed_agent_provider = config
+        .managed_agent_bootstrap()
+        .ok_or(IdentityManifestError::InvalidEnrollmentArtifact)?
+        .selection();
+    if config.schema() != DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+        || identities.schema() != DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+        || config.config_commitment() != *identities.config_commitment()
+        || ready.target() != config.control().target()
+        || ready.runtime_principal() != config.control().runtime_principal()
+        || ready.controller_principal() != config.control().controller_principal()
+        || ready.source_scope() != config.control().source_scope()
+        || ready.writer() != config.control().writer()
+        || ready.authority_principal() != config.control().authority_principal()
+        || ready.tenure_authority_ref() != config.control().tenure_authority_ref()
+        || ready.tenure_key_ref() != config.control().tenure_key_ref()
+        || ready.runtime_response_key_ref() != config.control().runtime_response_key_ref()
+        || node_target.node_id().as_bytes() != identities.node_id()
+        || node_target.node_incarnation().as_bytes() != identities.node_incarnation()
+        || node_target.management_endpoint_ref().as_bytes()
+            != identities.node_management_endpoint_ref()
+        || runtime_observation_endpoint_ref.as_bytes()
+            != identities
+                .runtime_observation_endpoint_ref()
+                .ok_or(IdentityManifestError::InvalidEnrollmentArtifact)?
+    {
+        return Err(IdentityManifestError::EnrollmentArtifactCrossPinMismatch);
+    }
+    let remote = config
+        .node_control()
+        .ok_or(IdentityManifestError::InvalidEnrollmentArtifact)?;
+    if remote.node_certificate_principal().as_bytes() != identities.node_principal() {
+        return Err(IdentityManifestError::EnrollmentArtifactCrossPinMismatch);
+    }
+    let runtime_profile = config.restricted_runtime_apply();
+    let expected = DeveloperNodeEnrollmentArtifactV2::try_new(
+        DeveloperNodeEnrollmentArtifactInputV2 {
+            base: DeveloperNodeEnrollmentArtifactInputV1 {
+                node_config_commitment: config.config_commitment(),
+                runtime_manifest_wire: ready.manifest_canonical_wire(),
+                runtime_manifest_digest: ready.manifest_digest(),
+                runtime_response_key_ref: ready.runtime_response_key_ref(),
+                runtime_response_public_key: ready.runtime_response_public_key(),
+                source_scope: ready.source_scope(),
+                writer: ready.writer(),
+                authority_principal: ready.authority_principal(),
+                tenure_authority_ref: ready.tenure_authority_ref(),
+                tenure_key_ref: ready.tenure_key_ref(),
+                tenure_verification_key: config.control().tenure_verification_key(),
+                runtime_transport_profile: runtime_profile.transport_profile(),
+                runtime_transport_profile_ref: runtime_profile.control_transport_profile_ref(),
+                runtime_carrier_binding,
+                node_control_endpoint_ref: remote.endpoint_ref(),
+                node_control_endpoint_generation: remote.endpoint_generation(),
+                node_control_locator: remote.tls_listener_locator(),
+                node_control_route: remote.route(),
+                node_principal: *remote.node_certificate_principal().as_bytes(),
+                node_route_config_digest: *remote.route_config_carrier_digest().as_bytes(),
+                node_trust_domain_ref: *remote.trust_domain_ref().as_bytes(),
+                node_trust_anchor_ref: *remote.trust_anchor_ref().as_bytes(),
+                node_controller_connector_credential_ref: *remote
+                    .controller_connector_credential_ref()
+                    .as_bytes(),
+                node_listener_credential_ref: *remote.node_listener_credential_ref().as_bytes(),
+                node_control_transport_profile_ref: remote.control_transport_profile_ref(),
+                node_target,
+                runtime_observation_endpoint_ref,
+                enrollment_issuer_ref: config.control().enrollment_issuer_ref(),
+            },
+            managed_agent_provider,
+        },
+        identities.runtime_response_signing_seed(),
+    )?;
+    publish_or_reopen_enrollment_artifact(path, &expected.0)
+}
+
 /// DeploymentController-side strict ingress for the public deployment composition.
 /// The independently transported plain whole-file SHA-256 is checked before
 /// parsing any attacker-controlled length, signature, or semantic field.
@@ -1050,6 +1241,31 @@ pub(crate) fn decode_pinned_node_enrollment_artifact_v1(
     if bytes_are_zero(&expected_tenure_verification_key)
         || expected_controller_verification_key == expected_tenure_verification_key
         || artifact.tenure_verification_key != expected_tenure_verification_key
+    {
+        return Err(IdentityManifestError::EnrollmentArtifactCrossPinMismatch);
+    }
+    Ok(artifact)
+}
+
+/// Strict PXEA v2 ingress. Whole-file pin verification still precedes every
+/// attacker-controlled length, canonical component, signature and cross-pin.
+pub(crate) fn decode_pinned_node_enrollment_artifact_v2(
+    frame: &[u8],
+    expected_whole_file_sha256: [u8; 32],
+    expected_controller_verification_key: [u8; 32],
+    expected_tenure_verification_key: [u8; 32],
+) -> Result<DeveloperNodeEnrollmentArtifactV2, IdentityManifestError> {
+    let observed: [u8; 32] = Sha256::digest(frame).into();
+    if bytes_are_zero(&expected_whole_file_sha256) || observed != expected_whole_file_sha256 {
+        return Err(IdentityManifestError::EnrollmentArtifactDigestMismatch);
+    }
+    let artifact = DeveloperNodeEnrollmentArtifactV2::decode(frame)?;
+    artifact
+        .0
+        .validate_controller_verification_key(expected_controller_verification_key)?;
+    if bytes_are_zero(&expected_tenure_verification_key)
+        || expected_controller_verification_key == expected_tenure_verification_key
+        || artifact.0.tenure_verification_key != expected_tenure_verification_key
     {
         return Err(IdentityManifestError::EnrollmentArtifactCrossPinMismatch);
     }
@@ -1415,6 +1631,7 @@ where
                 conflicting_profiles[1],
                 conflicting_profiles[2],
                 conflicting_profiles[3],
+                conflicting_profiles[4],
                 DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
                 LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
             ],
@@ -1441,6 +1658,7 @@ fn load_or_create_distributed_inner(
                 DEEPSEEK_IDENTITY_DIRECTORY_NAME,
                 NODE_IDENTITY_DIRECTORY_NAME,
                 NODE_V2_IDENTITY_DIRECTORY_NAME,
+                NODE_V3_IDENTITY_DIRECTORY_NAME,
                 LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
             ],
             wire_bytes: DISTRIBUTED_MANIFEST_WIRE_BYTES,
@@ -1460,6 +1678,9 @@ fn load_or_create_node_inner(
         DeveloperNodeConfigSchemaV1::HostLocalV1 => load_or_create_node_v1_inner(config, entropy),
         DeveloperNodeConfigSchemaV1::RemoteControlV2 => {
             load_or_create_node_v2_inner(config, entropy)
+        }
+        DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3 => {
+            load_or_create_node_v3_inner(config, entropy)
         }
     }
 }
@@ -1482,6 +1703,7 @@ fn load_or_create_node_v1_inner(
                 DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
                 LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
                 NODE_V2_IDENTITY_DIRECTORY_NAME,
+                NODE_V3_IDENTITY_DIRECTORY_NAME,
             ],
             wire_bytes: NODE_MANIFEST_WIRE_BYTES,
             access: IdentityManifestAccessV1::Initialize,
@@ -1529,6 +1751,7 @@ fn load_or_create_node_v2_inner(
                 DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
                 LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
                 NODE_IDENTITY_DIRECTORY_NAME,
+                NODE_V3_IDENTITY_DIRECTORY_NAME,
             ],
             wire_bytes: NODE_V2_MANIFEST_WIRE_BYTES,
             access: IdentityManifestAccessV1::Initialize,
@@ -1555,6 +1778,59 @@ fn load_or_create_node_v2_inner(
     )
 }
 
+fn load_or_create_node_v3_inner(
+    config: &DeveloperNodeConfigV1,
+    entropy: &mut impl EntropySource,
+) -> Result<DeveloperNodeIdentityManifestV1, IdentityManifestError> {
+    let config_commitment = config.config_commitment();
+    let controller_verification_key = config.control().controller_request_verification_key();
+    let tenure_verification_key = config.control().tenure_verification_key();
+    let node_principal = *config
+        .node_control()
+        .ok_or(IdentityManifestError::InvalidManifestField)?
+        .node_certificate_principal()
+        .as_bytes();
+    if config.managed_agent_bootstrap().is_none() {
+        return Err(IdentityManifestError::InvalidManifestField);
+    }
+    load_or_create_identity_manifest(
+        config.state_root(),
+        IdentityPaths::node_v3,
+        IdentityManifestLoadOptions {
+            conflicting_directories: &[
+                IDENTITY_DIRECTORY_NAME,
+                OPENAI_IDENTITY_DIRECTORY_NAME,
+                DEEPSEEK_IDENTITY_DIRECTORY_NAME,
+                DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
+                LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
+                NODE_IDENTITY_DIRECTORY_NAME,
+                NODE_V2_IDENTITY_DIRECTORY_NAME,
+            ],
+            wire_bytes: NODE_V3_MANIFEST_WIRE_BYTES,
+            access: IdentityManifestAccessV1::Initialize,
+        },
+        || {
+            DeveloperNodeIdentityManifestV1::try_generate_v3(
+                config_commitment,
+                controller_verification_key,
+                tenure_verification_key,
+                node_principal,
+                entropy,
+            )
+        },
+        DeveloperNodeIdentityManifestV1::encode_v3,
+        |wire| {
+            DeveloperNodeIdentityManifestV1::decode_v3(
+                wire,
+                config_commitment,
+                controller_verification_key,
+                tenure_verification_key,
+                node_principal,
+            )
+        },
+    )
+}
+
 fn open_distributed_inner(
     state_root: &Path,
 ) -> Result<DistributedDeveloperLocalIdentityManifestV1, IdentityManifestError> {
@@ -1568,6 +1844,7 @@ fn open_distributed_inner(
                 DEEPSEEK_IDENTITY_DIRECTORY_NAME,
                 NODE_IDENTITY_DIRECTORY_NAME,
                 NODE_V2_IDENTITY_DIRECTORY_NAME,
+                NODE_V3_IDENTITY_DIRECTORY_NAME,
                 LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
             ],
             wire_bytes: DISTRIBUTED_MANIFEST_WIRE_BYTES,
@@ -1602,6 +1879,12 @@ impl SensitiveManifestWire for SensitiveNodeWire {
 }
 
 impl SensitiveManifestWire for SensitiveNodeV2Wire {
+    fn as_sensitive_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl SensitiveManifestWire for SensitiveNodeV3Wire {
     fn as_sensitive_bytes(&self) -> &[u8] {
         self.as_bytes()
     }
@@ -2372,6 +2655,179 @@ impl DeveloperNodeIdentityManifestV1 {
         Ok(())
     }
 
+    fn try_generate_v3(
+        config_commitment: [u8; 32],
+        controller_verification_key: [u8; 32],
+        tenure_verification_key: [u8; 32],
+        node_principal: [u8; 16],
+        entropy: &mut impl EntropySource,
+    ) -> Result<Self, IdentityManifestError> {
+        let mut bytes = SensitiveNodeV3Entropy::zeroed();
+        entropy.fill(&mut bytes.0)?;
+        let mut cursor = ByteCursor::new(&bytes.0);
+        let manifest = Self {
+            schema: DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3,
+            runtime_response_signing_seed: cursor.array(),
+            pxnb_reference_token: cursor.array(),
+            pxob_observation_token: Some(cursor.array()),
+            manifest_instance_id: cursor.array(),
+            node_id: cursor.array(),
+            node_principal,
+            node_incarnation: cursor.array(),
+            node_management_endpoint_ref: cursor.array(),
+            runtime_observation_endpoint_ref: Some(cursor.array()),
+            config_commitment,
+        };
+        debug_assert_eq!(cursor.remaining(), 0);
+        manifest
+            .validate_v3(
+                config_commitment,
+                controller_verification_key,
+                tenure_verification_key,
+                node_principal,
+            )
+            .map_err(|_| IdentityManifestError::InvalidFreshEntropy)?;
+        Ok(manifest)
+    }
+
+    fn encode_v3(&self) -> SensitiveNodeV3Wire {
+        const ZERO_SECRET: [u8; 32] = [0; 32];
+        const ZERO_IDENTITY: [u8; 16] = [0; 16];
+
+        debug_assert_eq!(
+            self.schema,
+            DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+        );
+        let mut wire = SensitiveNodeV3Wire::zeroed();
+        wire.0[0..4].copy_from_slice(NODE_MANIFEST_MAGIC);
+        wire.0[4..6].copy_from_slice(&NODE_V3_MANIFEST_VERSION.to_be_bytes());
+        wire.0[6..8].copy_from_slice(
+            &u16::try_from(NODE_V3_MANIFEST_HEADER_BYTES)
+                .expect("node v3 manifest header width fits u16")
+                .to_be_bytes(),
+        );
+        wire.0[8..12].copy_from_slice(
+            &u32::try_from(NODE_V3_MANIFEST_WIRE_BYTES)
+                .expect("node v3 manifest wire width fits u32")
+                .to_be_bytes(),
+        );
+        wire.0[12..14].copy_from_slice(&NODE_V3_MANIFEST_FIELD_COUNT.to_be_bytes());
+        wire.0[14..16].copy_from_slice(&NODE_V3_MANIFEST_FLAGS.to_be_bytes());
+
+        let mut cursor = NODE_V3_MANIFEST_HEADER_BYTES;
+        for field in [
+            self.runtime_response_signing_seed(),
+            self.pxnb_reference_token(),
+            self.pxob_observation_token().unwrap_or(&ZERO_SECRET),
+        ] {
+            put_bytes(&mut wire.0, &mut cursor, field);
+        }
+        let observation_endpoint = self
+            .runtime_observation_endpoint_ref()
+            .unwrap_or(&ZERO_IDENTITY);
+        for field in self.identity_fields_v3(observation_endpoint) {
+            put_bytes(&mut wire.0, &mut cursor, field);
+        }
+        put_bytes(&mut wire.0, &mut cursor, self.config_commitment());
+        debug_assert_eq!(cursor, NODE_V3_MANIFEST_CHECKSUM_OFFSET);
+        let checksum = node_v3_manifest_checksum(&wire.0[..NODE_V3_MANIFEST_CHECKSUM_OFFSET]);
+        wire.0[NODE_V3_MANIFEST_CHECKSUM_OFFSET..].copy_from_slice(&checksum);
+        wire
+    }
+
+    fn decode_v3(
+        bytes: &[u8],
+        expected_config_commitment: [u8; 32],
+        controller_verification_key: [u8; 32],
+        tenure_verification_key: [u8; 32],
+        expected_node_principal: [u8; 16],
+    ) -> Result<Self, IdentityManifestError> {
+        if bytes.len() != NODE_V3_MANIFEST_WIRE_BYTES {
+            return Err(IdentityManifestError::InvalidManifestLength);
+        }
+        if &bytes[0..4] != NODE_MANIFEST_MAGIC {
+            return Err(IdentityManifestError::InvalidManifestMagic);
+        }
+        if read_u16(bytes, 4) != NODE_V3_MANIFEST_VERSION {
+            return Err(IdentityManifestError::UnsupportedManifestVersion);
+        }
+        if usize::from(read_u16(bytes, 6)) != NODE_V3_MANIFEST_HEADER_BYTES
+            || usize::try_from(read_u32(bytes, 8)).ok() != Some(NODE_V3_MANIFEST_WIRE_BYTES)
+            || read_u16(bytes, 12) != NODE_V3_MANIFEST_FIELD_COUNT
+            || read_u16(bytes, 14) != NODE_V3_MANIFEST_FLAGS
+        {
+            return Err(IdentityManifestError::InvalidManifestHeader);
+        }
+        let expected_checksum =
+            node_v3_manifest_checksum(&bytes[..NODE_V3_MANIFEST_CHECKSUM_OFFSET]);
+        if bytes[NODE_V3_MANIFEST_CHECKSUM_OFFSET..] != expected_checksum {
+            return Err(IdentityManifestError::ManifestChecksumMismatch);
+        }
+        let mut cursor = ByteCursor::new(
+            &bytes[NODE_V3_MANIFEST_HEADER_BYTES..NODE_V3_MANIFEST_CHECKSUM_OFFSET],
+        );
+        let manifest = Self {
+            schema: DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3,
+            runtime_response_signing_seed: cursor.array(),
+            pxnb_reference_token: cursor.array(),
+            pxob_observation_token: Some(cursor.array()),
+            manifest_instance_id: cursor.array(),
+            node_id: cursor.array(),
+            node_principal: cursor.array(),
+            node_incarnation: cursor.array(),
+            node_management_endpoint_ref: cursor.array(),
+            runtime_observation_endpoint_ref: Some(cursor.array()),
+            config_commitment: cursor.array(),
+        };
+        debug_assert_eq!(cursor.remaining(), 0);
+        manifest.validate_v3(
+            expected_config_commitment,
+            controller_verification_key,
+            tenure_verification_key,
+            expected_node_principal,
+        )?;
+        if manifest.encode_v3().as_bytes() != bytes {
+            return Err(IdentityManifestError::InvalidManifestField);
+        }
+        Ok(manifest)
+    }
+
+    fn validate_v3(
+        &self,
+        expected_config_commitment: [u8; 32],
+        controller_verification_key: [u8; 32],
+        tenure_verification_key: [u8; 32],
+        expected_node_principal: [u8; 16],
+    ) -> Result<(), IdentityManifestError> {
+        let pxob = self
+            .pxob_observation_token()
+            .ok_or(IdentityManifestError::InvalidManifestField)?;
+        let observation_endpoint = self
+            .runtime_observation_endpoint_ref()
+            .ok_or(IdentityManifestError::InvalidManifestField)?;
+        let secrets = [
+            self.runtime_response_signing_seed(),
+            self.pxnb_reference_token(),
+            pxob,
+        ];
+        let identities = self.identity_fields_v3(observation_endpoint);
+        let runtime_verification_key = SigningKey::from_bytes(self.runtime_response_signing_seed())
+            .verifying_key()
+            .to_bytes();
+        if self.schema != DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+            || !all_nonzero_and_distinct(&secrets)
+            || !all_nonzero_and_distinct(&identities)
+            || self.node_principal != expected_node_principal
+            || bytes_are_zero(self.config_commitment())
+            || self.config_commitment != expected_config_commitment
+            || runtime_verification_key == controller_verification_key
+            || runtime_verification_key == tenure_verification_key
+        {
+            return Err(IdentityManifestError::InvalidManifestField);
+        }
+        Ok(())
+    }
+
     fn identity_fields(&self) -> [&[u8; 16]; NODE_IDENTITY_FIELD_COUNT] {
         [
             self.manifest_instance_id(),
@@ -2395,6 +2851,20 @@ impl DeveloperNodeIdentityManifestV1 {
             observation_endpoint,
         ]
     }
+
+    fn identity_fields_v3<'a>(
+        &'a self,
+        observation_endpoint: &'a [u8; 16],
+    ) -> [&'a [u8; 16]; NODE_V3_IDENTITY_FIELD_COUNT] {
+        [
+            self.manifest_instance_id(),
+            self.node_id(),
+            self.node_principal(),
+            self.node_incarnation(),
+            self.node_management_endpoint_ref(),
+            observation_endpoint,
+        ]
+    }
 }
 
 impl DeveloperNodeEnrollmentArtifactV1 {
@@ -2402,8 +2872,22 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         input: DeveloperNodeEnrollmentArtifactInputV1<'_>,
         runtime_response_signing_seed: &[u8; 32],
     ) -> Result<Self, IdentityManifestError> {
+        Self::try_new_versioned(input, None, runtime_response_signing_seed)
+    }
+
+    fn try_new_versioned(
+        input: DeveloperNodeEnrollmentArtifactInputV1<'_>,
+        managed_agent_provider: Option<ManagedAgentProviderSelectionV1>,
+        runtime_response_signing_seed: &[u8; 32],
+    ) -> Result<Self, IdentityManifestError> {
+        let wire_version = if managed_agent_provider.is_some() {
+            NODE_ENROLLMENT_ARTIFACT_V2_VERSION
+        } else {
+            NODE_ENROLLMENT_ARTIFACT_VERSION
+        };
         let node_target = input.node_target;
         let mut artifact = Self {
+            wire_version,
             node_config_commitment: input.node_config_commitment,
             runtime_manifest_wire: input.runtime_manifest_wire.into(),
             runtime_manifest_digest: input.runtime_manifest_digest,
@@ -2444,6 +2928,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
             node_management_endpoint_ref: *node_target.management_endpoint_ref().as_bytes(),
             runtime_observation_endpoint_ref: *input.runtime_observation_endpoint_ref.as_bytes(),
             enrollment_issuer_ref: input.enrollment_issuer_ref,
+            managed_agent_provider,
             signature: [0; NODE_ENROLLMENT_ARTIFACT_SIGNATURE_BYTES],
             frame_digest: [0; NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES],
             canonical_wire: Box::new([]),
@@ -2456,10 +2941,13 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         }
         let unsigned = artifact.encode_unsigned()?;
         artifact.signature = signing_key
-            .sign(&node_enrollment_artifact_signature_transcript(&unsigned)?)
+            .sign(&node_enrollment_artifact_signature_transcript(
+                artifact.wire_version,
+                &unsigned,
+            )?)
             .to_bytes();
         let wire = artifact.encode_with_signature()?;
-        let decoded = Self::decode(&wire)?;
+        let decoded = Self::decode_exact(&wire, wire_version)?;
         if decoded != artifact.with_canonical_wire(wire.clone().into_boxed_slice()) {
             return Err(IdentityManifestError::InvalidEnrollmentArtifact);
         }
@@ -2467,17 +2955,32 @@ impl DeveloperNodeEnrollmentArtifactV1 {
     }
 
     fn decode(frame: &[u8]) -> Result<Self, IdentityManifestError> {
+        Self::decode_exact(frame, NODE_ENROLLMENT_ARTIFACT_VERSION)
+    }
+
+    fn decode_exact(frame: &[u8], expected_version: u16) -> Result<Self, IdentityManifestError> {
+        let (field_count, fixed_payload_bytes) = match expected_version {
+            NODE_ENROLLMENT_ARTIFACT_VERSION => (
+                NODE_ENROLLMENT_ARTIFACT_FIELD_COUNT,
+                NODE_ENROLLMENT_ARTIFACT_FIXED_PAYLOAD_BYTES,
+            ),
+            NODE_ENROLLMENT_ARTIFACT_V2_VERSION => (
+                NODE_ENROLLMENT_ARTIFACT_V2_FIELD_COUNT,
+                NODE_ENROLLMENT_ARTIFACT_V2_FIXED_PAYLOAD_BYTES,
+            ),
+            _ => return Err(IdentityManifestError::InvalidEnrollmentArtifact),
+        };
         if frame.len()
             < NODE_ENROLLMENT_ARTIFACT_HEADER_BYTES
-                + NODE_ENROLLMENT_ARTIFACT_FIXED_PAYLOAD_BYTES
+                + fixed_payload_bytes
                 + NODE_ENROLLMENT_ARTIFACT_SIGNATURE_BYTES
                 + NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES
             || frame.len() > MAX_NODE_ENROLLMENT_ARTIFACT_BYTES
             || frame.get(..4) != Some(&NODE_ENROLLMENT_ARTIFACT_MAGIC[..])
-            || read_u16(frame, 4) != NODE_ENROLLMENT_ARTIFACT_VERSION
+            || read_u16(frame, 4) != expected_version
             || usize::from(read_u16(frame, 6)) != NODE_ENROLLMENT_ARTIFACT_HEADER_BYTES
             || usize::try_from(read_u32(frame, 8)).ok() != Some(frame.len())
-            || read_u16(frame, 12) != NODE_ENROLLMENT_ARTIFACT_FIELD_COUNT
+            || read_u16(frame, 12) != field_count
             || read_u16(frame, 14) != NODE_ENROLLMENT_ARTIFACT_FLAGS
             || read_u32(frame, 28) != 0
         {
@@ -2504,7 +3007,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
             .and_then(|value| value.checked_add(route_len))
             .ok_or(IdentityManifestError::InvalidEnrollmentArtifact)?;
         let signature_offset = NODE_ENROLLMENT_ARTIFACT_HEADER_BYTES
-            .checked_add(NODE_ENROLLMENT_ARTIFACT_FIXED_PAYLOAD_BYTES)
+            .checked_add(fixed_payload_bytes)
             .and_then(|value| value.checked_add(variable_len))
             .ok_or(IdentityManifestError::InvalidEnrollmentArtifact)?;
         let digest_offset = signature_offset
@@ -2518,7 +3021,9 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         }
 
         let observed_frame_digest = copy_array(frame, digest_offset);
-        if observed_frame_digest != node_enrollment_artifact_frame_digest(&frame[..digest_offset]) {
+        if observed_frame_digest
+            != node_enrollment_artifact_frame_digest(expected_version, &frame[..digest_offset])?
+        {
             return Err(IdentityManifestError::EnrollmentArtifactDigestMismatch);
         }
 
@@ -2552,6 +3057,26 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         let node_management_endpoint_ref = cursor.array();
         let runtime_observation_endpoint_ref = cursor.array();
         let enrollment_issuer_ref = cursor.array();
+        let managed_agent_provider = match expected_version {
+            NODE_ENROLLMENT_ARTIFACT_VERSION => None,
+            NODE_ENROLLMENT_ARTIFACT_V2_VERSION => {
+                let profile = u16::from_be_bytes(cursor.array());
+                if profile != ManagedAgentProviderProfileV1::DeterministicFixture as u16 {
+                    return Err(IdentityManifestError::InvalidEnrollmentArtifact);
+                }
+                let provider_ref = ManagedAgentProviderRefV1::try_from_bytes(cursor.array())
+                    .map_err(|_| IdentityManifestError::InvalidEnrollmentArtifact)?;
+                let config_digest = Digest32::from_bytes(cursor.array());
+                Some(
+                    ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+                        provider_ref,
+                        config_digest,
+                    )
+                    .map_err(|_| IdentityManifestError::InvalidEnrollmentArtifact)?,
+                )
+            }
+            _ => return Err(IdentityManifestError::InvalidEnrollmentArtifact),
+        };
         let runtime_manifest_wire = cursor.take(manifest_len).into();
         let runtime_transport_profile_wire = cursor.take(profile_len).into();
         let runtime_carrier_binding_wire = cursor.take(carrier_len).into();
@@ -2566,6 +3091,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         }
         let signature = copy_array(frame, signature_offset);
         let artifact = Self {
+            wire_version: expected_version,
             node_config_commitment,
             runtime_manifest_wire,
             runtime_manifest_digest,
@@ -2599,6 +3125,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
             node_management_endpoint_ref,
             runtime_observation_endpoint_ref,
             enrollment_issuer_ref,
+            managed_agent_provider,
             signature,
             frame_digest: observed_frame_digest,
             canonical_wire: frame.into(),
@@ -2612,7 +3139,10 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         if verifying_key.is_weak()
             || verifying_key
                 .verify_strict(
-                    &node_enrollment_artifact_signature_transcript(&frame[..signature_offset])?,
+                    &node_enrollment_artifact_signature_transcript(
+                        expected_version,
+                        &frame[..signature_offset],
+                    )?,
                     &Signature::from_bytes(&artifact.signature),
                 )
                 .is_err()
@@ -2624,6 +3154,15 @@ impl DeveloperNodeEnrollmentArtifactV1 {
     }
 
     fn validate_canonical_components(&self) -> Result<(), IdentityManifestError> {
+        match (self.wire_version, self.managed_agent_provider) {
+            (NODE_ENROLLMENT_ARTIFACT_VERSION, None) => {}
+            (NODE_ENROLLMENT_ARTIFACT_V2_VERSION, Some(provider))
+                if provider.profile() == ManagedAgentProviderProfileV1::DeterministicFixture
+                    && provider.secret_ref().is_none()
+                    && provider.config_digest()
+                        == deterministic_fixture_provider_configuration_digest() => {}
+            _ => return Err(IdentityManifestError::InvalidEnrollmentArtifact),
+        }
         let ingress = verify_immutable_manifest_ingress(
             &self.runtime_manifest_wire,
             Digest32::from_bytes(self.runtime_manifest_digest),
@@ -2673,6 +3212,17 @@ impl DeveloperNodeEnrollmentArtifactV1 {
                 .map_err(|_| IdentityManifestError::EnrollmentArtifactCrossPinMismatch)?;
         let tenure_key = VerifyingKey::from_bytes(&self.tenure_verification_key)
             .map_err(|_| IdentityManifestError::EnrollmentArtifactCrossPinMismatch)?;
+        if let Some(provider) = self.managed_agent_provider {
+            let expected_provider_ref = derive_developer_node_managed_agent_provider_ref(
+                ingress.target(),
+                Digest32::from_bytes(self.node_config_commitment),
+                provider.config_digest(),
+            )
+            .map_err(|_| IdentityManifestError::EnrollmentArtifactCrossPinMismatch)?;
+            if provider.provider_ref() != expected_provider_ref {
+                return Err(IdentityManifestError::EnrollmentArtifactCrossPinMismatch);
+            }
+        }
         let authority_refs = [
             &self.source_scope,
             &self.writer,
@@ -2782,6 +3332,17 @@ impl DeveloperNodeEnrollmentArtifactV1 {
     }
 
     fn encode_unsigned(&self) -> Result<Vec<u8>, IdentityManifestError> {
+        let (field_count, fixed_payload_bytes) = match self.wire_version {
+            NODE_ENROLLMENT_ARTIFACT_VERSION if self.managed_agent_provider.is_none() => (
+                NODE_ENROLLMENT_ARTIFACT_FIELD_COUNT,
+                NODE_ENROLLMENT_ARTIFACT_FIXED_PAYLOAD_BYTES,
+            ),
+            NODE_ENROLLMENT_ARTIFACT_V2_VERSION if self.managed_agent_provider.is_some() => (
+                NODE_ENROLLMENT_ARTIFACT_V2_FIELD_COUNT,
+                NODE_ENROLLMENT_ARTIFACT_V2_FIXED_PAYLOAD_BYTES,
+            ),
+            _ => return Err(IdentityManifestError::InvalidEnrollmentArtifact),
+        };
         let manifest_len = u32::try_from(self.runtime_manifest_wire.len())
             .map_err(|_| IdentityManifestError::InvalidEnrollmentArtifact)?;
         let profile_len = u16::try_from(self.runtime_transport_profile_wire.len())
@@ -2793,7 +3354,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
         let route_len = u16::try_from(self.node_control_route.len())
             .map_err(|_| IdentityManifestError::InvalidEnrollmentArtifact)?;
         let total_len = NODE_ENROLLMENT_ARTIFACT_HEADER_BYTES
-            .checked_add(NODE_ENROLLMENT_ARTIFACT_FIXED_PAYLOAD_BYTES)
+            .checked_add(fixed_payload_bytes)
             .and_then(|value| value.checked_add(usize::try_from(manifest_len).ok()?))
             .and_then(|value| value.checked_add(usize::from(profile_len)))
             .and_then(|value| value.checked_add(usize::from(carrier_len)))
@@ -2810,7 +3371,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
             - NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES;
         let mut wire = Vec::with_capacity(unsigned_len);
         wire.extend_from_slice(NODE_ENROLLMENT_ARTIFACT_MAGIC);
-        wire.extend_from_slice(&NODE_ENROLLMENT_ARTIFACT_VERSION.to_be_bytes());
+        wire.extend_from_slice(&self.wire_version.to_be_bytes());
         wire.extend_from_slice(
             &u16::try_from(NODE_ENROLLMENT_ARTIFACT_HEADER_BYTES)
                 .map_err(|_| IdentityManifestError::InvalidEnrollmentArtifact)?
@@ -2821,7 +3382,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
                 .map_err(|_| IdentityManifestError::InvalidEnrollmentArtifact)?
                 .to_be_bytes(),
         );
-        wire.extend_from_slice(&NODE_ENROLLMENT_ARTIFACT_FIELD_COUNT.to_be_bytes());
+        wire.extend_from_slice(&field_count.to_be_bytes());
         wire.extend_from_slice(&NODE_ENROLLMENT_ARTIFACT_FLAGS.to_be_bytes());
         wire.extend_from_slice(&manifest_len.to_be_bytes());
         wire.extend_from_slice(&profile_len.to_be_bytes());
@@ -2866,6 +3427,15 @@ impl DeveloperNodeEnrollmentArtifactV1 {
             self.node_management_endpoint_ref.as_slice(),
             self.runtime_observation_endpoint_ref.as_slice(),
             self.enrollment_issuer_ref.as_slice(),
+        ] {
+            wire.extend_from_slice(value);
+        }
+        if let Some(provider) = self.managed_agent_provider {
+            wire.extend_from_slice(&(provider.profile() as u16).to_be_bytes());
+            wire.extend_from_slice(provider.provider_ref().as_bytes());
+            wire.extend_from_slice(provider.config_digest().as_bytes());
+        }
+        for value in [
             self.runtime_manifest_wire.as_ref(),
             self.runtime_transport_profile_wire.as_ref(),
             self.runtime_carrier_binding_wire.as_ref(),
@@ -2883,7 +3453,7 @@ impl DeveloperNodeEnrollmentArtifactV1 {
     fn encode_with_signature(&self) -> Result<Vec<u8>, IdentityManifestError> {
         let mut wire = self.encode_unsigned()?;
         wire.extend_from_slice(&self.signature);
-        let digest = node_enrollment_artifact_frame_digest(&wire);
+        let digest = node_enrollment_artifact_frame_digest(self.wire_version, &wire)?;
         wire.extend_from_slice(&digest);
         Ok(wire)
     }
@@ -3078,14 +3648,57 @@ impl DeveloperNodeEnrollmentArtifactV1 {
     }
 }
 
+impl DeveloperNodeEnrollmentArtifactV2 {
+    fn try_new(
+        input: DeveloperNodeEnrollmentArtifactInputV2<'_>,
+        runtime_response_signing_seed: &[u8; 32],
+    ) -> Result<Self, IdentityManifestError> {
+        DeveloperNodeEnrollmentArtifactV1::try_new_versioned(
+            input.base,
+            Some(input.managed_agent_provider),
+            runtime_response_signing_seed,
+        )
+        .map(Self)
+    }
+
+    fn decode(frame: &[u8]) -> Result<Self, IdentityManifestError> {
+        DeveloperNodeEnrollmentArtifactV1::decode_exact(
+            frame,
+            NODE_ENROLLMENT_ARTIFACT_V2_VERSION,
+        )
+        .map(Self)
+    }
+
+    pub(crate) const fn common(&self) -> &DeveloperNodeEnrollmentArtifactV1 {
+        &self.0
+    }
+
+    pub(crate) fn managed_agent_provider_selection(&self) -> ManagedAgentProviderSelectionV1 {
+        self.0
+            .managed_agent_provider
+            .expect("PXEA v2 decoder retained its required provider selection")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_wire(&self) -> &[u8] {
+        &self.0.canonical_wire
+    }
+}
+
 fn node_enrollment_artifact_signature_transcript(
+    version: u16,
     unsigned: &[u8],
 ) -> Result<Vec<u8>, IdentityManifestError> {
+    let domain = match version {
+        NODE_ENROLLMENT_ARTIFACT_VERSION => NODE_ENROLLMENT_ARTIFACT_SIGNATURE_DOMAIN,
+        NODE_ENROLLMENT_ARTIFACT_V2_VERSION => NODE_ENROLLMENT_ARTIFACT_V2_SIGNATURE_DOMAIN,
+        _ => return Err(IdentityManifestError::InvalidEnrollmentArtifact),
+    };
     let mut transcript = Vec::with_capacity(
-        NODE_ENROLLMENT_ARTIFACT_SIGNATURE_DOMAIN.len() + 2 + 4 + unsigned.len(),
+        domain.len() + 2 + 4 + unsigned.len(),
     );
-    transcript.extend_from_slice(NODE_ENROLLMENT_ARTIFACT_SIGNATURE_DOMAIN);
-    transcript.extend_from_slice(&NODE_ENROLLMENT_ARTIFACT_VERSION.to_be_bytes());
+    transcript.extend_from_slice(domain);
+    transcript.extend_from_slice(&version.to_be_bytes());
     transcript.extend_from_slice(
         &u32::try_from(unsigned.len())
             .map_err(|_| IdentityManifestError::InvalidEnrollmentArtifact)?
@@ -3095,12 +3708,20 @@ fn node_enrollment_artifact_signature_transcript(
     Ok(transcript)
 }
 
-fn node_enrollment_artifact_frame_digest(frame_without_digest: &[u8]) -> [u8; 32] {
+fn node_enrollment_artifact_frame_digest(
+    version: u16,
+    frame_without_digest: &[u8],
+) -> Result<[u8; 32], IdentityManifestError> {
+    let domain = match version {
+        NODE_ENROLLMENT_ARTIFACT_VERSION => NODE_ENROLLMENT_ARTIFACT_FRAME_DIGEST_DOMAIN,
+        NODE_ENROLLMENT_ARTIFACT_V2_VERSION => NODE_ENROLLMENT_ARTIFACT_V2_FRAME_DIGEST_DOMAIN,
+        _ => return Err(IdentityManifestError::InvalidEnrollmentArtifact),
+    };
     let mut digest = Sha256::new();
-    digest.update(NODE_ENROLLMENT_ARTIFACT_FRAME_DIGEST_DOMAIN);
-    digest.update(NODE_ENROLLMENT_ARTIFACT_VERSION.to_be_bytes());
+    digest.update(domain);
+    digest.update(version.to_be_bytes());
     digest.update(frame_without_digest);
-    digest.finalize().into()
+    Ok(digest.finalize().into())
 }
 
 fn publish_or_reopen_enrollment_artifact(
@@ -3112,7 +3733,12 @@ fn publish_or_reopen_enrollment_artifact(
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or(IdentityManifestError::InvalidEnrollmentArtifact)?;
     validate_enrollment_artifact_parent(parent)?;
-    let temporary = parent.join(NODE_ENROLLMENT_ARTIFACT_TEMP_FILE_NAME);
+    let temporary_file_name = match expected.wire_version {
+        NODE_ENROLLMENT_ARTIFACT_VERSION => NODE_ENROLLMENT_ARTIFACT_TEMP_FILE_NAME,
+        NODE_ENROLLMENT_ARTIFACT_V2_VERSION => NODE_V2_ENROLLMENT_ARTIFACT_TEMP_FILE_NAME,
+        _ => return Err(IdentityManifestError::InvalidEnrollmentArtifact),
+    };
+    let temporary = parent.join(temporary_file_name);
     if temporary == path {
         return Err(IdentityManifestError::InvalidEnrollmentArtifact);
     }
@@ -3128,7 +3754,8 @@ fn publish_or_reopen_enrollment_artifact(
             {
                 return Err(IdentityManifestError::EnrollmentArtifactPublicationConflict);
             }
-            let recovered = read_enrollment_artifact_file(path, 2)?;
+            let recovered =
+                read_enrollment_artifact_file(path, 2, expected.wire_version)?;
             if recovered.canonical_wire != expected.canonical_wire {
                 return Err(IdentityManifestError::EnrollmentArtifactPublicationConflict);
             }
@@ -3229,7 +3856,7 @@ fn strict_reopen_enrollment_artifact(
     path: &Path,
     expected: &DeveloperNodeEnrollmentArtifactV1,
 ) -> Result<(), IdentityManifestError> {
-    let actual = read_enrollment_artifact_file(path, 1)?;
+    let actual = read_enrollment_artifact_file(path, 1, expected.wire_version)?;
     if actual.canonical_wire != expected.canonical_wire {
         return Err(IdentityManifestError::EnrollmentArtifactPublicationConflict);
     }
@@ -3239,6 +3866,7 @@ fn strict_reopen_enrollment_artifact(
 fn read_enrollment_artifact_file(
     path: &Path,
     expected_links: u64,
+    expected_version: u16,
 ) -> Result<DeveloperNodeEnrollmentArtifactV1, IdentityManifestError> {
     let uid = Uid::effective().as_raw();
     let gid = Gid::effective().as_raw();
@@ -3284,7 +3912,7 @@ fn read_enrollment_artifact_file(
         expected_links,
         Some(metadata.len()),
     )?;
-    DeveloperNodeEnrollmentArtifactV1::decode(&wire)
+    DeveloperNodeEnrollmentArtifactV1::decode_exact(&wire, expected_version)
 }
 
 fn validate_enrollment_artifact_parent(path: &Path) -> Result<(), IdentityManifestError> {
@@ -4259,11 +4887,16 @@ fn node_v2_manifest_checksum(bytes: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-fn deterministic_provider_configuration_digest() -> [u8; 32] {
+fn node_v3_manifest_checksum(bytes: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(DETERMINISTIC_PROVIDER_CONFIG_DOMAIN);
-    digest.update(DETERMINISTIC_PROVIDER_PROFILE);
+    digest.update(NODE_V3_MANIFEST_CHECKSUM_DOMAIN);
+    digest.update(NODE_V3_MANIFEST_VERSION.to_be_bytes());
+    digest.update(bytes);
     digest.finalize().into()
+}
+
+fn deterministic_provider_configuration_digest() -> [u8; 32] {
+    *deterministic_fixture_provider_configuration_digest().as_bytes()
 }
 
 fn put_bytes(destination: &mut [u8], cursor: &mut usize, value: &[u8]) {
@@ -4504,56 +5137,85 @@ mod tests {
             }
         }
 
-        fn artifact(&self) -> DeveloperNodeEnrollmentArtifactV1 {
-            DeveloperNodeEnrollmentArtifactV1::try_new(
-                DeveloperNodeEnrollmentArtifactInputV1 {
-                    node_config_commitment: [0x30; 32],
-                    runtime_manifest_wire: &self.manifest_wire,
-                    runtime_manifest_digest: self.manifest_digest,
-                    runtime_response_key_ref: [0x09; 16],
-                    runtime_response_public_key: SigningKey::from_bytes(
-                        &self.runtime_response_signing_seed,
-                    )
+        fn input(&self) -> DeveloperNodeEnrollmentArtifactInputV1<'_> {
+            DeveloperNodeEnrollmentArtifactInputV1 {
+                node_config_commitment: [0x30; 32],
+                runtime_manifest_wire: &self.manifest_wire,
+                runtime_manifest_digest: self.manifest_digest,
+                runtime_response_key_ref: [0x09; 16],
+                runtime_response_public_key: SigningKey::from_bytes(
+                    &self.runtime_response_signing_seed,
+                )
+                .verifying_key()
+                .to_bytes(),
+                source_scope: [0x03; 16],
+                writer: [0x04; 16],
+                authority_principal: [0x07; 16],
+                tenure_authority_ref: [0x0a; 16],
+                tenure_key_ref: [0x0b; 16],
+                tenure_verification_key: SigningKey::from_bytes(&self.tenure_signing_seed)
                     .verifying_key()
                     .to_bytes(),
-                    source_scope: [0x03; 16],
-                    writer: [0x04; 16],
-                    authority_principal: [0x07; 16],
-                    tenure_authority_ref: [0x0a; 16],
-                    tenure_key_ref: [0x0b; 16],
-                    tenure_verification_key: SigningKey::from_bytes(&self.tenure_signing_seed)
-                        .verifying_key()
-                        .to_bytes(),
-                    runtime_transport_profile: &self.profile,
-                    runtime_transport_profile_ref: [0x12; 16],
-                    runtime_carrier_binding: &self.carrier,
-                    node_control_endpoint_ref: [0x13; 16],
-                    node_control_endpoint_generation: 1,
-                    node_control_locator: "tls/192.0.2.10:7449",
-                    node_control_route: "paraegox/node/control/v1",
-                    node_principal: [0x19; 16],
-                    node_route_config_digest: [0x31; 32],
-                    node_trust_domain_ref: [0x14; 16],
-                    node_trust_anchor_ref: [0x15; 16],
-                    node_controller_connector_credential_ref: [0x16; 16],
-                    node_listener_credential_ref: [0x17; 16],
-                    node_control_transport_profile_ref: [0x18; 16],
-                    node_target: NodeManagementTargetV1::try_new(
-                        NodeId::try_from_bytes([0x1a; 16]).expect("Node id"),
-                        NodeManagementEndpointRefV1::try_from_bytes([0x1c; 16])
-                            .expect("Node management endpoint"),
-                        NodeIncarnation::try_from_bytes([0x1b; 16]).expect("Node incarnation"),
-                        1,
-                    )
-                    .expect("Node target"),
-                    runtime_observation_endpoint_ref:
-                        RuntimeObservationEndpointRefV1::try_from_bytes([0x1d; 16])
-                            .expect("Runtime observation endpoint"),
-                    enrollment_issuer_ref: [0x0c; 16],
+                runtime_transport_profile: &self.profile,
+                runtime_transport_profile_ref: [0x12; 16],
+                runtime_carrier_binding: &self.carrier,
+                node_control_endpoint_ref: [0x13; 16],
+                node_control_endpoint_generation: 1,
+                node_control_locator: "tls/192.0.2.10:7449",
+                node_control_route: "paraegox/node/control/v1",
+                node_principal: [0x19; 16],
+                node_route_config_digest: [0x31; 32],
+                node_trust_domain_ref: [0x14; 16],
+                node_trust_anchor_ref: [0x15; 16],
+                node_controller_connector_credential_ref: [0x16; 16],
+                node_listener_credential_ref: [0x17; 16],
+                node_control_transport_profile_ref: [0x18; 16],
+                node_target: NodeManagementTargetV1::try_new(
+                    NodeId::try_from_bytes([0x1a; 16]).expect("Node id"),
+                    NodeManagementEndpointRefV1::try_from_bytes([0x1c; 16])
+                        .expect("Node management endpoint"),
+                    NodeIncarnation::try_from_bytes([0x1b; 16]).expect("Node incarnation"),
+                    1,
+                )
+                .expect("Node target"),
+                runtime_observation_endpoint_ref:
+                    RuntimeObservationEndpointRefV1::try_from_bytes([0x1d; 16])
+                        .expect("Runtime observation endpoint"),
+                enrollment_issuer_ref: [0x0c; 16],
+            }
+        }
+
+        fn artifact(&self) -> DeveloperNodeEnrollmentArtifactV1 {
+            DeveloperNodeEnrollmentArtifactV1::try_new(
+                self.input(),
+                &self.runtime_response_signing_seed,
+            )
+            .expect("canonical signed PXEA v1 fixture")
+        }
+
+        fn artifact_v2(&self) -> DeveloperNodeEnrollmentArtifactV2 {
+            let input = self.input();
+            let config_digest = deterministic_fixture_provider_configuration_digest();
+            let provider_ref = derive_developer_node_managed_agent_provider_ref(
+                self.profile.target(),
+                Digest32::from_bytes(input.node_config_commitment),
+                config_digest,
+            )
+            .expect("derived PXEA v2 provider ref");
+            let managed_agent_provider =
+                ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+                    provider_ref,
+                    config_digest,
+                )
+                .expect("PXEA v2 deterministic provider");
+            DeveloperNodeEnrollmentArtifactV2::try_new(
+                DeveloperNodeEnrollmentArtifactInputV2 {
+                    base: input,
+                    managed_agent_provider,
                 },
                 &self.runtime_response_signing_seed,
             )
-            .expect("canonical signed PXEA fixture")
+            .expect("canonical signed PXEA v2 fixture")
         }
 
         fn controller_public_key(&self) -> [u8; 32] {
@@ -4570,18 +5232,23 @@ mod tests {
     }
 
     fn resign_enrollment_wire(wire: &mut [u8], runtime_response_signing_seed: &[u8; 32]) {
+        let version = read_u16(wire, 4);
         let signature_offset = wire.len()
             - NODE_ENROLLMENT_ARTIFACT_SIGNATURE_BYTES
             - NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES;
         let digest_offset = wire.len() - NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES;
         let signature = SigningKey::from_bytes(runtime_response_signing_seed)
             .sign(
-                &node_enrollment_artifact_signature_transcript(&wire[..signature_offset])
+                &node_enrollment_artifact_signature_transcript(
+                    version,
+                    &wire[..signature_offset],
+                )
                     .expect("PXEA test signing transcript"),
             )
             .to_bytes();
         wire[signature_offset..digest_offset].copy_from_slice(&signature);
-        let digest = node_enrollment_artifact_frame_digest(&wire[..digest_offset]);
+        let digest = node_enrollment_artifact_frame_digest(version, &wire[..digest_offset])
+            .expect("PXEA test frame digest");
         wire[digest_offset..].copy_from_slice(&digest);
     }
 
@@ -4988,6 +5655,21 @@ mod tests {
         let first_wire = first.encode_v2();
         assert_eq!(&first_wire.as_bytes()[..4], NODE_MANIFEST_MAGIC);
         assert_eq!(read_u16(first_wire.as_bytes(), 4), NODE_V2_MANIFEST_VERSION);
+        assert_eq!(
+            DeveloperNodeIdentityManifestV1::decode_v3(
+                first_wire.as_bytes(),
+                config.config_commitment(),
+                config.control().controller_request_verification_key(),
+                config.control().tenure_verification_key(),
+                *config
+                    .node_control()
+                    .expect("schema v2 remote control")
+                    .node_certificate_principal()
+                    .as_bytes(),
+            )
+            .unwrap_err(),
+            IdentityManifestError::UnsupportedManifestVersion
+        );
 
         let reopened = load_or_create_node_with_entropy(&config, &mut FailingEntropy)
             .expect("strict node v2 identity reopen");
@@ -5062,6 +5744,122 @@ mod tests {
         );
         assert!(
             !IdentityPaths::node_v2(&alias_directory.path)
+                .manifest
+                .exists()
+        );
+    }
+
+    #[test]
+    fn node_manifest_v3_is_private_stable_provider_and_desired_free_version_strict() {
+        let directory = TestDirectory::new();
+        let config = crate::config::developer_node_config_v3_for_test(&directory.path);
+        let paths = IdentityPaths::node_v3(&directory.path);
+        let mut entropy = PatternEntropy::new();
+        let first = load_or_create_node_with_entropy(&config, &mut entropy)
+            .expect("first node v3 identity manifest");
+        assert_eq!(entropy.calls, 1);
+        assert_eq!(
+            first.schema(),
+            DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+        );
+        assert_eq!(first.config_commitment(), &config.config_commitment());
+        assert_eq!(
+            first.node_principal(),
+            config
+                .node_control()
+                .expect("schema v3 remote control")
+                .node_certificate_principal()
+                .as_bytes()
+        );
+        assert!(first.pxob_observation_token().is_some());
+        assert!(first.runtime_observation_endpoint_ref().is_some());
+
+        let metadata = fs::symlink_metadata(&paths.manifest).expect("node v3 manifest metadata");
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.len(), NODE_V3_MANIFEST_WIRE_BYTES as u64);
+        assert_eq!(NODE_V3_MANIFEST_WIRE_BYTES, NODE_V2_MANIFEST_WIRE_BYTES);
+        assert_eq!(NODE_V3_MANIFEST_FIELD_COUNT, NODE_V2_MANIFEST_FIELD_COUNT);
+        assert!(!paths.temporary.exists());
+        let first_wire = first.encode_v3();
+        assert_eq!(&first_wire.as_bytes()[..4], NODE_MANIFEST_MAGIC);
+        assert_eq!(read_u16(first_wire.as_bytes(), 4), NODE_V3_MANIFEST_VERSION);
+        assert_eq!(
+            read_u16(first_wire.as_bytes(), 12),
+            NODE_V3_MANIFEST_FIELD_COUNT
+        );
+
+        let provider = config
+            .managed_agent_bootstrap()
+            .expect("schema v3 provider selection")
+            .selection();
+        assert!(!contains_subslice(
+            first_wire.as_bytes(),
+            provider.provider_ref().as_bytes()
+        ));
+        assert!(!contains_subslice(
+            first_wire.as_bytes(),
+            provider.config_digest().as_bytes()
+        ));
+        for deployment_owned_desired in [
+            [0x20; 16].as_slice(),
+            [0x21; 16].as_slice(),
+            b"tcp/127.0.0.1:7447".as_slice(),
+            b"developer-agent-bootstrap-v1".as_slice(),
+        ] {
+            assert!(!contains_subslice(
+                first_wire.as_bytes(),
+                deployment_owned_desired
+            ));
+        }
+        assert_eq!(
+            DeveloperNodeIdentityManifestV1::decode_v2(
+                first_wire.as_bytes(),
+                config.config_commitment(),
+                config.control().controller_request_verification_key(),
+                config.control().tenure_verification_key(),
+                *config
+                    .node_control()
+                    .expect("schema v3 remote control")
+                    .node_certificate_principal()
+                    .as_bytes(),
+            )
+            .unwrap_err(),
+            IdentityManifestError::UnsupportedManifestVersion
+        );
+
+        let reopened = load_or_create_node_with_entropy(&config, &mut FailingEntropy)
+            .expect("strict node v3 identity reopen");
+        assert_eq!(reopened.encode_v3().as_bytes(), first_wire.as_bytes());
+        assert!(!directory.path.join(NODE_IDENTITY_DIRECTORY_NAME).exists());
+        assert!(!directory.path.join(NODE_V2_IDENTITY_DIRECTORY_NAME).exists());
+
+        let v2 = crate::config::developer_node_config_v2_for_test(&directory.path);
+        assert_eq!(
+            load_or_create_node_with_entropy(&v2, &mut FailingEntropy).unwrap_err(),
+            IdentityManifestError::ProviderProfileMismatch
+        );
+
+        let mut corrupt = fs::read(&paths.manifest).expect("PXNI v3 bytes");
+        corrupt[NODE_V3_MANIFEST_HEADER_BYTES + 3] ^= 1;
+        fs::write(&paths.manifest, &corrupt).expect("corrupt PXNI v3");
+        assert_eq!(
+            load_or_create_node_with_entropy(&config, &mut FailingEntropy).unwrap_err(),
+            IdentityManifestError::ManifestChecksumMismatch
+        );
+
+        let alias_directory = TestDirectory::new();
+        let alias_config = crate::config::developer_node_config_v3_for_test(&alias_directory.path);
+        assert_eq!(
+            load_or_create_node_with_entropy(
+                &alias_config,
+                &mut ConfiguredPrincipalAliasingNodeV2Entropy,
+            )
+            .unwrap_err(),
+            IdentityManifestError::InvalidFreshEntropy
+        );
+        assert!(
+            !IdentityPaths::node_v3(&alias_directory.path)
                 .manifest
                 .exists()
         );
@@ -5273,6 +6071,226 @@ mod tests {
     }
 
     #[test]
+    fn node_enrollment_artifact_v2_is_additive_provider_pinned_and_version_strict() {
+        const PROVIDER_PROFILE_OFFSET: usize =
+            NODE_ENROLLMENT_ARTIFACT_HEADER_BYTES + NODE_ENROLLMENT_ARTIFACT_FIXED_PAYLOAD_BYTES;
+        const PROVIDER_REF_OFFSET: usize = PROVIDER_PROFILE_OFFSET + 2;
+        const PROVIDER_CONFIG_DIGEST_OFFSET: usize = PROVIDER_REF_OFFSET + 16;
+
+        let directory = TestDirectory::new();
+        let mut builder = DirBuilder::new();
+        builder
+            .mode(0o700)
+            .create(&directory.path)
+            .expect("PXEA v2 owner directory");
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("PXEA v2 owner directory mode");
+        let path = directory.path.join("enrollment-v2.pxea");
+        let fixture = EnrollmentArtifactFixture::new();
+        let legacy = fixture.artifact();
+        let artifact = fixture.artifact_v2();
+        let wire = artifact.canonical_wire();
+
+        assert_eq!(read_u16(wire, 4), NODE_ENROLLMENT_ARTIFACT_V2_VERSION);
+        assert_eq!(
+            read_u16(wire, 12),
+            NODE_ENROLLMENT_ARTIFACT_V2_FIELD_COUNT
+        );
+        assert_eq!(wire.len(), legacy.canonical_wire().len() + 50);
+        assert_eq!(
+            &wire[PROVIDER_PROFILE_OFFSET..PROVIDER_REF_OFFSET],
+            &(ManagedAgentProviderProfileV1::DeterministicFixture as u16).to_be_bytes()
+        );
+        let provider = artifact.managed_agent_provider_selection();
+        assert_eq!(
+            provider.profile(),
+            ManagedAgentProviderProfileV1::DeterministicFixture
+        );
+        assert_eq!(provider.secret_ref(), None);
+        assert_eq!(
+            provider.config_digest(),
+            deterministic_fixture_provider_configuration_digest()
+        );
+        assert_eq!(
+            &wire[PROVIDER_REF_OFFSET..PROVIDER_CONFIG_DIGEST_OFFSET],
+            provider.provider_ref().as_bytes()
+        );
+        assert_eq!(
+            &wire[PROVIDER_CONFIG_DIGEST_OFFSET..PROVIDER_CONFIG_DIGEST_OFFSET + 32],
+            provider.config_digest().as_bytes()
+        );
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/wire/t1_node_enrollment_artifact_v2.json"
+        ))
+        .expect("valid public-safe PXEA v2 golden fixture");
+        let provider_extension =
+            &wire[PROVIDER_PROFILE_OFFSET..PROVIDER_CONFIG_DIGEST_OFFSET + 32];
+        let provider_config_digest_hex = lower_hex(provider.config_digest().as_bytes());
+        let provider_ref_hex = lower_hex(provider.provider_ref().as_bytes());
+        let provider_extension_hex = lower_hex(provider_extension);
+        let whole_file_sha256: [u8; 32] = Sha256::digest(wire).into();
+        let whole_file_sha256_hex = lower_hex(&whole_file_sha256);
+        let wire_hex = lower_hex(wire);
+        let signature_offset = wire.len()
+            - NODE_ENROLLMENT_ARTIFACT_SIGNATURE_BYTES
+            - NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES;
+        let frame_digest_offset = wire.len() - NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES;
+        let signature_hex = lower_hex(&wire[signature_offset..frame_digest_offset]);
+        let frame_digest_hex = lower_hex(&wire[frame_digest_offset..]);
+        assert_eq!(
+            golden["protocol"]["version"].as_u64(),
+            Some(u64::from(NODE_ENROLLMENT_ARTIFACT_V2_VERSION))
+        );
+        assert_eq!(
+            golden["protocol"]["field_count"].as_u64(),
+            Some(u64::from(NODE_ENROLLMENT_ARTIFACT_V2_FIELD_COUNT))
+        );
+        assert_eq!(
+            golden["protocol"]["provider_extension_offset"].as_u64(),
+            u64::try_from(PROVIDER_PROFILE_OFFSET).ok()
+        );
+        assert_eq!(
+            golden["expected"]["provider_configuration_digest_hex"].as_str(),
+            Some(provider_config_digest_hex.as_str())
+        );
+        assert_eq!(
+            golden["expected"]["provider_ref_hex"].as_str(),
+            Some(provider_ref_hex.as_str())
+        );
+        assert_eq!(
+            golden["expected"]["provider_extension_hex"].as_str(),
+            Some(provider_extension_hex.as_str())
+        );
+        assert_eq!(
+            golden["expected"]["wire_length"].as_u64(),
+            u64::try_from(wire.len()).ok()
+        );
+        assert_eq!(
+            golden["expected"]["whole_file_sha256_hex"].as_str(),
+            Some(whole_file_sha256_hex.as_str())
+        );
+        assert_eq!(
+            golden["expected"]["signature_hex"].as_str(),
+            Some(signature_hex.as_str())
+        );
+        assert_eq!(
+            golden["expected"]["frame_digest_hex"].as_str(),
+            Some(frame_digest_hex.as_str())
+        );
+        assert_eq!(
+            golden["expected"]["wire_hex"].as_str(),
+            Some(wire_hex.as_str())
+        );
+        assert_eq!(
+            DeveloperNodeEnrollmentArtifactV1::decode(wire).unwrap_err(),
+            IdentityManifestError::InvalidEnrollmentArtifact
+        );
+        assert_eq!(
+            DeveloperNodeEnrollmentArtifactV2::decode(legacy.canonical_wire()).unwrap_err(),
+            IdentityManifestError::InvalidEnrollmentArtifact
+        );
+
+        publish_or_reopen_enrollment_artifact(&path, artifact.common())
+            .expect("atomic PXEA v2 publication");
+        let metadata = fs::symlink_metadata(&path).expect("published PXEA v2 metadata");
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(
+            !directory
+                .path
+                .join(NODE_V2_ENROLLMENT_ARTIFACT_TEMP_FILE_NAME)
+                .exists()
+        );
+        publish_or_reopen_enrollment_artifact(&path, artifact.common())
+            .expect("strict PXEA v2 reopen");
+        let published = fs::read(&path).expect("published PXEA v2 bytes");
+        assert_eq!(published.as_slice(), wire);
+        let decoded = decode_pinned_node_enrollment_artifact_v2(
+            wire,
+            whole_file_sha256,
+            fixture.controller_public_key(),
+            fixture.tenure_public_key(),
+        )
+        .expect("independently pinned PXEA v2");
+        assert_eq!(decoded.canonical_wire(), wire);
+        assert_eq!(decoded.managed_agent_provider_selection(), provider);
+        assert_eq!(
+            decoded.common().node_config_commitment().as_bytes(),
+            &[0x30; 32]
+        );
+        assert_eq!(
+            decoded.common().target(),
+            RuntimeHostId::from_bytes([0x02; 16])
+        );
+        let mut wrong_whole_file_sha256 = whole_file_sha256;
+        wrong_whole_file_sha256[0] ^= 1;
+        assert_eq!(
+            decode_pinned_node_enrollment_artifact_v2(
+                wire,
+                wrong_whole_file_sha256,
+                fixture.controller_public_key(),
+                fixture.tenure_public_key(),
+            )
+            .unwrap_err(),
+            IdentityManifestError::EnrollmentArtifactDigestMismatch
+        );
+
+        for secret in [
+            fixture.runtime_response_signing_seed.as_slice(),
+            fixture.controller_signing_seed.as_slice(),
+            fixture.tenure_signing_seed.as_slice(),
+            [0xe1; 32].as_slice(),
+            [0xe2; 32].as_slice(),
+        ] {
+            assert!(!contains_subslice(wire, secret));
+        }
+        assert!(!contains_subslice(wire, &fixture.controller_public_key()));
+        assert!(!contains_subslice(
+            wire,
+            directory.path.as_os_str().as_bytes()
+        ));
+        for deployment_owned_desired in [
+            [0x20; 16].as_slice(),
+            [0x21; 16].as_slice(),
+            b"tcp/127.0.0.1:7447".as_slice(),
+            b"developer-agent-bootstrap-v1".as_slice(),
+        ] {
+            assert!(!contains_subslice(wire, deployment_owned_desired));
+        }
+
+        let mut unknown_profile = wire.to_vec();
+        unknown_profile[PROVIDER_PROFILE_OFFSET..PROVIDER_REF_OFFSET]
+            .copy_from_slice(&u16::MAX.to_be_bytes());
+        resign_enrollment_wire(
+            &mut unknown_profile,
+            &fixture.runtime_response_signing_seed,
+        );
+        assert_eq!(
+            DeveloperNodeEnrollmentArtifactV2::decode(&unknown_profile).unwrap_err(),
+            IdentityManifestError::InvalidEnrollmentArtifact
+        );
+
+        let mut ref_drift = wire.to_vec();
+        ref_drift[PROVIDER_REF_OFFSET] ^= 1;
+        resign_enrollment_wire(&mut ref_drift, &fixture.runtime_response_signing_seed);
+        assert_eq!(
+            DeveloperNodeEnrollmentArtifactV2::decode(&ref_drift).unwrap_err(),
+            IdentityManifestError::EnrollmentArtifactCrossPinMismatch
+        );
+
+        let mut config_digest_drift = wire.to_vec();
+        config_digest_drift[PROVIDER_CONFIG_DIGEST_OFFSET] ^= 1;
+        resign_enrollment_wire(
+            &mut config_digest_drift,
+            &fixture.runtime_response_signing_seed,
+        );
+        assert_eq!(
+            DeveloperNodeEnrollmentArtifactV2::decode(&config_digest_drift).unwrap_err(),
+            IdentityManifestError::InvalidEnrollmentArtifact
+        );
+    }
+
+    #[test]
     fn node_enrollment_artifact_rejects_digest_signature_alias_and_wrong_owner_keys() {
         const SOURCE_SCOPE_OFFSET: usize = NODE_ENROLLMENT_ARTIFACT_HEADER_BYTES + 112;
         const NODE_ENDPOINT_REF_OFFSET: usize = NODE_ENROLLMENT_ARTIFACT_HEADER_BYTES + 304;
@@ -5305,7 +6323,11 @@ mod tests {
             - NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES;
         signature_tamper[signature_offset] ^= 1;
         let digest_offset = signature_tamper.len() - NODE_ENROLLMENT_ARTIFACT_DIGEST_BYTES;
-        let digest = node_enrollment_artifact_frame_digest(&signature_tamper[..digest_offset]);
+        let digest = node_enrollment_artifact_frame_digest(
+            NODE_ENROLLMENT_ARTIFACT_VERSION,
+            &signature_tamper[..digest_offset],
+        )
+        .expect("PXEA v1 test frame digest");
         signature_tamper[digest_offset..].copy_from_slice(&digest);
         assert_eq!(
             DeveloperNodeEnrollmentArtifactV1::decode(&signature_tamper).unwrap_err(),

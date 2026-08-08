@@ -10,8 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use nix::unistd::{Gid, Uid, chown};
 
 use crate::config::{
-    DeveloperDeploymentConfigV1, DeveloperFixtureConfigV1, DeveloperNodeConfigV1,
-    DeveloperProvisionedConfigV1,
+    DeveloperDeploymentConfigV1, DeveloperFixtureConfigV1, DeveloperNodeConfigSchemaV1,
+    DeveloperNodeConfigV1, DeveloperProvisionedConfigV1,
 };
 use crate::identity::{
     DeveloperNodeIdentityManifestV1, DistributedDeveloperLocalIdentityManifestV1,
@@ -33,6 +33,7 @@ const NODE_OBSERVATION_SOCKET_FILE: &str = "o.sock";
 const PXNB_BOOTSTRAP_FILE: &str = "node.pxnb";
 const PXOB_BOOTSTRAP_FILE: &str = "observe.pxob";
 const NODE_ENROLLMENT_ARTIFACT_FILE: &str = "enrollment-v1.pxea";
+const NODE_ENROLLMENT_ARTIFACT_V2_FILE: &str = "enrollment-v2.pxea";
 const DEPLOYMENT_CONTROLLER_STORE_DIRECTORY: &str = "controller-store";
 const DEPLOYMENT_MANAGED_FABRIC_SUCCESSOR_STORE_DIRECTORY: &str = "managed-fabric-successor-store";
 const AGENT_IPC_SOCKET_FILE: &str = "c.sock";
@@ -239,9 +240,15 @@ pub(crate) fn prepare_node(
     let pxob_bootstrap_path = config
         .node_control()
         .map(|_| node_bootstrap_directory.join(PXOB_BOOTSTRAP_FILE));
-    let node_enrollment_artifact_path = config
-        .node_control()
-        .map(|_| node_owner_directory.join(NODE_ENROLLMENT_ARTIFACT_FILE));
+    let node_enrollment_artifact_path = match config.schema() {
+        DeveloperNodeConfigSchemaV1::HostLocalV1 => None,
+        DeveloperNodeConfigSchemaV1::RemoteControlV2 => {
+            Some(node_owner_directory.join(NODE_ENROLLMENT_ARTIFACT_FILE))
+        }
+        DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3 => {
+            Some(node_owner_directory.join(NODE_ENROLLMENT_ARTIFACT_V2_FILE))
+        }
+    };
     for path in [&runtime_socket_path, &node_management_socket_path]
         .into_iter()
         .chain(node_observation_socket_path.iter())
@@ -1920,6 +1927,74 @@ mod tests {
             first.validate(uid, gid).unwrap_err(),
             DeveloperLocalLayoutError::OverlappingPath
         );
+        drop(first);
+        drop(cleanup);
+    }
+
+    #[test]
+    fn public_node_v3_layout_versions_only_the_enrollment_coordinate() {
+        let directory = TestDirectory::new();
+        let config = crate::config::developer_node_config_v3_for_test(&directory.path);
+        let identities =
+            crate::identity::load_or_create_node(&config).expect("node v3 identity owner");
+        let first = prepare_node(&config, &identities).expect("node v3 filesystem layout");
+        let cleanup = SocketDirectoryCleanup([first.socket_directory().to_path_buf()]);
+        let enrollment_artifact = first
+            .node_enrollment_artifact_path()
+            .expect("schema v3 enrollment artifact coordinate");
+
+        assert_eq!(
+            enrollment_artifact,
+            first
+                .node_owner_directory()
+                .join(NODE_ENROLLMENT_ARTIFACT_V2_FILE)
+        );
+        assert_ne!(
+            enrollment_artifact,
+            first
+                .node_owner_directory()
+                .join(NODE_ENROLLMENT_ARTIFACT_FILE)
+        );
+        assert!(first.node_observation_socket_path().is_some());
+        assert!(first.pxob_bootstrap_path().is_some());
+        assert!(
+            !first
+                .node_owner_directory()
+                .join(NODE_ENROLLMENT_ARTIFACT_FILE)
+                .exists()
+        );
+        for absent in [
+            CONTROLLER_STATE_DIRECTORY,
+            SUCCESSOR_STATE_DIRECTORY,
+            AUTHORITY_STATE_DIRECTORY,
+            DISTRIBUTED_STATE_DIRECTORY,
+            "agent",
+            "model",
+            "inspection",
+            "console",
+        ] {
+            assert!(!first.canonical_state_root().join(absent).exists());
+        }
+        assert!(
+            !first
+                .socket_directory()
+                .join(AGENT_IPC_SOCKET_FILE)
+                .exists()
+        );
+        assert!(
+            !first
+                .socket_directory()
+                .join(INSPECTION_IPC_SOCKET_FILE)
+                .exists()
+        );
+
+        let second = prepare_node(&config, &identities).expect("stable node v3 reopen");
+        assert_eq!(first.owned_paths(), second.owned_paths());
+        assert_eq!(
+            first.node_enrollment_artifact_path(),
+            second.node_enrollment_artifact_path()
+        );
+        drop(second);
         drop(first);
         drop(cleanup);
     }

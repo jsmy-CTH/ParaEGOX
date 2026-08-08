@@ -30,7 +30,14 @@ use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     MAX_RESTRICTED_RUNTIME_APPLY_ROUTE_BYTES, RestrictedRuntimeApplyTransportProfileFieldsV1,
     RestrictedRuntimeApplyTransportProfileV1,
 };
-use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentProviderRefV1;
+use paraegox_runtime_contracts::{
+    managed_agent_stack_plan::{
+        ManagedAgentProviderProfileV1, ManagedAgentProviderRefV1,
+        ManagedAgentProviderSelectionV1, ManagedAgentStackPlanError,
+    },
+    managed_fabric_plan::ManagedFabricListenEndpointV1,
+    managed_service::ManagedServiceId,
+};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
@@ -47,12 +54,21 @@ const DEEPSEEK_SECRET_REF: &str = "env:DEEPSEEK_API_KEY";
 const CHAT_CONFIG_SCHEMA_VERSION: u16 = 1;
 const NODE_CONFIG_SCHEMA_V1: u16 = 1;
 const NODE_CONFIG_SCHEMA_V2: u16 = 2;
+const NODE_CONFIG_SCHEMA_V3: u16 = 3;
 const DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1: u16 = 1;
+const DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V2: u16 = 2;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_DEVELOPER_DEPLOYMENT_ARTIFACT_BYTES: u64 = 1024 * 1024;
 const DEVELOPER_DEPLOYMENT_SIGNING_SEED_BYTES: u64 = 32;
 const NODE_CONFIG_COMMITMENT_V1_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v1";
 const NODE_CONFIG_COMMITMENT_V2_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v2";
+const NODE_CONFIG_COMMITMENT_V3_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v3";
+const NODE_MANAGED_AGENT_PROVIDER_REF_DOMAIN: &[u8] =
+    b"paraegox.local.developer-node-managed-agent-provider-ref.sha256.v1";
+const DETERMINISTIC_PROVIDER_CONFIG_DOMAIN: &[u8] =
+    b"paraegox.local.developer-fixture-provider.config.sha256.v1";
+const DETERMINISTIC_PROVIDER_PROFILE: &[u8] = b"deterministic-fixture-v1";
+const DEVELOPER_AGENT_BOOTSTRAP_LIMITS_PROFILE: &str = "developer-agent-bootstrap-v1";
 const NODE_CONTROL_ROUTE_CONFIG_DOMAIN: &[u8] =
     b"paraegox.local.developer-node-control-route-config.sha256.v1";
 const DEVELOPER_NODE_OPERATION_TIMEOUT_NANOS: u64 = 30_000_000_000;
@@ -151,6 +167,7 @@ struct DeveloperNodeConfigDocumentV1 {
     control: DeveloperNodeControlDocumentV1,
     restricted_runtime_apply: DeveloperNodeRestrictedRuntimeApplyDocumentV1,
     node_control: Option<DeveloperNodeRemoteControlDocumentV2>,
+    managed_agent_bootstrap: Option<ManagedAgentBootstrapFixtureDocumentV3>,
 }
 
 #[derive(Deserialize)]
@@ -209,6 +226,12 @@ struct DeveloperNodeRemoteControlDocumentV2 {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ManagedAgentBootstrapFixtureDocumentV3 {
+    provider: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeveloperDeploymentConfigDocumentV1 {
     schema_version: u16,
     state_root: String,
@@ -220,6 +243,7 @@ struct DeveloperDeploymentConfigDocumentV1 {
     authority_socket_path: String,
     runtime_connector: DeveloperDeploymentConnectorDocumentV1,
     node_connector: DeveloperDeploymentConnectorDocumentV1,
+    managed_agent_bootstrap: Option<DeveloperDeploymentAgentBootstrapDocumentV2>,
 }
 
 #[derive(Deserialize)]
@@ -230,10 +254,20 @@ struct DeveloperDeploymentConnectorDocumentV1 {
     client_private_key_file: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperDeploymentAgentBootstrapDocumentV2 {
+    fabric_service_id: String,
+    agent_service_id: String,
+    fabric_listen: String,
+    limits_profile: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeveloperNodeConfigSchemaV1 {
     HostLocalV1,
     RemoteControlV2,
+    ManagedAgentBootstrapV3,
 }
 
 impl DeveloperNodeConfigSchemaV1 {
@@ -241,6 +275,7 @@ impl DeveloperNodeConfigSchemaV1 {
         match self {
             Self::HostLocalV1 => NODE_CONFIG_SCHEMA_V1,
             Self::RemoteControlV2 => NODE_CONFIG_SCHEMA_V2,
+            Self::ManagedAgentBootstrapV3 => NODE_CONFIG_SCHEMA_V3,
         }
     }
 }
@@ -255,6 +290,7 @@ pub(crate) struct DeveloperNodeConfigV1 {
     control: DeveloperNodeControlConfigV1,
     restricted_runtime_apply: DeveloperNodeRestrictedRuntimeApplyConfigV1,
     node_control: Option<DeveloperNodeRemoteControlConfigV2>,
+    managed_agent_bootstrap: Option<ManagedAgentBootstrapFixtureV3>,
     config_commitment: [u8; 32],
 }
 
@@ -267,6 +303,7 @@ impl fmt::Debug for DeveloperNodeConfigV1 {
             .field("control", &self.control)
             .field("restricted_runtime_apply", &self.restricted_runtime_apply)
             .field("node_control", &self.node_control)
+            .field("managed_agent_bootstrap", &self.managed_agent_bootstrap)
             .field("config_commitment", &"<redacted-digest>")
             .finish()
     }
@@ -295,8 +332,27 @@ impl DeveloperNodeConfigV1 {
         self.node_control.as_ref()
     }
 
+    pub(crate) const fn managed_agent_bootstrap(
+        &self,
+    ) -> Option<&ManagedAgentBootstrapFixtureV3> {
+        self.managed_agent_bootstrap.as_ref()
+    }
+
     pub(crate) const fn config_commitment(&self) -> [u8; 32] {
         self.config_commitment
+    }
+}
+
+/// Exact non-secret deterministic provider selection enabled only by Node
+/// schema v3. Service identities, endpoints and limits remain Deployment-owned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedAgentBootstrapFixtureV3 {
+    selection: ManagedAgentProviderSelectionV1,
+}
+
+impl ManagedAgentBootstrapFixtureV3 {
+    pub(crate) const fn selection(self) -> ManagedAgentProviderSelectionV1 {
+        self.selection
     }
 }
 
@@ -555,6 +611,7 @@ impl DeveloperNodeRemoteControlConfigV2 {
 /// solely from the separately SHA-256-pinned enrollment artifact.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct DeveloperDeploymentConfigV1 {
+    schema: DeveloperDeploymentConfigSchemaV1,
     state_root: PathBuf,
     enrollment_artifact_file: PathBuf,
     enrollment_artifact_sha256: [u8; 32],
@@ -564,6 +621,55 @@ pub(crate) struct DeveloperDeploymentConfigV1 {
     authority_socket_path: PathBuf,
     runtime_connector: DeveloperDeploymentConnectorConfigV1,
     node_connector: DeveloperDeploymentConnectorConfigV1,
+    managed_agent_bootstrap: Option<DeveloperDeploymentAgentBootstrapConfigV2>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeveloperDeploymentConfigSchemaV1 {
+    EnrollmentV1,
+    ManagedAgentBootstrapV2,
+}
+
+impl DeveloperDeploymentConfigSchemaV1 {
+    pub(crate) const fn wire_value(self) -> u16 {
+        match self {
+            Self::EnrollmentV1 => DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1,
+            Self::ManagedAgentBootstrapV2 => DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeveloperDeploymentAgentBootstrapLimitsProfileV1 {
+    DeveloperAgentBootstrapV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeveloperDeploymentAgentBootstrapConfigV2 {
+    fabric_service_id: ManagedServiceId,
+    agent_service_id: ManagedServiceId,
+    fabric_listen: ManagedFabricListenEndpointV1,
+    limits_profile: DeveloperDeploymentAgentBootstrapLimitsProfileV1,
+}
+
+impl DeveloperDeploymentAgentBootstrapConfigV2 {
+    pub(crate) const fn fabric_service_id(&self) -> ManagedServiceId {
+        self.fabric_service_id
+    }
+
+    pub(crate) const fn agent_service_id(&self) -> ManagedServiceId {
+        self.agent_service_id
+    }
+
+    pub(crate) const fn fabric_listen(&self) -> &ManagedFabricListenEndpointV1 {
+        &self.fabric_listen
+    }
+
+    pub(crate) const fn limits_profile(
+        &self,
+    ) -> DeveloperDeploymentAgentBootstrapLimitsProfileV1 {
+        self.limits_profile
+    }
 }
 
 pub(crate) struct DeveloperDeploymentResolvedInputsV1 {
@@ -598,15 +704,20 @@ impl fmt::Debug for DeveloperDeploymentConfigV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DeveloperDeploymentConfigV1")
-            .field("schema_version", &DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1)
+            .field("schema_version", &self.schema.wire_value())
             .field("state_root", &self.state_root)
             .field("enrollment_artifact_sha256", &"<non-secret-pin>")
+            .field("managed_agent_bootstrap", &self.managed_agent_bootstrap)
             .field("secret_and_connector_paths", &"<redacted-paths>")
             .finish()
     }
 }
 
 impl DeveloperDeploymentConfigV1 {
+    pub(crate) const fn schema(&self) -> DeveloperDeploymentConfigSchemaV1 {
+        self.schema
+    }
+
     pub(crate) fn state_root(&self) -> &Path {
         &self.state_root
     }
@@ -641,6 +752,12 @@ impl DeveloperDeploymentConfigV1 {
 
     pub(crate) const fn node_connector(&self) -> &DeveloperDeploymentConnectorConfigV1 {
         &self.node_connector
+    }
+
+    pub(crate) const fn managed_agent_bootstrap(
+        &self,
+    ) -> Option<&DeveloperDeploymentAgentBootstrapConfigV2> {
+        self.managed_agent_bootstrap.as_ref()
     }
 
     /// Revalidates owner, mode, inode and independently pinned artifact bytes
@@ -1955,9 +2072,22 @@ pub(crate) fn parse_developer_deployment_config_toml_v1(
     ensure_unix_developer_local()?;
     let document = toml::from_str::<DeveloperDeploymentConfigDocumentV1>(document)
         .map_err(|_| ConfigError::InvalidConfigDocument)?;
-    if document.schema_version != DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1 {
-        return Err(ConfigError::UnsupportedConfigSchema);
-    }
+    let schema = match (
+        document.schema_version,
+        document.managed_agent_bootstrap.is_some(),
+    ) {
+        (DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1, false) => {
+            DeveloperDeploymentConfigSchemaV1::EnrollmentV1
+        }
+        (DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V2, true) => {
+            DeveloperDeploymentConfigSchemaV1::ManagedAgentBootstrapV2
+        }
+        (
+            DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1 | DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V2,
+            _,
+        ) => return Err(ConfigError::InvalidDeploymentConfiguration),
+        _ => return Err(ConfigError::UnsupportedConfigSchema),
+    };
     let state_root = parse_deployment_path(document.state_root)?;
     let enrollment_artifact_file = parse_deployment_path(document.enrollment_artifact_file)?;
     let enrollment_artifact_sha256 =
@@ -1969,7 +2099,12 @@ pub(crate) fn parse_developer_deployment_config_toml_v1(
     let authority_socket_path = parse_deployment_path(document.authority_socket_path)?;
     let runtime_connector = parse_deployment_connector(document.runtime_connector)?;
     let node_connector = parse_deployment_connector(document.node_connector)?;
+    let managed_agent_bootstrap = document
+        .managed_agent_bootstrap
+        .map(parse_deployment_agent_bootstrap)
+        .transpose()?;
     let config = DeveloperDeploymentConfigV1 {
+        schema,
         state_root,
         enrollment_artifact_file,
         enrollment_artifact_sha256,
@@ -1979,6 +2114,7 @@ pub(crate) fn parse_developer_deployment_config_toml_v1(
         authority_socket_path,
         runtime_connector,
         node_connector,
+        managed_agent_bootstrap,
     };
     let files = config.all_file_paths();
     let authority_socket_parent = config
@@ -2026,6 +2162,36 @@ fn parse_deployment_connector(
     })
 }
 
+fn parse_deployment_agent_bootstrap(
+    document: DeveloperDeploymentAgentBootstrapDocumentV2,
+) -> Result<DeveloperDeploymentAgentBootstrapConfigV2, ConfigError> {
+    let fabric_service_id = ManagedServiceId::from_bytes(
+        parse_nonzero_ref(&document.fabric_service_id)
+            .ok_or(ConfigError::InvalidDeploymentConfiguration)?,
+    );
+    let agent_service_id = ManagedServiceId::from_bytes(
+        parse_nonzero_ref(&document.agent_service_id)
+            .ok_or(ConfigError::InvalidDeploymentConfiguration)?,
+    );
+    if fabric_service_id == agent_service_id {
+        return Err(ConfigError::InvalidDeploymentConfiguration);
+    }
+    let fabric_listen = ManagedFabricListenEndpointV1::try_new(&document.fabric_listen)
+        .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let limits_profile = match document.limits_profile.as_str() {
+        DEVELOPER_AGENT_BOOTSTRAP_LIMITS_PROFILE => {
+            DeveloperDeploymentAgentBootstrapLimitsProfileV1::DeveloperAgentBootstrapV1
+        }
+        _ => return Err(ConfigError::InvalidDeploymentConfiguration),
+    };
+    Ok(DeveloperDeploymentAgentBootstrapConfigV2 {
+        fabric_service_id,
+        agent_service_id,
+        fabric_listen,
+        limits_profile,
+    })
+}
+
 fn parse_deployment_path(value: String) -> Result<PathBuf, ConfigError> {
     parse_tls_file_path(value).map_err(|_| ConfigError::InvalidDeploymentConfiguration)
 }
@@ -2049,14 +2215,28 @@ fn parse_deployment_sha256_pin(value: &str) -> Result<[u8; 32], ConfigError> {
 fn parse_node_config_document(
     document: DeveloperNodeConfigDocumentV1,
 ) -> Result<Command, ConfigError> {
-    let schema = match (document.schema_version, document.node_control.is_some()) {
-        (NODE_CONFIG_SCHEMA_V1, false) => DeveloperNodeConfigSchemaV1::HostLocalV1,
-        (NODE_CONFIG_SCHEMA_V2, true) => DeveloperNodeConfigSchemaV1::RemoteControlV2,
-        (NODE_CONFIG_SCHEMA_V1 | NODE_CONFIG_SCHEMA_V2, _) => {
+    let schema = match (
+        document.schema_version,
+        document.node_control.is_some(),
+        document.managed_agent_bootstrap.is_some(),
+    ) {
+        (NODE_CONFIG_SCHEMA_V1, false, false) => DeveloperNodeConfigSchemaV1::HostLocalV1,
+        (NODE_CONFIG_SCHEMA_V2, true, false) => DeveloperNodeConfigSchemaV1::RemoteControlV2,
+        (NODE_CONFIG_SCHEMA_V3, true, true) => {
+            DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+        }
+        (NODE_CONFIG_SCHEMA_V1 | NODE_CONFIG_SCHEMA_V2 | NODE_CONFIG_SCHEMA_V3, _, _) => {
             return Err(ConfigError::InvalidNodeConfiguration);
         }
         _ => return Err(ConfigError::UnsupportedConfigSchema),
     };
+    if document
+        .managed_agent_bootstrap
+        .as_ref()
+        .is_some_and(|fixture| fixture.provider != DETERMINISTIC_ECHO_PROVIDER)
+    {
+        return Err(ConfigError::InvalidNodeConfiguration);
+    }
     let state_root = parse_state_root(document.state_root)?;
     let control_document = document.control;
     let control = DeveloperNodeControlConfigV1 {
@@ -2143,13 +2323,26 @@ fn parse_node_config_document(
         &control,
         &restricted_runtime_apply,
         node_control.as_ref(),
+        document.managed_agent_bootstrap.as_ref(),
     );
+    let managed_agent_bootstrap = document
+        .managed_agent_bootstrap
+        .map(|_| {
+            developer_node_managed_agent_provider_selection(
+                RuntimeHostId::from_bytes(control.target()),
+                Digest32::from_bytes(config_commitment),
+            )
+            .map(|selection| ManagedAgentBootstrapFixtureV3 { selection })
+            .map_err(|_| ConfigError::InvalidNodeConfiguration)
+        })
+        .transpose()?;
     Ok(Command::DeveloperNodeV1(Box::new(DeveloperNodeConfigV1 {
         schema,
         state_root,
         control,
         restricted_runtime_apply,
         node_control,
+        managed_agent_bootstrap,
         config_commitment,
     })))
 }
@@ -2306,11 +2499,15 @@ fn developer_node_config_commitment(
     control: &DeveloperNodeControlConfigV1,
     restricted: &DeveloperNodeRestrictedRuntimeApplyConfigV1,
     node_control: Option<&DeveloperNodeRemoteControlConfigV2>,
+    managed_agent_bootstrap: Option<&ManagedAgentBootstrapFixtureDocumentV3>,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(match schema {
         DeveloperNodeConfigSchemaV1::HostLocalV1 => NODE_CONFIG_COMMITMENT_V1_DOMAIN,
         DeveloperNodeConfigSchemaV1::RemoteControlV2 => NODE_CONFIG_COMMITMENT_V2_DOMAIN,
+        DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3 => {
+            NODE_CONFIG_COMMITMENT_V3_DOMAIN
+        }
     });
     digest.update(schema.wire_value().to_be_bytes());
     update_node_commitment_field(&mut digest, state_root.as_os_str().as_encoded_bytes());
@@ -2339,7 +2536,58 @@ fn developer_node_config_commitment(
             update_node_commitment_field(&mut digest, path.as_os_str().as_encoded_bytes());
         }
     }
+    if let Some(managed_agent_bootstrap) = managed_agent_bootstrap {
+        update_node_commitment_field(
+            &mut digest,
+            managed_agent_bootstrap.provider.as_bytes(),
+        );
+    }
     digest.finalize().into()
+}
+
+pub(crate) fn deterministic_fixture_provider_configuration_digest() -> Digest32 {
+    let mut digest = Sha256::new();
+    digest.update(DETERMINISTIC_PROVIDER_CONFIG_DOMAIN);
+    digest.update(DETERMINISTIC_PROVIDER_PROFILE);
+    Digest32::from_bytes(digest.finalize().into())
+}
+
+pub(crate) fn derive_developer_node_managed_agent_provider_ref(
+    target: RuntimeHostId,
+    node_config_commitment: Digest32,
+    provider_config_digest: Digest32,
+) -> Result<ManagedAgentProviderRefV1, ManagedAgentStackPlanError> {
+    let mut digest = Sha256::new();
+    digest.update(NODE_MANAGED_AGENT_PROVIDER_REF_DOMAIN);
+    digest.update(NODE_CONFIG_SCHEMA_V3.to_be_bytes());
+    digest.update(
+        (ManagedAgentProviderProfileV1::DeterministicFixture as u16).to_be_bytes(),
+    );
+    digest.update(target.as_bytes());
+    digest.update(node_config_commitment.as_bytes());
+    digest.update(provider_config_digest.as_bytes());
+    let derived: [u8; 32] = digest.finalize().into();
+    ManagedAgentProviderRefV1::try_from_bytes(
+        derived[..16]
+            .try_into()
+            .map_err(|_| ManagedAgentStackPlanError::InvalidProvider)?,
+    )
+}
+
+fn developer_node_managed_agent_provider_selection(
+    target: RuntimeHostId,
+    node_config_commitment: Digest32,
+) -> Result<ManagedAgentProviderSelectionV1, ManagedAgentStackPlanError> {
+    let provider_config_digest = deterministic_fixture_provider_configuration_digest();
+    let provider_ref = derive_developer_node_managed_agent_provider_ref(
+        target,
+        node_config_commitment,
+        provider_config_digest,
+    )?;
+    ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+        provider_ref,
+        provider_config_digest,
+    )
 }
 
 struct DeveloperNodeControlRouteConfigDigestInputV2<'a> {
@@ -2912,6 +3160,21 @@ pub(crate) fn developer_node_config_v2_for_test(state_root: &Path) -> DeveloperN
 }
 
 #[cfg(test)]
+pub(crate) fn developer_node_config_v3_for_test(state_root: &Path) -> DeveloperNodeConfigV1 {
+    let state_root = state_root.to_str().expect("UTF-8 test state root");
+    match parse_node_config_toml_for_test(&developer_node_document_v3_for_test(state_root))
+        .expect("valid developer node v3 test config")
+    {
+        Command::DeveloperNodeV1(config) => *config,
+        Command::DeveloperDeploymentV1(_)
+        | Command::DeveloperFixtureV1(_)
+        | Command::DeveloperDistributedFixtureV1(_)
+        | Command::DeveloperProvisionedV1(_)
+        | Command::Help => panic!("unexpected developer node v3 test command"),
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn developer_deployment_config_for_test(
     state_root: &Path,
 ) -> DeveloperDeploymentConfigV1 {
@@ -3005,6 +3268,21 @@ root_ca_certificate_file = "{state_root}/credentials/node-root-ca.pem"
 node_listener_certificate_file = "{state_root}/credentials/node.pem"
 node_listener_private_key_file = "{state_root}/credentials/node-key.pem"
 "#
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn developer_node_document_v3_for_test(state_root: &str) -> String {
+    let remote = developer_node_document_v2_for_test(state_root).replacen(
+        "schema_version = 2",
+        "schema_version = 3",
+        1,
+    );
+    format!(
+        r#"{remote}
+[managed_agent_bootstrap]
+provider = "deterministic-echo-v1"
+"#,
     )
 }
 
@@ -3181,6 +3459,23 @@ client_private_key_file = {:?}
                     .to_str()
                     .expect("UTF-8 certificate"),
                 self.node_client_key_path().to_str().expect("UTF-8 key"),
+            )
+        }
+
+        fn document_v2(&self) -> String {
+            let enrollment = self.document().replacen(
+                "schema_version = 1",
+                "schema_version = 2",
+                1,
+            );
+            format!(
+                r#"{enrollment}
+[managed_agent_bootstrap]
+fabric_service_id = "31313131313131313131313131313131"
+agent_service_id = "32323232323232323232323232323232"
+fabric_listen = "tcp/127.0.0.1:7447"
+limits_profile = "developer-agent-bootstrap-v1"
+"#,
             )
         }
     }
@@ -3558,6 +3853,127 @@ client_private_key_file = {:?}
 
     #[cfg(unix)]
     #[test]
+    fn deployment_config_v2_owns_only_exact_agent_bootstrap_desired_inputs() {
+        let fixture = DeploymentConfigFixture::new();
+        let v1 = fixture.document();
+        let v2 = fixture.document_v2();
+        let config = parse_developer_deployment_config_toml_v1(&v2)
+            .expect("strict Deployment v2 config");
+        assert_eq!(
+            config.schema(),
+            DeveloperDeploymentConfigSchemaV1::ManagedAgentBootstrapV2
+        );
+        let desired = config
+            .managed_agent_bootstrap()
+            .expect("schema v2 managed Agent desired inputs");
+        assert_eq!(desired.fabric_service_id().as_bytes(), &[0x31; 16]);
+        assert_eq!(desired.agent_service_id().as_bytes(), &[0x32; 16]);
+        assert_eq!(desired.fabric_listen().as_str(), "tcp/127.0.0.1:7447");
+        assert_eq!(
+            desired.limits_profile(),
+            DeveloperDeploymentAgentBootstrapLimitsProfileV1::DeveloperAgentBootstrapV1
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&v1.replacen(
+                "schema_version = 1",
+                "schema_version = 2",
+                1,
+            )),
+            Err(ConfigError::InvalidDeploymentConfiguration)
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&v2.replacen(
+                "schema_version = 2",
+                "schema_version = 1",
+                1,
+            )),
+            Err(ConfigError::InvalidDeploymentConfiguration)
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&v2.replacen(
+                "schema_version = 2",
+                "schema_version = 3",
+                1,
+            )),
+            Err(ConfigError::UnsupportedConfigSchema)
+        );
+        for invalid in [
+            v2.replace(
+                "fabric_service_id = \"31313131313131313131313131313131\"",
+                "fabric_service_id = \"00000000000000000000000000000000\"",
+            ),
+            v2.replace(
+                "fabric_service_id = \"31313131313131313131313131313131\"",
+                "fabric_service_id = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
+            ),
+            v2.replace(
+                "agent_service_id = \"32323232323232323232323232323232\"",
+                "agent_service_id = \"31313131313131313131313131313131\"",
+            ),
+            v2.replace("tcp/127.0.0.1:7447", "tcp/0.0.0.0:7447"),
+            v2.replace("tcp/127.0.0.1:7447", "tcp/127.0.0.1:07447"),
+            v2.replace(
+                "developer-agent-bootstrap-v1",
+                "developer-agent-bootstrap-v2",
+            ),
+        ] {
+            assert_eq!(
+                parse_developer_deployment_config_toml_v1(&invalid),
+                Err(ConfigError::InvalidDeploymentConfiguration)
+            );
+        }
+        let provider_injection = v2.replace(
+            "limits_profile = \"developer-agent-bootstrap-v1\"",
+            "limits_profile = \"developer-agent-bootstrap-v1\"\nprovider = \"deterministic-echo-v1\"",
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&provider_injection),
+            Err(ConfigError::InvalidConfigDocument)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_bootstrap_examples_parse_to_exact_versioned_projections() {
+        let node = parse_node_fixture(include_str!(
+            "../../../configs/paraegox-node.agent-bootstrap.example.toml"
+        ));
+        assert_eq!(
+            node.schema(),
+            DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+        );
+        let provider = node
+            .managed_agent_bootstrap()
+            .expect("Node v3 example provider")
+            .selection();
+        assert_eq!(
+            provider.profile(),
+            ManagedAgentProviderProfileV1::DeterministicFixture
+        );
+        assert_eq!(provider.secret_ref(), None);
+
+        let deployment = parse_developer_deployment_config_toml_v1(include_str!(
+            "../../../configs/paraegox-deployment.agent-bootstrap.example.toml"
+        ))
+        .expect("Deployment v2 example");
+        assert_eq!(
+            deployment.schema(),
+            DeveloperDeploymentConfigSchemaV1::ManagedAgentBootstrapV2
+        );
+        let desired = deployment
+            .managed_agent_bootstrap()
+            .expect("Deployment v2 example desired inputs");
+        assert_eq!(desired.fabric_service_id().as_bytes(), &[0x20; 16]);
+        assert_eq!(desired.agent_service_id().as_bytes(), &[0x21; 16]);
+        assert_eq!(desired.fabric_listen().as_str(), "tcp/127.0.0.1:7447");
+        assert_eq!(
+            desired.limits_profile(),
+            DeveloperDeploymentAgentBootstrapLimitsProfileV1::DeveloperAgentBootstrapV1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn deployment_resolver_defers_stale_authority_socket_to_authority_owner() {
         let fixture = DeploymentConfigFixture::new();
         let listener = UnixListener::bind(fixture.authority_socket())
@@ -3875,9 +4291,82 @@ client_private_key_file = {:?}
     }
 
     #[test]
+    fn node_config_v3_pins_only_one_derived_deterministic_provider_selection() {
+        let state_root = "/var/tmp/paraegox-node-v3-test";
+        let document = developer_node_document_v3_for_test(state_root);
+        let config = parse_node_fixture(&document);
+        assert_eq!(
+            config.schema(),
+            DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+        );
+        assert!(config.node_control().is_some());
+        let selection = config
+            .managed_agent_bootstrap()
+            .expect("schema v3 provider selection")
+            .selection();
+        assert_eq!(
+            selection.profile(),
+            ManagedAgentProviderProfileV1::DeterministicFixture
+        );
+        assert_eq!(selection.secret_ref(), None);
+        assert_eq!(
+            selection.config_digest(),
+            deterministic_fixture_provider_configuration_digest()
+        );
+        assert_eq!(
+            selection.provider_ref(),
+            derive_developer_node_managed_agent_provider_ref(
+                RuntimeHostId::from_bytes(config.control().target()),
+                Digest32::from_bytes(config.config_commitment()),
+                selection.config_digest(),
+            )
+            .expect("derived provider ref")
+        );
+        assert_eq!(parse_node_fixture(&document), config);
+        assert_ne!(
+            config.config_commitment(),
+            parse_node_fixture(&developer_node_document_v2_for_test(state_root))
+                .config_commitment()
+        );
+
+        let missing = document
+            .split_once("\n[managed_agent_bootstrap]")
+            .expect("v3 managed Agent section")
+            .0;
+        assert_eq!(
+            parse_node_config_toml_for_test(missing),
+            Err(ConfigError::InvalidNodeConfiguration)
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&document.replace(
+                "deterministic-echo-v1",
+                "openai-responses-v1"
+            )),
+            Err(ConfigError::InvalidNodeConfiguration)
+        );
+        let desired_injection = document.replace(
+            "provider = \"deterministic-echo-v1\"",
+            "provider = \"deterministic-echo-v1\"\nfabric_service_id = \"31313131313131313131313131313131\"",
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&desired_injection),
+            Err(ConfigError::InvalidConfigDocument)
+        );
+        let secret_injection = document.replace(
+            "provider = \"deterministic-echo-v1\"",
+            "provider = \"deterministic-echo-v1\"\nsecret_ref = \"env:OPENAI_API_KEY\"",
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&secret_injection),
+            Err(ConfigError::InvalidConfigDocument)
+        );
+    }
+
+    #[test]
     fn node_config_versions_and_secret_fields_fail_closed() {
         let v1 = developer_node_document_for_test("/var/tmp/paraegox-node-v1-test");
         let v2 = developer_node_document_v2_for_test("/var/tmp/paraegox-node-v2-test");
+        let v3 = developer_node_document_v3_for_test("/var/tmp/paraegox-node-v3-test");
         assert_eq!(
             parse_node_fixture(&v1).schema(),
             DeveloperNodeConfigSchemaV1::HostLocalV1
@@ -3903,6 +4392,22 @@ client_private_key_file = {:?}
             parse_node_config_toml_for_test(&v2.replacen(
                 "schema_version = 2",
                 "schema_version = 3",
+                1
+            )),
+            Err(ConfigError::InvalidNodeConfiguration)
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&v3.replacen(
+                "schema_version = 3",
+                "schema_version = 2",
+                1
+            )),
+            Err(ConfigError::InvalidNodeConfiguration)
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&v3.replacen(
+                "schema_version = 3",
+                "schema_version = 4",
                 1
             )),
             Err(ConfigError::UnsupportedConfigSchema)

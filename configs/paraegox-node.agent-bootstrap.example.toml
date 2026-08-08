@@ -1,0 +1,60 @@
+# Additive Node schema v3 example. This file pins only the deterministic
+# managed-Agent provider selection. Desired service identities, the Fabric
+# listen endpoint, and limits remain Deployment-owned and are not valid Node
+# fields. Never place a signing seed, PXNB/PXOB token, certificate contents,
+# private-key bytes, or provider secret in this file.
+#
+# Before launch, create state_root and its credentials child as the non-root
+# service user with mode 0700. All six TLS files must share that exact
+# owner-private credentials directory. Both listener private-key files must be
+# mode 0600; CA and listener certificates must not be group/other writable.
+schema_version = 3
+state_root = "/var/lib/paraegox-node"
+
+[control]
+installation_id = "01010101010101010101010101010101"
+target = "02020202020202020202020202020202"
+source_scope = "03030303030303030303030303030303"
+writer = "04040404040404040404040404040404"
+runtime_principal = "05050505050505050505050505050505"
+controller_principal = "06060606060606060606060606060606"
+authority_principal = "07070707070707070707070707070707"
+controller_request_key_ref = "08080808080808080808080808080808"
+runtime_response_key_ref = "09090909090909090909090909090909"
+tenure_authority_ref = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+tenure_key_ref = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+enrollment_issuer_ref = "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+controller_request_verification_key = "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b"
+tenure_verification_key = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
+
+[restricted_runtime_apply]
+endpoint_ref = "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+endpoint_generation = 1
+tls_listener_locator = "tls/192.0.2.10:7448"
+route = "paraegox/runtime/02020202020202020202020202020202/apply"
+trust_domain_ref = "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"
+trust_anchor_ref = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+controller_connector_credential_ref = "10101010101010101010101010101010"
+runtime_listener_credential_ref = "11111111111111111111111111111111"
+control_transport_profile_ref = "12121212121212121212121212121212"
+root_ca_certificate_file = "/var/lib/paraegox-node/credentials/root-ca.pem"
+runtime_listener_certificate_file = "/var/lib/paraegox-node/credentials/runtime.pem"
+runtime_listener_private_key_file = "/var/lib/paraegox-node/credentials/runtime-key.pem"
+
+[node_control]
+endpoint_ref = "13131313131313131313131313131313"
+endpoint_generation = 1
+tls_listener_locator = "tls/192.0.2.10:7449"
+route = "paraegox/node/control/v1"
+trust_domain_ref = "14141414141414141414141414141414"
+trust_anchor_ref = "15151515151515151515151515151515"
+controller_connector_credential_ref = "16161616161616161616161616161616"
+node_listener_credential_ref = "17171717171717171717171717171717"
+control_transport_profile_ref = "18181818181818181818181818181818"
+node_certificate_principal = "19191919191919191919191919191919"
+root_ca_certificate_file = "/var/lib/paraegox-node/credentials/node-root-ca.pem"
+node_listener_certificate_file = "/var/lib/paraegox-node/credentials/node.pem"
+node_listener_private_key_file = "/var/lib/paraegox-node/credentials/node-key.pem"
+
+[managed_agent_bootstrap]
+provider = "deterministic-echo-v1"

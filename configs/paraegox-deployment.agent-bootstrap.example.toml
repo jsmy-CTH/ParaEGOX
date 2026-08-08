@@ -1,0 +1,33 @@
+# Public Deployment schema v2 example. Deployment alone owns the desired
+# managed Fabric/Agent service identities, loopback Fabric listen endpoint,
+# and named limits profile. The PXEA v2 artifact supplies the separately
+# committed provider profile/ref/config digest.
+#
+# Never place a signing seed, certificate/private-key bytes, PXNB/PXOB token,
+# challenge, bearer credential value, or provider secret in TOML. Replace every
+# path and the public artifact digest with deployment-specific values.
+schema_version = 2
+state_root = "/var/lib/paraegox-deployment/controller"
+enrollment_artifact_file = "/var/lib/paraegox-deployment/input/enrollment-v2.pxea"
+enrollment_artifact_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+controller_signing_seed_file = "/var/lib/paraegox-deployment/secrets/controller.ed25519.seed"
+authority_signing_seed_file = "/var/lib/paraegox-deployment/secrets/authority.ed25519.seed"
+authority_state_directory = "/var/lib/paraegox-deployment/authority"
+# Pre-create this socket parent for the service uid/gid with exact mode 02750.
+authority_socket_path = "/run/paraegox-deployment-authority/authority.sock"
+
+[runtime_connector]
+root_ca_certificate_file = "/var/lib/paraegox-deployment/credentials/runtime-root-ca.pem"
+client_certificate_file = "/var/lib/paraegox-deployment/credentials/runtime-controller.pem"
+client_private_key_file = "/var/lib/paraegox-deployment/credentials/runtime-controller-key.pem"
+
+[node_connector]
+root_ca_certificate_file = "/var/lib/paraegox-deployment/credentials/node-root-ca.pem"
+client_certificate_file = "/var/lib/paraegox-deployment/credentials/node-controller.pem"
+client_private_key_file = "/var/lib/paraegox-deployment/credentials/node-controller-key.pem"
+
+[managed_agent_bootstrap]
+fabric_service_id = "20202020202020202020202020202020"
+agent_service_id = "21212121212121212121212121212121"
+fabric_listen = "tcp/127.0.0.1:7447"
+limits_profile = "developer-agent-bootstrap-v1"
