@@ -195,8 +195,8 @@ pub(crate) fn run_distributed(
     let authority_verification_key = signing_verification_key(manifest.authority_signing_seed());
     let operation_timeout = config.profile().operation_timeout();
     let target_configs = config.targets();
-    let prepared_a = prepare_distributed_target_prestart_v1(
-        PrepareDistributedTargetPrestartInput {
+    let prepared_a =
+        prepare_distributed_target_prestart_v1(PrepareDistributedTargetPrestartInput {
             manifest: &manifest,
             target: target_a,
             peer_target: target_b,
@@ -206,10 +206,9 @@ pub(crate) fn run_distributed(
             authority_verification_key,
             operation_timeout,
             runtime_startup_error: LocalProcessError::DistributedRuntimeAStartup,
-        },
-    )?;
-    let prepared_b = prepare_distributed_target_prestart_v1(
-        PrepareDistributedTargetPrestartInput {
+        })?;
+    let prepared_b =
+        prepare_distributed_target_prestart_v1(PrepareDistributedTargetPrestartInput {
             manifest: &manifest,
             target: target_b,
             peer_target: target_a,
@@ -219,8 +218,7 @@ pub(crate) fn run_distributed(
             authority_verification_key,
             operation_timeout,
             runtime_startup_error: LocalProcessError::DistributedRuntimeBStartup,
-        },
-    )?;
+        })?;
     let provider = prepare_distributed_fixture_provider(&manifest)
         .map_err(|_| LocalProcessError::DistributedDeploymentActivation)?;
     let authority_config = DeveloperLocalTenureAuthorityConfigV1::try_new(
