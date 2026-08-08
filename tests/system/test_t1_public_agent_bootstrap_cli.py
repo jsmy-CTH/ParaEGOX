@@ -9,8 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
-
-from tests.system import test_g2_public_deployment_cli as g2
+import test_g2_public_deployment_cli as g2
 
 DEPLOYMENT_AGENT_BOOTSTRAP_READY = b"paraegox: deployment agent bootstrap ready\n"
 FABRIC_SERVICE_ID = "20" * 16
