@@ -264,6 +264,23 @@ def _logs(process: RunningProcess) -> tuple[bytes, bytes]:
     return process.stdout_path.read_bytes(), process.stderr_path.read_bytes()
 
 
+def _inventory(root: Path) -> list[tuple[str, int, int, int, int, int]]:
+    observed = []
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        observed.append(
+            (
+                str(path.relative_to(root)),
+                metadata.st_mode & 0o7777,
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_nlink,
+                metadata.st_size,
+            )
+        )
+    return observed
+
+
 def _wait_for_marker(
     process: RunningProcess, marker: bytes, *, timeout: float = PROCESS_TIMEOUT_SECONDS
 ) -> None:
@@ -277,12 +294,14 @@ def _wait_for_marker(
         if return_code is not None:
             pytest.fail(
                 f"process exited {return_code} before {marker!r}; "
-                f"stdout={stdout!r}; stderr={stderr!r}"
+                f"stdout={stdout!r}; stderr={stderr!r}; "
+                f"inventory={_inventory(process.stdout_path.parent)!r}"
             )
         time.sleep(0.05)
     stdout, stderr = _logs(process)
     pytest.fail(
-        f"process timed out before {marker!r}; stdout={stdout!r}; stderr={stderr!r}"
+        f"process timed out before {marker!r}; stdout={stdout!r}; stderr={stderr!r}; "
+        f"inventory={_inventory(process.stdout_path.parent)!r}"
     )
 
 
