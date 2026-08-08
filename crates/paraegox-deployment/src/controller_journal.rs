@@ -8171,7 +8171,13 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     fn remote_connector_projection_fixture() -> RemoteConnectorProjectionFixtureV1 {
-        let target = TARGET;
+        remote_connector_projection_fixture_for(TARGET)
+    }
+
+    #[cfg(unix)]
+    fn remote_connector_projection_fixture_for(
+        target: RuntimeHostId,
+    ) -> RemoteConnectorProjectionFixtureV1 {
         let node_id = NodeId::try_from_bytes([0x71; 16]).expect("Node id");
         let node_incarnation =
             NodeIncarnation::try_from_bytes([0x72; 16]).expect("Node incarnation");
@@ -8527,6 +8533,57 @@ pub(crate) mod tests {
             node_latest_request: node_latest.canonical_wire().into(),
             latest_response,
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn remote_connector_terminal_snapshot_from(
+        predecessor: ControllerJournalSnapshot,
+    ) -> ControllerJournalSnapshot {
+        let fixture =
+            remote_connector_projection_fixture_for(predecessor.state().allocation().target());
+        let mut terminal = predecessor
+            .try_initialize_remote_connector(
+                digest(0xb1),
+                fixture.target,
+                [0xb2; 32],
+                [0xb3; 32],
+            )
+            .expect("remote connector identity");
+        for (step, request, response) in [
+            (
+                super::ControllerRemoteConnectorStepV1::NodeDescribe,
+                fixture.node_describe_request.as_ref(),
+                fixture.node_describe_response.as_ref(),
+            ),
+            (
+                super::ControllerRemoteConnectorStepV1::RuntimeDescribe,
+                fixture.runtime_describe_request.canonical_wire(),
+                fixture.runtime_describe_response.canonical_wire(),
+            ),
+            (
+                super::ControllerRemoteConnectorStepV1::NodeChallenge,
+                fixture.node_challenge_request.as_ref(),
+                fixture.node_challenge_response.as_ref(),
+            ),
+            (
+                super::ControllerRemoteConnectorStepV1::RuntimeQuery,
+                fixture.runtime_query_request.as_ref(),
+                fixture.query_response.canonical_wire(),
+            ),
+            (
+                super::ControllerRemoteConnectorStepV1::NodePublish,
+                fixture.node_publish_request.as_ref(),
+                fixture.observation_ack.canonical_wire(),
+            ),
+            (
+                super::ControllerRemoteConnectorStepV1::NodeLatest,
+                fixture.node_latest_request.as_ref(),
+                fixture.latest_response.canonical_wire(),
+            ),
+        ] {
+            terminal = remote_connector_response_durable(&terminal, step, request, response);
+        }
+        terminal
     }
 
     #[cfg(unix)]
