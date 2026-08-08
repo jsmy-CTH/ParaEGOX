@@ -1222,6 +1222,11 @@ impl RuntimeAgentControlRequestV1 {
     }
 
     /// Verifies the outer Controller signature against the exact PXCB pins.
+    ///
+    /// This does not cryptographically verify an embedded PXAR v6/v7 request.
+    /// An Apply consumer must still pass that exact inner request through the
+    /// existing managed-Fabric or managed-Agent-stack admission owner, which
+    /// independently verifies its signing transcript and authentication.
     pub fn verify_controller_request<Verify>(
         &self,
         expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
