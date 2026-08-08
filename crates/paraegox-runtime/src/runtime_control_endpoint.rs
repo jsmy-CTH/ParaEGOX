@@ -30,7 +30,9 @@ use nix::{
 use paraegox_fabric::{
     RestrictedRuntimeApplyEndpointConfigV1, RestrictedRuntimeApplyEndpointV1,
     RestrictedRuntimeApplyErrorV1, RestrictedRuntimeApplyReceiverV1,
-    RestrictedRuntimeApplyRespondErrorV1,
+    RestrictedRuntimeApplyRespondErrorV1, RestrictedRuntimeControlEndpointConfigV1,
+    RestrictedRuntimeControlEndpointV1, RestrictedRuntimeControlInboundV1,
+    RestrictedRuntimeControlReceiverV1,
 };
 #[cfg(test)]
 use paraegox_kernel::identity::PrincipalRef;
@@ -75,10 +77,15 @@ use paraegox_runtime_contracts::{
         ManagedModelAgentStackPlanError, ManagedModelAgentStackProjectionV1,
     },
     managed_serving_bootstrap::{
+        ControllerAuthenticatedRuntimeControlCarrierV1,
         MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES, MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES,
-        ManagedServingBootstrapError, ManagedServingBootstrapFactsV1,
-        ManagedServingBootstrapRequestV1, ManagedServingBootstrapResponseAuthClaimV1,
-        ManagedServingBootstrapResponseDraftV1,
+        MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES,
+        MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES, ManagedServingBootstrapError,
+        ManagedServingBootstrapFactsV1, ManagedServingBootstrapRequestV1,
+        ManagedServingBootstrapResponseAuthClaimV1, ManagedServingBootstrapResponseDraftV1,
+        RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestV1,
+        RuntimeControlDescribeReadyFactsV1, RuntimeControlDescribeReadyPhaseV1,
+        RuntimeControlDescribeReadyResponseDraftV1,
     },
     provenance::{SourcePlanRevision, TargetSliceDigest},
     reference_control::{
@@ -264,8 +271,46 @@ impl fmt::Debug for RuntimeDistributedAgentStackDependenciesV1 {
 /// Provisioning-owned identity/key pins before opening the listener.
 #[derive(Clone)]
 pub(crate) struct RuntimeRestrictedApplyEndpointDependenciesV1 {
-    endpoint_config: RestrictedRuntimeApplyEndpointConfigV1,
+    endpoint_config: RestrictedRuntimeEndpointConfigV1,
     expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    protocol: RestrictedRuntimeEndpointProtocolV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestrictedRuntimeEndpointProtocolV1 {
+    LegacyApply,
+    RuntimeControl,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RestrictedRuntimeEndpointConfigV1 {
+    LegacyApply(RestrictedRuntimeApplyEndpointConfigV1),
+    RuntimeControl(RestrictedRuntimeControlEndpointConfigV1),
+}
+
+impl RestrictedRuntimeEndpointConfigV1 {
+    #[cfg(test)]
+    fn route(&self) -> &str {
+        match self {
+            Self::LegacyApply(config) => config.route(),
+            Self::RuntimeControl(config) => config.route(),
+        }
+    }
+
+    fn matches_restricted_carrier(&self, carrier: &RestrictedRuntimeApplyCarrierBindingV1) -> bool {
+        match self {
+            Self::LegacyApply(config) => config.matches_restricted_carrier(carrier),
+            Self::RuntimeControl(config) => config.matches_restricted_carrier(carrier),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_legacy_apply(self) -> RestrictedRuntimeApplyEndpointConfigV1 {
+        match self {
+            Self::LegacyApply(config) => config,
+            Self::RuntimeControl(_) => panic!("expected legacy restricted endpoint config"),
+        }
+    }
 }
 
 impl RuntimeRestrictedApplyEndpointDependenciesV1 {
@@ -274,8 +319,20 @@ impl RuntimeRestrictedApplyEndpointDependenciesV1 {
         expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
     ) -> Self {
         Self {
-            endpoint_config,
+            endpoint_config: RestrictedRuntimeEndpointConfigV1::LegacyApply(endpoint_config),
             expected_carrier,
+            protocol: RestrictedRuntimeEndpointProtocolV1::LegacyApply,
+        }
+    }
+
+    pub(crate) fn new_runtime_control(
+        endpoint_config: RestrictedRuntimeControlEndpointConfigV1,
+        expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> Self {
+        Self {
+            endpoint_config: RestrictedRuntimeEndpointConfigV1::RuntimeControl(endpoint_config),
+            expected_carrier,
+            protocol: RestrictedRuntimeEndpointProtocolV1::RuntimeControl,
         }
     }
 }
@@ -286,6 +343,7 @@ impl fmt::Debug for RuntimeRestrictedApplyEndpointDependenciesV1 {
             .debug_struct("RuntimeRestrictedApplyEndpointDependenciesV1")
             .field("endpoint_config", &"<composition-pinned>")
             .field("expected_carrier", &"<composition-pinned>")
+            .field("protocol", &self.protocol)
             .finish()
     }
 }
@@ -1712,6 +1770,62 @@ impl ManagedFabricControlService {
         Ok(wire.into())
     }
 
+    async fn handle_authenticated_runtime_control_carrier_v1(
+        &mut self,
+        authenticated: ControllerAuthenticatedRuntimeControlCarrierV1<'_>,
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        match authenticated.kind() {
+            RuntimeControlCarrierKindV1::Describe => {
+                let facts = self.runtime_control_describe_facts()?;
+                runtime_control_describe_response(&self.provisioning, authenticated, facts)
+            }
+            RuntimeControlCarrierKindV1::ManagedServingBootstrap => {
+                let request = authenticated
+                    .managed_serving_bootstrap_request()
+                    .ok_or(RuntimeControlRequestError::Rejected)?;
+                self.handle_request(request.canonical_wire(), self.channel)
+                    .await
+            }
+            RuntimeControlCarrierKindV1::ReferenceQuery => {
+                // PXQR describes the frozen predecessor journal and never
+                // acquires a successor interpretation or fallback.
+                Err(RuntimeControlRequestError::Rejected)
+            }
+        }
+    }
+
+    fn runtime_control_describe_facts(
+        &self,
+    ) -> Result<RuntimeControlDescribeReadyFactsV1, RuntimeControlRequestError> {
+        let observed = self
+            .core
+            .recovered_observation()
+            .map_err(map_managed_fabric_error)?;
+        let serving = ManagedServingBootstrapFactsV1::try_recovered_ready(
+            observed.target,
+            observed.store_instance_id,
+            observed.projection,
+            observed.runtime_host_epoch,
+            observed.successor_snapshot_sequence,
+            observed.clock,
+        )
+        .map_err(|error| {
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedServingContract(error),
+            )
+        })?;
+        RuntimeControlDescribeReadyFactsV1::try_new(
+            RuntimeControlDescribeReadyPhaseV1::ManagedReady,
+            serving,
+            self.channel,
+        )
+        .map_err(|error| {
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedServingContract(error),
+            )
+        })
+    }
+
     fn handle_serving_bootstrap(
         &self,
         frame: &[u8],
@@ -2171,6 +2285,187 @@ fn authenticate_restricted_distributed_agent_stack_apply<'a>(
         .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Rejected)
 }
 
+fn authenticate_runtime_control_carrier<'a>(
+    provisioning: &RuntimeProvisioningV1,
+    request: &'a RuntimeControlCarrierRequestV1,
+    expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+) -> Result<ControllerAuthenticatedRuntimeControlCarrierV1<'a>, RuntimeControlRequestError> {
+    let controller_key_fingerprint = validate_restricted_runtime_apply_carrier_pins(
+        provisioning,
+        expected_carrier,
+    )
+    .map_err(|error| match error {
+        RuntimeRestrictedRemoteApplyErrorV1::Rejected
+        | RuntimeRestrictedRemoteApplyErrorV1::Unavailable => RuntimeControlRequestError::Rejected,
+        RuntimeRestrictedRemoteApplyErrorV1::Internal => {
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::InvalidProvisioning)
+        }
+    })?;
+    let claim = request.authentication().claim();
+    if claim.principal() != provisioning.controller_principal()
+        || claim.key() != provisioning.controller_request_key_ref()
+        || claim.algorithm().value() != ED25519_ALGORITHM
+        || claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+    {
+        return Err(RuntimeControlRequestError::Rejected);
+    }
+    request
+        .verify_controller_carrier(
+            expected_carrier,
+            |principal, key, fingerprint, transcript, signature| {
+                if principal != provisioning.controller_principal()
+                    || key != provisioning.controller_request_key_ref()
+                    || fingerprint != controller_key_fingerprint
+                {
+                    return false;
+                }
+                let Ok(signature) = Signature::from_slice(signature) else {
+                    return false;
+                };
+                provisioning
+                    .controller_key()
+                    .verify_strict(transcript, &signature)
+                    .is_ok()
+            },
+        )
+        .map_err(|_| RuntimeControlRequestError::Rejected)
+}
+
+fn decode_runtime_control_carrier(
+    canonical_pxcc: &[u8],
+) -> Result<RuntimeControlCarrierRequestV1, RuntimeControlRequestError> {
+    if canonical_pxcc.is_empty() || canonical_pxcc.len() > MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES
+    {
+        return Err(RuntimeControlRequestError::Rejected);
+    }
+    RuntimeControlCarrierRequestV1::decode(canonical_pxcc)
+        .map_err(|_| RuntimeControlRequestError::Rejected)
+}
+
+fn runtime_control_describe_response(
+    provisioning: &RuntimeProvisioningV1,
+    authenticated: ControllerAuthenticatedRuntimeControlCarrierV1<'_>,
+    facts: RuntimeControlDescribeReadyFactsV1,
+) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    let algorithm = ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM).map_err(|_| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::InvalidStartedState)
+    })?;
+    let auth_claim = ManagedServingBootstrapResponseAuthClaimV1::try_new(
+        facts.channel(),
+        provisioning.runtime_response_key_ref(),
+        algorithm,
+        ED25519_ALGORITHM_VERSION,
+    )
+    .map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedServingContract(
+            error,
+        ))
+    })?;
+    let draft = RuntimeControlDescribeReadyResponseDraftV1::try_new(
+        authenticated.request(),
+        facts,
+        auth_claim,
+    )
+    .map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedServingContract(
+            error,
+        ))
+    })?;
+    let signature = provisioning
+        .response_signer()
+        .sign(
+            draft
+                .signing_transcript()
+                .map_err(|error| {
+                    RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::ManagedServingContract(error),
+                    )
+                })?
+                .as_bytes(),
+        )
+        .to_bytes();
+    let response = draft.finalize(&signature).map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedServingContract(
+            error,
+        ))
+    })?;
+    let wire = response.canonical_wire();
+    if wire.is_empty() || wire.len() > MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES {
+        return Err(RuntimeControlRequestError::Internal(
+            RuntimeBootstrapEndpointError::InvalidStartedState,
+        ));
+    }
+    Ok(wire.into())
+}
+
+fn legacy_runtime_control_describe_facts<Store, Owner>(
+    legacy: &RuntimeControlService<Store, Owner>,
+    live_channel: ReferenceChannelBindingV1,
+) -> Result<RuntimeControlDescribeReadyFactsV1, RuntimeControlRequestError>
+where
+    Store: RuntimeReferenceApplyStore,
+    Owner: RuntimeReferenceMaterializationOwner,
+{
+    if live_channel != legacy.channel {
+        return Err(RuntimeControlRequestError::Rejected);
+    }
+    let snapshot = legacy.apply.snapshot();
+    validate_snapshot_pins(&legacy.provisioning, snapshot)
+        .map_err(RuntimeControlRequestError::Internal)?;
+    let state = RuntimeControlState::try_from_started_snapshot(snapshot).map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ControlState(error))
+    })?;
+    let journal = state.bootstrap_facts().map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ControlState(error))
+    })?;
+    let installation =
+        verify_startup_installation(snapshot, legacy.provisioning.target(), legacy.compiled)
+            .map_err(RuntimeControlRequestError::Internal)?;
+    let manifest = installation.immutable_manifest_ingress().map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::Installation(error))
+    })?;
+    validate_startup_durable_control_state(
+        snapshot,
+        &manifest,
+        legacy.compiled,
+        &legacy.provisioning,
+    )
+    .map_err(RuntimeControlRequestError::Internal)?;
+    let projection = ManagedFabricManifestProjectionV1::try_from_verified_legacy_manifest(
+        &manifest,
+    )
+    .map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedFabricContract(
+            error,
+        ))
+    })?;
+    let serving = ManagedServingBootstrapFactsV1::try_recovered_ready(
+        legacy.provisioning.target(),
+        journal.store_instance_id(),
+        projection,
+        journal.runtime_host_epoch(),
+        journal.snapshot_sequence(),
+        legacy.clock.reading().map_err(|_| {
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::RuntimeClock)
+        })?,
+    )
+    .map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedServingContract(
+            error,
+        ))
+    })?;
+    RuntimeControlDescribeReadyFactsV1::try_new(
+        RuntimeControlDescribeReadyPhaseV1::LegacyReady,
+        serving,
+        live_channel,
+    )
+    .map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedServingContract(
+            error,
+        ))
+    })
+}
+
 fn validate_restricted_inner_terminal(
     provisioning: &RuntimeProvisioningV1,
     authenticated: ControllerAuthenticatedDistributedAgentStackApplyRequestV1<'_>,
@@ -2412,7 +2707,14 @@ pub(crate) fn run_runtime_bootstrap_process(
     provisioning: RuntimeProvisioningV1,
     dependencies: RuntimeManagedFabricServiceDependenciesV1,
 ) -> Result<(), RuntimeBootstrapEndpointError> {
-    if ManagedFabricStore::cutover_present(state_directory)? {
+    let managed_cutover_present = match ManagedFabricStore::cutover_present(state_directory) {
+        Ok(present) => present,
+        Err(ManagedFabricStoreError::Open(error)) => {
+            return Err(RuntimeBootstrapEndpointError::StoreOpen(error));
+        }
+        Err(error) => return Err(RuntimeBootstrapEndpointError::ManagedFabricStore(error)),
+    };
+    if managed_cutover_present {
         // Build the executor before constructing any managed owner so an
         // executor startup failure cannot strand an owner that would require
         // asynchronous shutdown.
@@ -2608,15 +2910,44 @@ where
                             RestrictedRuntimeApplyErrorV1::EndpointWorkerFailed,
                         ));
                     };
-                    let response = match &mut control {
-                        DeveloperLocalControlState::Managed(managed) => managed
-                            .handle_restricted_distributed_agent_stack_apply_v1(
-                                inbound.canonical_request(),
-                                &restricted.expected_carrier,
+                    let response = match restricted.protocol {
+                        RestrictedRuntimeEndpointProtocolV1::LegacyApply => match &mut control {
+                            DeveloperLocalControlState::Managed(managed) => managed
+                                .handle_restricted_distributed_agent_stack_apply_v1(
+                                    inbound.canonical_request(),
+                                    &restricted.expected_carrier,
+                                )
+                                .await
+                                .map_err(|error| match error {
+                                    RuntimeRestrictedRemoteApplyErrorV1::Internal => Some(
+                                        RuntimeBootstrapEndpointError::RestrictedRuntimeApplyOwner(
+                                            error,
+                                        ),
+                                    ),
+                                    RuntimeRestrictedRemoteApplyErrorV1::Rejected
+                                    | RuntimeRestrictedRemoteApplyErrorV1::Unavailable => None,
+                                }),
+                            DeveloperLocalControlState::Legacy(_) => Err(None),
+                        },
+                        RestrictedRuntimeEndpointProtocolV1::RuntimeControl => {
+                            handle_developer_restricted_runtime_control_v1(
+                                &mut control,
+                                DeveloperRestrictedRuntimeControlInputV1 {
+                                    canonical_pxcc: inbound.canonical_request(),
+                                    expected_carrier: &restricted.expected_carrier,
+                                    live_channel: channel,
+                                    state_directory,
+                                    expected_store_instance_id,
+                                    handle_broker: &handle_broker,
+                                    dependencies: &dependencies,
+                                },
                             )
-                            .await,
-                        DeveloperLocalControlState::Legacy(_) => {
-                            Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)
+                            .await
+                            .map_err(|error| match error {
+                                RuntimeControlRequestError::Rejected
+                                | RuntimeControlRequestError::Unavailable => None,
+                                RuntimeControlRequestError::Internal(error) => Some(error),
+                            })
                         }
                     };
                     match response {
@@ -2628,22 +2959,15 @@ where
                                 );
                             }
                         }
-                        Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected) => {
-                            // Before PXFB cutover this is the only possible
-                            // outcome. Dropping the unanswered request exposes
-                            // no legacy state and produces Fabric's fixed body.
+                        Err(None) => {
+                            // Every malformed, unauthorized, unavailable, or
+                            // phase-incompatible request has the same fixed
+                            // transport rejection and cannot observe state.
                             drop(inbound);
                         }
-                        Err(RuntimeRestrictedRemoteApplyErrorV1::Unavailable) => {
-                            // Keep the committed live owner installed so the
-                            // same authenticated request can retry publication.
+                        Err(Some(error)) => {
                             drop(inbound);
-                        }
-                        Err(error @ RuntimeRestrictedRemoteApplyErrorV1::Internal) => {
-                            drop(inbound);
-                            break Err(
-                                RuntimeBootstrapEndpointError::RestrictedRuntimeApplyOwner(error),
-                            );
+                            break Err(error);
                         }
                     }
                     continue;
@@ -2818,6 +3142,115 @@ fn live_runtime_channel_from_state(
         }
         DeveloperLocalControlState::Legacy(None) => {
             Err(RuntimeBootstrapEndpointError::InvalidStartedState)
+        }
+    }
+}
+
+struct DeveloperRestrictedRuntimeControlInputV1<'a> {
+    canonical_pxcc: &'a [u8],
+    expected_carrier: &'a RestrictedRuntimeApplyCarrierBindingV1,
+    live_channel: ReferenceChannelBindingV1,
+    state_directory: &'a Path,
+    expected_store_instance_id: [u8; 32],
+    handle_broker: &'a RuntimeAgentHandleBroker,
+    dependencies: &'a RuntimeManagedFabricServiceDependenciesV1,
+}
+
+async fn handle_developer_restricted_runtime_control_v1(
+    control: &mut DeveloperLocalControlState,
+    input: DeveloperRestrictedRuntimeControlInputV1<'_>,
+) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    let DeveloperRestrictedRuntimeControlInputV1 {
+        canonical_pxcc,
+        expected_carrier,
+        live_channel,
+        state_directory,
+        expected_store_instance_id,
+        handle_broker,
+        dependencies,
+    } = input;
+    let request = decode_runtime_control_carrier(canonical_pxcc)?;
+    let provisioning = match control {
+        DeveloperLocalControlState::Legacy(Some(legacy)) => &legacy.provisioning,
+        DeveloperLocalControlState::Managed(managed) => &managed.provisioning,
+        DeveloperLocalControlState::Legacy(None) => {
+            return Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::InvalidStartedState,
+            ));
+        }
+    };
+    let authenticated =
+        authenticate_runtime_control_carrier(provisioning, &request, expected_carrier)?;
+    match control {
+        DeveloperLocalControlState::Managed(managed) => {
+            managed
+                .handle_authenticated_runtime_control_carrier_v1(authenticated)
+                .await
+        }
+        DeveloperLocalControlState::Legacy(slot) => {
+            let legacy = slot.as_mut().ok_or(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::InvalidStartedState,
+            ))?;
+            match authenticated.kind() {
+                RuntimeControlCarrierKindV1::Describe => {
+                    let facts = legacy_runtime_control_describe_facts(legacy, live_channel)?;
+                    runtime_control_describe_response(&legacy.provisioning, authenticated, facts)
+                }
+                RuntimeControlCarrierKindV1::ReferenceQuery => {
+                    let query = authenticated
+                        .reference_query_request()
+                        .ok_or(RuntimeControlRequestError::Rejected)?;
+                    legacy.handle_query(query.canonical_wire())
+                }
+                RuntimeControlCarrierKindV1::ManagedServingBootstrap => {
+                    let request = authenticated
+                        .managed_serving_bootstrap_request()
+                        .ok_or(RuntimeControlRequestError::Rejected)?;
+                    prevalidate_developer_managed_cutover_request(
+                        legacy,
+                        request.canonical_wire(),
+                        live_channel,
+                    )?;
+                    let legacy = slot.take().ok_or(RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::InvalidStartedState,
+                    ))?;
+                    let RuntimeControlService {
+                        apply,
+                        compiled,
+                        provisioning,
+                        channel,
+                        ..
+                    } = *legacy;
+                    let legacy_store =
+                        apply
+                            .into_developer_managed_cutover_store()
+                            .map_err(|error| {
+                                RuntimeControlRequestError::Internal(
+                                    RuntimeBootstrapEndpointError::Apply(error),
+                                )
+                            })?;
+                    let started =
+                        StartedManagedFabricService::try_cutover_developer_local_from_store(
+                            state_directory,
+                            expected_store_instance_id,
+                            compiled,
+                            provisioning,
+                            legacy_store,
+                            handle_broker.clone(),
+                            dependencies.clone(),
+                        )
+                        .map_err(RuntimeControlRequestError::Internal)?;
+                    let mut managed =
+                        recover_managed_control_for_existing_channel(started, channel)
+                            .await
+                            .map_err(RuntimeControlRequestError::Internal)?;
+                    let response = managed
+                        .handle_request(request.canonical_wire(), live_channel)
+                        .await;
+                    *control = DeveloperLocalControlState::Managed(Box::new(managed));
+                    response
+                }
+            }
         }
     }
 }
@@ -3256,9 +3689,59 @@ where
 }
 
 struct RunningRestrictedRuntimeApplyEndpointV1 {
-    endpoint: RestrictedRuntimeApplyEndpointV1,
-    receiver: RestrictedRuntimeApplyReceiverV1,
+    endpoint: RunningRestrictedRuntimeEndpointLifecycleV1,
+    receiver: RunningRestrictedRuntimeEndpointReceiverV1,
     expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    protocol: RestrictedRuntimeEndpointProtocolV1,
+}
+
+enum RunningRestrictedRuntimeEndpointLifecycleV1 {
+    LegacyApply(RestrictedRuntimeApplyEndpointV1),
+    RuntimeControl(RestrictedRuntimeControlEndpointV1),
+}
+
+enum RunningRestrictedRuntimeEndpointReceiverV1 {
+    LegacyApply(RestrictedRuntimeApplyReceiverV1),
+    RuntimeControl(RestrictedRuntimeControlReceiverV1),
+}
+
+enum RunningRestrictedRuntimeInboundV1 {
+    LegacyApply(paraegox_fabric::RestrictedRuntimeApplyInboundV1),
+    RuntimeControl(RestrictedRuntimeControlInboundV1),
+}
+
+impl RunningRestrictedRuntimeEndpointReceiverV1 {
+    async fn recv(&mut self) -> Option<RunningRestrictedRuntimeInboundV1> {
+        match self {
+            Self::LegacyApply(receiver) => receiver
+                .recv()
+                .await
+                .map(RunningRestrictedRuntimeInboundV1::LegacyApply),
+            Self::RuntimeControl(receiver) => receiver
+                .recv()
+                .await
+                .map(RunningRestrictedRuntimeInboundV1::RuntimeControl),
+        }
+    }
+}
+
+impl RunningRestrictedRuntimeInboundV1 {
+    fn canonical_request(&self) -> &[u8] {
+        match self {
+            Self::LegacyApply(inbound) => inbound.canonical_request(),
+            Self::RuntimeControl(inbound) => inbound.canonical_request(),
+        }
+    }
+
+    fn respond(
+        self,
+        canonical_response: Vec<u8>,
+    ) -> Result<(), RestrictedRuntimeApplyRespondErrorV1> {
+        match self {
+            Self::LegacyApply(inbound) => inbound.respond(canonical_response),
+            Self::RuntimeControl(inbound) => inbound.respond(canonical_response),
+        }
+    }
 }
 
 fn validate_restricted_runtime_apply_endpoint_dependencies(
@@ -3282,14 +3765,36 @@ impl RunningRestrictedRuntimeApplyEndpointV1 {
         provisioning: &RuntimeProvisioningV1,
     ) -> Result<Self, RuntimeBootstrapEndpointError> {
         validate_restricted_runtime_apply_endpoint_dependencies(&dependencies, provisioning)?;
-        let (endpoint, receiver) =
-            RestrictedRuntimeApplyEndpointV1::start(dependencies.endpoint_config)
-                .await
-                .map_err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply)?;
+        let RuntimeRestrictedApplyEndpointDependenciesV1 {
+            endpoint_config,
+            expected_carrier,
+            protocol,
+        } = dependencies;
+        let (endpoint, receiver) = match endpoint_config {
+            RestrictedRuntimeEndpointConfigV1::LegacyApply(config) => {
+                let (endpoint, receiver) = RestrictedRuntimeApplyEndpointV1::start(config)
+                    .await
+                    .map_err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply)?;
+                (
+                    RunningRestrictedRuntimeEndpointLifecycleV1::LegacyApply(endpoint),
+                    RunningRestrictedRuntimeEndpointReceiverV1::LegacyApply(receiver),
+                )
+            }
+            RestrictedRuntimeEndpointConfigV1::RuntimeControl(config) => {
+                let (endpoint, receiver) = RestrictedRuntimeControlEndpointV1::start(config)
+                    .await
+                    .map_err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply)?;
+                (
+                    RunningRestrictedRuntimeEndpointLifecycleV1::RuntimeControl(endpoint),
+                    RunningRestrictedRuntimeEndpointReceiverV1::RuntimeControl(receiver),
+                )
+            }
+        };
         Ok(Self {
             endpoint,
             receiver,
-            expected_carrier: dependencies.expected_carrier,
+            expected_carrier,
+            protocol,
         })
     }
 
@@ -3298,15 +3803,21 @@ impl RunningRestrictedRuntimeApplyEndpointV1 {
             endpoint,
             receiver,
             expected_carrier: _,
+            protocol: _,
         } = self;
         // Closing the sole consumer drops queued responders before endpoint
         // undeclaration/join, so shutdown cannot leave the worker waiting for
         // a Runtime owner that has already stopped selecting this receiver.
         drop(receiver);
-        endpoint
-            .shutdown()
-            .await
-            .map_err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply)
+        match endpoint {
+            RunningRestrictedRuntimeEndpointLifecycleV1::LegacyApply(endpoint) => {
+                endpoint.shutdown().await
+            }
+            RunningRestrictedRuntimeEndpointLifecycleV1::RuntimeControl(endpoint) => {
+                endpoint.shutdown().await
+            }
+        }
+        .map_err(RuntimeBootstrapEndpointError::RestrictedRuntimeApply)
     }
 }
 
@@ -3516,12 +4027,63 @@ where
                             RestrictedRuntimeApplyErrorV1::EndpointWorkerFailed,
                         ));
                     };
-                    let response = control
-                        .handle_restricted_distributed_agent_stack_apply_v1(
-                            inbound.canonical_request(),
-                            &restricted.expected_carrier,
-                        )
-                        .await;
+                    let response = match restricted.protocol {
+                        RestrictedRuntimeEndpointProtocolV1::LegacyApply => control
+                            .handle_restricted_distributed_agent_stack_apply_v1(
+                                inbound.canonical_request(),
+                                &restricted.expected_carrier,
+                            )
+                            .await
+                            .map_err(|error| match error {
+                                RuntimeRestrictedRemoteApplyErrorV1::Internal => Some(
+                                    RuntimeBootstrapEndpointError::RestrictedRuntimeApplyOwner(
+                                        error,
+                                    ),
+                                ),
+                                RuntimeRestrictedRemoteApplyErrorV1::Rejected
+                                | RuntimeRestrictedRemoteApplyErrorV1::Unavailable => None,
+                            }),
+                        RestrictedRuntimeEndpointProtocolV1::RuntimeControl => {
+                            let request = match decode_runtime_control_carrier(
+                                inbound.canonical_request(),
+                            ) {
+                                Ok(request) => request,
+                                Err(RuntimeControlRequestError::Rejected)
+                                | Err(RuntimeControlRequestError::Unavailable) => {
+                                    drop(inbound);
+                                    continue;
+                                }
+                                Err(RuntimeControlRequestError::Internal(error)) => {
+                                    drop(inbound);
+                                    break Err(error);
+                                }
+                            };
+                            let authenticated = match authenticate_runtime_control_carrier(
+                                &control.provisioning,
+                                &request,
+                                &restricted.expected_carrier,
+                            ) {
+                                Ok(authenticated) => authenticated,
+                                Err(RuntimeControlRequestError::Rejected)
+                                | Err(RuntimeControlRequestError::Unavailable) => {
+                                    drop(inbound);
+                                    continue;
+                                }
+                                Err(RuntimeControlRequestError::Internal(error)) => {
+                                    drop(inbound);
+                                    break Err(error);
+                                }
+                            };
+                            control
+                                .handle_authenticated_runtime_control_carrier_v1(authenticated)
+                                .await
+                                .map_err(|error| match error {
+                                    RuntimeControlRequestError::Rejected
+                                    | RuntimeControlRequestError::Unavailable => None,
+                                    RuntimeControlRequestError::Internal(error) => Some(error),
+                                })
+                        }
+                    };
                     match response {
                         Ok(response) => {
                             if let Err(error) = inbound.respond(response.into_vec()) {
@@ -3531,21 +4093,14 @@ where
                                 );
                             }
                         }
-                        Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected) => {
+                        Err(None) => {
                             // Dropping the unanswered request makes Fabric emit
                             // only its fixed generic remote rejection.
                             drop(inbound);
                         }
-                        Err(RuntimeRestrictedRemoteApplyErrorV1::Unavailable) => {
-                            // Preserve the committed live owner for exact
-                            // authenticated replay of the same request.
+                        Err(Some(error)) => {
                             drop(inbound);
-                        }
-                        Err(error @ RuntimeRestrictedRemoteApplyErrorV1::Internal) => {
-                            drop(inbound);
-                            break Err(
-                                RuntimeBootstrapEndpointError::RestrictedRuntimeApplyOwner(error),
-                            );
+                            break Err(error);
                         }
                     }
                     continue;
@@ -4767,6 +5322,7 @@ mod tests {
         managed_serving_bootstrap::{
             ManagedServingBootstrapRequestDraftV1, ManagedServingBootstrapRequestIdV1,
             ManagedServingBootstrapResponseV1, ManagedServingReadinessV1,
+            RuntimeControlCarrierRequestDraftV1, RuntimeControlDescribeReadyResponseV1,
         },
         provenance::{PlanProvenance, SourcePlanDigest, SourcePlanRef, SourcePlanRevision},
         reference_control::{
@@ -4964,6 +5520,25 @@ mod tests {
         .unwrap_or_else(|error| panic!("restricted endpoint config rejected: {error}"))
     }
 
+    fn restricted_control_endpoint_config(
+        profile: &RestrictedRuntimeApplyTransportProfileV1,
+        profile_ref: [u8; 16],
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> RestrictedRuntimeControlEndpointConfigV1 {
+        RestrictedRuntimeControlEndpointConfigV1::try_from_transport_profile(
+            profile,
+            profile_ref,
+            carrier,
+            PathBuf::from("/tmp/paraegox-restricted-root-ca.pem"),
+            ResolvedRemoteMtlsIdentityFiles::try_new(
+                PathBuf::from("/tmp/paraegox-restricted-runtime.pem"),
+                PathBuf::from("/tmp/paraegox-restricted-runtime.key"),
+            )
+            .unwrap_or_else(|error| panic!("restricted identity files rejected: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("restricted control endpoint config rejected: {error}"))
+    }
+
     fn restricted_carrier_with_profile_digest(
         profile: &RestrictedRuntimeApplyTransportProfileV1,
         profile_ref: [u8; 16],
@@ -5005,6 +5580,73 @@ mod tests {
         profile_ref: [u8; 16],
     ) -> RestrictedRuntimeApplyCarrierBindingV1 {
         restricted_carrier_with_profile_digest(profile, profile_ref, profile.profile_digest())
+    }
+
+    fn runtime_control_auth_claim(nonce: &[u8]) -> ApplyRequestAuthClaim {
+        ApplyRequestAuthClaim::try_new(
+            CONTROLLER_PRINCIPAL,
+            CONTROLLER_KEY_REF,
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("control-carrier algorithm rejected: {error}")),
+            ED25519_ALGORITHM_VERSION,
+            nonce,
+        )
+        .unwrap_or_else(|error| panic!("control-carrier claim rejected: {error}"))
+    }
+
+    fn signed_runtime_control_describe(
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        request_id_byte: u8,
+        nonce: &[u8],
+        signing_seed: [u8; 32],
+    ) -> RuntimeControlCarrierRequestV1 {
+        let draft = RuntimeControlCarrierRequestDraftV1::try_describe(
+            ManagedServingBootstrapRequestIdV1::try_from_bytes([request_id_byte; 16])
+                .unwrap_or_else(|error| panic!("Describe request ID rejected: {error}")),
+            carrier,
+            runtime_control_auth_claim(nonce),
+        )
+        .unwrap_or_else(|error| panic!("Describe carrier draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&signing_seed)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("Describe carrier transcript failed: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("Describe carrier finalization failed: {error}"))
+    }
+
+    fn signed_runtime_control_reference_query(
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        query: ReferenceQueryRequestV1,
+        request_id_byte: u8,
+        nonce: &[u8],
+    ) -> RuntimeControlCarrierRequestV1 {
+        let draft = RuntimeControlCarrierRequestDraftV1::try_reference_query(
+            ManagedServingBootstrapRequestIdV1::try_from_bytes([request_id_byte; 16])
+                .unwrap_or_else(|error| panic!("ReferenceQuery request ID rejected: {error}")),
+            carrier,
+            query,
+            runtime_control_auth_claim(nonce),
+        )
+        .unwrap_or_else(|error| panic!("ReferenceQuery carrier draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| {
+                        panic!("ReferenceQuery carrier transcript failed: {error}")
+                    })
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("ReferenceQuery carrier finalization failed: {error}"))
     }
 
     fn restricted_endpoint_dependencies_from_profile(
@@ -5240,7 +5882,8 @@ mod tests {
             &mismatched_profile,
             RESTRICTED_PROFILE_REF,
         )
-        .endpoint_config;
+        .endpoint_config
+        .into_legacy_apply();
         let mismatched = RuntimeRestrictedApplyEndpointDependenciesV1::new(
             mismatched_config,
             restricted.expected_carrier,
@@ -5249,6 +5892,93 @@ mod tests {
             validate_restricted_runtime_apply_endpoint_dependencies(&mismatched, &provisioning),
             Err(RuntimeBootstrapEndpointError::InvalidProvisioning)
         ));
+    }
+
+    #[test]
+    fn runtime_control_dependency_is_explicit_and_cannot_collapse_to_legacy_apply() {
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let carrier = restricted_carrier_for_profile(&profile, RESTRICTED_PROFILE_REF);
+        let legacy = RuntimeRestrictedApplyEndpointDependenciesV1::new(
+            restricted_endpoint_config(&profile, RESTRICTED_PROFILE_REF, &carrier),
+            carrier.clone(),
+        );
+        let control = RuntimeRestrictedApplyEndpointDependenciesV1::new_runtime_control(
+            restricted_control_endpoint_config(&profile, RESTRICTED_PROFILE_REF, &carrier),
+            carrier,
+        );
+
+        assert_eq!(
+            legacy.protocol,
+            RestrictedRuntimeEndpointProtocolV1::LegacyApply
+        );
+        assert_eq!(
+            control.protocol,
+            RestrictedRuntimeEndpointProtocolV1::RuntimeControl
+        );
+        assert!(matches!(
+            legacy.endpoint_config,
+            RestrictedRuntimeEndpointConfigV1::LegacyApply(_)
+        ));
+        assert!(matches!(
+            control.endpoint_config,
+            RestrictedRuntimeEndpointConfigV1::RuntimeControl(_)
+        ));
+    }
+
+    #[test]
+    fn runtime_control_dispatch_authenticates_before_phase_selection_and_uses_sole_owners() {
+        let source = include_str!("runtime_control_endpoint.rs");
+        let legacy = section(
+            source,
+            "async fn handle_developer_restricted_runtime_control_v1",
+            "fn prevalidate_developer_managed_cutover_request",
+        );
+        let decode = legacy
+            .find("decode_runtime_control_carrier")
+            .unwrap_or_else(|| panic!("missing strict PXCC decode"));
+        let authenticate = legacy
+            .find("authenticate_runtime_control_carrier")
+            .unwrap_or_else(|| panic!("missing outer Controller authentication"));
+        let phase = authenticate
+            + legacy[authenticate..]
+                .find("match control")
+                .unwrap_or_else(|| panic!("missing authenticated phase selection"));
+        let prevalidate = legacy
+            .find("prevalidate_developer_managed_cutover_request")
+            .unwrap_or_else(|| panic!("missing sole PXFB prevalidation"));
+        let take_store = legacy
+            .find("slot.take()")
+            .unwrap_or_else(|| panic!("missing one-way legacy owner transfer"));
+        let cutover = legacy
+            .find("try_cutover_developer_local_from_store")
+            .unwrap_or_else(|| panic!("missing sole managed cutover owner"));
+        assert!(decode < authenticate && authenticate < phase);
+        assert!(authenticate < prevalidate && prevalidate < take_store && take_store < cutover);
+        assert_eq!(legacy.match_indices("legacy.handle_query(").count(), 1);
+        assert_eq!(
+            legacy
+                .match_indices("prevalidate_developer_managed_cutover_request")
+                .count(),
+            1
+        );
+
+        let managed = section(
+            source,
+            "async fn handle_authenticated_runtime_control_carrier_v1",
+            "fn handle_serving_bootstrap",
+        );
+        assert!(managed.contains("RuntimeControlCarrierKindV1::Describe"));
+        assert!(managed.contains("self.runtime_control_describe_facts()"));
+        let reference_query = managed
+            .find("RuntimeControlCarrierKindV1::ReferenceQuery")
+            .unwrap_or_else(|| panic!("missing managed ReferenceQuery branch"));
+        assert!(managed[reference_query..].contains("Err(RuntimeControlRequestError::Rejected)"));
+        assert!(!managed[reference_query..].contains("handle_query("));
     }
 
     #[tokio::test]
@@ -5355,35 +6085,35 @@ mod tests {
             (
                 "locator",
                 RuntimeRestrictedApplyEndpointDependenciesV1::new(
-                    locator_dependencies.endpoint_config,
+                    locator_dependencies.endpoint_config.into_legacy_apply(),
                     base.expected_carrier.clone(),
                 ),
             ),
             (
                 "profile-ref",
                 RuntimeRestrictedApplyEndpointDependenciesV1::new(
-                    profile_ref_dependencies.endpoint_config,
+                    profile_ref_dependencies.endpoint_config.into_legacy_apply(),
                     base.expected_carrier.clone(),
                 ),
             ),
             (
                 "profile-digest",
                 RuntimeRestrictedApplyEndpointDependenciesV1::new(
-                    base.endpoint_config.clone(),
+                    base.endpoint_config.clone().into_legacy_apply(),
                     digest_carrier,
                 ),
             ),
             (
                 "endpoint-generation",
                 RuntimeRestrictedApplyEndpointDependenciesV1::new(
-                    generation_config,
+                    generation_config.into_legacy_apply(),
                     base.expected_carrier.clone(),
                 ),
             ),
             (
                 "timeout",
                 RuntimeRestrictedApplyEndpointDependenciesV1::new(
-                    timeout_config,
+                    timeout_config.into_legacy_apply(),
                     base.expected_carrier.clone(),
                 ),
             ),
@@ -5551,7 +6281,7 @@ mod tests {
         assert!(serve.contains("if let Err(error) = inbound.respond(response.into_vec())"));
         assert!(serve.contains("RestrictedRuntimeApplyResponseHandoff(error)"));
         let rejection = serve
-            .find("Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)")
+            .find("RuntimeRestrictedRemoteApplyErrorV1::Rejected")
             .unwrap_or_else(|| panic!("missing generic rejection branch"));
         assert!(serve[rejection..].contains("drop(inbound)"));
 
@@ -5765,7 +6495,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("restricted listener starts after readiness"))
         );
         assert!(legacy.contains("DeveloperLocalControlState::Legacy(_)"));
-        assert!(legacy.contains("Err(RuntimeRestrictedRemoteApplyErrorV1::Rejected)"));
+        assert!(legacy.contains("RuntimeRestrictedRemoteApplyErrorV1::Rejected"));
         assert!(!legacy.contains("cleanup.and("));
 
         let recovery = section(
@@ -7388,6 +8118,184 @@ mod tests {
             .validate_against_request(request, channel, expected_serving)
             .unwrap_or_else(|error| panic!("PXQS correlation failed: {error}"));
         (response, facts)
+    }
+
+    #[test]
+    fn runtime_control_outer_auth_precedes_legacy_describe_and_query_without_mutation() {
+        let socket_directory = TestSocketDirectory::create();
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xc1),
+            digest(0xc2),
+        )
+        .unwrap_or_else(|error| panic!("Runtime-control channel rejected: {error}"));
+        let legacy = started_service(socket_directory.socket_path.clone())
+            .into_control_service(channel)
+            .unwrap_or_else(|error| panic!("legacy control start failed: {error}"));
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let carrier = restricted_carrier_for_profile(&profile, RESTRICTED_PROFILE_REF);
+        let before = legacy.apply.snapshot().clone();
+
+        let describe = signed_runtime_control_describe(
+            carrier.clone(),
+            0xc3,
+            b"legacy-describe-outer-nonce",
+            CONTROLLER_SEED,
+        );
+        let decoded = decode_runtime_control_carrier(describe.canonical_wire())
+            .unwrap_or_else(|_| panic!("canonical Describe carrier failed to decode"));
+        let authenticated =
+            authenticate_runtime_control_carrier(&legacy.provisioning, &decoded, &carrier)
+                .unwrap_or_else(|_| panic!("canonical Describe carrier failed authentication"));
+        let facts = legacy_runtime_control_describe_facts(&legacy, channel)
+            .unwrap_or_else(|_| panic!("legacy Describe facts failed"));
+        assert_eq!(
+            facts.phase(),
+            RuntimeControlDescribeReadyPhaseV1::LegacyReady
+        );
+        let response_wire =
+            runtime_control_describe_response(&legacy.provisioning, authenticated, facts)
+                .unwrap_or_else(|_| panic!("legacy Describe response failed"));
+        let response = RuntimeControlDescribeReadyResponseV1::decode(&response_wire)
+            .unwrap_or_else(|error| panic!("legacy PXDR decode failed: {error}"));
+        let verified = response
+            .verify_runtime_response(
+                &decoded,
+                &carrier,
+                |principal, key, fingerprint, transcript, signature| {
+                    if principal != RUNTIME_PRINCIPAL
+                        || key != RESPONSE_KEY_REF
+                        || fingerprint != carrier.runtime_response_key_fingerprint()
+                    {
+                        return false;
+                    }
+                    let Ok(signature) = Signature::from_slice(signature) else {
+                        return false;
+                    };
+                    SigningKey::from_bytes(&RESPONSE_SEED)
+                        .verifying_key()
+                        .verify_strict(transcript, &signature)
+                        .is_ok()
+                },
+            )
+            .unwrap_or_else(|error| panic!("legacy PXDR verification failed: {error}"));
+        assert_eq!(
+            verified.facts().phase(),
+            RuntimeControlDescribeReadyPhaseV1::LegacyReady
+        );
+
+        let query = signed_query_request(QueryRequestFixture::fresh(0xc4));
+        let control_query = signed_runtime_control_reference_query(
+            carrier.clone(),
+            query.clone(),
+            0xc5,
+            b"legacy-reference-query-outer-nonce",
+        );
+        let authenticated_query =
+            authenticate_runtime_control_carrier(&legacy.provisioning, &control_query, &carrier)
+                .unwrap_or_else(|_| {
+                    panic!("canonical ReferenceQuery carrier failed authentication")
+                });
+        let inner = authenticated_query
+            .reference_query_request()
+            .unwrap_or_else(|| panic!("authenticated ReferenceQuery lost its strict payload"));
+        let query_response = legacy
+            .handle_query(inner.canonical_wire())
+            .unwrap_or_else(|_| panic!("legacy PXQR owner rejected authenticated query"));
+        let _ = decode_verify_query_response(
+            &query_response,
+            &query,
+            channel,
+            independent_query_serving(&before),
+        );
+
+        let bad_signature = signed_runtime_control_describe(
+            carrier.clone(),
+            0xc6,
+            b"bad-outer-signature-nonce",
+            [0xf1; 32],
+        );
+        assert!(matches!(
+            authenticate_runtime_control_carrier(&legacy.provisioning, &bad_signature, &carrier,),
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        assert_eq!(legacy.apply.snapshot(), &before);
+    }
+
+    #[tokio::test]
+    async fn managed_runtime_control_describes_ready_and_rejects_predecessor_query() {
+        let socket_directory = TestSocketDirectory::create();
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xd1),
+            digest(0xd2),
+        )
+        .unwrap_or_else(|error| panic!("managed Runtime-control channel rejected: {error}"));
+        let (_state_directory, started) =
+            managed_started_service(socket_directory.socket_path.clone());
+        let mut managed = recover_managed_control_for_existing_channel(started, channel)
+            .await
+            .unwrap_or_else(|error| panic!("managed recovery failed: {error}"));
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let carrier = restricted_carrier_for_profile(&profile, RESTRICTED_PROFILE_REF);
+
+        let describe = signed_runtime_control_describe(
+            carrier.clone(),
+            0xd3,
+            b"managed-describe-outer-nonce",
+            CONTROLLER_SEED,
+        );
+        let authenticated =
+            authenticate_runtime_control_carrier(&managed.provisioning, &describe, &carrier)
+                .unwrap_or_else(|_| panic!("managed Describe carrier failed authentication"));
+        let response_wire = managed
+            .handle_authenticated_runtime_control_carrier_v1(authenticated)
+            .await
+            .unwrap_or_else(|_| panic!("managed Describe failed"));
+        let response = RuntimeControlDescribeReadyResponseV1::decode(&response_wire)
+            .unwrap_or_else(|error| panic!("managed PXDR decode failed: {error}"));
+        assert_eq!(
+            response.facts().phase(),
+            RuntimeControlDescribeReadyPhaseV1::ManagedReady
+        );
+
+        let query = signed_query_request(QueryRequestFixture::fresh(0xd4));
+        let control_query = signed_runtime_control_reference_query(
+            carrier.clone(),
+            query,
+            0xd5,
+            b"managed-reference-query-outer-nonce",
+        );
+        let authenticated_query =
+            authenticate_runtime_control_carrier(&managed.provisioning, &control_query, &carrier)
+                .unwrap_or_else(|_| panic!("managed ReferenceQuery outer auth failed"));
+        assert!(matches!(
+            managed
+                .handle_authenticated_runtime_control_carrier_v1(authenticated_query)
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+
+        shutdown_managed_successor_chain(
+            &mut managed.distributed,
+            &mut managed.model_stack,
+            &mut managed.stack,
+            &mut managed.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("managed cleanup failed: {error}"));
     }
 
     #[derive(Clone, Copy)]

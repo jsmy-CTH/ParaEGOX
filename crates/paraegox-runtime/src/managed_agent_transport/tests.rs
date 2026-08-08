@@ -991,7 +991,12 @@ async fn malformed_and_unknown_session_are_rejected_without_implicit_open() {
 async fn typed_client_maps_stale_generation_and_handler_timeout_without_retry() {
     let deck_run_id = id(0x61, AgentConversationDeckRunId::try_from_bytes);
     let session_id = id(0x62, AgentConversationSessionId::try_from_bytes);
-    let (mut server_fabric, client_fabric) = fabric_pair().await;
+    let endpoint = available_tcp_endpoint();
+    let server_config = FabricServiceConfig::try_peer(vec![endpoint.clone()], Vec::new()).unwrap();
+    let mut server_fabric = FabricService::start(server_config).await.unwrap();
+    let client_config = FabricServiceConfig::try_peer(Vec::new(), vec![endpoint]).unwrap();
+    let client_fabric_before_replacement =
+        FabricService::start(client_config.clone()).await.unwrap();
     let installed_v1 = install_agent_conversation_port(
         &mut server_fabric,
         BindingId::from_bytes([0x23; 16]),
@@ -1012,6 +1017,9 @@ async fn typed_client_maps_stale_generation_and_handler_timeout_without_retry() 
     .await
     .unwrap();
     let (port_v2, endpoint_v2) = installed_v2.into_parts();
+
+    client_fabric_before_replacement.shutdown().await.unwrap();
+    let client_fabric = FabricService::start(client_config).await.unwrap();
 
     let mut retired_service = AgentService::new(AgentServiceConfigV1::default());
     let mut retired_provider = DeterministicEchoModelProvider::new();

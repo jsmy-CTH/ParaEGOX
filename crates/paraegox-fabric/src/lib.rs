@@ -31,6 +31,11 @@ pub use runtime_apply::{
     RestrictedRuntimeApplyEndpointV1, RestrictedRuntimeApplyErrorV1,
     RestrictedRuntimeApplyInboundV1, RestrictedRuntimeApplyPreflightV1,
     RestrictedRuntimeApplyReceiverV1, RestrictedRuntimeApplyRespondErrorV1,
+    RestrictedRuntimeControlClientConfigV1, RestrictedRuntimeControlClientV1,
+    RestrictedRuntimeControlConfigErrorV1, RestrictedRuntimeControlEndpointConfigV1,
+    RestrictedRuntimeControlEndpointV1, RestrictedRuntimeControlErrorV1,
+    RestrictedRuntimeControlInboundV1, RestrictedRuntimeControlPreflightV1,
+    RestrictedRuntimeControlReceiverV1, RestrictedRuntimeControlRespondErrorV1,
     restricted_runtime_apply_peer_certificate_common_name_v1,
 };
 pub use service::{

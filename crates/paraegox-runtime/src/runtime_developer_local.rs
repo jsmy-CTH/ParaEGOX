@@ -26,7 +26,7 @@ use nix::unistd::{getegid, geteuid};
 use paraegox_evidence::{EvidenceOwnerRefV1, EvidenceRetentionPolicyV1, EvidenceStoreEpochV1};
 use paraegox_fabric::{
     ResolvedRemoteMtlsIdentityFiles, RestrictedRuntimeApplyConfigErrorV1,
-    RestrictedRuntimeApplyEndpointConfigV1,
+    RestrictedRuntimeApplyEndpointConfigV1, RestrictedRuntimeControlEndpointConfigV1,
 };
 use paraegox_kernel::digest::{Digest32, Digest32Builder};
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
@@ -534,6 +534,29 @@ impl RuntimeDeveloperLocalConfigV1 {
         )
     }
 
+    /// Constructs DeveloperLocal with the additive PXCC/PXDR Runtime-control
+    /// protocol on one exact PXRP/PXCB restricted listener. The legacy apply
+    /// constructor remains byte-for-byte bounded to PXRC/PXDS and unchanged.
+    pub fn try_new_with_restricted_runtime_control_endpoint(
+        state_directory: PathBuf,
+        socket_path: PathBuf,
+        identity: RuntimeDeveloperLocalIdentityV1,
+        transport_profile: RestrictedRuntimeApplyTransportProfileV1,
+        resolved_profile_ref: [u8; 16],
+        expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        listener_credentials: (PathBuf, ResolvedRemoteMtlsIdentityFiles),
+    ) -> Result<Self, RuntimeDeveloperLocalError> {
+        let (root_ca_certificate_file, listener_identity) = listener_credentials;
+        Self::try_new(state_directory, socket_path, identity)?
+            .try_with_restricted_runtime_control_endpoint(
+                transport_profile,
+                resolved_profile_ref,
+                expected_carrier,
+                root_ca_certificate_file,
+                listener_identity,
+            )
+    }
+
     fn try_new_with_restricted_runtime_apply_endpoint_input(
         input: RestrictedRuntimeApplyConstructorInput,
     ) -> Result<Self, RuntimeDeveloperLocalError> {
@@ -597,6 +620,52 @@ impl RuntimeDeveloperLocalConfigV1 {
         )?;
         self.restricted_runtime_apply_endpoint = Some(
             RuntimeRestrictedApplyEndpointDependenciesV1::new(endpoint_config, expected_carrier),
+        );
+        Ok(self)
+    }
+
+    /// Adds one complete PXCC/PXDR restricted Runtime-control listener. This is
+    /// an explicit opt-in and cannot replace either an existing G1 apply
+    /// listener or a previously configured control listener.
+    pub fn try_with_restricted_runtime_control_endpoint(
+        mut self,
+        transport_profile: RestrictedRuntimeApplyTransportProfileV1,
+        resolved_profile_ref: [u8; 16],
+        expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        root_ca_certificate_file: PathBuf,
+        listener_identity: ResolvedRemoteMtlsIdentityFiles,
+    ) -> Result<Self, RuntimeDeveloperLocalError> {
+        if self.restricted_runtime_apply_endpoint.is_some() {
+            return Err(RuntimeDeveloperLocalError::InvalidConfiguration(
+                "restricted Runtime endpoint is already configured",
+            ));
+        }
+        let endpoint_config = RestrictedRuntimeControlEndpointConfigV1::try_from_transport_profile(
+            &transport_profile,
+            resolved_profile_ref,
+            &expected_carrier,
+            root_ca_certificate_file,
+            listener_identity,
+        )
+        .map_err(RuntimeDeveloperLocalError::RestrictedEndpointConfiguration)?;
+        let provisioning = RuntimeProvisioningV1::try_new_developer_local(
+            self.identity.provisioning_input(self.socket_path.clone()),
+        )
+        .map_err(|error| {
+            RuntimeDeveloperLocalError::InvalidConfigurationOwned(error.to_string().into())
+        })?;
+        validate_restricted_runtime_apply_carrier_pins(&provisioning, &expected_carrier).map_err(
+            |_| {
+                RuntimeDeveloperLocalError::InvalidConfiguration(
+                    "restricted Runtime endpoint does not match DeveloperLocal identity pins",
+                )
+            },
+        )?;
+        self.restricted_runtime_apply_endpoint = Some(
+            RuntimeRestrictedApplyEndpointDependenciesV1::new_runtime_control(
+                endpoint_config,
+                expected_carrier,
+            ),
         );
         Ok(self)
     }
@@ -2000,6 +2069,79 @@ mod tests {
             format!("{configured:?}"),
             "RuntimeDeveloperLocalConfigV1(<redacted>)"
         );
+    }
+
+    #[test]
+    fn runtime_control_endpoint_is_an_explicit_g2_opt_in_and_blocks_cross_protocol_replacement() {
+        let layout = TestLayout::new();
+        let profile = restricted_transport_profile();
+        let carrier = restricted_carrier(&profile);
+        let configured =
+            RuntimeDeveloperLocalConfigV1::try_new_with_restricted_runtime_control_endpoint(
+                layout.state.clone(),
+                layout.socket.clone(),
+                identity(),
+                profile,
+                RESTRICTED_PROFILE_REF,
+                carrier,
+                (
+                    PathBuf::from("/tmp/paraegox-developer-local-root-ca.pem"),
+                    restricted_listener_identity(),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("Runtime-control config rejected: {error}"));
+        let dependency_debug = format!(
+            "{:?}",
+            configured
+                .restricted_runtime_apply_endpoint
+                .as_ref()
+                .unwrap_or_else(|| panic!("Runtime-control dependency disappeared"))
+        );
+        assert!(dependency_debug.contains("protocol: RuntimeControl"));
+        assert!(!dependency_debug.contains("paraegox-developer-local-runtime.key"));
+
+        let replacement_profile = restricted_transport_profile();
+        let replacement_carrier = restricted_carrier(&replacement_profile);
+        let error = configured
+            .try_with_restricted_runtime_apply_endpoint(
+                replacement_profile,
+                RESTRICTED_PROFILE_REF,
+                replacement_carrier,
+                PathBuf::from("/tmp/paraegox-developer-local-other-root-ca.pem"),
+                restricted_listener_identity(),
+            )
+            .expect_err("G1 apply must not replace an installed G2 control endpoint");
+        assert!(matches!(
+            error,
+            RuntimeDeveloperLocalError::InvalidConfiguration(
+                "restricted Runtime endpoint is already configured"
+            )
+        ));
+
+        let source = include_str!("runtime_developer_local.rs");
+        let g2 = source
+            .split_once("pub fn try_new_with_restricted_runtime_control_endpoint")
+            .and_then(|(_, tail)| {
+                tail.split_once("fn try_new_with_restricted_runtime_apply_endpoint_input")
+            })
+            .map(|(section, _)| section)
+            .unwrap_or_else(|| panic!("missing explicit G2 constructor"));
+        assert!(g2.contains("try_with_restricted_runtime_control_endpoint"));
+        assert!(!g2.contains("RuntimeDeveloperLocalSigningSeedsV1"));
+        let g2_builder = source
+            .split_once("pub fn try_with_restricted_runtime_control_endpoint")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n}"))
+            .map(|(section, _)| section)
+            .unwrap_or_else(|| panic!("missing explicit G2 builder"));
+        assert!(
+            g2_builder
+                .contains("RestrictedRuntimeControlEndpointConfigV1::try_from_transport_profile")
+        );
+        assert!(
+            g2_builder
+                .contains("RuntimeRestrictedApplyEndpointDependenciesV1::new_runtime_control")
+        );
+        assert!(!g2_builder.contains("RuntimeDeveloperLocalSigningSeedsV1"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
-//! Restricted Controller-to-Runtime query transport for canonical apply bytes.
+//! Restricted Controller-to-Runtime raw-query transport.
 //!
 //! This module owns only transport mechanics. It never decodes, authenticates,
-//! signs, admits, or persists PXRC, PXAR, or PXDS values. The Controller side
+//! signs, admits, or persists PXCC, PXDR, PXRC, PXAR, or PXDS values. The Controller side
 //! has one connector-only TLS session and the Runtime side has one
 //! listener-only TLS session. Their application-message ACL exposes one exact
 //! query route; Zenoh still owns its internal control-plane and link maintenance.
@@ -22,6 +22,11 @@ use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     MAX_RESTRICTED_RUNTIME_APPLY_ROUTE_BYTES, RestrictedRuntimeApplyCarrierBindingV1,
     RestrictedRuntimeApplyTransportProfileV1,
 };
+use paraegox_runtime_contracts::managed_serving_bootstrap::{
+    MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES, MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES,
+    MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES,
+};
+use paraegox_runtime_contracts::reference_control::MAX_REFERENCE_QUERY_RESPONSE_BYTES;
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
@@ -48,6 +53,39 @@ const RESTRICTED_REPLY_CAPACITY: usize = 1;
 const RESTRICTED_ZENOH_FRAMING_ALLOWANCE_BYTES: usize = 64 * 1024;
 const REMOTE_REJECTION_BODY: &[u8] = b"restricted runtime apply rejected";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RestrictedRawQueryFrameBounds {
+    request: usize,
+    response: usize,
+}
+
+impl RestrictedRawQueryFrameBounds {
+    const fn legacy_apply() -> Self {
+        Self {
+            request: MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES,
+            response: MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES,
+        }
+    }
+
+    const fn runtime_control() -> Self {
+        Self {
+            request: MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES,
+            response: if MAX_REFERENCE_QUERY_RESPONSE_BYTES
+                > MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES
+                && MAX_REFERENCE_QUERY_RESPONSE_BYTES > MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES
+            {
+                MAX_REFERENCE_QUERY_RESPONSE_BYTES
+            } else if MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES
+                > MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES
+            {
+                MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES
+            } else {
+                MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES
+            },
+        }
+    }
+}
+
 struct RestrictedRuntimeApplyPeerExpectation {
     expected_target: RuntimeHostId,
     expected_peer_principal: PrincipalRef,
@@ -66,6 +104,7 @@ pub struct RestrictedRuntimeApplyClientConfigV1 {
     expected_runtime_principal: PrincipalRef,
     expected_carrier_binding_digest: Digest32,
     operation_timeout: Duration,
+    frame_bounds: RestrictedRawQueryFrameBounds,
 }
 
 impl RestrictedRuntimeApplyClientConfigV1 {
@@ -87,7 +126,7 @@ impl RestrictedRuntimeApplyClientConfigV1 {
         if endpoint.as_str() != profile.tls_listener_locator().as_str() {
             return Err(RestrictedRuntimeApplyConfigErrorV1::ProfileEndpointMappingMismatch);
         }
-        Self::try_new(
+        Self::try_new_with_frame_bounds(
             endpoint,
             profile.route(),
             root_ca_certificate_file,
@@ -98,6 +137,41 @@ impl RestrictedRuntimeApplyClientConfigV1 {
                 expected_carrier_binding_digest: carrier.binding_digest(),
                 timeout: Duration::from_nanos(profile.operation_timeout_nanos()),
             },
+            RestrictedRawQueryFrameBounds::legacy_apply(),
+        )
+    }
+
+    /// Maps one exact canonical PXRP/PXCB pair into the same transport-only
+    /// connector for a PXCC/PXDR raw query. Authentication, kind selection,
+    /// decoding, and admission remain the caller's responsibility.
+    fn try_from_runtime_control_transport_profile(
+        profile: &RestrictedRuntimeApplyTransportProfileV1,
+        resolved_profile_ref: [u8; 16],
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        root_ca_certificate_file: PathBuf,
+        connector_identity: ResolvedRemoteMtlsIdentityFiles,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        profile
+            .validate_carrier_binding(resolved_profile_ref, carrier)
+            .map_err(|_| RestrictedRuntimeApplyConfigErrorV1::ProfileCarrierMismatch)?;
+        let endpoint =
+            RemoteTlsEndpoint::try_new(profile.tls_listener_locator().as_str().to_owned())
+                .map_err(|_| RestrictedRuntimeApplyConfigErrorV1::ProfileEndpointMappingMismatch)?;
+        if endpoint.as_str() != profile.tls_listener_locator().as_str() {
+            return Err(RestrictedRuntimeApplyConfigErrorV1::ProfileEndpointMappingMismatch);
+        }
+        Self::try_new_with_frame_bounds(
+            endpoint,
+            profile.route(),
+            root_ca_certificate_file,
+            connector_identity,
+            RestrictedRuntimeApplyPeerExpectation {
+                expected_target: profile.target(),
+                expected_peer_principal: profile.runtime_principal(),
+                expected_carrier_binding_digest: carrier.binding_digest(),
+                timeout: Duration::from_nanos(profile.operation_timeout_nanos()),
+            },
+            RestrictedRawQueryFrameBounds::runtime_control(),
         )
     }
 
@@ -107,12 +181,31 @@ impl RestrictedRuntimeApplyClientConfigV1 {
     ///
     /// The Runtime certificate Common Name must use the deterministic
     /// `paraegox-principal-<lowercase-principal-hex>` form.
+    #[cfg(test)]
     fn try_new(
         endpoint: RemoteTlsEndpoint,
         route: impl Into<String>,
         root_ca_certificate_file: PathBuf,
         connector_identity: ResolvedRemoteMtlsIdentityFiles,
         peer_expectation: RestrictedRuntimeApplyPeerExpectation,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        Self::try_new_with_frame_bounds(
+            endpoint,
+            route,
+            root_ca_certificate_file,
+            connector_identity,
+            peer_expectation,
+            RestrictedRawQueryFrameBounds::legacy_apply(),
+        )
+    }
+
+    fn try_new_with_frame_bounds(
+        endpoint: RemoteTlsEndpoint,
+        route: impl Into<String>,
+        root_ca_certificate_file: PathBuf,
+        connector_identity: ResolvedRemoteMtlsIdentityFiles,
+        peer_expectation: RestrictedRuntimeApplyPeerExpectation,
+        frame_bounds: RestrictedRawQueryFrameBounds,
     ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
         let RestrictedRuntimeApplyPeerExpectation {
             expected_target,
@@ -135,6 +228,7 @@ impl RestrictedRuntimeApplyClientConfigV1 {
             expected_runtime_principal,
             expected_carrier_binding_digest,
             operation_timeout,
+            frame_bounds,
         })
     }
 
@@ -152,6 +246,7 @@ impl RestrictedRuntimeApplyClientConfigV1 {
             &self.root_ca_certificate_file,
             &self.connector_identity,
             self.expected_runtime_principal,
+            self.frame_bounds,
         )
     }
 }
@@ -169,6 +264,7 @@ impl fmt::Debug for RestrictedRuntimeApplyClientConfigV1 {
             .field("expected_runtime_principal", &"<redacted>")
             .field("expected_carrier_binding_digest", &"<redacted>")
             .field("operation_timeout", &self.operation_timeout)
+            .field("frame_bounds", &self.frame_bounds)
             .finish()
     }
 }
@@ -184,6 +280,7 @@ pub struct RestrictedRuntimeApplyEndpointConfigV1 {
     expected_controller_principal: PrincipalRef,
     expected_carrier_binding_digest: Digest32,
     handler_timeout: Duration,
+    frame_bounds: RestrictedRawQueryFrameBounds,
 }
 
 impl RestrictedRuntimeApplyEndpointConfigV1 {
@@ -205,7 +302,7 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
         if endpoint.as_str() != profile.tls_listener_locator().as_str() {
             return Err(RestrictedRuntimeApplyConfigErrorV1::ProfileEndpointMappingMismatch);
         }
-        Self::try_new(
+        Self::try_new_with_frame_bounds(
             endpoint,
             profile.route(),
             root_ca_certificate_file,
@@ -216,6 +313,41 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
                 expected_carrier_binding_digest: carrier.binding_digest(),
                 timeout: Duration::from_nanos(profile.operation_timeout_nanos()),
             },
+            RestrictedRawQueryFrameBounds::legacy_apply(),
+        )
+    }
+
+    /// Maps one exact canonical PXRP/PXCB pair into the same transport-only
+    /// listener for PXCC/PXDR raw queries. The Runtime owner still performs all
+    /// carrier authentication, kind selection, and state admission.
+    fn try_from_runtime_control_transport_profile(
+        profile: &RestrictedRuntimeApplyTransportProfileV1,
+        resolved_profile_ref: [u8; 16],
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        root_ca_certificate_file: PathBuf,
+        listener_identity: ResolvedRemoteMtlsIdentityFiles,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        profile
+            .validate_carrier_binding(resolved_profile_ref, carrier)
+            .map_err(|_| RestrictedRuntimeApplyConfigErrorV1::ProfileCarrierMismatch)?;
+        let endpoint =
+            RemoteTlsEndpoint::try_new(profile.tls_listener_locator().as_str().to_owned())
+                .map_err(|_| RestrictedRuntimeApplyConfigErrorV1::ProfileEndpointMappingMismatch)?;
+        if endpoint.as_str() != profile.tls_listener_locator().as_str() {
+            return Err(RestrictedRuntimeApplyConfigErrorV1::ProfileEndpointMappingMismatch);
+        }
+        Self::try_new_with_frame_bounds(
+            endpoint,
+            profile.route(),
+            root_ca_certificate_file,
+            listener_identity,
+            RestrictedRuntimeApplyPeerExpectation {
+                expected_target: profile.target(),
+                expected_peer_principal: profile.controller_principal(),
+                expected_carrier_binding_digest: carrier.binding_digest(),
+                timeout: Duration::from_nanos(profile.operation_timeout_nanos()),
+            },
+            RestrictedRawQueryFrameBounds::runtime_control(),
         )
     }
 
@@ -224,12 +356,31 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
     ///
     /// The Controller certificate Common Name must use the deterministic
     /// `paraegox-principal-<lowercase-principal-hex>` form.
+    #[cfg(test)]
     fn try_new(
         endpoint: RemoteTlsEndpoint,
         route: impl Into<String>,
         root_ca_certificate_file: PathBuf,
         listener_identity: ResolvedRemoteMtlsIdentityFiles,
         peer_expectation: RestrictedRuntimeApplyPeerExpectation,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        Self::try_new_with_frame_bounds(
+            endpoint,
+            route,
+            root_ca_certificate_file,
+            listener_identity,
+            peer_expectation,
+            RestrictedRawQueryFrameBounds::legacy_apply(),
+        )
+    }
+
+    fn try_new_with_frame_bounds(
+        endpoint: RemoteTlsEndpoint,
+        route: impl Into<String>,
+        root_ca_certificate_file: PathBuf,
+        listener_identity: ResolvedRemoteMtlsIdentityFiles,
+        peer_expectation: RestrictedRuntimeApplyPeerExpectation,
+        frame_bounds: RestrictedRawQueryFrameBounds,
     ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
         let RestrictedRuntimeApplyPeerExpectation {
             expected_target,
@@ -241,7 +392,7 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
         validate_target(expected_target)?;
         validate_principal(expected_controller_principal)?;
         validate_digest(expected_carrier_binding_digest)?;
-        restricted_ingress_limits(handler_timeout)?;
+        restricted_ingress_limits(handler_timeout, frame_bounds)?;
         Ok(Self {
             endpoint,
             route: validate_route(route.into())?,
@@ -253,6 +404,7 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
             expected_controller_principal,
             expected_carrier_binding_digest,
             handler_timeout,
+            frame_bounds,
         })
     }
 
@@ -283,6 +435,7 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
             &self.root_ca_certificate_file,
             &self.listener_identity,
             self.expected_controller_principal,
+            self.frame_bounds,
         )
     }
 }
@@ -300,6 +453,7 @@ impl fmt::Debug for RestrictedRuntimeApplyEndpointConfigV1 {
             .field("expected_controller_principal", &"<redacted>")
             .field("expected_carrier_binding_digest", &"<redacted>")
             .field("handler_timeout", &self.handler_timeout)
+            .field("frame_bounds", &self.frame_bounds)
             .finish()
     }
 }
@@ -317,6 +471,7 @@ fn build_restricted_zenoh_config(
     root_ca_certificate_file: &str,
     identity: &ResolvedRemoteMtlsIdentityFiles,
     expected_peer_principal: PrincipalRef,
+    frame_bounds: RestrictedRawQueryFrameBounds,
 ) -> Result<zenoh::Config, FabricError> {
     let mut config = zenoh::Config::default();
     let (mode, listen_endpoints, connect_endpoints, tls_role) = match role {
@@ -358,7 +513,7 @@ fn build_restricted_zenoh_config(
     config
         .insert_json5(
             "transport/link/rx/max_message_size",
-            &restricted_transport_message_limit().to_string(),
+            &restricted_transport_message_limit(frame_bounds).to_string(),
         )
         .map_err(|_| FabricError::SessionConfigurationFailed)?;
     set_protocols(&mut config, r#"["tls"]"#)?;
@@ -468,9 +623,10 @@ fn validate_digest(digest: Digest32) -> Result<(), RestrictedRuntimeApplyConfigE
     Ok(())
 }
 
-fn restricted_transport_message_limit() -> usize {
-    MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES
-        .max(MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES)
+fn restricted_transport_message_limit(frame_bounds: RestrictedRawQueryFrameBounds) -> usize {
+    frame_bounds
+        .request
+        .max(frame_bounds.response)
         .saturating_add(RESTRICTED_ZENOH_FRAMING_ALLOWANCE_BYTES)
 }
 
@@ -502,12 +658,13 @@ fn validate_timeout(timeout: Duration) -> Result<Duration, RestrictedRuntimeAppl
 
 fn restricted_ingress_limits(
     handler_timeout: Duration,
+    frame_bounds: RestrictedRawQueryFrameBounds,
 ) -> Result<IngressLimits, RestrictedRuntimeApplyConfigErrorV1> {
     IngressLimits::try_new(
         RESTRICTED_INGRESS_CAPACITY,
-        MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES,
-        MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES,
-        MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES,
+        frame_bounds.request,
+        frame_bounds.request,
+        frame_bounds.response,
         handler_timeout,
     )
     .map_err(|_| RestrictedRuntimeApplyConfigErrorV1::ContractBoundsUnsupported)
@@ -569,6 +726,7 @@ pub struct RestrictedRuntimeApplyClientV1 {
     expected_runtime_principal: PrincipalRef,
     expected_carrier_binding_digest: Digest32,
     operation_timeout: Duration,
+    frame_bounds: RestrictedRawQueryFrameBounds,
     deferred_querier_cleanup_failure: bool,
 }
 
@@ -593,6 +751,7 @@ impl RestrictedRuntimeApplyClientV1 {
             expected_runtime_principal: config.expected_runtime_principal,
             expected_carrier_binding_digest: config.expected_carrier_binding_digest,
             operation_timeout: config.operation_timeout,
+            frame_bounds: config.frame_bounds,
             deferred_querier_cleanup_failure: false,
         })
     }
@@ -623,7 +782,7 @@ impl RestrictedRuntimeApplyClientV1 {
         &mut self,
         canonical_request: Vec<u8>,
     ) -> Result<RestrictedRuntimeApplyPreflightV1<'_>, RestrictedRuntimeApplyErrorV1> {
-        validate_request_frame(&canonical_request)?;
+        validate_request_frame(&canonical_request, self.frame_bounds)?;
         let deadline = checked_deadline(self.operation_timeout)?;
         let querier = deadline_result(
             deadline,
@@ -707,6 +866,7 @@ impl RestrictedRuntimeApplyPreflightV1<'_> {
             // before resolving the immediately-ready builder.
             let (reply_sender, mut reply_receiver) = mpsc::channel(RESTRICTED_REPLY_CAPACITY);
             let expected_route = Arc::<str>::from(route);
+            let frame_bounds = self.client.frame_bounds;
             // Send through the same preflight Querier. Its id owns the pending
             // QueryState, so the unconditional undeclare below cancels that
             // state after the first outcome or the absolute deadline. A
@@ -716,7 +876,7 @@ impl RestrictedRuntimeApplyPreflightV1<'_> {
                 .get()
                 .payload(self.canonical_request.as_ref())
                 .callback(move |reply| {
-                    let outcome = decode_restricted_reply(&expected_route, reply);
+                    let outcome = decode_restricted_reply(&expected_route, reply, frame_bounds);
                     // BestMatching selects one responder. The one-slot callback
                     // is an additional hard memory bound if a peer misbehaves.
                     let _ = reply_sender.try_send(outcome);
@@ -746,6 +906,7 @@ impl RestrictedRuntimeApplyPreflightV1<'_> {
 fn decode_restricted_reply(
     expected_route: &str,
     reply: Reply,
+    frame_bounds: RestrictedRawQueryFrameBounds,
 ) -> Result<Box<[u8]>, RestrictedRuntimeApplyErrorV1> {
     let sample = reply
         .into_result()
@@ -753,7 +914,7 @@ fn decode_restricted_reply(
     if sample.key_expr().as_str() != expected_route {
         return Err(RestrictedRuntimeApplyErrorV1::ResponseRouteMismatch);
     }
-    validate_response_frame_length(sample.payload().len())?;
+    validate_response_frame_length(sample.payload().len(), frame_bounds)?;
     let response = sample.payload().to_bytes();
     Ok(response.as_ref().to_vec().into_boxed_slice())
 }
@@ -844,6 +1005,7 @@ impl OneQueryAttempt {
 pub struct RestrictedRuntimeApplyInboundV1 {
     canonical_request: Box<[u8]>,
     responder: Option<oneshot::Sender<Box<[u8]>>>,
+    frame_bounds: RestrictedRawQueryFrameBounds,
 }
 
 impl RestrictedRuntimeApplyInboundV1 {
@@ -859,7 +1021,7 @@ impl RestrictedRuntimeApplyInboundV1 {
         mut self,
         canonical_response: Vec<u8>,
     ) -> Result<(), RestrictedRuntimeApplyRespondErrorV1> {
-        validate_response_frame(&canonical_response)
+        validate_response_frame(&canonical_response, self.frame_bounds)
             .map_err(|_| RestrictedRuntimeApplyRespondErrorV1::ResponseTooLargeOrEmpty)?;
         let responder = self
             .responder
@@ -907,7 +1069,7 @@ impl RestrictedRuntimeApplyEndpointV1 {
     pub async fn start(
         config: RestrictedRuntimeApplyEndpointConfigV1,
     ) -> Result<(Self, RestrictedRuntimeApplyReceiverV1), RestrictedRuntimeApplyErrorV1> {
-        let ingress_limits = restricted_ingress_limits(config.handler_timeout)
+        let ingress_limits = restricted_ingress_limits(config.handler_timeout, config.frame_bounds)
             .map_err(|_| RestrictedRuntimeApplyErrorV1::IngressConfigurationFailed)?;
         let zenoh_config = config
             .build_zenoh_config()
@@ -922,6 +1084,7 @@ impl RestrictedRuntimeApplyEndpointV1 {
             sender: ingress_sender,
             budget: ingress_budget,
             handler_timeout: config.handler_timeout,
+            frame_bounds: config.frame_bounds,
         };
         let queryable = match session
             .declare_queryable(config.route.as_str().to_owned())
@@ -1000,6 +1163,7 @@ struct RestrictedIngress {
     sender: mpsc::Sender<RestrictedIngressFrame>,
     budget: Arc<IngressBudget>,
     handler_timeout: Duration,
+    frame_bounds: RestrictedRawQueryFrameBounds,
 }
 
 impl RestrictedIngress {
@@ -1027,6 +1191,7 @@ impl RestrictedIngress {
             query,
             lease,
             deadline,
+            frame_bounds: self.frame_bounds,
         }) {
             Ok(()) => self.budget.admitted(),
             Err(_) => self.budget.rejected_closed(),
@@ -1038,6 +1203,7 @@ struct RestrictedIngressFrame {
     query: Query,
     lease: IngressLease,
     deadline: Instant,
+    frame_bounds: RestrictedRawQueryFrameBounds,
 }
 
 async fn run_restricted_endpoint_worker(
@@ -1074,6 +1240,7 @@ async fn handle_restricted_query(
         query,
         lease: _lease,
         deadline,
+        frame_bounds,
     } = frame;
     let Some(payload) = query.payload() else {
         return;
@@ -1083,13 +1250,14 @@ async fn handle_restricted_query(
         return;
     }
     let request = payload.to_bytes();
-    if validate_request_frame(request.as_ref()).is_err() {
+    if validate_request_frame(request.as_ref(), frame_bounds).is_err() {
         return;
     }
     let (response_sender, response_receiver) = oneshot::channel();
     let inbound = RestrictedRuntimeApplyInboundV1 {
         canonical_request: request.as_ref().to_vec().into_boxed_slice(),
         responder: Some(response_sender),
+        frame_bounds,
     };
     if request_sender.try_send(inbound).is_err() {
         reply_remote_error(deadline, &query).await;
@@ -1106,7 +1274,7 @@ async fn handle_restricted_query(
         reply_remote_error(deadline, &query).await;
         return;
     };
-    if validate_response_frame(&response).is_err() {
+    if validate_response_frame(&response, frame_bounds).is_err() {
         reply_remote_error(deadline, &query).await;
         return;
     }
@@ -1117,25 +1285,34 @@ async fn reply_remote_error(deadline: Instant, query: &Query) {
     let _ = deadline_result(deadline, query.reply_err(REMOTE_REJECTION_BODY)).await;
 }
 
-fn validate_request_frame(frame: &[u8]) -> Result<(), RestrictedRuntimeApplyErrorV1> {
+fn validate_request_frame(
+    frame: &[u8],
+    frame_bounds: RestrictedRawQueryFrameBounds,
+) -> Result<(), RestrictedRuntimeApplyErrorV1> {
     if frame.is_empty() {
         return Err(RestrictedRuntimeApplyErrorV1::EmptyRequest);
     }
-    if frame.len() > MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES {
+    if frame.len() > frame_bounds.request {
         return Err(RestrictedRuntimeApplyErrorV1::RequestTooLarge);
     }
     Ok(())
 }
 
-fn validate_response_frame(frame: &[u8]) -> Result<(), RestrictedRuntimeApplyErrorV1> {
-    validate_response_frame_length(frame.len())
+fn validate_response_frame(
+    frame: &[u8],
+    frame_bounds: RestrictedRawQueryFrameBounds,
+) -> Result<(), RestrictedRuntimeApplyErrorV1> {
+    validate_response_frame_length(frame.len(), frame_bounds)
 }
 
-fn validate_response_frame_length(length: usize) -> Result<(), RestrictedRuntimeApplyErrorV1> {
+fn validate_response_frame_length(
+    length: usize,
+    frame_bounds: RestrictedRawQueryFrameBounds,
+) -> Result<(), RestrictedRuntimeApplyErrorV1> {
     if length == 0 {
         return Err(RestrictedRuntimeApplyErrorV1::EmptyResponse);
     }
-    if length > MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES {
+    if length > frame_bounds.response {
         return Err(RestrictedRuntimeApplyErrorV1::ResponseTooLarge);
     }
     Ok(())
@@ -1269,6 +1446,183 @@ impl fmt::Display for RestrictedRuntimeApplyErrorV1 {
 
 impl std::error::Error for RestrictedRuntimeApplyErrorV1 {}
 
+/// Transport-only PXCC/PXDR connector configuration over the same private raw
+/// query owner as G1. Its distinct type prevents control and legacy frame
+/// bounds from being substituted across protocols.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RestrictedRuntimeControlClientConfigV1(RestrictedRuntimeApplyClientConfigV1);
+
+impl RestrictedRuntimeControlClientConfigV1 {
+    pub fn try_from_transport_profile(
+        profile: &RestrictedRuntimeApplyTransportProfileV1,
+        resolved_profile_ref: [u8; 16],
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        root_ca_certificate_file: PathBuf,
+        connector_identity: ResolvedRemoteMtlsIdentityFiles,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        RestrictedRuntimeApplyClientConfigV1::try_from_runtime_control_transport_profile(
+            profile,
+            resolved_profile_ref,
+            carrier,
+            root_ca_certificate_file,
+            connector_identity,
+        )
+        .map(Self)
+    }
+
+    #[must_use]
+    pub fn route(&self) -> &str {
+        self.0.route()
+    }
+}
+
+impl fmt::Debug for RestrictedRuntimeControlClientConfigV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RestrictedRuntimeControlClientConfigV1(<redacted>)")
+    }
+}
+
+/// Transport-only PXCC/PXDR connector lifecycle.
+pub struct RestrictedRuntimeControlClientV1(RestrictedRuntimeApplyClientV1);
+
+impl RestrictedRuntimeControlClientV1 {
+    pub async fn start(
+        config: RestrictedRuntimeControlClientConfigV1,
+    ) -> Result<Self, RestrictedRuntimeApplyErrorV1> {
+        RestrictedRuntimeApplyClientV1::start(config.0)
+            .await
+            .map(Self)
+    }
+
+    #[must_use]
+    pub fn matches_restricted_target(
+        &self,
+        target: RuntimeHostId,
+        route: &str,
+        runtime_principal: PrincipalRef,
+        carrier_binding_digest: Digest32,
+    ) -> bool {
+        self.0
+            .matches_restricted_target(target, route, runtime_principal, carrier_binding_digest)
+    }
+
+    pub async fn preflight(
+        &mut self,
+        canonical_request: Vec<u8>,
+    ) -> Result<RestrictedRuntimeControlPreflightV1<'_>, RestrictedRuntimeApplyErrorV1> {
+        self.0
+            .preflight(canonical_request)
+            .await
+            .map(|inner| RestrictedRuntimeControlPreflightV1 { inner })
+    }
+
+    pub async fn shutdown(self) -> Result<(), RestrictedRuntimeApplyErrorV1> {
+        self.0.shutdown().await
+    }
+}
+
+/// Move-only authority for one PXCC/PXDR query under one absolute deadline.
+pub struct RestrictedRuntimeControlPreflightV1<'client> {
+    inner: RestrictedRuntimeApplyPreflightV1<'client>,
+}
+
+impl RestrictedRuntimeControlPreflightV1<'_> {
+    pub async fn send_once(self) -> Result<Box<[u8]>, RestrictedRuntimeApplyErrorV1> {
+        self.inner.send_once().await
+    }
+}
+
+/// Transport-only PXCC/PXDR listener configuration with control frame bounds.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RestrictedRuntimeControlEndpointConfigV1(RestrictedRuntimeApplyEndpointConfigV1);
+
+impl RestrictedRuntimeControlEndpointConfigV1 {
+    pub fn try_from_transport_profile(
+        profile: &RestrictedRuntimeApplyTransportProfileV1,
+        resolved_profile_ref: [u8; 16],
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        root_ca_certificate_file: PathBuf,
+        listener_identity: ResolvedRemoteMtlsIdentityFiles,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        RestrictedRuntimeApplyEndpointConfigV1::try_from_runtime_control_transport_profile(
+            profile,
+            resolved_profile_ref,
+            carrier,
+            root_ca_certificate_file,
+            listener_identity,
+        )
+        .map(Self)
+    }
+
+    #[must_use]
+    pub fn route(&self) -> &str {
+        self.0.route()
+    }
+
+    #[must_use]
+    pub fn matches_restricted_carrier(
+        &self,
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> bool {
+        self.0.matches_restricted_carrier(carrier)
+    }
+}
+
+impl fmt::Debug for RestrictedRuntimeControlEndpointConfigV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RestrictedRuntimeControlEndpointConfigV1(<redacted>)")
+    }
+}
+
+/// Transport-only PXCC/PXDR listener lifecycle.
+pub struct RestrictedRuntimeControlEndpointV1(RestrictedRuntimeApplyEndpointV1);
+
+impl RestrictedRuntimeControlEndpointV1 {
+    pub async fn start(
+        config: RestrictedRuntimeControlEndpointConfigV1,
+    ) -> Result<(Self, RestrictedRuntimeControlReceiverV1), RestrictedRuntimeApplyErrorV1> {
+        let (endpoint, receiver) = RestrictedRuntimeApplyEndpointV1::start(config.0).await?;
+        Ok((Self(endpoint), RestrictedRuntimeControlReceiverV1(receiver)))
+    }
+
+    pub async fn shutdown(self) -> Result<(), RestrictedRuntimeApplyErrorV1> {
+        self.0.shutdown().await
+    }
+}
+
+/// Single-consumer stream for bounded, still-unauthenticated PXCC bytes.
+pub struct RestrictedRuntimeControlReceiverV1(RestrictedRuntimeApplyReceiverV1);
+
+impl RestrictedRuntimeControlReceiverV1 {
+    pub async fn recv(&mut self) -> Option<RestrictedRuntimeControlInboundV1> {
+        self.0.recv().await.map(RestrictedRuntimeControlInboundV1)
+    }
+}
+
+/// One bounded, still-unauthenticated PXCC request and one-shot response handoff.
+pub struct RestrictedRuntimeControlInboundV1(RestrictedRuntimeApplyInboundV1);
+
+impl RestrictedRuntimeControlInboundV1 {
+    #[must_use]
+    pub fn canonical_request(&self) -> &[u8] {
+        self.0.canonical_request()
+    }
+
+    pub fn respond(
+        self,
+        canonical_response: Vec<u8>,
+    ) -> Result<(), RestrictedRuntimeApplyRespondErrorV1> {
+        self.0.respond(canonical_response)
+    }
+}
+
+/// Shared fail-closed raw-query configuration error taxonomy.
+pub type RestrictedRuntimeControlConfigErrorV1 = RestrictedRuntimeApplyConfigErrorV1;
+/// Shared fail-closed raw-query lifecycle error taxonomy.
+pub type RestrictedRuntimeControlErrorV1 = RestrictedRuntimeApplyErrorV1;
+/// Shared one-shot response handoff error taxonomy.
+pub type RestrictedRuntimeControlRespondErrorV1 = RestrictedRuntimeApplyRespondErrorV1;
+
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, time::Duration};
@@ -1279,12 +1633,13 @@ mod tests {
     };
 
     use super::{
-        OneQueryAttempt, RestrictedRuntimeApplyClientConfigV1, RestrictedRuntimeApplyConfigErrorV1,
-        RestrictedRuntimeApplyEndpointConfigV1, RestrictedRuntimeApplyErrorV1,
-        RestrictedRuntimeApplyInboundV1, RestrictedRuntimeApplyPeerExpectation,
-        RestrictedRuntimeApplyRespondErrorV1, checked_deadline, deadline_result,
-        preserve_query_outcome, reduce_client_shutdown_failures, reduce_endpoint_shutdown_failures,
-        reduce_queryable_declaration_failure,
+        OneQueryAttempt, RestrictedRawQueryFrameBounds, RestrictedRuntimeApplyClientConfigV1,
+        RestrictedRuntimeApplyConfigErrorV1, RestrictedRuntimeApplyEndpointConfigV1,
+        RestrictedRuntimeApplyErrorV1, RestrictedRuntimeApplyInboundV1,
+        RestrictedRuntimeApplyPeerExpectation, RestrictedRuntimeApplyRespondErrorV1,
+        RestrictedRuntimeControlClientConfigV1, RestrictedRuntimeControlEndpointConfigV1,
+        checked_deadline, deadline_result, preserve_query_outcome, reduce_client_shutdown_failures,
+        reduce_endpoint_shutdown_failures, reduce_queryable_declaration_failure,
         restricted_runtime_apply_peer_certificate_common_name_v1, validate_request_frame,
         validate_response_frame,
     };
@@ -1570,6 +1925,50 @@ mod tests {
     }
 
     #[test]
+    fn runtime_control_names_select_only_the_additive_raw_frame_bounds() {
+        let (profile_ref, profile, carrier) = restricted_profile_and_carrier();
+        let legacy = RestrictedRuntimeApplyEndpointConfigV1::try_from_transport_profile(
+            &profile,
+            profile_ref,
+            &carrier,
+            PathBuf::from("/run/paraegox/root-ca.pem"),
+            identity("runtime"),
+        )
+        .expect("legacy endpoint mapping");
+        let control = RestrictedRuntimeControlEndpointConfigV1::try_from_transport_profile(
+            &profile,
+            profile_ref,
+            &carrier,
+            PathBuf::from("/run/paraegox/root-ca.pem"),
+            identity("runtime"),
+        )
+        .expect("control endpoint mapping");
+        let client = RestrictedRuntimeControlClientConfigV1::try_from_transport_profile(
+            &profile,
+            profile_ref,
+            &carrier,
+            PathBuf::from("/run/paraegox/root-ca.pem"),
+            identity("controller"),
+        )
+        .expect("control client mapping");
+        assert_eq!(
+            legacy.frame_bounds,
+            RestrictedRawQueryFrameBounds::legacy_apply()
+        );
+        assert_eq!(
+            control.0.frame_bounds,
+            RestrictedRawQueryFrameBounds::runtime_control()
+        );
+        assert_eq!(
+            client.0.frame_bounds,
+            RestrictedRawQueryFrameBounds::runtime_control()
+        );
+        assert_eq!(control.route(), profile.route());
+        assert_eq!(client.route(), profile.route());
+        assert!(control.matches_restricted_carrier(&carrier));
+    }
+
+    #[test]
     fn profiles_disable_discovery_pubsub_retry_and_protocol_fallback() {
         let config = RestrictedRuntimeApplyClientConfigV1::try_new(
             endpoint(),
@@ -1624,9 +2023,16 @@ mod tests {
             config
                 .get_json("transport/link/rx/max_message_size")
                 .unwrap(),
-            super::restricted_transport_message_limit().to_string()
+            super::restricted_transport_message_limit(
+                RestrictedRawQueryFrameBounds::legacy_apply(),
+            )
+            .to_string()
         );
-        assert!(super::restricted_transport_message_limit() < 1024 * 1024);
+        assert!(
+            super::restricted_transport_message_limit(
+                RestrictedRawQueryFrameBounds::runtime_control(),
+            ) < 1024 * 1024
+        );
         assert_eq!(config.get_json("access_control/enabled").unwrap(), "true");
         assert_eq!(
             config
@@ -1735,23 +2141,21 @@ mod tests {
             Err(RestrictedRuntimeApplyConfigErrorV1::ZeroCarrierBindingDigest)
         );
         assert_eq!(
-            validate_request_frame(&[]),
+            validate_request_frame(&[], RestrictedRawQueryFrameBounds::legacy_apply()),
             Err(RestrictedRuntimeApplyErrorV1::EmptyRequest)
         );
         assert_eq!(
-            validate_request_frame(&vec![
-                0_u8;
-                MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES
-                    + 1
-            ]),
+            validate_request_frame(
+                &vec![0_u8; MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES + 1],
+                RestrictedRawQueryFrameBounds::legacy_apply(),
+            ),
             Err(RestrictedRuntimeApplyErrorV1::RequestTooLarge)
         );
         assert_eq!(
-            validate_response_frame(&vec![
-                0_u8;
-                MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES
-                    + 1
-            ]),
+            validate_response_frame(
+                &vec![0_u8; MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES + 1],
+                RestrictedRawQueryFrameBounds::legacy_apply(),
+            ),
             Err(RestrictedRuntimeApplyErrorV1::ResponseTooLarge)
         );
     }
@@ -1872,6 +2276,7 @@ mod tests {
         let inbound = RestrictedRuntimeApplyInboundV1 {
             canonical_request: request.clone().into_boxed_slice(),
             responder: Some(sender),
+            frame_bounds: RestrictedRawQueryFrameBounds::legacy_apply(),
         };
         assert_eq!(inbound.canonical_request(), request);
         inbound.respond(response.clone()).unwrap();
@@ -1881,6 +2286,7 @@ mod tests {
         let oversized = RestrictedRuntimeApplyInboundV1 {
             canonical_request: request.into_boxed_slice(),
             responder: Some(sender),
+            frame_bounds: RestrictedRawQueryFrameBounds::legacy_apply(),
         };
         assert_eq!(
             oversized.respond(vec![
