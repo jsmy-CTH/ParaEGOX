@@ -2102,6 +2102,12 @@ mod tests {
         RestrictedRuntimeApplyCarrierBindingFieldsV1, RestrictedRuntimeApplyCarrierBindingV1,
         RestrictedRuntimeApplyTransportProfileFieldsV1, RestrictedRuntimeApplyTransportProfileV1,
     };
+    use paraegox_runtime_contracts::managed_serving_bootstrap::{
+        MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES, MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES,
+        MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES, MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES,
+        MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES,
+    };
+    use paraegox_runtime_contracts::reference_control::MAX_REFERENCE_QUERY_RESPONSE_BYTES;
     use paraegox_runtime_contracts::wire::ApplyAuthKeyRef;
 
     fn endpoint() -> RemoteTlsEndpoint {
