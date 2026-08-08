@@ -2669,9 +2669,10 @@ mod tests {
     use paraegox_runtime_contracts::managed_serving_bootstrap::{
         ManagedServingBootstrapError, ManagedServingBootstrapFactsV1,
         ManagedServingBootstrapRequestIdV1, ManagedServingBootstrapResponseAuthClaimV1,
-        RuntimeAgentControlKindV1, RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestDraftV1,
-        RuntimeControlCarrierRequestV1, RuntimeControlDescribeReadyFactsV1,
-        RuntimeControlDescribeReadyPhaseV1, RuntimeControlDescribeReadyResponseDraftV1,
+        RuntimeAgentControlKindV1, RuntimeControlCarrierKindV1,
+        RuntimeControlCarrierRequestDraftV1, RuntimeControlCarrierRequestV1,
+        RuntimeControlDescribeReadyFactsV1, RuntimeControlDescribeReadyPhaseV1,
+        RuntimeControlDescribeReadyResponseDraftV1,
     };
     use paraegox_runtime_contracts::provenance::{SourcePlanRevision, SourceScopeRef};
     use paraegox_runtime_contracts::reference_control::{
@@ -2688,13 +2689,12 @@ mod tests {
     };
 
     use super::{
-        FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1,
-        ManagedServingBootstrapPhaseV1, ManagedServingBootstrapStateV1,
-        ManagedServingControllerError, ManagedServingDescribeIngressV1,
-        ManagedServingDescribeVerifierV1, RuntimeAgentControlDurablePhaseV1,
-        RuntimeAgentControlDurableSlotV1, RuntimeReferenceQueryMtlsExchangeSuccessV1,
-        RuntimeReferenceQueryTransportErrorV1, VerifiedManagedServingReadyV1,
-        ingress_reference_serving_identity,
+        FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1, ManagedServingBootstrapPhaseV1,
+        ManagedServingBootstrapStateV1, ManagedServingControllerError,
+        ManagedServingDescribeIngressV1, ManagedServingDescribeVerifierV1,
+        RuntimeAgentControlDurablePhaseV1, RuntimeAgentControlDurableSlotV1,
+        RuntimeReferenceQueryMtlsExchangeSuccessV1, RuntimeReferenceQueryTransportErrorV1,
+        VerifiedManagedServingReadyV1, ingress_reference_serving_identity,
     };
     use crate::runtime_control_client::PreparedRuntimeQueryRequest;
 
@@ -2739,10 +2739,7 @@ mod tests {
         });
         let ready = VerifiedManagedServingReadyV1 {
             ingress: ManagedServingDescribeIngressV1::try_accept(
-                &verifier,
-                None,
-                describe,
-                &response,
+                &verifier, None, describe, &response,
             )
             .expect("ManagedReady ingress"),
         };
@@ -2751,8 +2748,7 @@ mod tests {
                 &ready,
                 Digest32::from_bytes([0x93; 32]),
                 PrincipalRef::from_bytes([0x94; 16]),
-                FreshRuntimeAgentControlV1::try_new([0x95; 16], [0x96; 32])
-                    .expect("fresh PXAG"),
+                FreshRuntimeAgentControlV1::try_new([0x95; 16], [0x96; 32]).expect("fresh PXAG"),
                 &controller,
             )
             .expect("signed descriptor PXAG");

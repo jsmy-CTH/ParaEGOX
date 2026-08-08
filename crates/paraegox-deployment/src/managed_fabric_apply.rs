@@ -3655,9 +3655,9 @@ pub(crate) mod tests {
         MODEL_STACK_STATE_FIXED_BYTES, MODEL_STACK_STATE_VERSION,
         ManagedFabricApplyControllerError, ManagedFabricApplyJournalV1, ManagedFabricApplyPhaseV1,
         ManagedFabricControllerStateV1, ManagedFabricRemoteAgentControlActivateInputV1,
-        ManagedServingDescribeSendActionV1,
-        REMOTE_CARRIER_STATE_FIXED_BYTES, REMOTE_CARRIER_STATE_VERSION, STATE_CHECKSUM_BYTES,
-        STATE_FIXED_BYTES, STATE_VERSION, state_checksum,
+        ManagedServingDescribeSendActionV1, REMOTE_CARRIER_STATE_FIXED_BYTES,
+        REMOTE_CARRIER_STATE_VERSION, STATE_CHECKSUM_BYTES, STATE_FIXED_BYTES, STATE_VERSION,
+        state_checksum,
     };
     use crate::managed_fabric_producer::{
         FreshManagedFabricApplyV1, ManagedFabricControllerIdentityV1,
@@ -3667,9 +3667,8 @@ pub(crate) mod tests {
         VerifiedManagedFabricProducerContextV1,
     };
     use crate::managed_serving_client::{
-        FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1,
-        ManagedServingBootstrapStateV1, ManagedServingControllerError,
-        ManagedServingDescribeIngressV1,
+        FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1, ManagedServingBootstrapStateV1,
+        ManagedServingControllerError, ManagedServingDescribeIngressV1,
         ManagedServingDescribeReconcileDecodeV1, ManagedServingDescribeReconcilePhaseV1,
         ManagedServingDescribeVerifierV1, RuntimeAgentControlDurablePhaseV1,
         RuntimeAgentControlMtlsExchangeSuccessV1, RuntimeAgentControlTransportErrorV1,
@@ -4342,13 +4341,9 @@ pub(crate) mod tests {
             )
             .expect("remote Fabric prepare");
         let action = journal
-            .claim_remote_agent_control_send_with(
-                prepared,
-                &controller,
-                &remote,
-                &ingress,
-                |_| Ok(()),
-            )
+            .claim_remote_agent_control_send_with(prepared, &controller, &remote, &ingress, |_| {
+                Ok(())
+            })
             .expect("remote Fabric claim");
         let outer = signed_runtime_fabric_receipt(action.request(), &remote);
         let transport = RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
@@ -4743,7 +4738,10 @@ pub(crate) mod tests {
             .into_inner()
             .expect("one Uncertain commit image");
         assert_eq!(durable_uncertain.sequence(), durable_prepare.sequence() + 1);
-        assert_eq!(durable_uncertain.phase(), ManagedFabricApplyPhaseV1::Uncertain);
+        assert_eq!(
+            durable_uncertain.phase(),
+            ManagedFabricApplyPhaseV1::Uncertain
+        );
         assert_eq!(
             durable_uncertain.fabric_agent_control().phase(),
             RuntimeAgentControlDurablePhaseV1::Uncertain
@@ -4802,7 +4800,11 @@ pub(crate) mod tests {
             })
             .await;
         let (spent, second_response) = second.into_parts();
-        assert_eq!(calls.get(), 1, "spent action must not invoke transport twice");
+        assert_eq!(
+            calls.get(),
+            1,
+            "spent action must not invoke transport twice"
+        );
         assert_eq!(
             second_response,
             Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
@@ -4827,8 +4829,14 @@ pub(crate) mod tests {
         let durable_terminal = terminal_commit
             .into_inner()
             .expect("one terminal commit image");
-        assert_eq!(durable_terminal.sequence(), durable_uncertain.sequence() + 1);
-        assert_eq!(durable_terminal.phase(), ManagedFabricApplyPhaseV1::ReceiptDurable);
+        assert_eq!(
+            durable_terminal.sequence(),
+            durable_uncertain.sequence() + 1
+        );
+        assert_eq!(
+            durable_terminal.phase(),
+            ManagedFabricApplyPhaseV1::ReceiptDurable
+        );
         assert_eq!(
             durable_terminal.fabric_agent_control().phase(),
             RuntimeAgentControlDurablePhaseV1::ReceiptDurable

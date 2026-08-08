@@ -2181,18 +2181,13 @@ mod tests {
         );
         assert_eq!(
             durable_prepare.agent_stack_agent_control().phase(),
-            crate::managed_serving_client::RuntimeAgentControlDurablePhaseV1::
-                RequestDurableNotSent
+            crate::managed_serving_client::RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
         );
 
         let action = journal
-            .claim_remote_agent_control_send_with(
-                prepared,
-                &controller,
-                &remote,
-                &ingress,
-                |_| Ok(()),
-            )
+            .claim_remote_agent_control_send_with(prepared, &controller, &remote, &ingress, |_| {
+                Ok(())
+            })
             .expect("inner and outer Agent Uncertain fences durable");
         assert_eq!(
             journal.prepared_remote_agent_control(&controller, &remote, &ingress),
