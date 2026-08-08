@@ -1564,12 +1564,11 @@ fn validate_evidence_snapshot_successor(
             DistributedAgentStackEvidenceHandoffV2::None,
             _,
         ) => return Err(DistributedAgentStackStateError::InvalidEvidenceState),
-        (_, _, DistributedAgentStackDurablePhase::ActiveReady) => {
+        (_, _, DistributedAgentStackDurablePhase::ActiveReady)
             if prior.phase != DistributedAgentStackDurablePhase::ActiveReady
-                || prior.transition() != next.transition()
-            {
-                return Err(DistributedAgentStackStateError::InvalidEvidenceState);
-            }
+                || prior.transition() != next.transition() =>
+        {
+            return Err(DistributedAgentStackStateError::InvalidEvidenceState);
         }
         _ => {}
     }
