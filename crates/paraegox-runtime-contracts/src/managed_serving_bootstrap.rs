@@ -21,15 +21,13 @@ use crate::distributed_agent_stack_plan::{
     MAX_RESTRICTED_RUNTIME_APPLY_CARRIER_BINDING_BYTES, RestrictedRuntimeApplyCarrierBindingV1,
 };
 use crate::managed_agent_stack_plan::{
-    MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES,
-    MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedAgentStackApplyRequestV1,
-    ManagedAgentStackTerminalReceiptV1,
+    MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES, MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
+    ManagedAgentStackApplyRequestV1, ManagedAgentStackTerminalReceiptV1,
 };
 use crate::managed_fabric_plan::{
     MANAGED_FABRIC_PROJECTION_BYTES, MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES,
     MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES, ManagedFabricApplyRequestV1,
-    ManagedFabricApplyTerminalReceiptV1, ManagedFabricManifestProjectionV1,
-    ManagedFabricPlanError,
+    ManagedFabricApplyTerminalReceiptV1, ManagedFabricManifestProjectionV1, ManagedFabricPlanError,
 };
 use crate::managed_service::ManagedServiceGeneration;
 use crate::provenance::SourceScopeRef;
@@ -138,8 +136,7 @@ const MAX_RUNTIME_AGENT_CONTROL_RECEIPT_PAYLOAD_BYTES: usize =
     if MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES
         > MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES
     {
-        if MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES
-            > MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES
+        if MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES > MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES
         {
             MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES
         } else {
@@ -878,9 +875,7 @@ impl ManagedServingBootstrapResponseV1 {
 pub struct RuntimeAgentControlRequestIdV1([u8; 16]);
 
 impl RuntimeAgentControlRequestIdV1 {
-    pub const fn try_from_bytes(
-        bytes: [u8; 16],
-    ) -> Result<Self, ManagedServingBootstrapError> {
+    pub const fn try_from_bytes(bytes: [u8; 16]) -> Result<Self, ManagedServingBootstrapError> {
         if bytes_are_zero(&bytes) {
             return Err(ManagedServingBootstrapError::InvalidIdentity);
         }
@@ -1691,8 +1686,7 @@ impl RuntimeAgentControlReceiptV1 {
             return Err(ManagedServingBootstrapError::InvalidAgentControlBinding);
         }
         let payload_wire = cursor.take(payload_length)?;
-        if digest(AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN, payload_wire)?
-            != payload_wire_digest
+        if digest(AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN, payload_wire)? != payload_wire_digest
         {
             return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
         }
@@ -1711,9 +1705,7 @@ impl RuntimeAgentControlReceiptV1 {
             }
             RuntimeAgentControlKindV1::DescribeConversationPort => {
                 validate_runtime_agent_port_descriptor(payload_wire)?;
-                RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(
-                    payload_wire.into(),
-                )
+                RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(payload_wire.into())
             }
         };
         let signature = cursor.take(signature_length)?;
@@ -1924,21 +1916,15 @@ impl RuntimeAgentControlReceiptV1 {
     }
 
     #[must_use]
-    pub fn managed_fabric_receipt(
-        &self,
-    ) -> Option<&ManagedFabricApplyTerminalReceiptV1> {
+    pub fn managed_fabric_receipt(&self) -> Option<&ManagedFabricApplyTerminalReceiptV1> {
         match &self.payload {
-            RuntimeAgentControlReceiptPayloadV1::ManagedFabric(receipt) => {
-                Some(receipt.as_ref())
-            }
+            RuntimeAgentControlReceiptPayloadV1::ManagedFabric(receipt) => Some(receipt.as_ref()),
             _ => None,
         }
     }
 
     #[must_use]
-    pub fn managed_agent_stack_receipt(
-        &self,
-    ) -> Option<&ManagedAgentStackTerminalReceiptV1> {
+    pub fn managed_agent_stack_receipt(&self) -> Option<&ManagedAgentStackTerminalReceiptV1> {
         match &self.payload {
             RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(receipt) => {
                 Some(receipt.as_ref())
@@ -2916,8 +2902,7 @@ fn validate_runtime_agent_control_request_fields(
                     != fields.expected_runtime_store_instance_id
                 || request.authentication().claim().principal()
                     != fields.carrier.controller_principal()
-                || request.authentication().claim().key()
-                    != fields.carrier.controller_request_key()
+                || request.authentication().claim().key() != fields.carrier.controller_request_key()
                 || request.authentication().claim().nonce() == fields.auth_claim.nonce()
             {
                 return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
@@ -2932,8 +2917,7 @@ fn validate_runtime_agent_control_request_fields(
                     != fields.expected_runtime_store_instance_id
                 || request.authentication().claim().principal()
                     != fields.carrier.controller_principal()
-                || request.authentication().claim().key()
-                    != fields.carrier.controller_request_key()
+                || request.authentication().claim().key() != fields.carrier.controller_request_key()
                 || request.authentication().claim().nonce() == fields.auth_claim.nonce()
             {
                 return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
@@ -3212,17 +3196,20 @@ fn validate_runtime_agent_control_receipt_against_request(
         (
             RuntimeAgentControlReceiptPayloadV1::ManagedFabric(receipt),
             RuntimeAgentControlKindV1::ApplyManagedFabric,
-        ) => request.managed_fabric_apply_request.as_ref().is_some_and(|inner| {
-            receipt.target() == inner.target()
-                && receipt.runtime_store_instance_id()
-                    == inner.expected_runtime_store_instance_id()
-                && receipt.provenance() == inner.provenance()
-                && receipt.operation_id() == inner.operation_id()
-                && receipt.request_digest() == inner.envelope_request_digest()
-                && receipt.request_nonce() == inner.authentication().claim().nonce()
-                && receipt.target_slice_digest() == inner.target_slice_digest()
-                && receipt.assignment_digest() == inner.assignment_digest()
-        }),
+        ) => request
+            .managed_fabric_apply_request
+            .as_ref()
+            .is_some_and(|inner| {
+                receipt.target() == inner.target()
+                    && receipt.runtime_store_instance_id()
+                        == inner.expected_runtime_store_instance_id()
+                    && receipt.provenance() == inner.provenance()
+                    && receipt.operation_id() == inner.operation_id()
+                    && receipt.request_digest() == inner.envelope_request_digest()
+                    && receipt.request_nonce() == inner.authentication().claim().nonce()
+                    && receipt.target_slice_digest() == inner.target_slice_digest()
+                    && receipt.assignment_digest() == inner.assignment_digest()
+            }),
         (
             RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(receipt),
             RuntimeAgentControlKindV1::ApplyManagedAgentStack,
@@ -3274,12 +3261,10 @@ fn validate_runtime_agent_control_receipt_lengths(
     }
     let valid = match kind {
         RuntimeAgentControlKindV1::ApplyManagedFabric => {
-            payload_length != 0
-                && payload_length <= MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES
+            payload_length != 0 && payload_length <= MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES
         }
         RuntimeAgentControlKindV1::ApplyManagedAgentStack => {
-            payload_length != 0
-                && payload_length <= MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES
+            payload_length != 0 && payload_length <= MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES
         }
         RuntimeAgentControlKindV1::DescribeConversationPort => {
             (6..=MAX_RUNTIME_AGENT_PORT_DESCRIPTOR_BYTES).contains(&payload_length)
@@ -4599,10 +4584,7 @@ mod tests {
                 |principal, key, fingerprint, transcript, signature| {
                     assert_eq!(principal, carrier.controller_principal());
                     assert_eq!(key, carrier.controller_request_key());
-                    assert_eq!(
-                        fingerprint,
-                        carrier.controller_request_key_fingerprint()
-                    );
+                    assert_eq!(fingerprint, carrier.controller_request_key_fingerprint());
                     assert!(!transcript.is_empty());
                     signature == [0x94; 64]
                 },
@@ -4631,14 +4613,21 @@ mod tests {
             Some(&descriptor[..])
         );
         assert_eq!(
-            receipt.fabric_generation().map(ManagedServiceGeneration::value),
+            receipt
+                .fabric_generation()
+                .map(ManagedServiceGeneration::value),
             Some(17)
         );
         assert_eq!(
-            receipt.agent_generation().map(ManagedServiceGeneration::value),
+            receipt
+                .agent_generation()
+                .map(ManagedServiceGeneration::value),
             Some(19)
         );
-        assert_eq!(receipt.expected_active_pxst_digest(), request.expected_active_pxst_digest());
+        assert_eq!(
+            receipt.expected_active_pxst_digest(),
+            request.expected_active_pxst_digest()
+        );
         assert_eq!(receipt.intended_client(), request.intended_client());
         let decoded = RuntimeAgentControlReceiptV1::decode(receipt.canonical_wire())
             .expect("strict PXAH descriptor");
@@ -4673,9 +4662,8 @@ mod tests {
 
         let mut request_digest_tamper = receipt.canonical_wire().to_vec();
         request_digest_tamper[34] ^= 1;
-        let wrong_request_digest =
-            RuntimeAgentControlReceiptV1::decode(&request_digest_tamper)
-                .expect("opaque signature permits correlation check after decode");
+        let wrong_request_digest = RuntimeAgentControlReceiptV1::decode(&request_digest_tamper)
+            .expect("opaque signature permits correlation check after decode");
         assert_eq!(
             wrong_request_digest
                 .validate_descriptor_against_request(&request)
@@ -4786,9 +4774,7 @@ mod tests {
                 &fabric_outer,
                 fabric_channel,
                 &fabric_carrier,
-                |_, _, _, transcript, signature| {
-                    !transcript.is_empty() && signature == [0xa3; 64]
-                },
+                |_, _, _, transcript, signature| !transcript.is_empty() && signature == [0xa3; 64],
             )
             .expect("PXFT outer and inner correlation");
         let wrong_fabric_channel = ReferenceChannelBindingV1::try_new(
@@ -4860,9 +4846,7 @@ mod tests {
                 &agent_outer,
                 agent_channel,
                 &agent_carrier,
-                |_, _, _, transcript, signature| {
-                    !transcript.is_empty() && signature == [0xa6; 64]
-                },
+                |_, _, _, transcript, signature| !transcript.is_empty() && signature == [0xa6; 64],
             )
             .expect("PXST outer and inner correlation");
 

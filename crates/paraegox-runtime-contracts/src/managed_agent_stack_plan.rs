@@ -429,10 +429,8 @@ impl ManagedAgentPortPlanV1 {
             target,
             service_id,
         )?;
-        let submit_key_expression =
-            target_scoped_agent_route(target, service_id, b"submit")?;
-        let control_key_expression =
-            target_scoped_agent_route(target, service_id, b"control")?;
+        let submit_key_expression = target_scoped_agent_route(target, service_id, b"submit")?;
+        let control_key_expression = target_scoped_agent_route(target, service_id, b"control")?;
         Self::try_new(
             submit_binding_id,
             control_binding_id,
@@ -518,9 +516,8 @@ fn target_scoped_agent_route(
     service_id: ManagedServiceId,
     lane: &[u8],
 ) -> Result<String, ManagedAgentStackPlanError> {
-    let mut route = Vec::with_capacity(
-        TARGET_SCOPED_AGENT_ROUTE_PREFIX.len() + 32 + 1 + 32 + 1 + lane.len(),
-    );
+    let mut route =
+        Vec::with_capacity(TARGET_SCOPED_AGENT_ROUTE_PREFIX.len() + 32 + 1 + 32 + 1 + lane.len());
     route.extend_from_slice(TARGET_SCOPED_AGENT_ROUTE_PREFIX);
     append_lower_hex(&mut route, target.as_bytes());
     route.push(b'/');
@@ -2717,31 +2714,23 @@ mod tests {
     fn target_scoped_agent_port_derives_exact_distinct_bounded_lanes() {
         let target = RuntimeHostId::from_bytes([0x11; 16]);
         let service_id = ManagedServiceId::from_bytes([0x22; 16]);
-        let first = ManagedAgentPortPlanV1::try_new_target_scoped(
-            target,
-            service_id,
-            ingress(),
-        )
-        .expect("target-scoped port");
-        let second = ManagedAgentPortPlanV1::try_new_target_scoped(
-            target,
-            service_id,
-            ingress(),
-        )
-        .expect("deterministic target-scoped port");
+        let first = ManagedAgentPortPlanV1::try_new_target_scoped(target, service_id, ingress())
+            .expect("target-scoped port");
+        let second = ManagedAgentPortPlanV1::try_new_target_scoped(target, service_id, ingress())
+            .expect("deterministic target-scoped port");
         assert_eq!(first, second);
         assert_eq!(
             first.submit_binding_id().as_bytes(),
             &[
-                0x57, 0x22, 0xf7, 0xae, 0xdf, 0xf8, 0x94, 0x82, 0x53, 0x5d, 0xe7, 0x7a,
-                0x0d, 0x37, 0x9b, 0x58,
+                0x57, 0x22, 0xf7, 0xae, 0xdf, 0xf8, 0x94, 0x82, 0x53, 0x5d, 0xe7, 0x7a, 0x0d, 0x37,
+                0x9b, 0x58,
             ]
         );
         assert_eq!(
             first.control_binding_id().as_bytes(),
             &[
-                0x17, 0x27, 0x45, 0xe5, 0xa0, 0x41, 0xec, 0x64, 0x81, 0x7d, 0x41, 0xde,
-                0x25, 0x2d, 0x0a, 0xe0,
+                0x17, 0x27, 0x45, 0xe5, 0xa0, 0x41, 0xec, 0x64, 0x81, 0x7d, 0x41, 0xde, 0x25, 0x2d,
+                0x0a, 0xe0,
             ]
         );
         assert_ne!(first.submit_binding_id(), first.control_binding_id());
