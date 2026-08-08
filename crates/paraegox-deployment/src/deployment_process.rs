@@ -3432,27 +3432,45 @@ mod platform {
         .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)
     }
 
-    fn fresh_developer_managed_fabric_apply()
-    -> Result<FreshManagedFabricApplyV1, DeveloperDeploymentErrorV1> {
-        FreshManagedFabricApplyV1::try_new(
-            nonzero_system_entropy::<16>()?,
-            nonzero_system_entropy::<16>()?,
-            nonzero_system_entropy::<32>()?,
-        )
-        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)
-    }
-
-    fn fresh_developer_managed_agent_stack_apply()
-    -> Result<FreshManagedAgentStackApplyV1, DeveloperDeploymentErrorV1> {
-        FreshManagedAgentStackApplyV1::try_new(
-            nonzero_system_entropy::<16>()?,
+    fn fresh_developer_managed_fabric_agent_control() -> Result<
+        (FreshManagedFabricApplyV1, FreshRuntimeAgentControlV1),
+        DeveloperDeploymentErrorV1,
+    > {
+        let operation_id = nonzero_system_entropy::<16>()?;
+        let inner = FreshManagedFabricApplyV1::try_new(
+            operation_id,
             nonzero_system_entropy::<16>()?,
             nonzero_system_entropy::<32>()?,
         )
-        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        let outer = FreshRuntimeAgentControlV1::try_new(
+            operation_id,
+            nonzero_system_entropy::<32>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        Ok((inner, outer))
     }
 
-    fn fresh_developer_runtime_agent_control()
+    fn fresh_developer_managed_agent_stack_agent_control() -> Result<
+        (FreshManagedAgentStackApplyV1, FreshRuntimeAgentControlV1),
+        DeveloperDeploymentErrorV1,
+    > {
+        let operation_id = nonzero_system_entropy::<16>()?;
+        let inner = FreshManagedAgentStackApplyV1::try_new(
+            operation_id,
+            nonzero_system_entropy::<16>()?,
+            nonzero_system_entropy::<32>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        let outer = FreshRuntimeAgentControlV1::try_new(
+            operation_id,
+            nonzero_system_entropy::<32>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        Ok((inner, outer))
+    }
+
+    fn fresh_developer_conversation_port_agent_control()
     -> Result<FreshRuntimeAgentControlV1, DeveloperDeploymentErrorV1> {
         FreshRuntimeAgentControlV1::try_new(
             nonzero_system_entropy::<16>()?,
@@ -3527,6 +3545,8 @@ mod platform {
                 .prepared_remote_agent_control(controller_signer, provisioning, ingress)
                 .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
         } else {
+            let (inner_fresh, outer_fresh) =
+                fresh_developer_managed_fabric_agent_control()?;
             journal
                 .prepare_remote_agent_control_activate_with(
                     ManagedFabricRemoteAgentControlActivateInputV1 {
@@ -3535,8 +3555,8 @@ mod platform {
                         previous: ingress,
                         service,
                         endpoint,
-                        inner_fresh: fresh_developer_managed_fabric_apply()?,
-                        outer_fresh: fresh_developer_runtime_agent_control()?,
+                        inner_fresh,
+                        outer_fresh,
                     },
                     |next| {
                         store
@@ -3674,6 +3694,8 @@ mod platform {
         } else {
             let mut durable = ManagedAgentStackDurableStoreV1::try_new(store)
                 .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+            let (inner_fresh, outer_fresh) =
+                fresh_developer_managed_agent_stack_agent_control()?;
             journal
                 .prepare_remote_agent_control_activate_with(
                     ManagedAgentStackRemoteAgentControlActivateInputV1 {
@@ -3681,8 +3703,8 @@ mod platform {
                         provisioning,
                         previous: ingress,
                         activation,
-                        inner_fresh: fresh_developer_managed_agent_stack_apply()?,
-                        outer_fresh: fresh_developer_runtime_agent_control()?,
+                        inner_fresh,
+                        outer_fresh,
                     },
                     |next| durable.commit(next),
                 )
@@ -3809,7 +3831,7 @@ mod platform {
                     provisioning,
                     ingress,
                     intended_client,
-                    fresh_developer_runtime_agent_control()?,
+                    fresh_developer_conversation_port_agent_control()?,
                     |next| durable.commit(next),
                 )
                 .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?
