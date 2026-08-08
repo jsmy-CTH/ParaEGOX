@@ -1434,6 +1434,59 @@ impl RuntimeAgentControlReceiptPayloadV1 {
     }
 }
 
+/// Marker for one already committed PXST whose exact historical bytes and
+/// receipt-time local channel must survive a later Runtime service binding.
+///
+/// Construction revalidates the inner request facts and delegates the PXST
+/// signature decision to the caller's pinned inner-response-key policy. It is
+/// correlation evidence only; the containing PXAH still requires an
+/// independently authenticated PXAG and the current public PXCB.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeVerifiedHistoricalManagedAgentStackReceiptV1 {
+    receipt: ManagedAgentStackTerminalReceiptV1,
+}
+
+impl RuntimeVerifiedHistoricalManagedAgentStackReceiptV1 {
+    pub fn try_verify<Verify>(
+        request: &ManagedAgentStackApplyRequestV1,
+        current_runtime_host_epoch: u64,
+        receipt: ManagedAgentStackTerminalReceiptV1,
+        verify: Verify,
+    ) -> Result<Self, ManagedServingBootstrapError>
+    where
+        Verify: FnOnce(ApplyAuthKeyRef, ApplyAuthAlgorithm, u16, &[u8], &[u8]) -> bool,
+    {
+        validate_historical_managed_agent_stack_receipt(
+            request,
+            current_runtime_host_epoch,
+            &receipt,
+        )?;
+        let transcript = receipt
+            .signing_transcript()
+            .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
+        if !verify(
+            receipt.authentication_key(),
+            receipt.authentication_algorithm(),
+            receipt.authentication_algorithm_version(),
+            transcript.as_bytes(),
+            receipt.authentication_signature(),
+        ) {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlAuthentication);
+        }
+        Ok(Self { receipt })
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &ManagedAgentStackTerminalReceiptV1 {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn into_receipt(self) -> ManagedAgentStackTerminalReceiptV1 {
+        self.receipt
+    }
+}
+
 /// Signature-independent Runtime producer for one PXAH receipt.
 ///
 /// Every public producer constructor requires a marker issued by
@@ -1501,9 +1554,48 @@ impl RuntimeAgentControlReceiptDraftV1 {
         let inner = request
             .managed_agent_stack_apply_request()
             .ok_or(ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
+        if receipt
+            .facts()
+            .evidence()
+            .fields()
+            .completion_runtime_host_epoch
+            != request.expected_runtime_host_epoch()
+        {
+            return Err(ManagedServingBootstrapError::InvalidAgentControlReceipt);
+        }
         receipt
             .validate_against_request(inner, current_channel)
             .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
+        Self::try_new(
+            request,
+            RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(Box::new(receipt)),
+            None,
+            None,
+            auth_claim,
+        )
+    }
+
+    /// Wraps one byte-identical, independently verified historical PXST.
+    ///
+    /// Unlike [`Self::try_managed_agent_stack_apply`], this path does not
+    /// reinterpret the current Runtime-local UDS channel as the channel frozen
+    /// inside the historical PXST. The outer PXAH remains bound to the exact
+    /// authenticated current PXAG, RuntimeHost epoch, and public PXCB.
+    pub fn try_historical_managed_agent_stack_apply(
+        authenticated_request: ControllerAuthenticatedRuntimeAgentControlRequestV1<'_>,
+        verified_receipt: RuntimeVerifiedHistoricalManagedAgentStackReceiptV1,
+        auth_claim: RuntimeAgentControlResponseAuthClaimV1,
+    ) -> Result<Self, ManagedServingBootstrapError> {
+        let request = authenticated_request.request();
+        let inner = request
+            .managed_agent_stack_apply_request()
+            .ok_or(ManagedServingBootstrapError::InvalidAgentControlReceipt)?;
+        let receipt = verified_receipt.into_receipt();
+        validate_historical_managed_agent_stack_receipt(
+            inner,
+            request.expected_runtime_host_epoch(),
+            &receipt,
+        )?;
         Self::try_new(
             request,
             RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(Box::new(receipt)),
@@ -1771,9 +1863,10 @@ impl RuntimeAgentControlReceiptV1 {
         validate_runtime_agent_control_receipt_against_request(&draft, request)
     }
 
-    /// Revalidates an Apply receipt against the exact inner request and the
-    /// supplied current Runtime-local channel. The channel is never compared
-    /// with, or reinterpreted as, the public PXCB/TLS binding.
+    /// Revalidates an Apply receipt against the exact inner request and its
+    /// supplied receipt-time Runtime-local channel. For a fresh receipt this is
+    /// the current channel; exact historical replay retains the earlier
+    /// channel. It is never compared with, or reinterpreted as, PXCB/TLS.
     pub fn validate_apply_against_request(
         &self,
         request: &RuntimeAgentControlRequestV1,
@@ -3127,6 +3220,31 @@ fn validate_runtime_agent_port_descriptor(
     Ok(())
 }
 
+fn validate_historical_managed_agent_stack_receipt(
+    request: &ManagedAgentStackApplyRequestV1,
+    current_runtime_host_epoch: u64,
+    receipt: &ManagedAgentStackTerminalReceiptV1,
+) -> Result<(), ManagedServingBootstrapError> {
+    let facts = receipt.facts();
+    let evidence = facts.evidence().fields();
+    if current_runtime_host_epoch == 0
+        || evidence.completion_runtime_host_epoch > current_runtime_host_epoch
+        || evidence.selection_clock_generation.value()
+            < request.temporal().target_clock_generation().value()
+        || facts.target() != request.target()
+        || facts.runtime_store_instance_id() != request.expected_runtime_store_instance_id()
+        || facts.source_scope() != request.provenance().source_scope()
+        || facts.operation_id() != request.operation_id()
+        || facts.request_digest() != request.envelope_request_digest()
+        || facts.target_slice_digest() != request.target_slice_digest()
+        || facts.assignment_digest() != request.assignment_digest()
+        || facts.request_mode() != request.target_execution().mode()
+    {
+        return Err(ManagedServingBootstrapError::InvalidAgentControlReceipt);
+    }
+    Ok(())
+}
+
 fn validate_runtime_agent_control_receipt_draft(
     draft: &RuntimeAgentControlReceiptDraftV1,
 ) -> Result<(), ManagedServingBootstrapError> {
@@ -3164,7 +3282,7 @@ fn validate_runtime_agent_control_receipt_draft(
             facts.target() == draft.target
                 && facts.runtime_store_instance_id() == draft.runtime_store_instance_id
                 && facts.evidence().fields().completion_runtime_host_epoch
-                    == draft.runtime_host_epoch
+                    <= draft.runtime_host_epoch
                 && digest_is_zero(draft.expected_active_pxst_digest)
                 && bytes_are_zero(draft.intended_client.as_bytes())
                 && draft.fabric_generation.is_none()
@@ -4954,6 +5072,103 @@ mod tests {
         assert_eq!(
             RuntimeAgentControlRequestV1::decode(&inner_tamper),
             Err(ManagedServingBootstrapError::InvalidAgentControlPayload)
+        );
+    }
+
+    #[test]
+    fn pxah_historical_pxst_requires_verified_marker_and_retains_receipt_time_channel() {
+        let (inner, terminal, receipt_time_channel) = managed_agent_apply_fixture();
+        let completion_epoch = terminal
+            .facts()
+            .evidence()
+            .fields()
+            .completion_runtime_host_epoch;
+        let current_epoch = completion_epoch + 1;
+        let carrier = agent_control_carrier(
+            inner.target(),
+            inner.authentication().claim().principal(),
+            inner.authentication().claim().key(),
+            receipt_time_channel.runtime_peer(),
+            terminal.authentication_key(),
+        );
+        let outer = RuntimeAgentControlRequestDraftV1::try_apply_managed_agent_stack(
+            agent_control_fields(
+                *inner.operation_id().as_bytes(),
+                inner.target(),
+                inner.expected_runtime_store_instance_id(),
+                current_epoch,
+                carrier.clone(),
+                &[0xb8; 32],
+            ),
+            inner.clone(),
+        )
+        .expect("historical PXAG draft")
+        .finalize(&[0xb9; 64])
+        .expect("historical PXAG");
+        let authenticated = authenticate_agent_control_request(&outer, &carrier, &[0xb9; 64]);
+        assert_eq!(
+            RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
+                authenticated,
+                terminal.clone(),
+                receipt_time_channel,
+                agent_control_response_auth(&carrier),
+            )
+            .err(),
+            Some(ManagedServingBootstrapError::InvalidAgentControlReceipt),
+            "fresh PXAH construction must not absorb an older PXST",
+        );
+        let verified = RuntimeVerifiedHistoricalManagedAgentStackReceiptV1::try_verify(
+            &inner,
+            current_epoch,
+            terminal.clone(),
+            |key, algorithm, version, transcript, signature| {
+                key == terminal.authentication_key()
+                    && algorithm == terminal.authentication_algorithm()
+                    && version == terminal.authentication_algorithm_version()
+                    && !transcript.is_empty()
+                    && signature == terminal.authentication_signature()
+            },
+        )
+        .expect("verified historical PXST marker");
+        let pxah = RuntimeAgentControlReceiptDraftV1::try_historical_managed_agent_stack_apply(
+            authenticated,
+            verified,
+            agent_control_response_auth(&carrier),
+        )
+        .expect("historical PXAH draft")
+        .finalize(&[0xba; 64])
+        .expect("historical PXAH");
+        let decoded = RuntimeAgentControlReceiptV1::decode(pxah.canonical_wire())
+            .expect("historical PXAH round trip");
+        assert_eq!(decoded.runtime_host_epoch(), current_epoch);
+        assert_eq!(
+            decoded
+                .managed_agent_stack_receipt()
+                .expect("historical PXST payload")
+                .canonical_wire(),
+            terminal.canonical_wire(),
+        );
+        decoded
+            .verify_runtime_apply_receipt(
+                &outer,
+                receipt_time_channel,
+                &carrier,
+                |_, _, _, transcript, signature| !transcript.is_empty() && signature == [0xba; 64],
+            )
+            .expect("outer PXAH and receipt-time PXST channel correlation");
+        let rotated_channel = ReferenceChannelBindingV1::try_new(
+            inner.target(),
+            receipt_time_channel.runtime_peer(),
+            Digest32::from_bytes([0xbb; 32]),
+            Digest32::from_bytes([0xbc; 32]),
+        )
+        .expect("rotated channel");
+        assert_eq!(
+            decoded
+                .validate_apply_against_request(&outer, rotated_channel)
+                .err(),
+            Some(ManagedServingBootstrapError::AgentControlCorrelationMismatch),
+            "consumer verification remains exact to the PXST receipt-time channel",
         );
     }
 
