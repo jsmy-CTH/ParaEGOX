@@ -5,7 +5,9 @@
 //! One identity-bound local channel carries canonical PXBR bootstrap reads,
 //! read-only PXQR operation/live queries, and canonical PXAR v5 applies. Apply
 //! success is represented exclusively by the canonical PXRT v1 terminal
-//! Receipt; no transport ACK or private status byte exists.
+//! Receipt; no transport ACK or private status byte exists. The restricted
+//! public Runtime-control listener additionally carries frozen PXCC v1 and the
+//! independent PXAG/PXAH v1 Agent-control exchange on the same pinned route.
 
 use core::{fmt, future::Future, time::Duration};
 use std::ffi::OsStr;
@@ -77,13 +79,18 @@ use paraegox_runtime_contracts::{
         ManagedModelAgentStackPlanError, ManagedModelAgentStackProjectionV1,
     },
     managed_serving_bootstrap::{
+        ControllerAuthenticatedRuntimeAgentControlRequestV1,
         ControllerAuthenticatedRuntimeControlCarrierV1,
         MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES, MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES,
+        MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES, MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES,
         MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES,
         MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES, ManagedServingBootstrapError,
         ManagedServingBootstrapFactsV1, ManagedServingBootstrapRequestV1,
         ManagedServingBootstrapResponseAuthClaimV1, ManagedServingBootstrapResponseDraftV1,
-        RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestV1,
+        RUNTIME_AGENT_CONTROL_REQUEST_MAGIC, RuntimeAgentControlKindV1,
+        RuntimeAgentControlReceiptDraftV1, RuntimeAgentControlRequestV1,
+        RuntimeAgentControlResponseAuthClaimV1, RuntimeControlCarrierKindV1,
+        RuntimeControlCarrierRequestV1,
         RuntimeControlDescribeReadyFactsV1, RuntimeControlDescribeReadyPhaseV1,
         RuntimeControlDescribeReadyResponseDraftV1,
     },
@@ -125,7 +132,8 @@ use crate::{
     distributed_fabric_runtime::RuntimeFabricCredentialResolverV2,
     managed_agent_stack_runtime::{
         ManagedAgentStackApplyOutcome, ManagedAgentStackOwnerConfig, ManagedAgentStackRuntimeCore,
-        ManagedAgentStackRuntimeError, RuntimeAgentHandleBroker,
+        ManagedAgentStackRuntimeError, RuntimeAgentConversationPortExportErrorV1,
+        RuntimeAgentHandleBroker,
     },
     managed_fabric_runtime::{
         ManagedFabricApplyOutcome, ManagedFabricOwnerConfig, ManagedFabricRuntimeCore,
@@ -1781,6 +1789,115 @@ impl ManagedFabricControlService {
         Ok(wire.into())
     }
 
+    /// Dispatches the additive PXAG carrier on the same restricted Runtime
+    /// control listener as frozen PXCC v1. Unknown magic is interpreted only
+    /// by the strict PXCC decoder and therefore fails closed.
+    async fn handle_restricted_runtime_control_frame_v1(
+        &mut self,
+        canonical_request: &[u8],
+        expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if canonical_request.starts_with(RUNTIME_AGENT_CONTROL_REQUEST_MAGIC) {
+            let request = decode_runtime_agent_control_request(canonical_request)?;
+            let authenticated = authenticate_runtime_agent_control_request(
+                &self.provisioning,
+                &request,
+                expected_carrier,
+            )?;
+            self.handle_authenticated_runtime_agent_control_request_v1(authenticated)
+                .await
+        } else {
+            let request = decode_runtime_control_carrier(canonical_request)?;
+            let authenticated = authenticate_runtime_control_carrier(
+                &self.provisioning,
+                &request,
+                expected_carrier,
+            )?;
+            self.handle_authenticated_runtime_control_carrier_v1(authenticated)
+                .await
+        }
+    }
+
+    /// The only mutable PXAG seam. Its type makes outer PXCB/Controller
+    /// authentication a precondition; inner PXAR admission remains owned by
+    /// the existing v6/v7 handlers below.
+    async fn handle_authenticated_runtime_agent_control_request_v1(
+        &mut self,
+        authenticated: ControllerAuthenticatedRuntimeAgentControlRequestV1<'_>,
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        let request = authenticated.request();
+        if request.target() != self.provisioning.target()
+            || request.expected_runtime_store_instance_id() != self.core.store_instance_id()
+            || request.expected_runtime_host_epoch() != self.core.runtime_host_epoch()
+        {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let auth_claim = runtime_agent_control_response_auth(
+            &self.provisioning,
+            request.carrier(),
+        )?;
+        let draft = match authenticated.kind() {
+            RuntimeAgentControlKindV1::ApplyManagedFabric => {
+                let inner = request
+                    .managed_fabric_apply_request()
+                    .ok_or(RuntimeControlRequestError::Rejected)?;
+                let terminal_wire = self.handle_apply(inner.canonical_wire()).await?;
+                let terminal = ManagedFabricApplyTerminalReceiptV1::decode(&terminal_wire)
+                    .map_err(|error| {
+                        RuntimeControlRequestError::Internal(
+                            RuntimeBootstrapEndpointError::ManagedFabricContract(error),
+                        )
+                    })?;
+                RuntimeAgentControlReceiptDraftV1::try_managed_fabric_apply(
+                    authenticated,
+                    terminal,
+                    self.channel,
+                    auth_claim,
+                )
+            }
+            RuntimeAgentControlKindV1::ApplyManagedAgentStack => {
+                let inner = request
+                    .managed_agent_stack_apply_request()
+                    .ok_or(RuntimeControlRequestError::Rejected)?;
+                let terminal_wire = self.handle_apply(inner.canonical_wire()).await?;
+                let terminal = ManagedAgentStackTerminalReceiptV1::decode(&terminal_wire)
+                    .map_err(|error| {
+                        RuntimeControlRequestError::Internal(
+                            RuntimeBootstrapEndpointError::ManagedAgentStackContract(error),
+                        )
+                    })?;
+                RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
+                    authenticated,
+                    terminal,
+                    self.channel,
+                    auth_claim,
+                )
+            }
+            RuntimeAgentControlKindV1::DescribeConversationPort => {
+                let exported = self
+                    .stack
+                    .as_ref()
+                    .ok_or(RuntimeControlRequestError::Unavailable)?
+                    .export_active_conversation_port_v1(request.expected_active_pxst_digest())
+                    .await
+                    .map_err(map_runtime_agent_port_export_error)?;
+                RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
+                    authenticated,
+                    &exported.descriptor_wire,
+                    exported.fabric_generation,
+                    exported.agent_generation,
+                    auth_claim,
+                )
+            }
+        }
+        .map_err(|error| {
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedServingContract(error),
+            )
+        })?;
+        runtime_agent_control_receipt_response(&self.provisioning, draft)
+    }
+
     async fn handle_authenticated_runtime_control_carrier_v1(
         &mut self,
         authenticated: ControllerAuthenticatedRuntimeControlCarrierV1<'_>,
@@ -2342,6 +2459,54 @@ fn authenticate_runtime_control_carrier<'a>(
         .map_err(|_| RuntimeControlRequestError::Rejected)
 }
 
+fn authenticate_runtime_agent_control_request<'a>(
+    provisioning: &RuntimeProvisioningV1,
+    request: &'a RuntimeAgentControlRequestV1,
+    expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+) -> Result<ControllerAuthenticatedRuntimeAgentControlRequestV1<'a>, RuntimeControlRequestError> {
+    let controller_key_fingerprint = validate_restricted_runtime_apply_carrier_pins(
+        provisioning,
+        expected_carrier,
+    )
+    .map_err(|error| match error {
+        RuntimeRestrictedRemoteApplyErrorV1::Rejected
+        | RuntimeRestrictedRemoteApplyErrorV1::Unavailable => RuntimeControlRequestError::Rejected,
+        RuntimeRestrictedRemoteApplyErrorV1::Internal => {
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::InvalidProvisioning)
+        }
+    })?;
+    let claim = request.authentication().claim();
+    if claim.principal() != provisioning.controller_principal()
+        || claim.key() != provisioning.controller_request_key_ref()
+        || claim.algorithm().value() != ED25519_ALGORITHM
+        || claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+        || request.authentication().signature().len() != ED25519_SIGNATURE_BYTES
+    {
+        return Err(RuntimeControlRequestError::Rejected);
+    }
+    request
+        .verify_controller_request(
+            expected_carrier,
+            |principal, key, fingerprint, transcript, signature| {
+                if principal != provisioning.controller_principal()
+                    || key != provisioning.controller_request_key_ref()
+                    || fingerprint != controller_key_fingerprint
+                    || signature.len() != ED25519_SIGNATURE_BYTES
+                {
+                    return false;
+                }
+                let Ok(signature) = Signature::from_slice(signature) else {
+                    return false;
+                };
+                provisioning
+                    .controller_key()
+                    .verify_strict(transcript, &signature)
+                    .is_ok()
+            },
+        )
+        .map_err(|_| RuntimeControlRequestError::Rejected)
+}
+
 fn decode_runtime_control_carrier(
     canonical_pxcc: &[u8],
 ) -> Result<RuntimeControlCarrierRequestV1, RuntimeControlRequestError> {
@@ -2351,6 +2516,69 @@ fn decode_runtime_control_carrier(
     }
     RuntimeControlCarrierRequestV1::decode(canonical_pxcc)
         .map_err(|_| RuntimeControlRequestError::Rejected)
+}
+
+fn decode_runtime_agent_control_request(
+    canonical_pxag: &[u8],
+) -> Result<RuntimeAgentControlRequestV1, RuntimeControlRequestError> {
+    if canonical_pxag.is_empty()
+        || canonical_pxag.len() > MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES
+    {
+        return Err(RuntimeControlRequestError::Rejected);
+    }
+    RuntimeAgentControlRequestV1::decode(canonical_pxag)
+        .map_err(|_| RuntimeControlRequestError::Rejected)
+}
+
+fn runtime_agent_control_response_auth(
+    provisioning: &RuntimeProvisioningV1,
+    carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+) -> Result<RuntimeAgentControlResponseAuthClaimV1, RuntimeControlRequestError> {
+    let algorithm = ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM).map_err(|_| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::InvalidStartedState)
+    })?;
+    RuntimeAgentControlResponseAuthClaimV1::try_new(
+        carrier,
+        provisioning.runtime_response_key_ref(),
+        algorithm,
+        ED25519_ALGORITHM_VERSION,
+    )
+    .map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedServingContract(
+            error,
+        ))
+    })
+}
+
+fn runtime_agent_control_receipt_response(
+    provisioning: &RuntimeProvisioningV1,
+    draft: RuntimeAgentControlReceiptDraftV1,
+) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    let signature = provisioning
+        .response_signer()
+        .sign(
+            draft
+                .signing_transcript()
+                .map_err(|error| {
+                    RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::ManagedServingContract(error),
+                    )
+                })?
+                .as_bytes(),
+        )
+        .to_bytes();
+    let receipt = draft.finalize(&signature).map_err(|error| {
+        RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedServingContract(
+            error,
+        ))
+    })?;
+    let wire = receipt.canonical_wire();
+    if wire.is_empty() || wire.len() > MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES {
+        return Err(RuntimeControlRequestError::Internal(
+            RuntimeBootstrapEndpointError::InvalidStartedState,
+        ));
+    }
+    Ok(wire.into())
 }
 
 fn runtime_control_describe_response(
@@ -2646,6 +2874,24 @@ fn map_managed_agent_stack_error(
         RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedAgentStack(
             error,
         ))
+    }
+}
+
+fn map_runtime_agent_port_export_error(
+    error: RuntimeAgentConversationPortExportErrorV1,
+) -> RuntimeControlRequestError {
+    match error {
+        RuntimeAgentConversationPortExportErrorV1::ExpectedActiveReceiptMismatch => {
+            RuntimeControlRequestError::Rejected
+        }
+        RuntimeAgentConversationPortExportErrorV1::OwnerUnavailable => {
+            RuntimeControlRequestError::Unavailable
+        }
+        RuntimeAgentConversationPortExportErrorV1::InternalInvariant => {
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedAgentStack(
+                ManagedAgentStackRuntimeError::InvalidDurableState,
+            ))
+        }
     }
 }
 
@@ -2949,7 +3195,7 @@ where
                             handle_developer_restricted_runtime_control_v1(
                                 &mut control,
                                 DeveloperRestrictedRuntimeControlInputV1 {
-                                    canonical_pxcc: inbound.canonical_request(),
+                                    canonical_request: inbound.canonical_request(),
                                     expected_carrier: &restricted.expected_carrier,
                                     live_channel: channel,
                                     state_directory,
@@ -3163,7 +3409,7 @@ fn live_runtime_channel_from_state(
 }
 
 struct DeveloperRestrictedRuntimeControlInputV1<'a> {
-    canonical_pxcc: &'a [u8],
+    canonical_request: &'a [u8],
     expected_carrier: &'a RestrictedRuntimeApplyCarrierBindingV1,
     live_channel: ReferenceChannelBindingV1,
     state_directory: &'a Path,
@@ -3177,7 +3423,7 @@ async fn handle_developer_restricted_runtime_control_v1(
     input: DeveloperRestrictedRuntimeControlInputV1<'_>,
 ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
     let DeveloperRestrictedRuntimeControlInputV1 {
-        canonical_pxcc,
+        canonical_request,
         expected_carrier,
         live_channel,
         state_directory,
@@ -3185,7 +3431,6 @@ async fn handle_developer_restricted_runtime_control_v1(
         handle_broker,
         dependencies,
     } = input;
-    let request = decode_runtime_control_carrier(canonical_pxcc)?;
     let provisioning = match control {
         DeveloperLocalControlState::Legacy(Some(legacy)) => &legacy.provisioning,
         DeveloperLocalControlState::Managed(managed) => &managed.provisioning,
@@ -3195,6 +3440,21 @@ async fn handle_developer_restricted_runtime_control_v1(
             ));
         }
     };
+    if canonical_request.starts_with(RUNTIME_AGENT_CONTROL_REQUEST_MAGIC) {
+        let request = decode_runtime_agent_control_request(canonical_request)?;
+        let authenticated = authenticate_runtime_agent_control_request(
+            provisioning,
+            &request,
+            expected_carrier,
+        )?;
+        if let DeveloperLocalControlState::Managed(managed) = control {
+            return managed
+                .handle_authenticated_runtime_agent_control_request_v1(authenticated)
+                .await;
+        }
+        return Err(RuntimeControlRequestError::Rejected);
+    }
+    let request = decode_runtime_control_carrier(canonical_request)?;
     let authenticated =
         authenticate_runtime_control_carrier(provisioning, &request, expected_carrier)?;
     match control {
@@ -4065,38 +4325,11 @@ where
                                 | RuntimeRestrictedRemoteApplyErrorV1::Unavailable => None,
                             }),
                         RestrictedRuntimeEndpointProtocolV1::RuntimeControl => {
-                            let request = match decode_runtime_control_carrier(
-                                inbound.canonical_request(),
-                            ) {
-                                Ok(request) => request,
-                                Err(RuntimeControlRequestError::Rejected)
-                                | Err(RuntimeControlRequestError::Unavailable) => {
-                                    drop(inbound);
-                                    continue;
-                                }
-                                Err(RuntimeControlRequestError::Internal(error)) => {
-                                    drop(inbound);
-                                    break Err(error);
-                                }
-                            };
-                            let authenticated = match authenticate_runtime_control_carrier(
-                                &control.provisioning,
-                                &request,
-                                &restricted.expected_carrier,
-                            ) {
-                                Ok(authenticated) => authenticated,
-                                Err(RuntimeControlRequestError::Rejected)
-                                | Err(RuntimeControlRequestError::Unavailable) => {
-                                    drop(inbound);
-                                    continue;
-                                }
-                                Err(RuntimeControlRequestError::Internal(error)) => {
-                                    drop(inbound);
-                                    break Err(error);
-                                }
-                            };
                             control
-                                .handle_authenticated_runtime_control_carrier_v1(authenticated)
+                                .handle_restricted_runtime_control_frame_v1(
+                                    inbound.canonical_request(),
+                                    &restricted.expected_carrier,
+                                )
                                 .await
                                 .map_err(|error| match error {
                                     RuntimeControlRequestError::Rejected
@@ -5294,7 +5527,7 @@ mod tests {
             RuntimeApplyControl, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm,
             TenureProofAuthority, WriterTenureClaim, WriterTenureProof,
         },
-        assignment::{BindingId, InstanceRef},
+        assignment::InstanceRef,
         distributed_agent_stack_plan::{
             DistributedAgentStackApplyRequestDraftV1,
             DistributedAgentStackLocalBindingEvidenceFieldsV1,
@@ -5343,6 +5576,8 @@ mod tests {
         managed_serving_bootstrap::{
             ManagedServingBootstrapRequestDraftV1, ManagedServingBootstrapRequestIdV1,
             ManagedServingBootstrapResponseV1, ManagedServingReadinessV1,
+            RuntimeAgentControlReceiptV1, RuntimeAgentControlRequestDraftV1,
+            RuntimeAgentControlRequestFieldsV1, RuntimeAgentControlRequestIdV1,
             RuntimeControlCarrierRequestDraftV1, RuntimeControlDescribeReadyResponseV1,
         },
         provenance::{PlanProvenance, SourcePlanDigest, SourcePlanRef, SourcePlanRevision},
@@ -5668,6 +5903,142 @@ mod tests {
         draft
             .finalize(&signature)
             .unwrap_or_else(|error| panic!("ReferenceQuery carrier finalization failed: {error}"))
+    }
+
+    fn runtime_agent_control_fields(
+        request_id: [u8; 16],
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        runtime_host_epoch: u64,
+        nonce: &[u8],
+        algorithm: u16,
+        algorithm_version: u16,
+    ) -> RuntimeAgentControlRequestFieldsV1 {
+        RuntimeAgentControlRequestFieldsV1 {
+            request_id: RuntimeAgentControlRequestIdV1::try_from_bytes(request_id)
+                .unwrap_or_else(|error| panic!("Agent-control request ID rejected: {error}")),
+            target: TARGET,
+            expected_runtime_store_instance_id: STORE_INSTANCE_ID,
+            expected_runtime_host_epoch: runtime_host_epoch,
+            auth_claim: ApplyRequestAuthClaim::try_new(
+                CONTROLLER_PRINCIPAL,
+                CONTROLLER_KEY_REF,
+                ApplyAuthAlgorithm::try_new(algorithm).unwrap_or_else(|error| {
+                    panic!("Agent-control authentication algorithm rejected: {error}")
+                }),
+                algorithm_version,
+                nonce,
+            )
+            .unwrap_or_else(|error| panic!("Agent-control authentication rejected: {error}")),
+            carrier,
+        }
+    }
+
+    fn finalize_runtime_agent_control_request(
+        draft: RuntimeAgentControlRequestDraftV1,
+        signature_length: usize,
+    ) -> RuntimeAgentControlRequestV1 {
+        let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| {
+                        panic!("Agent-control signing transcript failed: {error}")
+                    })
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature[..signature_length])
+            .unwrap_or_else(|error| panic!("Agent-control request finalization failed: {error}"))
+    }
+
+    fn signed_runtime_agent_fabric_apply(
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        request: ManagedFabricApplyRequestV1,
+        runtime_host_epoch: u64,
+    ) -> RuntimeAgentControlRequestV1 {
+        let fields = runtime_agent_control_fields(
+            *request.operation_id().as_bytes(),
+            carrier,
+            runtime_host_epoch,
+            b"runtime-agent-fabric-outer-nonce",
+            ED25519_ALGORITHM,
+            ED25519_ALGORITHM_VERSION,
+        );
+        let draft = RuntimeAgentControlRequestDraftV1::try_apply_managed_fabric(fields, request)
+            .unwrap_or_else(|error| panic!("Agent-control Fabric draft rejected: {error}"));
+        finalize_runtime_agent_control_request(draft, ED25519_SIGNATURE_BYTES)
+    }
+
+    fn signed_runtime_agent_stack_apply(
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        request: ManagedAgentStackApplyRequestV1,
+        runtime_host_epoch: u64,
+    ) -> RuntimeAgentControlRequestV1 {
+        let fields = runtime_agent_control_fields(
+            *request.operation_id().as_bytes(),
+            carrier,
+            runtime_host_epoch,
+            b"runtime-agent-stack-outer-nonce",
+            ED25519_ALGORITHM,
+            ED25519_ALGORITHM_VERSION,
+        );
+        let draft = RuntimeAgentControlRequestDraftV1::try_apply_managed_agent_stack(fields, request)
+            .unwrap_or_else(|error| panic!("Agent-control stack draft rejected: {error}"));
+        finalize_runtime_agent_control_request(draft, ED25519_SIGNATURE_BYTES)
+    }
+
+    struct RuntimeAgentDescribeFixtureV1 {
+        request_id_byte: u8,
+        expected_active_pxst_digest: Digest32,
+        intended_client: PrincipalRef,
+        algorithm: u16,
+        algorithm_version: u16,
+        signature_length: usize,
+    }
+
+    fn signed_runtime_agent_describe(
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        runtime_host_epoch: u64,
+        fixture: RuntimeAgentDescribeFixtureV1,
+    ) -> RuntimeAgentControlRequestV1 {
+        let fields = runtime_agent_control_fields(
+            [fixture.request_id_byte; 16],
+            carrier,
+            runtime_host_epoch,
+            b"runtime-agent-describe-outer-nonce",
+            fixture.algorithm,
+            fixture.algorithm_version,
+        );
+        let draft = RuntimeAgentControlRequestDraftV1::try_describe_conversation_port(
+            fields,
+            fixture.expected_active_pxst_digest,
+            fixture.intended_client,
+        )
+        .unwrap_or_else(|error| panic!("Agent-control Describe draft rejected: {error}"));
+        finalize_runtime_agent_control_request(draft, fixture.signature_length)
+    }
+
+    fn verify_runtime_agent_response_signature(
+        principal: PrincipalRef,
+        key: ApplyAuthKeyRef,
+        fingerprint: Digest32,
+        transcript: &[u8],
+        signature: &[u8],
+    ) -> bool {
+        let verifying_key = SigningKey::from_bytes(&RESPONSE_SEED).verifying_key();
+        if principal != RUNTIME_PRINCIPAL
+            || key != RESPONSE_KEY_REF
+            || fingerprint
+                != ed25519_control_key_fingerprint(verifying_key.as_bytes())
+                    .unwrap_or_else(|error| panic!("Runtime response fingerprint failed: {error}"))
+        {
+            return false;
+        }
+        let Ok(signature) = Signature::from_slice(signature) else {
+            return false;
+        };
+        verifying_key.verify_strict(transcript, &signature).is_ok()
     }
 
     fn restricted_endpoint_dependencies_from_profile(
@@ -7062,11 +7433,9 @@ mod tests {
             2_000_000_000,
         )
         .unwrap_or_else(|error| panic!("managed Agent ingress rejected: {error}"));
-        let port = ManagedAgentPortPlanV1::try_new(
-            BindingId::from_bytes([0xb1; 16]),
-            BindingId::from_bytes([0xb2; 16]),
-            "paraegox/runtime/endpoint-stack/submit",
-            "paraegox/runtime/endpoint-stack/control",
+        let port = ManagedAgentPortPlanV1::try_new_target_scoped(
+            TARGET,
+            service.service_id(),
             ingress,
         )
         .unwrap_or_else(|error| panic!("managed Agent port rejected: {error}"));
@@ -7525,12 +7894,35 @@ mod tests {
             channel,
             dependencies: started.dependencies,
         };
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let carrier = restricted_carrier_for_profile(&profile, RESTRICTED_PROFILE_REF);
+        let fabric_outer = signed_runtime_agent_fabric_apply(
+            carrier.clone(),
+            fabric_request.clone(),
+            control.core.runtime_host_epoch(),
+        );
         let fabric_wire = control
-            .handle_request(fabric_request.canonical_wire(), channel)
+            .handle_restricted_runtime_control_frame_v1(fabric_outer.canonical_wire(), &carrier)
             .await
-            .unwrap_or_else(|error| panic!("restricted predecessor PXAR-v6 failed: {error:?}"));
-        let fabric_receipt = ManagedFabricApplyTerminalReceiptV1::decode(&fabric_wire)
-            .unwrap_or_else(|error| panic!("restricted predecessor PXFT failed: {error}"));
+            .unwrap_or_else(|error| panic!("restricted predecessor PXAG-v1 failed: {error:?}"));
+        let fabric_outer_receipt = RuntimeAgentControlReceiptV1::decode(&fabric_wire)
+            .unwrap_or_else(|error| panic!("restricted predecessor PXAH-v1 failed: {error}"));
+        fabric_outer_receipt
+            .verify_runtime_apply_receipt(
+                &fabric_outer,
+                channel,
+                &carrier,
+                verify_runtime_agent_response_signature,
+            )
+            .unwrap_or_else(|error| panic!("restricted predecessor PXAH verification failed: {error}"));
+        let fabric_receipt = fabric_outer_receipt
+            .managed_fabric_receipt()
+            .unwrap_or_else(|| panic!("restricted predecessor PXAH lost PXFT"));
         assert_eq!(
             fabric_receipt.facts().outcome(),
             ManagedFabricApplyTerminalOutcomeV1::ActiveReady
@@ -7544,15 +7936,56 @@ mod tests {
                 .unwrap_or_else(|error| panic!("restricted stack clock failed: {error}"))
                 .generation(),
         );
+        let stack_outer = signed_runtime_agent_stack_apply(
+            carrier.clone(),
+            stack_request.clone(),
+            control.core.runtime_host_epoch(),
+        );
         let stack_wire = control
-            .handle_request(stack_request.canonical_wire(), channel)
+            .handle_restricted_runtime_control_frame_v1(stack_outer.canonical_wire(), &carrier)
             .await
-            .unwrap_or_else(|error| panic!("restricted predecessor PXAR-v7 failed: {error:?}"));
-        let stack_receipt = ManagedAgentStackTerminalReceiptV1::decode(&stack_wire)
-            .unwrap_or_else(|error| panic!("restricted predecessor PXST failed: {error}"));
+            .unwrap_or_else(|error| panic!("restricted predecessor PXAG-v2 failed: {error:?}"));
+        let stack_outer_receipt = RuntimeAgentControlReceiptV1::decode(&stack_wire)
+            .unwrap_or_else(|error| panic!("restricted predecessor PXAH-v2 failed: {error}"));
+        stack_outer_receipt
+            .verify_runtime_apply_receipt(
+                &stack_outer,
+                channel,
+                &carrier,
+                verify_runtime_agent_response_signature,
+            )
+            .unwrap_or_else(|error| panic!("restricted stack PXAH verification failed: {error}"));
+        let stack_receipt = stack_outer_receipt
+            .managed_agent_stack_receipt()
+            .unwrap_or_else(|| panic!("restricted stack PXAH lost PXST"));
         assert_eq!(
             stack_receipt.facts().state().outcome(),
             ManagedAgentStackTerminalOutcomeV1::ActiveReady
+        );
+        let replay_sequence = control
+            .core
+            .recovered_observation()
+            .unwrap_or_else(|error| panic!("pre-replay observation failed: {error}"))
+            .successor_snapshot_sequence;
+        assert_eq!(
+            control
+                .handle_restricted_runtime_control_frame_v1(
+                    stack_outer.canonical_wire(),
+                    &carrier,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("same PXAG-v2 replay failed: {error:?}")),
+            stack_wire,
+            "same-epoch exact PXAG replay must return byte-identical PXAH",
+        );
+        assert_eq!(
+            control
+                .core
+                .recovered_observation()
+                .unwrap_or_else(|error| panic!("post-replay observation failed: {error}"))
+                .successor_snapshot_sequence,
+            replay_sequence,
+            "same PXAG replay must not commit a second successor transition",
         );
         assert!(control.stack.is_some());
         assert!(control.distributed.is_none());
@@ -8317,6 +8750,215 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("managed cleanup failed: {error}"));
+    }
+
+    #[test]
+    fn agent_port_export_failures_keep_rejection_unavailability_and_invariants_distinct() {
+        assert!(matches!(
+            map_runtime_agent_port_export_error(
+                RuntimeAgentConversationPortExportErrorV1::ExpectedActiveReceiptMismatch,
+            ),
+            RuntimeControlRequestError::Rejected
+        ));
+        assert!(matches!(
+            map_runtime_agent_port_export_error(
+                RuntimeAgentConversationPortExportErrorV1::OwnerUnavailable,
+            ),
+            RuntimeControlRequestError::Unavailable
+        ));
+        assert!(matches!(
+            map_runtime_agent_port_export_error(
+                RuntimeAgentConversationPortExportErrorV1::InternalInvariant,
+            ),
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedAgentStack(
+                    ManagedAgentStackRuntimeError::InvalidDurableState
+                )
+            )
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pxag_apply_and_describe_use_one_authenticated_owner_chain_and_fail_closed() {
+        let socket_directory = TestSocketDirectory::create();
+        let (_state_directory, mut control, stack_request) =
+            managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let carrier = restricted_carrier_for_profile(&profile, RESTRICTED_PROFILE_REF);
+        let active_wire = control
+            .handle_request(stack_request.canonical_wire(), control.channel)
+            .await
+            .unwrap_or_else(|error| panic!("active PXST replay failed: {error:?}"));
+        let active = ManagedAgentStackTerminalReceiptV1::decode(&active_wire)
+            .unwrap_or_else(|error| panic!("active PXST decode failed: {error}"));
+        let intended_client = PrincipalRef::from_bytes([0xf8; 16]);
+        let describe = signed_runtime_agent_describe(
+            carrier.clone(),
+            control.core.runtime_host_epoch(),
+            RuntimeAgentDescribeFixtureV1 {
+                request_id_byte: 0xf1,
+                expected_active_pxst_digest: active.receipt_digest(),
+                intended_client,
+                algorithm: ED25519_ALGORITHM,
+                algorithm_version: ED25519_ALGORITHM_VERSION,
+                signature_length: ED25519_SIGNATURE_BYTES,
+            },
+        );
+        let before_sequence = control
+            .core
+            .recovered_observation()
+            .unwrap_or_else(|error| panic!("pre-Describe observation failed: {error}"))
+            .successor_snapshot_sequence;
+        let response_wire = control
+            .handle_restricted_runtime_control_frame_v1(describe.canonical_wire(), &carrier)
+            .await
+            .unwrap_or_else(|error| panic!("authenticated PXAG Describe failed: {error:?}"));
+        let receipt = RuntimeAgentControlReceiptV1::decode(&response_wire)
+            .unwrap_or_else(|error| panic!("PXAH descriptor decode failed: {error}"));
+        receipt
+            .verify_runtime_descriptor_receipt(
+                &describe,
+                &carrier,
+                verify_runtime_agent_response_signature,
+            )
+            .unwrap_or_else(|error| panic!("PXAH descriptor verification failed: {error}"));
+        let descriptor = receipt
+            .conversation_port_descriptor()
+            .unwrap_or_else(|| panic!("PXAH descriptor payload disappeared"));
+        assert!(descriptor.starts_with(b"PXAP\0\x01"));
+        assert_eq!(receipt.expected_active_pxst_digest(), active.receipt_digest());
+        assert_eq!(receipt.intended_client(), intended_client);
+        assert_eq!(
+            receipt.fabric_generation(),
+            active.facts().state().fabric_generation()
+        );
+        assert_eq!(
+            receipt.agent_generation(),
+            active.facts().state().agent_generation()
+        );
+        assert_eq!(
+            control
+                .core
+                .recovered_observation()
+                .unwrap_or_else(|error| panic!("post-Describe observation failed: {error}"))
+                .successor_snapshot_sequence,
+            before_sequence,
+            "Describe must not mutate either durable owner",
+        );
+
+        let mut wrong_signature = describe.canonical_wire().to_vec();
+        *wrong_signature
+            .last_mut()
+            .unwrap_or_else(|| panic!("PXAG signature disappeared")) ^= 1;
+        assert!(matches!(
+            control
+                .handle_restricted_runtime_control_frame_v1(&wrong_signature, &carrier)
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+
+        for (request_id_byte, algorithm, algorithm_version, signature_length) in [
+            (0xf2, ED25519_ALGORITHM + 1, ED25519_ALGORITHM_VERSION, 64),
+            (0xf3, ED25519_ALGORITHM, ED25519_ALGORITHM_VERSION + 1, 64),
+            (0xf4, ED25519_ALGORITHM, ED25519_ALGORITHM_VERSION, 63),
+        ] {
+            let invalid = signed_runtime_agent_describe(
+                carrier.clone(),
+                control.core.runtime_host_epoch(),
+                RuntimeAgentDescribeFixtureV1 {
+                    request_id_byte,
+                    expected_active_pxst_digest: active.receipt_digest(),
+                    intended_client,
+                    algorithm,
+                    algorithm_version,
+                    signature_length,
+                },
+            );
+            assert!(matches!(
+                control
+                    .handle_restricted_runtime_control_frame_v1(
+                        invalid.canonical_wire(),
+                        &carrier,
+                    )
+                    .await,
+                Err(RuntimeControlRequestError::Rejected)
+            ));
+        }
+
+        let wrong_active = signed_runtime_agent_describe(
+            carrier.clone(),
+            control.core.runtime_host_epoch(),
+            RuntimeAgentDescribeFixtureV1 {
+                request_id_byte: 0xf5,
+                expected_active_pxst_digest: digest(0xf6),
+                intended_client,
+                algorithm: ED25519_ALGORITHM,
+                algorithm_version: ED25519_ALGORITHM_VERSION,
+                signature_length: ED25519_SIGNATURE_BYTES,
+            },
+        );
+        assert!(matches!(
+            control
+                .handle_restricted_runtime_control_frame_v1(
+                    wrong_active.canonical_wire(),
+                    &carrier,
+                )
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        assert_eq!(
+            control
+                .core
+                .recovered_observation()
+                .unwrap_or_else(|error| panic!("rejected-Describe observation failed: {error}"))
+                .successor_snapshot_sequence,
+            before_sequence,
+            "outer-auth and expected-root failures must precede mutation",
+        );
+
+        control
+            .handle_broker
+            .revoke()
+            .unwrap_or_else(|error| panic!("broker revocation fixture failed: {error}"));
+        let broken_invariant = signed_runtime_agent_describe(
+            carrier.clone(),
+            control.core.runtime_host_epoch(),
+            RuntimeAgentDescribeFixtureV1 {
+                request_id_byte: 0xf7,
+                expected_active_pxst_digest: active.receipt_digest(),
+                intended_client,
+                algorithm: ED25519_ALGORITHM,
+                algorithm_version: ED25519_ALGORITHM_VERSION,
+                signature_length: ED25519_SIGNATURE_BYTES,
+            },
+        );
+        assert!(matches!(
+            control
+                .handle_restricted_runtime_control_frame_v1(
+                    broken_invariant.canonical_wire(),
+                    &carrier,
+                )
+                .await,
+            Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedAgentStack(
+                    ManagedAgentStackRuntimeError::InvalidDurableState
+                )
+            ))
+        ));
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("Agent-control cleanup failed: {error}"));
     }
 
     #[derive(Clone, Copy)]

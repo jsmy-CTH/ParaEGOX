@@ -40,7 +40,7 @@ use paraegox_runtime_contracts::managed_agent_stack_plan::{
     ManagedAgentStackTargetModeV1,
 };
 use paraegox_runtime_contracts::managed_service::{
-    ManagedServiceLifecycleStage, ManagedServiceSpecV1,
+    ManagedServiceGeneration, ManagedServiceLifecycleStage, ManagedServiceSpecV1,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -420,6 +420,54 @@ impl ManagedAgentAssembly {
             descriptor.request_binding_descriptor_digest(),
             descriptor.event_binding_descriptor_digest(),
         ))
+    }
+
+    /// Exports one descriptor only while durable-owner and broker handles both
+    /// identify this exact live assembly and the Fabric census remains exact.
+    /// This observes the existing session once; it never opens, retries, or
+    /// replaces a Fabric session or Agent conversation.
+    pub(crate) async fn export_live_conversation_port_descriptor_v1(
+        &self,
+        owner_handle: &RuntimeAgentConversationHandle,
+        broker_handle: &RuntimeAgentConversationHandle,
+        expected_fabric_generation: ManagedServiceGeneration,
+    ) -> Result<Box<[u8]>, ManagedAgentAssemblyError> {
+        let port = self
+            .port
+            .as_ref()
+            .ok_or(ManagedAgentAssemblyError::InstalledPortUnavailable)?;
+        if self.owner_state.load(Ordering::Acquire) != OWNER_READY
+            || !self.owns_live_handle(owner_handle, port, expected_fabric_generation)
+            || !self.owns_live_handle(broker_handle, port, expected_fabric_generation)
+            || self.fabric.generation() != expected_fabric_generation
+        {
+            return Err(ManagedAgentAssemblyError::InstalledPortUnavailable);
+        }
+        let expected_census = physical_binding_count()?;
+        if self.fabric.binding_census().await? != expected_census {
+            return Err(ManagedAgentAssemblyError::InstalledPortUnavailable);
+        }
+        let descriptor_wire = port.export_descriptor_wire_v1()?;
+        if self.owner_state.load(Ordering::Acquire) != OWNER_READY
+            || !self.owns_live_handle(owner_handle, port, expected_fabric_generation)
+            || !self.owns_live_handle(broker_handle, port, expected_fabric_generation)
+            || self.fabric.generation() != expected_fabric_generation
+        {
+            return Err(ManagedAgentAssemblyError::InstalledPortUnavailable);
+        }
+        Ok(descriptor_wire)
+    }
+
+    fn owns_live_handle(
+        &self,
+        handle: &RuntimeAgentConversationHandle,
+        port: &AgentConversationPort,
+        expected_fabric_generation: ManagedServiceGeneration,
+    ) -> bool {
+        !handle.closed
+            && Arc::ptr_eq(&self.owner_state, &handle.owner_state)
+            && handle.port == *port
+            && handle.fabric.generation() == expected_fabric_generation
     }
 }
 

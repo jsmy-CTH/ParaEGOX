@@ -321,6 +321,20 @@ pub(crate) enum ManagedAgentStackApplyOutcome {
     Replayed(ManagedAgentStackTerminalReceiptV1),
 }
 
+/// One bootstrap-only snapshot of the exact currently published Agent port.
+pub(crate) struct RuntimeAgentConversationPortExportV1 {
+    pub(crate) descriptor_wire: Box<[u8]>,
+    pub(crate) fabric_generation: ManagedServiceGeneration,
+    pub(crate) agent_generation: ManagedServiceGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeAgentConversationPortExportErrorV1 {
+    ExpectedActiveReceiptMismatch,
+    OwnerUnavailable,
+    InternalInvariant,
+}
+
 #[derive(Clone, Copy)]
 struct TerminalSelection {
     outcome: ManagedAgentStackTerminalOutcomeV1,
@@ -413,6 +427,74 @@ impl ManagedAgentStackRuntimeCore {
         Ok(ManagedAgentStackDistributedCutoverObservation {
             execution: active.request.target_execution().clone(),
             target_slice_digest: active.request.target_slice_digest(),
+            fabric_generation: active.fabric_generation,
+            agent_generation: active.agent_generation,
+        })
+    }
+
+    /// Exports a PXAP only from the intersection of durable ActiveReady,
+    /// complete two-binding census, the exact currently brokered PXST root,
+    /// and this core's live assembly/handle. The terminal receipt generation
+    /// is deliberately not compared with the current physical generations:
+    /// restart recovery may retain exact PXST bytes while rebuilding both live
+    /// generations.
+    pub(crate) async fn export_active_conversation_port_v1(
+        &self,
+        expected_active_pxst_digest: Digest32,
+    ) -> Result<RuntimeAgentConversationPortExportV1, RuntimeAgentConversationPortExportErrorV1>
+    {
+        if !self.recovery_completed
+            || self.snapshot.phase != ManagedAgentStackDurablePhase::ActiveReady
+        {
+            return Err(RuntimeAgentConversationPortExportErrorV1::OwnerUnavailable);
+        }
+        if self.snapshot.physical_binding_census != 2
+            || !self.snapshot.census_complete
+            || !self.snapshot.fabric_ready
+            || !self.snapshot.agent_ready
+            || !self.snapshot.dependency_satisfied
+        {
+            return Err(RuntimeAgentConversationPortExportErrorV1::InternalInvariant);
+        }
+        let active = self
+            .snapshot
+            .active
+            .as_ref()
+            .ok_or(RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        let receipt = self
+            .active_terminal_receipt()
+            .map_err(|_| RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        if receipt.facts().state().outcome() != ManagedAgentStackTerminalOutcomeV1::ActiveReady {
+            return Err(RuntimeAgentConversationPortExportErrorV1::InternalInvariant);
+        }
+        if receipt.receipt_digest() != expected_active_pxst_digest {
+            return Err(
+                RuntimeAgentConversationPortExportErrorV1::ExpectedActiveReceiptMismatch,
+            );
+        }
+        let broker_handle = self
+            .handle_broker
+            .try_claim(receipt.canonical_wire())
+            .map_err(|_| RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?
+            .ok_or(RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        let owner_handle = self
+            .handle
+            .as_ref()
+            .ok_or(RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        let assembly = self
+            .assembly
+            .as_ref()
+            .ok_or(RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        let descriptor_wire = assembly
+            .export_live_conversation_port_descriptor_v1(
+                owner_handle,
+                &broker_handle,
+                active.fabric_generation,
+            )
+            .await
+            .map_err(|_| RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        Ok(RuntimeAgentConversationPortExportV1 {
+            descriptor_wire,
             fabric_generation: active.fabric_generation,
             agent_generation: active.agent_generation,
         })

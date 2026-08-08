@@ -188,6 +188,14 @@ impl AgentConversationPort {
     ) -> Result<AgentConversationPortDescriptorV1, AgentConversationPortDescriptorError> {
         AgentConversationPortDescriptorV1::try_from_port(self)
     }
+
+    /// Copies the canonical owner-private PXAP bootstrap without exposing
+    /// either Fabric lane or constructing a client/session.
+    pub(crate) fn export_descriptor_wire_v1(
+        &self,
+    ) -> Result<Box<[u8]>, AgentConversationPortDescriptorError> {
+        Ok(self.export_descriptor_v1()?.canonical_wire.clone())
+    }
 }
 
 fn validate_lanes(

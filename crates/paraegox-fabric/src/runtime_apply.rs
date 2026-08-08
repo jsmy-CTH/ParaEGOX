@@ -1,9 +1,9 @@
 //! Restricted Controller raw-query transports for Runtime and Node owners.
 //!
 //! This module owns only transport mechanics. It never decodes, authenticates,
-//! signs, admits, or persists PXCC, PXDR, PXRC, PXAR, PXDS, PXNR, PXNE, PXNS,
-//! or PXNA values. Each Controller side has one connector-only TLS session and
-//! each Runtime or Node side has one listener-only TLS session. Their
+//! signs, admits, or persists PXCC, PXDR, PXAG, PXAH, PXRC, PXAR, PXDS, PXNR,
+//! PXNE, PXNS, or PXNA values. Each Controller side has one connector-only TLS
+//! session and each Runtime or Node side has one listener-only TLS session. Their
 //! application-message ACL exposes one exact query route; Zenoh still owns its
 //! internal control-plane and link maintenance.
 //! The configured custom CA is not an exclusive trust store in Zenoh 1.9, so
@@ -35,6 +35,7 @@ use paraegox_runtime_contracts::distributed_agent_stack_plan::{
 };
 use paraegox_runtime_contracts::managed_serving_bootstrap::{
     MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES, MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES,
+    MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES, MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES,
     MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES,
 };
 use paraegox_runtime_contracts::reference_control::MAX_REFERENCE_QUERY_RESPONSE_BYTES;
@@ -80,8 +81,22 @@ impl RestrictedRawQueryFrameBounds {
 
     const fn runtime_control() -> Self {
         Self {
-            request: MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES,
-            response: if MAX_REFERENCE_QUERY_RESPONSE_BYTES
+            request: if MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES
+                > MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES
+            {
+                MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES
+            } else {
+                MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES
+            },
+            response: if MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES
+                > MAX_REFERENCE_QUERY_RESPONSE_BYTES
+                && MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES
+                    > MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES
+                && MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES
+                    > MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES
+            {
+                MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES
+            } else if MAX_REFERENCE_QUERY_RESPONSE_BYTES
                 > MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES
                 && MAX_REFERENCE_QUERY_RESPONSE_BYTES > MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES
             {
@@ -2401,6 +2416,45 @@ mod tests {
         assert_eq!(control.route(), profile.route());
         assert_eq!(client.route(), profile.route());
         assert!(control.matches_restricted_carrier(&carrier));
+        assert_eq!(
+            control.0.frame_bounds.request,
+            MAX_RUNTIME_CONTROL_CARRIER_REQUEST_BYTES.max(MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES)
+        );
+        assert_eq!(
+            control.0.frame_bounds.response,
+            MAX_REFERENCE_QUERY_RESPONSE_BYTES
+                .max(MAX_RUNTIME_CONTROL_DESCRIBE_READY_RESPONSE_BYTES)
+                .max(MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES)
+                .max(MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES)
+        );
+        assert_eq!(
+            validate_request_frame(
+                &vec![0_u8; MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES],
+                control.0.frame_bounds,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_response_frame(
+                &vec![0_u8; MAX_RUNTIME_AGENT_CONTROL_RECEIPT_BYTES],
+                control.0.frame_bounds,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request_frame(
+                &vec![0_u8; control.0.frame_bounds.request + 1],
+                control.0.frame_bounds,
+            ),
+            Err(RestrictedRuntimeApplyErrorV1::RequestTooLarge)
+        );
+        assert_eq!(
+            validate_response_frame(
+                &vec![0_u8; control.0.frame_bounds.response + 1],
+                control.0.frame_bounds,
+            ),
+            Err(RestrictedRuntimeApplyErrorV1::ResponseTooLarge)
+        );
     }
 
     #[cfg(unix)]
