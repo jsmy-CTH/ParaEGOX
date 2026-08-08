@@ -540,7 +540,7 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
         wrong_pin: RunningProcess | None = None
         try:
             _wait_for_marker(node, NODE_READY)
-            artifact_source = root / "node" / "enrollment-v1.pxea"
+            artifact_source = root / "node" / "node" / "enrollment-v1.pxea"
             assert artifact_source.is_file() and artifact_source.stat().st_size > 0
             artifact = root / "input" / "enrollment-v1.pxea"
             _write_owned(artifact, artifact_source.read_bytes(), 0o400, uid, gid)
@@ -640,4 +640,3 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
             for process in (wrong_pin, deployment_restart, deployment, node):
                 if process is not None:
                     _stop_process(process)
-
