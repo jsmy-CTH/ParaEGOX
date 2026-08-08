@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -258,6 +260,18 @@ def _spawn(
     return RunningProcess(process, stdout_path, stderr_path, stdout_file, stderr_file)
 
 
+@contextmanager
+def _temporary_root() -> Iterator[Path]:
+    root = Path(tempfile.mkdtemp(prefix="pg2.", dir="/tmp"))
+    try:
+        yield root
+    finally:
+        if os.environ.get("PARAEGOX_PRESERVE_PUBLIC_DEPLOYMENT_SMOKE") == "1":
+            print(f"preserved public Deployment smoke root: {root}", file=sys.stderr)
+        else:
+            shutil.rmtree(root)
+
+
 def _logs(process: RunningProcess) -> tuple[bytes, bytes]:
     process.stdout_file.flush()
     process.stderr_file.flush()
@@ -289,6 +303,10 @@ def _wait_for_marker(
         stdout, stderr = _logs(process)
         if marker in stdout:
             assert stdout.count(marker) == 1, stdout
+            assert stdout == marker, stdout
+            assert process.process.poll() is None, (stdout, stderr)
+            time.sleep(0.1)
+            assert process.process.poll() is None, (stdout, stderr)
             return
         return_code = process.process.poll()
         if return_code is not None:
@@ -323,8 +341,13 @@ def _stop_process(process: RunningProcess) -> None:
         try:
             process.process.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            os.killpg(process.process.pid, signal.SIGKILL)
-            process.process.wait(timeout=10)
+            pass
+    try:
+        os.killpg(process.process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.process.poll() is None:
+        process.process.wait(timeout=10)
     process.close_logs()
 
 
@@ -435,8 +458,7 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
     uid, gid = account.pw_uid, account.pw_gid
     assert uid != 0 and gid != 0
 
-    with tempfile.TemporaryDirectory(prefix="pg2.", dir="/tmp") as temporary:
-        root = Path(temporary)
+    with _temporary_root() as root:
         os.chown(root, uid, gid)
         root.chmod(0o700)
         directories = {
@@ -594,6 +616,7 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
                 environment=environment,
             )
             _wait_for_marker(deployment, DEPLOYMENT_READY)
+            assert deployment.process.poll() is None
             deployment.process.send_signal(signal.SIGTERM)
             assert _wait_for_exit(deployment) == 0, _logs(deployment)
             deployment.close_logs()
@@ -612,6 +635,7 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
                 environment=environment,
             )
             _wait_for_marker(deployment_restart, DEPLOYMENT_READY)
+            assert deployment_restart.process.poll() is None
             deployment_restart.process.send_signal(signal.SIGTERM)
             assert _wait_for_exit(deployment_restart) == 0, _logs(deployment_restart)
             deployment_restart.close_logs()
@@ -653,6 +677,7 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
             wrong_pin.close_logs()
             wrong_pin = None
 
+            assert node.process.poll() is None
             node.process.send_signal(signal.SIGTERM)
             assert _wait_for_exit(node) == 0, _logs(node)
         finally:
