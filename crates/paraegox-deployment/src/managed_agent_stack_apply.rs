@@ -489,6 +489,16 @@ pub(crate) struct PreparedManagedAgentStackAgentControlApplyV1 {
     outer_request_digest: Digest32,
 }
 
+/// Explicit inputs for one remote Agent-stack Agent-control prepare.
+pub(crate) struct ManagedAgentStackRemoteAgentControlActivateInputV1<'a> {
+    pub(crate) controller_signer: &'a ed25519_dalek::SigningKey,
+    pub(crate) provisioning: &'a ManagedFabricRemoteControllerProvisioningV1,
+    pub(crate) previous: &'a ManagedServingDescribeIngressV1,
+    pub(crate) activation: &'a ManagedAgentStackActivationV1,
+    pub(crate) inner_fresh: FreshManagedAgentStackApplyV1,
+    pub(crate) outer_fresh: FreshRuntimeAgentControlV1,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ManagedAgentStackAgentControlSendActionV1 {
     outer_sequence: u64,
@@ -660,12 +670,7 @@ impl ManagedAgentStackApplyJournalV1 {
 
     pub(crate) fn prepare_remote_agent_control_activate_with<Commit>(
         &mut self,
-        controller_signer: &ed25519_dalek::SigningKey,
-        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
-        previous: &ManagedServingDescribeIngressV1,
-        activation: &ManagedAgentStackActivationV1,
-        inner_fresh: FreshManagedAgentStackApplyV1,
-        outer_fresh: FreshRuntimeAgentControlV1,
+        input: ManagedAgentStackRemoteAgentControlActivateInputV1<'_>,
         commit: Commit,
     ) -> Result<PreparedManagedAgentStackAgentControlApplyV1, ManagedAgentStackApplyControllerError>
     where
@@ -673,6 +678,14 @@ impl ManagedAgentStackApplyJournalV1 {
             &ManagedFabricControllerStateV1,
         ) -> Result<(), ManagedAgentStackApplyControllerError>,
     {
+        let ManagedAgentStackRemoteAgentControlActivateInputV1 {
+            controller_signer,
+            provisioning,
+            previous,
+            activation,
+            inner_fresh,
+            outer_fresh,
+        } = input;
         let (context, ready) = self.state.verified_current_remote_agent_context(
             controller_signer,
             provisioning,

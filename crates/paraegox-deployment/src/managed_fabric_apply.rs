@@ -1538,6 +1538,17 @@ fn validate_runtime_agent_control_slots(
         )?;
     }
 
+    // Once a v7 Agent-control Fabric slot exists, later siblings must be
+    // owned by their matching outer slot. The all-Idle early return above is
+    // the only compatibility path for v2-v6 and legacy direct-carrier state.
+    if state.model_stack.is_some()
+        || (state.agent_stack.is_some()
+            && state.agent_stack_agent_control.phase()
+                == RuntimeAgentControlDurablePhaseV1::Idle)
+    {
+        return Err(ManagedFabricApplyControllerError::AgentControlMismatch);
+    }
+
     if state.agent_stack_agent_control.phase() != RuntimeAgentControlDurablePhaseV1::Idle {
         if state.fabric_agent_control.phase() != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
             || state.receipt.as_ref().is_none_or(|receipt| {
@@ -1656,6 +1667,19 @@ pub(crate) struct PreparedManagedFabricAgentControlApplyV1 {
     cutover_marker_digest: Digest32,
     inner_request_digest: Digest32,
     outer_request_digest: Digest32,
+}
+
+/// Explicit inputs for one remote Fabric Agent-control prepare. Grouping the
+/// operation facts keeps the journal boundary narrow without hiding any
+/// caller-owned freshness or trust input in positional tuples.
+pub(crate) struct ManagedFabricRemoteAgentControlActivateInputV1<'a> {
+    pub(crate) controller_signer: &'a ed25519_dalek::SigningKey,
+    pub(crate) provisioning: &'a ManagedFabricRemoteControllerProvisioningV1,
+    pub(crate) previous: &'a ManagedServingDescribeIngressV1,
+    pub(crate) service: ManagedServiceSpecV1,
+    pub(crate) endpoint: ManagedFabricListenEndpointV1,
+    pub(crate) inner_fresh: FreshManagedFabricApplyV1,
+    pub(crate) outer_fresh: FreshRuntimeAgentControlV1,
 }
 
 /// Sole move-only authority for one public Runtime Agent-control Fabric send.
@@ -2599,13 +2623,7 @@ impl ManagedFabricApplyJournalV1 {
     /// PXAG before any public Runtime transport authority exists.
     pub(crate) fn prepare_remote_agent_control_activate_with<Commit>(
         &mut self,
-        controller_signer: &ed25519_dalek::SigningKey,
-        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
-        previous: &ManagedServingDescribeIngressV1,
-        service: ManagedServiceSpecV1,
-        endpoint: ManagedFabricListenEndpointV1,
-        inner_fresh: FreshManagedFabricApplyV1,
-        outer_fresh: FreshRuntimeAgentControlV1,
+        input: ManagedFabricRemoteAgentControlActivateInputV1<'_>,
         commit: Commit,
     ) -> Result<PreparedManagedFabricAgentControlApplyV1, ManagedFabricApplyControllerError>
     where
@@ -2613,6 +2631,15 @@ impl ManagedFabricApplyJournalV1 {
             &ManagedFabricControllerStateV1,
         ) -> Result<(), ManagedFabricApplyControllerError>,
     {
+        let ManagedFabricRemoteAgentControlActivateInputV1 {
+            controller_signer,
+            provisioning,
+            previous,
+            service,
+            endpoint,
+            inner_fresh,
+            outer_fresh,
+        } = input;
         let (context, ready) = self.state.verified_current_remote_agent_context(
             controller_signer,
             provisioning,
