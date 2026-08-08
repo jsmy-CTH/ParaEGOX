@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import importlib.util
+import os
+import struct
+import subprocess
+import sys
+import termios
+import tty
 from collections.abc import Callable
 from pathlib import Path
 
@@ -19,6 +27,15 @@ from paraegox_sdk.agent_worker.protocol import (
 )
 from paraegox_sdk.console_client import RuntimeAgentConversationCancelResultV1
 from paraegox_sdk.console_tui import ParaEGOXConsoleApp, _parse_arguments
+
+_SMOKE_SPEC = importlib.util.spec_from_file_location(
+    "paraegox_macos_textual_smoke",
+    Path(__file__).parents[2] / "scripts" / "smoke_macos_textual_chat.py",
+)
+if _SMOKE_SPEC is None or _SMOKE_SPEC.loader is None:
+    raise RuntimeError("unable to load the macOS Textual smoke harness")
+macos_textual_smoke = importlib.util.module_from_spec(_SMOKE_SPEC)
+_SMOKE_SPEC.loader.exec_module(macos_textual_smoke)
 
 
 def _request(input_text: str, sequence: int) -> AgentConversationRequestV1:
@@ -327,6 +344,114 @@ def test_console_ctrl_c_binding_closes_client_and_exits() -> None:
         assert client.close_calls == 1
 
     asyncio.run(scenario())
+
+
+def test_console_real_pty_ctrl_c_drains_teardown_and_exits() -> None:
+    child_code = (
+        "from paraegox_sdk.console_tui import ParaEGOXConsoleApp\n"
+        "class Client:\n"
+        "    def __init__(self): self.close_calls = 0\n"
+        "    async def open(self): return object()\n"
+        "    async def submit(self, input_text): raise AssertionError(input_text)\n"
+        "    async def cancel_pending(self): raise AssertionError('unexpected cancel')\n"
+        "    def close(self): self.close_calls += 1\n"
+        "client = Client()\n"
+        "app = ParaEGOXConsoleApp(client)\n"
+        "app.run()\n"
+        "print(f'PX_REAL_PTY_EXIT:{app.return_code}:{client.close_calls}', flush=True)\n"
+    )
+    master_fd, slave_fd = os.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+    environment = os.environ.copy()
+    environment["TERM"] = "xterm-256color"
+    environment.pop("TEXTUAL_ALLOW_SIGNALS", None)
+    process = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        start_new_session=True,
+    )
+    os.close(slave_fd)
+    capture = bytearray()
+    try:
+        macos_textual_smoke._read_until(
+            master_fd,
+            process,
+            capture,
+            b"System: connected",
+            5.0,
+        )
+        assert termios.tcgetattr(master_fd)[tty.LFLAG] & termios.ISIG == 0
+
+        os.write(master_fd, b"\x03")
+        macos_textual_smoke._wait_for_exit(master_fd, process, capture, 5.0)
+
+        assert b"PX_REAL_PTY_EXIT:0:1" in capture
+        assert macos_textual_smoke._TEXTUAL_TERMINAL_RESTORE in capture
+    finally:
+        macos_textual_smoke._stop_process(process)
+        os.close(master_fd)
+
+
+def test_console_smoke_exit_wait_keeps_timeout_and_nonzero_fail_closed() -> None:
+    class RunningProcess:
+        returncode = None
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    capture = bytearray()
+    reader_fd, writer_fd = os.pipe()
+    try:
+        os.write(writer_fd, b"PX_TEXTUAL_TEARDOWN_STARTED")
+        with pytest.raises(TimeoutError, match="Textual did not restore"):
+            macos_textual_smoke._wait_for_exit(
+                reader_fd,
+                RunningProcess(),
+                capture,
+                0.05,
+            )
+    finally:
+        os.close(writer_fd)
+        os.close(reader_fd)
+    assert b"PX_TEXTUAL_TEARDOWN_STARTED" in capture
+
+    reader_fd, writer_fd = os.pipe()
+    try:
+        with pytest.raises(TimeoutError, match="Rust parent did not join"):
+            macos_textual_smoke._wait_for_exit(
+                reader_fd,
+                RunningProcess(),
+                bytearray(macos_textual_smoke._TEXTUAL_TERMINAL_RESTORE),
+                0.05,
+            )
+    finally:
+        os.close(writer_fd)
+        os.close(reader_fd)
+
+    class FailedProcess:
+        returncode = 7
+
+        @staticmethod
+        def poll() -> int:
+            return 7
+
+    reader_fd, writer_fd = os.pipe()
+    os.close(writer_fd)
+    try:
+        with pytest.raises(RuntimeError, match="unsuccessfully with code 7"):
+            macos_textual_smoke._wait_for_exit(
+                reader_fd,
+                FailedProcess(),
+                bytearray(),
+                0.05,
+            )
+    finally:
+        os.close(reader_fd)
 
 
 def test_console_rejects_utf8_input_above_protocol_limit() -> None:

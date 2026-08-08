@@ -21,9 +21,13 @@ from pathlib import Path
 
 _STARTUP_TIMEOUT_SECONDS = 45.0
 _REPLY_TIMEOUT_SECONDS = 45.0
-_EXIT_TIMEOUT_SECONDS = 60.0
+# The joined Rust owner chain has an admitted worst-case serial shutdown
+# budget of roughly 68 seconds. This remains a hard failure bound while
+# leaving enough scheduling margin for a conforming macOS runner.
+_EXIT_TIMEOUT_SECONDS = 90.0
 _MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 _MESSAGE = "artifact-smoke-echo"
+_TEXTUAL_TERMINAL_RESTORE = b"\x1b[?1049l"
 
 
 def _arguments() -> argparse.Namespace:
@@ -105,11 +109,67 @@ def _read_until(
             raise RuntimeError(f"paraegox exited with {process.returncode} before {marker!r}")
 
 
-def _wait_for_exit(process: subprocess.Popen[bytes], timeout_seconds: float) -> None:
-    try:
-        return_code = process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as error:
-        raise TimeoutError("paraegox did not join after the Textual Ctrl+C quit binding") from error
+def _wait_for_exit(
+    master_fd: int,
+    process: subprocess.Popen[bytes],
+    capture: bytearray,
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    pty_open = True
+    return_code: int | None = None
+    while return_code is None:
+        return_code = process.poll()
+        if return_code is not None:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if _TEXTUAL_TERMINAL_RESTORE in capture:
+                raise TimeoutError(
+                    "paraegox Rust parent did not join after Textual restored the terminal"
+                )
+            raise TimeoutError(
+                "Textual did not restore the terminal after its Ctrl+C quit binding"
+            )
+        if not pty_open:
+            try:
+                return_code = process.wait(timeout=min(0.25, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            break
+        ready, _, _ = select.select([master_fd], [], [], min(0.25, remaining))
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master_fd, 65_536)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            pty_open = False
+            continue
+        if chunk:
+            _bounded_append(capture, chunk)
+        else:
+            pty_open = False
+
+    # Textual restores the terminal while shutting down. Consume bytes that
+    # were already committed before the joined parent exited so failure logs
+    # retain the complete teardown tail without allowing output backpressure
+    # to keep the Textual child alive.
+    while pty_open:
+        ready, _, _ = select.select([master_fd], [], [], 0)
+        if not ready:
+            break
+        try:
+            chunk = os.read(master_fd, 65_536)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            break
+        if not chunk:
+            break
+        _bounded_append(capture, chunk)
+
     if return_code != 0:
         raise RuntimeError(f"paraegox exited unsuccessfully with code {return_code}")
 
@@ -207,7 +267,11 @@ def main() -> int:
             # directly instead of racing a second Input submission with the
             # response redraw that supplied the Echo marker above.
             os.write(master_fd, b"\x03")
-            _wait_for_exit(process, _EXIT_TIMEOUT_SECONDS)
+            _wait_for_exit(master_fd, process, capture, _EXIT_TIMEOUT_SECONDS)
+            if _TEXTUAL_TERMINAL_RESTORE not in capture:
+                raise RuntimeError(
+                    "Textual exited without an observed terminal restore sequence"
+                )
         except Exception:
             print(_safe_terminal_tail(capture))
             raise
