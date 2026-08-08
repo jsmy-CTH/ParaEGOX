@@ -10,11 +10,11 @@ ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). 
 > terminal restoration, and joined parent shutdown. Textual is now the sole DeveloperLocal
 > presentation path; the retired Rust reference frontend has been removed. Ubuntu r33 commit
 > `7618f6a51c5eb5731874d2cdf3231603e3a824f7` additionally validates the public G1 host-local
-> `paraegox node` substrate. The current source additively wires the G2 host-side node profile
-> described below. Ubuntu r51 `b1d1206d2187b85d335ae352c226274d8e9d5827` is the latest validated G2
-> code-and-governance ref; it does not yet supply the public Mac Controller connector or two-host
-> proof. ParaEGOX is adopting a Rust-first core with polyglot managed workloads; no stable release
-> is currently available.
+> `paraegox node` substrate. The current source additively wires the G2 host-side node profile and
+> the public `paraegox deployment` Controller composition described below. Ubuntu r73 exact ref
+> `96bbb26f1d8013d2a3ca4020e88b0faf3135fbff` is the latest validated code ref for that composition;
+> its real cross-host process smoke is still pending. ParaEGOX is adopting a Rust-first core with
+> polyglot managed workloads; no stable release is currently available.
 
 ## Runnable DeveloperLocal slice
 
@@ -141,8 +141,8 @@ Both schemas print `paraegox: node ready` only after their configured local owne
 started. The marker does not prove that a Controller connected, PXFB cutover completed, a Runtime
 observation was published, or a desired Agent stack was applied. Neither schema starts Authority,
 DeploymentController, managed Fabric, Model, Agent, Inspection, Textual, or the chat chain. The
-repository still has no public Mac Controller connector, end-to-end two-host cutover evidence,
-remote Agent conversation path, or partition/reconnect policy.
+separate public Controller command described below now exists, but there is still no end-to-end
+two-host process proof, remote Agent conversation path, remote TUI, or partition/reconnect policy.
 
 Start from [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml). Copy it to an
 absolute regular-file path, replace both documentation-only `192.0.2.10` listener addresses with
@@ -167,7 +167,7 @@ preserved byte-identical PXNI/PXNB hashes, forced child death made the parent fa
 `PXLC-NODE-CHILD`, and root launch failed before state with `PXLC-EXECUTION-IDENTITY`. These facts
 prove the G1 host-local substrate and cleanup/restart boundary only.
 
-The current G2 ref is r51 `b1d1206d2187b85d335ae352c226274d8e9d5827`. Ubuntu passed workspace
+The host-side G2 validation ref is r51 `b1d1206d2187b85d335ae352c226274d8e9d5827`. Ubuntu passed workspace
 format checking, the focused public-help test 1/1, the complete governance checker, workspace
 all-target checking, workspace all-target Clippy with warnings denied, and the complete non-root
 `paraegox-local` suite 111/111. All workspace all-target test executables also compiled and linked
@@ -188,11 +188,56 @@ with each listener; both rejected a client without a certificate. SIGTERM exited
 up; a same-state restart reached Ready and exited zero with stable PXNI/PXNB/PXND digests. Killing the
 Node child made the parent exit one with `PXLC-NODE-CHILD` and removed listeners, PXOB, and processes;
 the same state then restarted successfully and SIGINT exited zero. Root launch failed before state
-mutation with `PXLC-EXECUTION-IDENTITY`. This proves the host process and mTLS/lifecycle boundary,
-not a PXCC/PXNR semantic exchange or cutover: there is still no public Mac Controller connector,
-two-host control sequence, remote Agent conversation, or reconnect evidence. The older two-target
-DeveloperLocal fixture remains internal; there is no public `developer-distributed-fixture-v1`
-command and no runnable full distributed-system claim yet.
+mutation with `PXLC-EXECUTION-IDENTITY`. This proves the r48 host process and mTLS/lifecycle boundary,
+not a PXCC/PXNR semantic exchange or cutover. The later public Controller composition does not
+retroactively turn this host-only smoke into a two-host control-sequence, remote Agent conversation,
+remote TUI, or reconnect result. The older two-target DeveloperLocal fixture remains internal; there
+is no public `developer-distributed-fixture-v1` command and no runnable full distributed-system claim
+yet.
+
+## Public Developer DeploymentController composition
+
+The third public command starts one bounded Controller-side owner graph:
+
+```text
+paraegox deployment --config <absolute-paraegox-deployment.toml>
+```
+
+Its strict TOML schema v1 contains only local filesystem authorities: `state_root`, an exact PXEA
+`enrollment_artifact_file` plus its lowercase whole-file `enrollment_artifact_sha256`, separate
+Controller and tenure-Authority signing-seed files, the Authority state directory/socket, and
+`[runtime_connector]` / `[node_connector]` CA, client-certificate, and client-private-key paths.
+Unknown fields and alternate CLI submodes fail closed. Endpoint, route, target, principal, trust,
+manifest, and credential-reference semantics are accepted only from the independently pinned PXEA;
+they cannot be restated in TOML as a second configuration authority. Start from
+[`configs/paraegox-deployment.example.toml`](configs/paraegox-deployment.example.toml).
+
+The schema-v2 Node process publishes canonical `<node-state-root>/node/enrollment-v1.pxea` only after
+its Runtime and Node bootstraps have been proved. PXEA v1 is public-safe and Runtime-attested: it
+contains the immutable Runtime manifest and the complete public Runtime/Node transport, identity,
+and enrollment pins, but no bearer token, signing seed, private-key bytes, or private-key path. The
+Controller side checks an independently transported whole-file SHA-256 before decoding any frame
+length, signature, or semantic field, and then cross-checks its separately provisioned Controller
+and Authority keys. The artifact signature is continuity evidence, not first-use trust.
+
+`paraegox: deployment ready` has a deliberately narrow meaning. Local can print and flush it only
+from the facade's `Ready` outcome, after the remote connector/cutover state is durable, the exact
+PXFR managed-serving terminal is durably `ResponseDurable`, and a fresh post-PXFR PXDR Describe has
+been verified as `ManagedReady` and durably committed. Delivery uncertainty, a publish state that
+needs operator reconciliation, an invalid response, or a ManagedReady Describe without durable PXFR
+cannot synthesize readiness; the command joins its owners and exits nonzero with a stable Deployment
+error instead. The process performs one bounded non-retrying attempt and is not a continuous
+reconciler.
+
+Ubuntu validated exact r73 ref `96bbb26f1d8013d2a3ca4020e88b0faf3135fbff` with workspace
+`cargo fmt --all --check`, locked workspace all-target checking, and warnings-denied locked workspace
+all-target Clippy. The complete prebuilt `paraegox-local` test binary passed 129/129 and the complete
+prebuilt `paraegox-deployment` test binary passed 387/387 as `nobody`, with
+`RUST_MIN_STACK=16777216` and `--test-threads=1`. This is compile, lint, and unit evidence. A real
+Mac-to-Ubuntu public-process smoke—including PXEA transfer/pinning, full semantic exchange, Ready,
+signals, owner death, and restart seams—has not yet run, so r73 is not presented as two-machine
+execution evidence. It also supplies no target-scoped remote Agent descriptor, remote conversation,
+remote TUI, or reconnect policy.
 
 A Unix-only `paraegox-noded developer-local-reference-v1` process can also reopen one externally
 authorized exact tenure and serve its last committed status through a same-user, token-bound local socket.

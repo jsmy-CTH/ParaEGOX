@@ -1032,7 +1032,7 @@ pub(crate) fn publish_or_reopen_node_enrollment_artifact_v1(
     publish_or_reopen_enrollment_artifact(path, &expected)
 }
 
-/// Controller-side strict ingress reserved for the next composition slice.
+/// DeploymentController-side strict ingress for the public deployment composition.
 /// The independently transported plain whole-file SHA-256 is checked before
 /// parsing any attacker-controlled length, signature, or semantic field.
 pub(crate) fn decode_pinned_node_enrollment_artifact_v1(

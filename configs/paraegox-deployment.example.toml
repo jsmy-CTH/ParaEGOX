@@ -1,4 +1,4 @@
-# Developer deployment-controller input for the next composition slice.
+# Public Developer DeploymentController input for `paraegox deployment --config`.
 # This file contains paths and one public SHA-256 pin only. Never place a
 # signing seed, certificate/private-key bytes, PXNB/PXOB token, challenge, or
 # bearer credential value in TOML. Replace every path and the artifact digest

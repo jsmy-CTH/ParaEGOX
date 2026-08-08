@@ -9,10 +9,11 @@ ParaEGOX 基于 [PhanthyMotus](https://github.com/4paradigm/phanthymotus) 构建
 > Runtime Agent IPC、Echo、Textual Ctrl-C、terminal restoration 和父进程 joined shutdown。Textual
 > 现在是唯一 DeveloperLocal 展示路径；旧 Rust reference frontend 已删除。Ubuntu r33 commit
 > `7618f6a51c5eb5731874d2cdf3231603e3a824f7` 还验证了公开 G1 host-local
-> `paraegox node` 系统基座。当前源码又增量接入了下文所述的 G2 host-side Node profile，但尚未提供
-> 公开 Mac Controller connector 或真实双主机证明。Ubuntu r51
-> `b1d1206d2187b85d335ae352c226274d8e9d5827` 是当前最新已验证 G2 code-and-governance ref。生产核心机制
-> 优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
+> `paraegox node` 系统基座。当前源码又增量接入了下文所述的 G2 host-side Node profile 与公开
+> `paraegox deployment` Controller composition。Ubuntu r73 精确 ref
+> `96bbb26f1d8013d2a3ca4020e88b0faf3135fbff` 是该 composition 当前最新已验证代码 ref；真实跨主机
+> process smoke 仍待完成。生产核心机制优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未
+> 提供稳定版本。
 
 ## 当前可运行切片
 
@@ -121,8 +122,8 @@ listener、durable owner 与 bridge，但不会把 Controller 偷塞进 Node 进
 两个 schema 都只在已配置的本地 owner 和 listener 启动后输出 `paraegox: node ready`。这个 marker
 不证明 Controller 已连接、PXFB cutover 已完成、Runtime observation 已发布，或目标 Agent stack 已
 apply。两种模式都不启动 Authority、DeploymentController、managed Fabric、Model、Agent、Inspection、
-Textual 或 chat 链。仓库当前仍没有公开 Mac Controller connector、真实双主机端到端 cutover 证据、
-remote Agent conversation 路径或 partition/reconnect policy。
+Textual 或 chat 链。下文所述的独立公开 Controller 命令现在已经存在，但仍没有端到端双主机 process
+proof、remote Agent conversation 路径、remote TUI 或 partition/reconnect policy。
 
 从 [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml) 开始。把它复制到绝对普通
 文件路径，将两处仅用于文档的 `192.0.2.10` listener 地址替换为宿主机真实拥有的 IPv4，并同步修改
@@ -144,7 +145,7 @@ Runtime split-trust/provisioning filter 通过。真实非 root process smoke �
 fail closed；root 启动在写 state 前以 `PXLC-EXECUTION-IDENTITY` 拒绝。这些事实只证明 G1 host-local
 基座及其 cleanup/restart 边界。
 
-当前 G2 ref 是 r51 `b1d1206d2187b85d335ae352c226274d8e9d5827`。Ubuntu 已通过 workspace format、
+host-side G2 的 validation ref 为 r51 `b1d1206d2187b85d335ae352c226274d8e9d5827`。Ubuntu 已通过 workspace format、
 公开 help focused test 1/1、完整 governance checker、workspace all-target check、warnings-denied
 workspace all-target Clippy，以及完整 non-root `paraegox-local` suite 111/111。所有 workspace all-target
 test executable 也已通过 `--no-run` 完成编译和链接。workspace doc tests 已通过，包括 Fabric 2 个、
@@ -162,10 +163,50 @@ observation UDS。使用已配置 Controller client certificate 时，两条 TLS
 certificate 时两端都拒绝。SIGTERM exit 0 并完成清理；同 state restart 再次 Ready/exit 0，PXNI/PXNB/
 PXND digest 稳定。杀死 Node child 后 parent exit 1 并报告 `PXLC-NODE-CHILD`，listener、PXOB 与进程全部
 清理；同 state 随后仍能再次 Ready，并以 SIGINT exit 0。root 启动在 state mutation 前以
-`PXLC-EXECUTION-IDENTITY` 拒绝。它证明 host process、mTLS 和 lifecycle boundary，不证明 PXCC/PXNR
-语义 exchange 或 cutover：当前仍没有公开 Mac Controller connector、真实双主机 control sequence、
-remote Agent conversation 或 reconnect 证据。旧的双目标 DeveloperLocal fixture 仍是内部实现；当前没有
-公开的 `developer-distributed-fixture-v1` 命令，也不宣称完整分布式系统已经可运行。
+`PXLC-EXECUTION-IDENTITY` 拒绝。它证明 r48 的 host process、mTLS 和 lifecycle boundary，不证明
+PXCC/PXNR 语义 exchange 或 cutover。后续公开 Controller composition 不会把这份 host-only smoke
+追溯升级成双主机 control sequence、remote Agent conversation、remote TUI 或 reconnect 结果。旧的
+双目标 DeveloperLocal fixture 仍是内部实现；当前没有公开的 `developer-distributed-fixture-v1` 命令，
+也不宣称完整分布式系统已经可运行。
+
+## 公开 Developer DeploymentController composition
+
+第三个公开命令会启动一条有界的 Controller-side owner graph：
+
+```text
+paraegox deployment --config <absolute-paraegox-deployment.toml>
+```
+
+其 strict TOML schema v1 只包含本地 filesystem authority：`state_root`、精确 PXEA
+`enrollment_artifact_file` 及其小写 whole-file `enrollment_artifact_sha256`、互相独立的 Controller 与
+tenure-Authority signing-seed 文件、Authority state directory/socket，以及 `[runtime_connector]` /
+`[node_connector]` 的 CA、client certificate 和 client private-key 路径。未知字段和替代 CLI submode
+都会 fail closed。endpoint、route、target、principal、trust、manifest 与 credential-reference 语义只从
+独立 pin 的 PXEA 接受，不能在 TOML 中重复声明为第二配置权威。配置从
+[`configs/paraegox-deployment.example.toml`](configs/paraegox-deployment.example.toml) 开始。
+
+schema-v2 Node process 只有在 Runtime 与 Node bootstrap 已获证明后，才发布 canonical
+`<node-state-root>/node/enrollment-v1.pxea`。PXEA v1 是 public-safe、由 Runtime attest 的 handoff：它包含
+immutable Runtime manifest 和完整 public Runtime/Node transport、identity、enrollment pins，但不含
+bearer token、signing seed、private-key bytes 或 private-key path。Controller 侧先核对通过独立渠道传递的
+whole-file SHA-256，随后才解码任何 frame length、signature 或 semantic field，并继续交叉验证另行配置的
+Controller 与 Authority keys。artifact signature 证明 continuity，不是 first-use trust。
+
+`paraegox: deployment ready` 的含义被刻意收窄。Local 只有收到 facade 的 `Ready` outcome 才能输出并
+flush 该 marker；此前必须保证 remote connector/cutover state 已持久化、精确 PXFR managed-serving
+terminal 已 durable `ResponseDurable`，且 fresh post-PXFR PXDR Describe 已验证为 `ManagedReady` 并持久
+提交。delivery uncertainty、需要 operator reconciliation 的 publish 状态、非法 response，或没有 durable
+PXFR 的 ManagedReady Describe 都不能合成 readiness；命令会 joined 关闭 owner，并用稳定 Deployment
+错误非零退出。这个 process 只执行一次有界、无重试 attempt，不是 continuous reconciler。
+
+Ubuntu 已在精确 r73 ref `96bbb26f1d8013d2a3ca4020e88b0faf3135fbff` 通过 workspace
+`cargo fmt --all --check`、locked workspace all-target check 与 warnings-denied locked workspace
+all-target Clippy。完整预编译 `paraegox-local` test binary 以 `nobody`、
+`RUST_MIN_STACK=16777216`、`--test-threads=1` 运行时 129/129 通过；完整预编译
+`paraegox-deployment` test binary 在同样条件下 387/387 通过。这是 compile、lint 与 unit evidence。
+真实 Mac→Ubuntu public-process smoke（包括 PXEA transfer/pinning、完整 semantic exchange、Ready、signal、
+owner death 与 restart seams）尚未运行，因此不能把 r73 写成双机 execution 证据。它也尚未提供
+target-scoped remote Agent descriptor、remote conversation、remote TUI 或 reconnect policy。
 
 Unix-only `paraegox-noded developer-local-reference-v1` 也能独立重开一份由外部授权的 exact tenure，
 并通过 same-user、token-bound 本地 socket 返回最后一次已提交状态。新增的
