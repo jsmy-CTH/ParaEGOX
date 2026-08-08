@@ -1357,6 +1357,17 @@ enum RuntimeControlRequestError {
     Internal(RuntimeBootstrapEndpointError),
 }
 
+fn runtime_control_readiness_error(
+    error: RuntimeControlRequestError,
+) -> RuntimeBootstrapEndpointError {
+    match error {
+        RuntimeControlRequestError::Internal(error) => error,
+        RuntimeControlRequestError::Rejected | RuntimeControlRequestError::Unavailable => {
+            RuntimeBootstrapEndpointError::InvalidStartedState
+        }
+    }
+}
+
 /// Display-safe outcome of the restricted remote PXRC processing seam.
 ///
 /// The transport owner distinguishes generic rejection, retryable owner
@@ -2771,6 +2782,7 @@ where
     F: Future<Output = io::Result<()>>,
     R: FnOnce(
         ReferenceChannelBindingV1,
+        RuntimeControlDescribeReadyFactsV1,
         RuntimeAgentHandleBroker,
     ) -> Result<(), RuntimeBootstrapEndpointError>,
 {
@@ -2818,6 +2830,7 @@ where
     F: Future<Output = io::Result<()>>,
     R: FnOnce(
         ReferenceChannelBindingV1,
+        RuntimeControlDescribeReadyFactsV1,
         RuntimeAgentHandleBroker,
     ) -> Result<(), RuntimeBootstrapEndpointError>,
 {
@@ -2881,7 +2894,10 @@ where
         }
         None => None,
     };
-    if let Err(error) = ready(channel, handle_broker.clone()) {
+    let ready_result = legacy_runtime_control_describe_facts(&legacy, channel)
+        .map_err(runtime_control_readiness_error)
+        .and_then(|facts| ready(channel, facts, handle_broker.clone()));
+    if let Err(error) = ready_result {
         drop(listener);
         let cleanup_result = guard.cleanup();
         let restricted_shutdown_result = match restricted.take() {
@@ -3685,7 +3701,7 @@ async fn serve_managed_fabric_until<F>(
 where
     F: Future<Output = io::Result<()>>,
 {
-    serve_managed_fabric_until_with_ready(started, shutdown, |_, _| Ok(())).await
+    serve_managed_fabric_until_with_ready(started, shutdown, |_, _, _| Ok(())).await
 }
 
 struct RunningRestrictedRuntimeApplyEndpointV1 {
@@ -3830,6 +3846,7 @@ where
     F: Future<Output = io::Result<()>>,
     R: FnOnce(
         ReferenceChannelBindingV1,
+        RuntimeControlDescribeReadyFactsV1,
         RuntimeAgentHandleBroker,
     ) -> Result<(), RuntimeBootstrapEndpointError>,
 {
@@ -3992,7 +4009,11 @@ where
         }
         None => None,
     };
-    if let Err(error) = ready(control.channel, control.handle_broker.clone()) {
+    let ready_result = control
+        .runtime_control_describe_facts()
+        .map_err(runtime_control_readiness_error)
+        .and_then(|facts| ready(control.channel, facts, control.handle_broker.clone()));
+    if let Err(error) = ready_result {
         drop(listener);
         let cleanup_result = guard.cleanup();
         let restricted_shutdown_result = match restricted.take() {

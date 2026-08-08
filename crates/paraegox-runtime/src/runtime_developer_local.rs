@@ -38,7 +38,9 @@ use paraegox_runtime_contracts::installation::{
     InstalledRuntimeArtifactObservationV1, MAX_INSTALLED_RUNTIME_ARTIFACT_BYTES,
     RuntimeCompiledInstallationFactsV1, generate_build_descriptor, generate_manifest,
 };
+use paraegox_runtime_contracts::managed_serving_bootstrap::RuntimeControlDescribeReadyFactsV1;
 use paraegox_runtime_contracts::provenance::SourceScopeRef;
+use paraegox_runtime_contracts::reference_control::ReferenceBootstrapServingIdentityV1;
 use paraegox_runtime_contracts::wire::ApplyAuthKeyRef;
 use sha2::{Digest as ShaDigest, Sha256};
 use tokio::sync::oneshot;
@@ -705,6 +707,7 @@ pub struct RuntimeDeveloperLocalReadyV1 {
     manifest_canonical_wire: Box<[u8]>,
     manifest_digest: [u8; 32],
     channel_binding_digest: [u8; 32],
+    runtime_control_describe_ready: RuntimeControlDescribeReadyFactsV1,
 }
 
 impl RuntimeDeveloperLocalReadyV1 {
@@ -794,6 +797,15 @@ impl RuntimeDeveloperLocalReadyV1 {
 
     pub const fn channel_binding_digest(&self) -> [u8; 32] {
         self.channel_binding_digest
+    }
+
+    /// Returns the immutable Runtime-local serving and channel facts that the
+    /// same owner signs into a remote PXDR Describe response. This value is
+    /// not a TLS channel, signer, or mutation capability.
+    pub const fn runtime_control_describe_ready(
+        &self,
+    ) -> &RuntimeControlDescribeReadyFactsV1 {
+        &self.runtime_control_describe_ready
     }
 }
 
@@ -909,8 +921,32 @@ struct ReadyTemplate {
 }
 
 impl ReadyTemplate {
-    fn bind(self, channel_binding_digest: [u8; 32]) -> RuntimeDeveloperLocalReadyV1 {
-        RuntimeDeveloperLocalReadyV1 {
+    fn bind(
+        self,
+        channel: paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1,
+        runtime_control_describe_ready: RuntimeControlDescribeReadyFactsV1,
+    ) -> Result<RuntimeDeveloperLocalReadyV1, RuntimeBootstrapEndpointError> {
+        let serving = runtime_control_describe_ready.serving();
+        if runtime_control_describe_ready.channel() != channel
+            || serving.target() != RuntimeHostId::from_bytes(self.identity.target)
+            || serving.runtime_store_instance_id() != self.runtime_store_instance_id
+            || runtime_control_describe_ready.manifest_digest()
+                != Digest32::from_bytes(self.manifest_digest)
+            || runtime_control_describe_ready.build_instance_id()
+                != self.compiled_build_instance_id
+        {
+            return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
+        }
+        ReferenceBootstrapServingIdentityV1::try_new(
+            serving.target(),
+            serving.runtime_store_instance_id(),
+            serving.snapshot_sequence(),
+            serving.runtime_host_epoch(),
+            serving.clock_domain(),
+            serving.clock_generation(),
+        )
+        .map_err(|_| RuntimeBootstrapEndpointError::InvalidStartedState)?;
+        Ok(RuntimeDeveloperLocalReadyV1 {
             state_directory: self.state_directory,
             socket_path: self.socket_path,
             runtime_store_instance_id: self.runtime_store_instance_id,
@@ -932,8 +968,9 @@ impl ReadyTemplate {
             compiled_build_instance_id: self.compiled_build_instance_id,
             manifest_canonical_wire: self.manifest_canonical_wire,
             manifest_digest: self.manifest_digest,
-            channel_binding_digest,
-        }
+            channel_binding_digest: *channel.binding_digest().as_bytes(),
+            runtime_control_describe_ready,
+        })
     }
 }
 
@@ -1152,8 +1189,8 @@ fn run_developer_local_thread(input: DeveloperLocalThreadInput) -> Result<(), Bo
                 )
             })
         },
-        move |channel, handle_broker| {
-            let facts = ready_template.bind(*channel.binding_digest().as_bytes());
+        move |channel, runtime_control_describe_ready, handle_broker| {
+            let facts = ready_template.bind(channel, runtime_control_describe_ready)?;
             let sender = readiness
                 .lock()
                 .map_err(|_| RuntimeBootstrapEndpointError::Runtime)?
