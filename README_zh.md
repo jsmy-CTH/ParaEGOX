@@ -5,15 +5,12 @@ ParaEGOX 是一个面向机器人与具身智能体的分布式 Agent OS，目�
 ParaEGOX 基于 [PhanthyMotus](https://github.com/4paradigm/phanthymotus) 构建。原始基线保留在 `archive/phanthymotus-baseline` 分支，并保留其许可证归属。
 
 > 当前状态：当前工作树已有首个 DeveloperLocal 后端、Textual 对话组合和 typed 单次 Inspection
-> 启动视图。原生 Intel macOS r29 artifact run `31238285076` 已通过真实可搬移 bundle 的 Inspection、
-> Runtime Agent IPC、Echo、Textual Ctrl-C、terminal restoration 和父进程 joined shutdown。Textual
-> 现在是唯一 DeveloperLocal 展示路径；旧 Rust reference frontend 已删除。Ubuntu r33 commit
-> `7618f6a51c5eb5731874d2cdf3231603e3a824f7` 还验证了公开 G1 host-local
-> `paraegox node` 系统基座。当前源码又增量接入了下文所述的 G2 host-side Node profile 与公开
-> `paraegox deployment` Controller composition。Ubuntu r86 精确 ref
-> `66aa4e58c0c2b3dc6ddf12d7de3fcae74d88b1bc` 是该 composition 当前最新已验证 ref；有界单 Ubuntu
-> 主机 public process smoke 已完成，但双主机执行与 remote Agent conversation 仍未获证明。生产核心机制
-> 优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
+> 启动视图；原生 Intel macOS r29 artifact run `31238285076` 仍是本地 Textual→Runtime Echo 证据。
+> Ubuntu r130 commit `92923eef016e6ce060c32113ad3cf5e59ee8520c` 是当前最新已验证的公开
+> Node/Deployment ref：Node schema v3 发布 PXEA v2，Deployment schema v2 持久完成 managed Fabric、
+> managed Agent stack 与 bootstrap descriptor 三段序列。其有界单主机 process smoke 已通过，但 Agent
+> access/session/Echo、双主机执行与 reconnect 仍未获证明。生产核心机制优先采用 Rust，Python/C++
+> 作为受管工作负载与生态语言，暂未提供稳定版本。
 
 ## 当前可运行切片
 
@@ -98,7 +95,7 @@ launcher 会创建或安全重开精确的本地 Node tenure，提交一份初�
 acquisition、多主机运行或 distributed readiness。正常退出顺序为 Textual child/Agent IPC → Runtime
 内部 Agent→Model→Fabric → NodeDaemon → Authority，并逐个 joined。
 
-## 可运行的 Node 宿主基座：G1 schema v1 与 G2 host-side schema v2
+## 可运行的 Node 宿主基座：schema v1、v2 与 v3
 
 下面这个独立公开命令总是启动一个 split-trust Runtime 和一个 NodeDaemon child。严格配置 schema
 决定宿主 profile；G2 没有另一条启动命令：
@@ -119,21 +116,31 @@ publication 交给既有唯一 NodeDaemon store 与 observation capability；创
 交叉验证 Runtime readiness facts。因此 schema v2 已提供后续外部 Controller 所需的真实 Ubuntu-side
 listener、durable owner 与 bridge，但不会把 Controller 偷塞进 Node 进程。
 
-两个 schema 都只在已配置的本地 owner 和 listener 启动后输出 `paraegox: node ready`。这个 marker
+当 `schema_version = 3` 时，Node 保留完整 schema-v2 control path，并额外强制
+`[managed_agent_bootstrap]` 使用编译内唯一的 `provider = "deterministic-echo-v1"` profile。该 provider
+selection、派生 provider ref 与 Node config digest 会进入 public-safe、Runtime-attested PXEA v2 successor：
+`<node-state-root>/node/enrollment-v2.pxea`。desired Fabric/Agent service identity、listen endpoint 与 limits
+仍归 Deployment 所有，不是合法 Node 字段。
+
+三个 schema 都只在已配置的本地 owner 和 listener 启动后输出 `paraegox: node ready`。这个 marker
 不证明 Controller 已连接、PXFB cutover 已完成、Runtime observation 已发布，或目标 Agent stack 已
-apply。两种模式都不启动 Authority、DeploymentController、managed Fabric、Model、Agent、Inspection、
+apply。三种模式都不启动 Authority、DeploymentController、managed Fabric、Model、Agent、Inspection、
 Textual 或 chat 链。下文所述的独立公开 Controller 命令现在已经存在，但仍没有端到端双主机 process
 proof、remote Agent conversation 路径、remote TUI 或 partition/reconnect policy。后续单 Ubuntu 主机
 smoke 已执行 semantic Controller sequence，但不会扩大这个 Node-local marker 的含义。
 
-从 [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml) 开始。把它复制到绝对普通
+T1 profile 从
+[`configs/paraegox-node.agent-bootstrap.example.toml`](configs/paraegox-node.agent-bootstrap.example.toml)
+开始；旧 schema-v2 示例仍位于
+[`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml)。把选中的文件复制到绝对普通
 文件路径，将两处仅用于文档的 `192.0.2.10` listener 地址替换为宿主机真实拥有的 IPv4，并同步修改
 `state_root` 和六条 credential path。启动前，同一个非 root 账号必须创建 canonical state root 及其
 精确的 `credentials` 子目录，两者 mode 都是 `0700`。Runtime 与 Node listener 分别使用不同的 PEM
 CA/certificate/key 文件，但六个文件都必须放在这一个目录；两张 certificate 的 SAN 都必须包含对应
-配置 IP，两把 key 必须是 `0600`，CA/certificate 不得允许 group/other 写入。示例默认选择 schema v2；
-若要保留 G1，设置 `schema_version = 1`、完整删除 `[node_control]` 表，并只准备三条 Runtime-listener
-credential。示例只含非秘密 reference value 和 public verification key；只有 Controller/Authority
+配置 IP，两把 key 必须是 `0600`，CA/certificate 不得允许 group/other 写入。agent-bootstrap 示例选择
+schema v3，旧示例选择 schema v2。若要保留 G1，设置 `schema_version = 1`，完整删除 `[node_control]`
+和 `[managed_agent_bootstrap]`，并只准备三条 Runtime-listener credential；若保留 schema v2，只删除
+`[managed_agent_bootstrap]`。两份示例都只含非秘密 reference value 和 public verification key；只有 Controller/Authority
 enrollment owner 才能替换这些 pin，绝不能填入 private seed。完整准备与启动命令见本地
 `docs/runbooks/developer-local.md`。
 
@@ -170,7 +177,7 @@ PXCC/PXNR 语义 exchange 或 cutover。后续公开 Controller composition 不�
 双目标 DeveloperLocal fixture 仍是内部实现；当前没有公开的 `developer-distributed-fixture-v1` 命令，
 也不宣称完整分布式系统已经可运行。
 
-## 公开 Developer DeploymentController composition
+## 公开 Developer DeploymentController 与 T1 Agent bootstrap
 
 第三个公开命令会启动一条有界的 Controller-side owner graph：
 
@@ -183,11 +190,17 @@ paraegox deployment --config <absolute-paraegox-deployment.toml>
 tenure-Authority signing-seed 文件、Authority state directory/socket，以及 `[runtime_connector]` /
 `[node_connector]` 的 CA、client certificate 和 client private-key 路径。未知字段和替代 CLI submode
 都会 fail closed。endpoint、route、target、principal、trust、manifest 与 credential-reference 语义只从
-独立 pin 的 PXEA 接受，不能在 TOML 中重复声明为第二配置权威。配置从
-[`configs/paraegox-deployment.example.toml`](configs/paraegox-deployment.example.toml) 开始。
+独立 pin 的 PXEA 接受，不能在 TOML 中重复声明为第二配置权威。增量 schema v2 保留这些字段，并严格
+要求 `[managed_agent_bootstrap]`：两个不同且非零的 Fabric/Agent service ID、loopback Fabric listen
+endpoint，以及固定 `developer-agent-bootstrap-v1` limits profile。T1 从
+[`configs/paraegox-deployment.agent-bootstrap.example.toml`](configs/paraegox-deployment.agent-bootstrap.example.toml)
+开始；旧 schema-v1 示例仍位于
+[`configs/paraegox-deployment.example.toml`](configs/paraegox-deployment.example.toml)。
 
-schema-v2 Node process 只有在 Runtime 与 Node bootstrap 已获证明后，才发布 canonical
-`<node-state-root>/node/enrollment-v1.pxea`。PXEA v1 是 public-safe、由 Runtime attest 的 handoff：它包含
+schema-v2 Node 发布 `<node-state-root>/node/enrollment-v1.pxea`；schema v3 改为发布
+`<node-state-root>/node/enrollment-v2.pxea`，两者都只在 Runtime 与 Node bootstrap 已获证明后发布。
+PXEA v2 保留 public-safe、Runtime-attested 的 v1 facts，并额外提交精确 provider profile/ref/config
+digest；它包含
 immutable Runtime manifest 和完整 public Runtime/Node transport、identity、enrollment pins，但不含
 bearer token、signing seed、private-key bytes 或 private-key path。Controller 侧先核对通过独立渠道传递的
 whole-file SHA-256，随后才解码任何 frame length、signature 或 semantic field，并继续交叉验证另行配置的
@@ -200,29 +213,28 @@ terminal 已 durable `ResponseDurable`，且 fresh post-PXFR PXDR Describe 已�
 PXFR 的 ManagedReady Describe 都不能合成 readiness；命令会 joined 关闭 owner，并用稳定 Deployment
 错误非零退出。这个 process 只执行一次有界、无重试 attempt，不是 continuous reconciler。
 
-Ubuntu 已在精确 r86 ref `66aa4e58c0c2b3dc6ddf12d7de3fcae74d88b1bc` 通过 workspace
-`cargo fmt --all -- --check`、完整 governance checker、locked workspace all-target check 与
-warnings-denied locked workspace all-target Clippy。其 production Rust tree 与 r85
-`83a020890a9098852d5ff60dbad0cc1cf77be702` 相同；r85 的完整非 root Node、Local、Deployment suites
-分别以 28/28、129/129、387/387 通过。
+schema v2 只有在 base managed-ready 与三个有序 PXAG/PXAH 操作全部持久终态后，才精确输出并 flush
+`paraegox: deployment agent bootstrap ready`：Fabric apply 携带逐字不变的 PXAR v6 并返回 PXFT
+ActiveReady；Agent-stack apply 携带逐字不变的 PXAR v7 并返回 PXST ActiveReady；descriptor Describe
+返回以该精确 PXST 及当前 Fabric/Agent generation 为根的 PXAH。PXFJ v7 保存 exact outer request 与
+receipt；同 state Resume 会重新验证历史 terminal bytes 并返回同一 Ready 结果，不会合成替代 terminal。
 
-r86 的预编译 public binary process smoke 以 1/1、20.39 秒通过。所有 ParaEGOX 进程在同一 Ubuntu
-主机、同一个 `nobody` UID/GID 下运行，并使用真实 non-loopback mTLS；它覆盖 fresh Node Ready 与 PXEA
-发布、隔离 fresh state 的 wrong-SHA 拒绝、fresh Deployment Ready 与 SIGTERM clean exit、同 state Node
-clean restart、Deployment Resume Ready 与 SIGTERM clean exit，以及独立 correct-config Node-unavailable
-非零退出（无 Ready，socket 已清理）。runner 实际使用 pytest 9.0.1 与 cryptography 46.0.3，而
-`uv.lock` 固定 pytest 9.1.1 与 cryptography 46.0.7；因此这是 process evidence，不是 exact-lock Python
-toolchain evidence。
+Ubuntu 已验证精确 r130 commit `92923eef016e6ce060c32113ad3cf5e59ee8520c`：workspace format、Local
+all-target check 与 warnings-denied Clippy、完整 non-root Local 138/138（49.57 秒）、workspace all-target
+check 与 warnings-denied Clippy 均通过；所有 workspace all-target test executable 也在 `--no-run` 下
+完成编译和链接。`--no-run` 不表示完整 workspace test suite 已执行。完整 Deployment suite 也以
+`nobody`、link-count-1 binary、16 MiB stack、单 test thread 运行，并以 393/393（172.97 秒）通过。
 
-另有 r84 ref `74e349aa2d117da416f816a840f0fe79768b4a7a` 的真实截止时间 process evidence：同一 binary 等待
-超过 60 秒 observation deadline 后，PXND 从 `next=3, visible=1, replay=1, validity=1` 收敛到
-`next=4, visible=0, replay=0, validity=0`；Node 到达 Ready 并 clean exit，随后 Node 与 Deployment
-均从原 state Resume 到 Ready 并 clean exit。r85 只增加对应 fence tests，r86 只增加治理/harness
-登记，没有修改 production Rust。
+精确 ref 的 public process smoke 在单 Ubuntu host、同一 `nobody` UID/GID 与真实 non-loopback mTLS 下
+以 1/1 通过。它覆盖 schema-v3 Node/PXEA-v2 fresh、隔离 wrong-SHA 拒绝、schema-v2 Deployment Fresh
+Ready 与 joined SIGTERM、同 state Node/Deployment Resume Ready，以及 Node unavailable 时无 Ready 且
+socket cleanup。pytest parent 使用默认 8192 KiB stack；harness 保留 16 MiB `RUST_MIN_STACK` fixture
+设置，r130 production 自身则在具名、有界 16 MiB executor thread 上承载 Deployment root future。
 
-这些结果没有覆盖 Authority-owner failure、独立 service account、双主机、Ready 后 peer liveness、
-remote Agent conversation/TUI 或 reconnect。下一有界切片是 target-scoped Agent descriptor，并只向
-本地交付 opaque conversation handle；bounded reconnect 与 remote TUI 后置。
+descriptor 只是 bootstrap evidence。这些结果不证明 descriptor access/authorization、Agent session、
+Agent data-plane traffic、Echo/conversation、reconnect、remote TUI、distributed/two-host、provider
+mismatch 或 Authority-owner failure。下一阶段 T2 是 asymmetric remote Agent data plane + Echo；
+reconnect 与 TUI 继续后置。
 
 Unix-only `paraegox-noded developer-local-reference-v1` 也能独立重开一份由外部授权的 exact tenure，
 并通过 same-user、token-bound 本地 socket 返回最后一次已提交状态。新增的

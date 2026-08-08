@@ -6,16 +6,13 @@ ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). 
 
 > Status: the current worktree contains the first DeveloperLocal backend, Textual chat composition,
 > and typed one-shot Inspection startup view. Native Intel macOS r29 artifact run `31238285076`
-> passed the real relocated-bundle path through Inspection, Runtime Agent IPC, Echo, Textual Ctrl-C,
-> terminal restoration, and joined parent shutdown. Textual is now the sole DeveloperLocal
-> presentation path; the retired Rust reference frontend has been removed. Ubuntu r33 commit
-> `7618f6a51c5eb5731874d2cdf3231603e3a824f7` additionally validates the public G1 host-local
-> `paraegox node` substrate. The current source additively wires the G2 host-side node profile and
-> the public `paraegox deployment` Controller composition described below. Ubuntu r86 exact ref
-> `66aa4e58c0c2b3dc6ddf12d7de3fcae74d88b1bc` is the latest validated ref for that composition;
-> its bounded single-host public process smoke is now complete, while two-host execution and remote
-> Agent conversation remain unproved. ParaEGOX is adopting a Rust-first core with polyglot managed
-> workloads; no stable release is currently available.
+> remains the local Textual-to-Runtime Echo evidence. Ubuntu r130 commit
+> `92923eef016e6ce060c32113ad3cf5e59ee8520c` is the latest validated public Node/Deployment ref:
+> Node schema v3 publishes PXEA v2, and Deployment schema v2 durably completes the managed
+> Fabric, managed Agent stack, and bootstrap descriptor sequence. Its bounded single-host process
+> smoke passed, while Agent access/session/Echo, two-host execution, and reconnect remain unproved.
+> ParaEGOX is adopting a Rust-first core with polyglot managed workloads; no stable release is
+> currently available.
 
 ## Runnable DeveloperLocal slice
 
@@ -114,7 +111,7 @@ registration acquisition, multi-host operation, or distributed readiness. Normal
 Textual child and Agent IPC boundary first, then Runtime-managed Agent→Model→Fabric shutdown, the
 NodeDaemon, and finally Authority.
 
-## Runnable Node host substrate: G1 schema v1 and G2 host-side schema v2
+## Runnable Node host substrate: schemas v1, v2, and v3
 
 The separate public command below always starts one split-trust Runtime and one NodeDaemon child.
 Its strict config schema selects the host profile; there is no second G2 command:
@@ -138,25 +135,37 @@ cross-checked before the observation bridge is created. Schema v2 therefore prov
 Ubuntu-side listeners, durable owners, and bridge needed by a later external Controller; it does not
 embed that Controller in the node process.
 
-Both schemas print `paraegox: node ready` only after their configured local owners and listeners have
-started. The marker does not prove that a Controller connected, PXFB cutover completed, a Runtime
-observation was published, or a desired Agent stack was applied. Neither schema starts Authority,
+With `schema_version = 3`, the Node retains the complete schema-v2 control path and additionally
+requires `[managed_agent_bootstrap]` with the exact compiled-in
+`provider = "deterministic-echo-v1"` profile. That provider selection, its derived provider ref, and
+the Node config digest are committed into the public-safe Runtime-attested PXEA v2 successor at
+`<node-state-root>/node/enrollment-v2.pxea`. Desired Fabric/Agent service identities, listen endpoint,
+and limits remain Deployment-owned and are not valid Node fields.
+
+All three schemas print `paraegox: node ready` only after their configured local owners and listeners
+have started. The marker does not prove that a Controller connected, PXFB cutover completed, a Runtime
+observation was published, or a desired Agent stack was applied. None of the schemas starts Authority,
 DeploymentController, managed Fabric, Model, Agent, Inspection, Textual, or the chat chain. The
 separate public Controller command described below now exists, but there is still no end-to-end
 two-host process proof, remote Agent conversation path, remote TUI, or partition/reconnect policy.
 The later single-Ubuntu-host smoke exercises the semantic Controller sequence, but does not widen
 the meaning of this Node-local marker.
 
-Start from [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml). Copy it to an
+For the T1 profile, start from
+[`configs/paraegox-node.agent-bootstrap.example.toml`](configs/paraegox-node.agent-bootstrap.example.toml).
+The predecessor schema-v2 example remains at
+[`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml). Copy the selected file to an
 absolute regular-file path, replace both documentation-only `192.0.2.10` listener addresses with
 IPv4 addresses actually assigned to the host, and update `state_root` plus all six credential paths
 together. Before launch, the same non-root account must create the canonical state root and its exact
 `credentials` child at mode `0700`. Provision distinct PEM CA/certificate/key files for the Runtime
 and Node listeners in that one directory; both certificate SANs must contain their configured IP,
 both keys must be mode `0600`, and CA/certificate files must not be group- or other-writable. The
-example selects schema v2. To retain G1, set `schema_version = 1`, remove the complete
-`[node_control]` table, and provision only the three Runtime-listener files. The example contains only
-non-secret reference values and public verification keys; replace those pins only from the owning
+agent-bootstrap example selects schema v3, while the predecessor example selects schema v2. To
+retain G1, set `schema_version = 1`, remove both the complete
+`[node_control]` and `[managed_agent_bootstrap]` tables, and provision only the three
+Runtime-listener files. To retain schema v2, omit only `[managed_agent_bootstrap]`. Both examples
+contain only non-secret reference values and public verification keys; replace those pins only from the owning
 Controller/Authority enrollment workflow, never with private seeds. Full credential preparation and
 launch commands are in the local `docs/runbooks/developer-local.md` runbook.
 
@@ -198,7 +207,7 @@ remote TUI, or reconnect result. The older two-target DeveloperLocal fixture rem
 is no public `developer-distributed-fixture-v1` command and no runnable full distributed-system claim
 yet.
 
-## Public Developer DeploymentController composition
+## Public Developer DeploymentController and T1 Agent bootstrap
 
 The third public command starts one bounded Controller-side owner graph:
 
@@ -212,11 +221,18 @@ Controller and tenure-Authority signing-seed files, the Authority state director
 `[runtime_connector]` / `[node_connector]` CA, client-certificate, and client-private-key paths.
 Unknown fields and alternate CLI submodes fail closed. Endpoint, route, target, principal, trust,
 manifest, and credential-reference semantics are accepted only from the independently pinned PXEA;
-they cannot be restated in TOML as a second configuration authority. Start from
+they cannot be restated in TOML as a second configuration authority. Additive schema v2 retains
+those exact fields and strictly requires `[managed_agent_bootstrap]` with distinct nonzero Fabric
+and Agent service IDs, a loopback Fabric listen endpoint, and the fixed
+`developer-agent-bootstrap-v1` limits profile. Start T1 from
+[`configs/paraegox-deployment.agent-bootstrap.example.toml`](configs/paraegox-deployment.agent-bootstrap.example.toml);
+the predecessor schema-v1 example remains at
 [`configs/paraegox-deployment.example.toml`](configs/paraegox-deployment.example.toml).
 
-The schema-v2 Node process publishes canonical `<node-state-root>/node/enrollment-v1.pxea` only after
-its Runtime and Node bootstraps have been proved. PXEA v1 is public-safe and Runtime-attested: it
+The schema-v2 Node process publishes canonical `<node-state-root>/node/enrollment-v1.pxea`; schema v3
+instead publishes `<node-state-root>/node/enrollment-v2.pxea`. Both are published only after the
+Runtime and Node bootstraps have been proved. PXEA v2 retains the public-safe Runtime-attested v1
+facts and additionally commits the exact provider profile/ref/config digest. It
 contains the immutable Runtime manifest and the complete public Runtime/Node transport, identity,
 and enrollment pins, but no bearer token, signing seed, private-key bytes, or private-key path. The
 Controller side checks an independently transported whole-file SHA-256 before decoding any frame
@@ -232,32 +248,33 @@ cannot synthesize readiness; the command joins its owners and exits nonzero with
 error instead. The process performs one bounded non-retrying attempt and is not a continuous
 reconciler.
 
-Ubuntu validated exact r86 ref `66aa4e58c0c2b3dc6ddf12d7de3fcae74d88b1bc` with workspace
-`cargo fmt --all -- --check`, the complete governance checker, locked workspace all-target checking,
-and warnings-denied locked workspace all-target Clippy. Its production Rust tree is unchanged from
-r85 `83a020890a9098852d5ff60dbad0cc1cf77be702`, whose complete non-root Node, Local, and Deployment
-suites passed 28/28, 129/129, and 387/387 respectively.
+For schema v2, Local prints and flushes exactly
+`paraegox: deployment agent bootstrap ready` only after the base managed-ready state and all three
+ordered PXAG/PXAH operations are durably terminal: Fabric apply carries the exact PXAR v6 and returns
+PXFT ActiveReady; Agent-stack apply carries the exact PXAR v7 and returns PXST ActiveReady; descriptor
+Describe returns a PXAH rooted in that exact PXST and current Fabric/Agent generations. The PXFJ v7
+journal preserves the exact outer requests and receipts. Same-state Resume revalidates terminal
+bytes and reaches the same Ready result without synthesizing a replacement terminal.
 
-The r86 prebuilt-binary public process smoke passed 1/1 in 20.39 seconds. On one Ubuntu host, every
-ParaEGOX process used the same `nobody` UID/GID and real non-loopback mTLS. It covered a fresh Node
-Ready and PXEA publication, an isolated fresh-state wrong-SHA rejection before success, fresh
-Deployment Ready and clean SIGTERM, clean same-state Node restart, Deployment Resume Ready and clean
-SIGTERM, and an independent correct-config Node-unavailable failure with no Ready marker and socket
-cleanup. The runner actually used pytest 9.0.1 and cryptography 46.0.3; the `uv.lock` versions are
-pytest 9.1.1 and cryptography 46.0.7. This smoke is therefore process evidence, not exact-lock
-Python toolchain evidence.
+Ubuntu validated exact r130 commit `92923eef016e6ce060c32113ad3cf5e59ee8520c` with workspace
+format checking, Local all-target checking and warnings-denied Clippy, the complete non-root Local
+suite at 138/138 in 49.57 seconds, workspace all-target checking and warnings-denied Clippy, and
+compilation/linking of all workspace all-target test executables under `--no-run`. The `--no-run`
+result is not a claim that the complete workspace test suite executed. The complete Deployment suite
+also passed 393/393 in 172.97 seconds as `nobody`, using a link-count-1 binary, a 16 MiB stack, and one
+test thread.
 
-Separate r84 ref `74e349aa2d117da416f816a840f0fe79768b4a7a` process evidence using the same binary
-crossed the real 60-second observation deadline: PXND converged from
-`next=3, visible=1, replay=1, validity=1` to
-`next=4, visible=0, replay=0, validity=0`, the Node reached Ready and exited cleanly, and Node plus
-Deployment subsequently resumed to Ready and exited cleanly. R85 added only the corresponding fence
-tests, and r86 added governance/harness registration without changing production Rust.
+The exact-ref public process smoke passed 1/1 on one Ubuntu host with the same `nobody` UID/GID and
+real non-loopback mTLS. It covered schema-v3 Node/PXEA-v2 fresh start, isolated wrong-SHA rejection,
+schema-v2 Deployment Fresh Ready and joined SIGTERM, same-state Node and Deployment Resume Ready,
+and a Node-unavailable failure with no Ready marker and socket cleanup. The pytest parent used the
+default 8192 KiB stack; the harness retained its 16 MiB `RUST_MIN_STACK` fixture setting, and r130
+production runs the Deployment root future on its own named bounded 16 MiB executor thread.
 
-These results do not cover an Authority-owner failure, distinct service accounts, two hosts, peer
-liveness after Ready, a remote Agent conversation/TUI, or reconnect behavior. The next bounded slice
-is a target-scoped Agent descriptor that yields only an opaque local conversation handle; bounded
-reconnect and remote TUI remain later work.
+The descriptor is bootstrap evidence only. These results do not prove descriptor access or
+authorization, an Agent session, Agent data-plane traffic, Echo or conversation, reconnect, a remote
+TUI, distributed/two-host execution, provider-mismatch handling, or Authority-owner failure. T2 is
+the next stage: an asymmetric remote Agent data plane plus Echo; reconnect and TUI remain later work.
 
 A Unix-only `paraegox-noded developer-local-reference-v1` process can also reopen one externally
 authorized exact tenure and serve its last committed status through a same-user, token-bound local socket.
