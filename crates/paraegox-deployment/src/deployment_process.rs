@@ -223,9 +223,8 @@ mod platform {
         DistributedAgentStackNodeDiscoveryStateV1, DistributedAgentStackNodeTargetV1,
         DistributedAgentStackRuntimeQueryInputV1, DistributedAgentStackRuntimeQueryPhaseV1,
         NodeObservationProcessGenerationV1, ReadyDistributedAgentStackRuntimeEndpointV1,
-        RuntimeObservationPublishFieldsV1, TransportAuthenticatedNodeResponseV1,
-        TrustedLocalNodeClientErrorV1, TrustedLocalNodeEndpointV1,
-        TrustedLocalRuntimeObservationEndpointV1,
+        TransportAuthenticatedNodeResponseV1, TrustedLocalNodeClientErrorV1,
+        TrustedLocalNodeEndpointV1, TrustedLocalRuntimeObservationEndpointV1,
     };
     use crate::distributed_agent_stack_producer::{
         DistributedAgentStackRolloutIdV1, DistributedAgentStackTargetRolloutInputV1,
@@ -284,7 +283,10 @@ mod platform {
         MAX_RUNTIME_OBSERVATION_CHALLENGE_NANOS, RuntimeObservationAuthorityV1,
         RuntimeObservationEndpointRefV1, derive_runtime_observation_query_nonce_v1,
     };
-    use paraegox_node::protocol::{NodeManagementRequestV1, NodeManagementTargetV1};
+    use paraegox_node::protocol::{
+        NodeControlObservationChallengeFieldsV1, NodeControlObservationChallengeV1,
+        NodeManagementRequestV1, NodeManagementTargetV1,
+    };
     use paraegox_node::{
         MAX_NODE_STATUS_FRESHNESS_NANOS, NodeId, NodeIncarnation, NodeManagementEndpointRefV1,
     };
@@ -3040,6 +3042,18 @@ mod platform {
             expires_at_unix_nanos,
         )
         .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
+        let challenge =
+            NodeControlObservationChallengeV1::try_new(NodeControlObservationChallengeFieldsV1 {
+                observation_endpoint_ref: observation.endpoint_ref,
+                runtime_host_id: predecessor.target(),
+                authority_digest: observation.authority.authority_digest(),
+                intended_status_sequence,
+                freshness_budget_nanos,
+                issued_at_unix_nanos,
+                expires_at_unix_nanos,
+                query_nonce: nonce,
+            })
+            .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
         let selector = ReferenceQuerySelectorV1::try_new(
             ReferenceQueryIdV1::from_bytes(query_id),
             predecessor.target(),
@@ -3055,7 +3069,7 @@ mod platform {
             ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
                 .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?,
             ED25519_ALGORITHM_VERSION,
-            nonce.as_bytes(),
+            challenge.query_nonce().as_bytes(),
         )
         .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)?;
         let draft = ReferenceQueryRequestDraftV1::try_new(
@@ -3077,15 +3091,7 @@ mod platform {
         DistributedAgentStackRuntimeQueryInputV1::try_new(
             request,
             observation.authority.serving_baseline(),
-            observation.endpoint_ref,
-            RuntimeObservationPublishFieldsV1::new(
-                intended_status_sequence,
-                freshness_budget_nanos,
-                predecessor.target(),
-                observation.authority.authority_digest(),
-                issued_at_unix_nanos,
-                expires_at_unix_nanos,
-            ),
+            challenge,
         )
         .map_err(|_| DistributedAgentStackOwnerApplyErrorV1::Operation)
     }

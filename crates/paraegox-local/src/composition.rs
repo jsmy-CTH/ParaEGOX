@@ -1,10 +1,10 @@
 //! One explicit DeveloperLocal composition of the real ParaEGOX owners.
 
 use std::env;
-use std::fs;
-use std::io::{self, Write};
-use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::fs::{self, TryLockError};
+use std::io::{self, Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -12,8 +12,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use nix::fcntl::{OFlag, open};
 use nix::sys::signal::{Signal, kill};
+use nix::sys::stat::Mode;
 use nix::unistd::{Gid, Pid, Uid};
 use paraegox_agent_contracts::{AgentConversationDeckRunId, AgentConversationSessionId};
 use paraegox_agent_service::AgentConversationModelServiceProviderV1;
@@ -33,7 +35,11 @@ use paraegox_deployment::{
 };
 use paraegox_evidence::EvidenceRetentionPolicyV1;
 use paraegox_evidence::{EvidenceOwnerRefV1, EvidenceStoreEpochV1};
-use paraegox_fabric::{ResolvedRemoteMtlsCredentialFiles, ResolvedRemoteMtlsIdentityFiles};
+use paraegox_fabric::{
+    ResolvedRemoteMtlsCredentialFiles, ResolvedRemoteMtlsIdentityFiles,
+    RestrictedNodeControlEndpointConfigV1, RestrictedNodeControlEndpointV1,
+    RestrictedNodeControlReceiverV1,
+};
 use paraegox_kernel::digest::Digest32;
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::BoundedDuration;
@@ -50,19 +56,25 @@ use paraegox_model_adapters::{
     OpenAiResponsesProviderFactoryV1,
 };
 use paraegox_node::observation::{
-    RuntimeObservationAuthorityV1, RuntimeObservationBootstrapInputV1,
-    RuntimeObservationBootstrapV1, RuntimeObservationEndpointRefV1,
+    MAX_RUNTIME_OBSERVATION_BOOTSTRAP_BYTES, RuntimeObservationAuthorityV1,
+    RuntimeObservationBootstrapInputV1, RuntimeObservationBootstrapV1,
+    RuntimeObservationEndpointRefV1, RuntimeObservationError,
 };
 use paraegox_node::process::{
-    DEVELOPER_LOCAL_REFERENCE_TOKEN_BYTES, DeveloperLocalNodeManagementEndpointV1,
+    DEVELOPER_LOCAL_REFERENCE_TOKEN_BYTES, DeveloperLocalNodeControlBridgeErrorV1,
+    DeveloperLocalNodeControlBridgeV1, DeveloperLocalNodeManagementEndpointV1,
     DeveloperLocalReferenceBootstrapInputV1, DeveloperLocalReferenceBootstrapV1,
 };
-use paraegox_node::protocol::{NodeManagementClientV1, NodeManagementTargetV1};
+use paraegox_node::protocol::{
+    NodeControlCarrierRequestV1, NodeManagementClientV1, NodeManagementProtocolError,
+    NodeManagementTargetV1,
+};
 use paraegox_node::store::DurableNodeDaemonV1;
 use paraegox_node::{
     EnrollmentIssuerRefV1, MAX_NODE_STATUS_FRESHNESS_NANOS, NodeArchitectureV1,
     NodeFeatureReportInputV1, NodeFeatureReportV1, NodeId, NodeIdentityV1, NodeIncarnation,
     NodeManagementEndpointRefV1, NodeOperatingSystemV1, NodeRegistrationTenureV1, NodeStatusV1,
+    RuntimeApplyEndpointDescriptorV1, RuntimeApplyEndpointRefV1,
 };
 use paraegox_runtime::{
     RuntimeAgentConversationHandle, RuntimeAgentDeveloperLocalConversationV1,
@@ -71,9 +83,10 @@ use paraegox_runtime::{
     RuntimeAgentProviderResolveError, RuntimeAgentProviderResolverV1,
     RuntimeDeveloperLocalConfigV1, RuntimeDeveloperLocalDistributedAgentStackConfigV1,
     RuntimeDeveloperLocalIdentityRefsV1, RuntimeDeveloperLocalIdentityV1,
-    RuntimeDeveloperLocalLifecycleV1, RuntimeFabricCredentialRequirementV1,
-    RuntimeFabricCredentialResolveErrorV2, RuntimeFabricCredentialResolverV2,
-    RuntimeModelBackendResolveError, RuntimeModelBackendResolverV1, RuntimeResolvedAgentProviderV1,
+    RuntimeDeveloperLocalLifecycleV1, RuntimeDeveloperLocalReadyV1,
+    RuntimeFabricCredentialRequirementV1, RuntimeFabricCredentialResolveErrorV2,
+    RuntimeFabricCredentialResolverV2, RuntimeModelBackendResolveError,
+    RuntimeModelBackendResolverV1, RuntimeResolvedAgentProviderV1,
     RuntimeResolvedFabricPeerCredentialV2, RuntimeResolvedModelBackendV1,
     start_runtime_agent_developer_local_ipc_v1, start_runtime_developer_local_v1,
 };
@@ -96,10 +109,15 @@ use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
 use paraegox_runtime_contracts::managed_service::{
     ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
 };
-use paraegox_runtime_contracts::reference_control::ed25519_control_key_fingerprint;
+use paraegox_runtime_contracts::reference_control::{
+    ReferenceBootstrapServingIdentityV1, ReferenceChannelBindingV1,
+    ed25519_control_key_fingerprint, reference_local_control_endpoint_identity_digest_v1,
+    reference_runtime_peer_credentials_digest_v1,
+};
 use paraegox_runtime_contracts::wire::ApplyAuthKeyRef;
 use sha2::{Digest as _, Sha256};
 use tokio::signal::unix::{Signal as TokioSignal, SignalKind, signal};
+use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 use zeroize::Zeroizing;
 
@@ -110,9 +128,9 @@ use crate::config::{
 };
 use crate::config::{
     DeveloperDistributedFixtureConfigV1, DeveloperDistributedTargetConfigV1,
-    DeveloperFixtureConfigV1, DeveloperLocalProfileV1, DeveloperNodeConfigV1,
-    DeveloperProvisionedConfigV1, ProviderProfileV1, ProvisionedProviderConfigV1,
-    ProvisionedSecretRefV1,
+    DeveloperFixtureConfigV1, DeveloperLocalProfileV1, DeveloperNodeConfigSchemaV1,
+    DeveloperNodeConfigV1, DeveloperProvisionedConfigV1, ProviderProfileV1,
+    ProvisionedProviderConfigV1, ProvisionedSecretRefV1,
 };
 use crate::error::LocalProcessError;
 use crate::inspection::{
@@ -142,6 +160,11 @@ const DEVELOPER_NODE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEVELOPER_NODE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
 const DEVELOPER_NODE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const DEVELOPER_NODE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const DEVELOPER_NODE_CONTROL_ED25519_ALGORITHM: u16 = 1;
+const DEVELOPER_NODE_CONTROL_ED25519_ALGORITHM_VERSION: u16 = 1;
+const DEVELOPER_NODE_CONTROL_SIGNATURE_BYTES: usize = 64;
+const DEVELOPER_NODE_PRIVATE_FILE_MODE: u32 = 0o600;
+const DEVELOPER_RUNTIME_CONTROL_SOCKET_MODE: u32 = 0o660;
 const DEVELOPER_DISTRIBUTED_EVIDENCE_MAX_RECORDS: u64 = 4_096;
 const DEVELOPER_DISTRIBUTED_EVIDENCE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DEVELOPER_NODE_ENROLLMENT_DOMAIN: &[u8] =
@@ -269,35 +292,97 @@ async fn run_node_with_signals(
         restricted.runtime_listener_private_key_file().to_path_buf(),
     )
     .map_err(|_| LocalProcessError::NodeCredentialFiles)?;
-    let runtime_config =
-        RuntimeDeveloperLocalConfigV1::try_new_with_restricted_runtime_apply_endpoint(
-            layout.runtime_state_directory().to_path_buf(),
-            layout.runtime_socket_path().to_path_buf(),
-            runtime_identity,
-            transport_profile,
-            restricted.control_transport_profile_ref(),
-            expected_carrier,
-            (
-                restricted.root_ca_certificate_file().to_path_buf(),
-                listener_identity,
-            ),
-        )
-        .map_err(|_| LocalProcessError::RuntimeStartup)?;
+    let runtime_config = match config.schema() {
+        DeveloperNodeConfigSchemaV1::HostLocalV1 => {
+            RuntimeDeveloperLocalConfigV1::try_new_with_restricted_runtime_apply_endpoint(
+                layout.runtime_state_directory().to_path_buf(),
+                layout.runtime_socket_path().to_path_buf(),
+                runtime_identity,
+                transport_profile,
+                restricted.control_transport_profile_ref(),
+                expected_carrier,
+                (
+                    restricted.root_ca_certificate_file().to_path_buf(),
+                    listener_identity,
+                ),
+            )
+        }
+        DeveloperNodeConfigSchemaV1::RemoteControlV2 => {
+            RuntimeDeveloperLocalConfigV1::try_new_with_restricted_runtime_control_endpoint(
+                layout.runtime_state_directory().to_path_buf(),
+                layout.runtime_socket_path().to_path_buf(),
+                runtime_identity,
+                transport_profile,
+                restricted.control_transport_profile_ref(),
+                expected_carrier,
+                (
+                    restricted.root_ca_certificate_file().to_path_buf(),
+                    listener_identity,
+                ),
+            )
+        }
+    }
+    .map_err(|_| LocalProcessError::RuntimeStartup)?;
     let runtime = start_runtime_developer_local_v1(runtime_config)
         .map_err(|_| LocalProcessError::RuntimeStartup)?;
     let mut owners = RunningNodeOwners::new(runtime);
-    let (node_bootstrap, node_status) =
-        prepare_public_developer_node_v1(&config, &layout, &manifest)?;
-    owners.node = Some(RunningNodeDaemon::start(
-        layout.pxnb_bootstrap_path(),
-        node_bootstrap,
-        node_status,
-    )?);
+    match config.schema() {
+        DeveloperNodeConfigSchemaV1::HostLocalV1 => {
+            let (node_bootstrap, node_status) =
+                prepare_public_developer_node_v1(&config, &layout, &manifest)?;
+            owners.node = Some(RunningNodeDaemon::start(
+                layout.pxnb_bootstrap_path(),
+                &node_bootstrap,
+                node_status,
+            )?);
+        }
+        DeveloperNodeConfigSchemaV1::RemoteControlV2 => {
+            let prepared = prepare_public_developer_node_v2(
+                &config,
+                &layout,
+                &manifest,
+                owners.runtime_ready(),
+            )?;
+            let PreparedPublicDeveloperNodeV2 {
+                node_bootstrap,
+                node_status,
+                observation_bootstrap,
+                observation_bootstrap_path,
+                observation_socket_path,
+            } = prepared;
+            owners.node = Some(RunningNodeDaemon::start_runtime_observation(
+                layout.pxnb_bootstrap_path(),
+                &observation_bootstrap_path,
+                &observation_socket_path,
+                &node_bootstrap,
+                node_status,
+            )?);
+            let bridge = DeveloperLocalNodeControlBridgeV1::try_from_bootstraps(
+                &node_bootstrap,
+                &observation_bootstrap,
+                DEVELOPER_NODE_EXCHANGE_TIMEOUT,
+            )
+            .map_err(|_| LocalProcessError::NodeStartup)?;
+            let remote = config
+                .node_control()
+                .ok_or(LocalProcessError::NodeStartup)?;
+            let endpoint_config = remote
+                .try_listener_config(PrincipalRef::from_bytes(control.controller_principal()))
+                .map_err(LocalProcessError::Configuration)?;
+            let verifier = NodeControlControllerVerifierV1::try_new(
+                PrincipalRef::from_bytes(control.controller_principal()),
+                ApplyAuthKeyRef::from_bytes(control.controller_request_key_ref()),
+                control.controller_request_verification_key(),
+            )?;
+            owners.node_control =
+                Some(RunningNodeControlEndpointV1::start(endpoint_config, bridge, verifier).await?);
+        }
+    }
     drop(manifest);
     write_node_ready(&mut io::stdout().lock())?;
 
     let wait_result = wait_for_node_shutdown(&mut owners, interrupt, terminate).await;
-    let cleanup_result = owners.shutdown();
+    let cleanup_result = owners.shutdown().await;
     wait_result.and(cleanup_result)
 }
 
@@ -326,6 +411,9 @@ async fn wait_for_node_shutdown(
             _ = child_poll.tick() => {
                 if owners.node_mut().poll_exit()?.is_some() {
                     return Err(LocalProcessError::NodeChild);
+                }
+                if owners.node_control_has_exited() {
+                    return Err(LocalProcessError::NodeStartup);
                 }
             }
         }
@@ -487,7 +575,7 @@ pub(crate) fn run_distributed(
                 layout.target(target_a).pxnb_bootstrap_path(),
                 layout.target(target_a).pxob_bootstrap_path(),
                 layout.target(target_a).node_observation_socket_path(),
-                node_a.bootstrap,
+                &node_a.bootstrap,
                 node_a.status,
             )
             .map_err(|_| LocalProcessError::DistributedNodeAStartup)?,
@@ -513,7 +601,7 @@ pub(crate) fn run_distributed(
                 layout.target(target_b).pxnb_bootstrap_path(),
                 layout.target(target_b).pxob_bootstrap_path(),
                 layout.target(target_b).node_observation_socket_path(),
-                node_b.bootstrap,
+                &node_b.bootstrap,
                 node_b.status,
             )
             .map_err(|_| LocalProcessError::DistributedNodeBStartup)?,
@@ -727,7 +815,7 @@ fn run_prepared(
     let (node_bootstrap, node_status) = prepare_developer_local_node_v1(&layout, identities)?;
     owners.node_a = Some(RunningNodeDaemon::start(
         layout.pxnb_bootstrap_path(),
-        node_bootstrap,
+        &node_bootstrap,
         node_status,
     )?);
 
@@ -2024,6 +2112,20 @@ fn prepare_public_developer_node_v1(
     layout: &layout::DeveloperNodeLayoutV1,
     manifest: &identity::DeveloperNodeIdentityManifestV1,
 ) -> Result<(DeveloperLocalReferenceBootstrapV1, NodeStatusV1), LocalProcessError> {
+    if config.schema() != DeveloperNodeConfigSchemaV1::HostLocalV1
+        || manifest.schema() != DeveloperNodeConfigSchemaV1::HostLocalV1
+    {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+    prepare_public_developer_node(config, layout, manifest, false)
+}
+
+fn prepare_public_developer_node(
+    config: &DeveloperNodeConfigV1,
+    layout: &layout::DeveloperNodeLayoutV1,
+    manifest: &identity::DeveloperNodeIdentityManifestV1,
+    retain_runtime_observation: bool,
+) -> Result<(DeveloperLocalReferenceBootstrapV1, NodeStatusV1), LocalProcessError> {
     let node_id = NodeId::try_from_bytes(*manifest.node_id())
         .map_err(|_| LocalProcessError::NodeBootstrap)?;
     let node_incarnation = NodeIncarnation::try_from_bytes(*manifest.node_incarnation())
@@ -2096,20 +2198,372 @@ fn prepare_public_developer_node_v1(
         bootstrap.initial_feature_report(),
     )
     .map_err(|_| LocalProcessError::NodeBootstrap)?;
-    if owner
-        .current_status()
-        .is_some_and(|status| !status.runtime_hosts().is_empty())
-    {
-        return Err(LocalProcessError::NodeBootstrap);
-    }
-    let status = owner
-        .publish_status(MAX_NODE_STATUS_FRESHNESS_NANOS)
-        .map_err(|_| LocalProcessError::NodeBootstrap)?;
-    if !status.runtime_hosts().is_empty() {
+    let current = owner.current_status().cloned();
+    let status = match (retain_runtime_observation, current) {
+        (true, Some(status)) => status,
+        (true, None) | (false, None) => owner
+            .publish_status(MAX_NODE_STATUS_FRESHNESS_NANOS)
+            .map_err(|_| LocalProcessError::NodeBootstrap)?,
+        (false, Some(status)) if status.runtime_hosts().is_empty() => owner
+            .publish_status(MAX_NODE_STATUS_FRESHNESS_NANOS)
+            .map_err(|_| LocalProcessError::NodeBootstrap)?,
+        (false, Some(_)) => return Err(LocalProcessError::NodeBootstrap),
+    };
+    if !retain_runtime_observation && !status.runtime_hosts().is_empty() {
         return Err(LocalProcessError::NodeBootstrap);
     }
     drop(owner);
     Ok((bootstrap, status))
+}
+
+struct PreparedPublicDeveloperNodeV2 {
+    node_bootstrap: DeveloperLocalReferenceBootstrapV1,
+    node_status: NodeStatusV1,
+    observation_bootstrap: RuntimeObservationBootstrapV1,
+    observation_bootstrap_path: PathBuf,
+    observation_socket_path: PathBuf,
+}
+
+fn prepare_public_developer_node_v2(
+    config: &DeveloperNodeConfigV1,
+    layout: &layout::DeveloperNodeLayoutV1,
+    manifest: &identity::DeveloperNodeIdentityManifestV1,
+    ready: &RuntimeDeveloperLocalReadyV1,
+) -> Result<PreparedPublicDeveloperNodeV2, LocalProcessError> {
+    if config.schema() != DeveloperNodeConfigSchemaV1::RemoteControlV2
+        || manifest.schema() != DeveloperNodeConfigSchemaV1::RemoteControlV2
+    {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+    let observation_token = manifest
+        .pxob_observation_token()
+        .ok_or(LocalProcessError::NodeBootstrap)?;
+    let observation_endpoint_ref = RuntimeObservationEndpointRefV1::try_from_bytes(
+        *manifest
+            .runtime_observation_endpoint_ref()
+            .ok_or(LocalProcessError::NodeBootstrap)?,
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let observation_bootstrap_path = layout
+        .pxob_bootstrap_path()
+        .ok_or(LocalProcessError::NodeBootstrap)?
+        .to_path_buf();
+    let observation_socket_path = layout
+        .node_observation_socket_path()
+        .ok_or(LocalProcessError::NodeBootstrap)?
+        .to_path_buf();
+    let (node_bootstrap, node_status) =
+        prepare_public_developer_node(config, layout, manifest, true)?;
+    let node_target = NodeManagementTargetV1::try_new(
+        node_bootstrap.identity().node_id(),
+        node_bootstrap.management_endpoint_ref(),
+        node_bootstrap.tenure().node_incarnation(),
+        node_bootstrap.tenure().registration_epoch(),
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let runtime_channel = reconstruct_runtime_reference_channel_v2(ready)?;
+    let describe = ready.runtime_control_describe_ready();
+    let observed = describe.serving();
+    if describe.channel() != runtime_channel
+        || observed.target() != RuntimeHostId::from_bytes(config.control().target())
+        || observed.runtime_store_instance_id() != ready.runtime_store_instance_id()
+        || describe.manifest_digest() != Digest32::from_bytes(ready.manifest_digest())
+        || describe.build_instance_id() != ready.compiled_build_instance_id()
+    {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+    let serving = ReferenceBootstrapServingIdentityV1::try_new(
+        observed.target(),
+        observed.runtime_store_instance_id(),
+        observed.snapshot_sequence(),
+        observed.runtime_host_epoch(),
+        observed.clock_domain(),
+        observed.clock_generation(),
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let restricted = config.restricted_runtime_apply();
+    let transport = restricted.transport_profile();
+    let runtime_endpoint = RuntimeApplyEndpointDescriptorV1::try_new(
+        RuntimeApplyEndpointRefV1::try_from_bytes(transport.endpoint_ref())
+            .map_err(|_| LocalProcessError::NodeBootstrap)?,
+        observed.target(),
+        transport.endpoint_generation(),
+        transport.route(),
+        config.control().runtime_response_key_ref(),
+        ready.runtime_response_public_key(),
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let authority = RuntimeObservationAuthorityV1::try_new(
+        PrincipalRef::from_bytes(config.control().runtime_principal()),
+        runtime_channel,
+        serving,
+        runtime_endpoint,
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let observation_bootstrap =
+        RuntimeObservationBootstrapV1::try_new(RuntimeObservationBootstrapInputV1 {
+            expected_uid: Uid::effective().as_raw(),
+            expected_gid: Gid::effective().as_raw(),
+            generation_token: *observation_token,
+            node_target,
+            observation_endpoint_ref,
+            socket_path: observation_socket_path.clone(),
+            authorities: vec![authority],
+        })
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    write_public_runtime_observation_bootstrap_v2(
+        &observation_bootstrap_path,
+        &observation_bootstrap,
+    )?;
+    Ok(PreparedPublicDeveloperNodeV2 {
+        node_bootstrap,
+        node_status,
+        observation_bootstrap,
+        observation_bootstrap_path,
+        observation_socket_path,
+    })
+}
+
+fn reconstruct_runtime_reference_channel_v2(
+    ready: &RuntimeDeveloperLocalReadyV1,
+) -> Result<ReferenceChannelBindingV1, LocalProcessError> {
+    let metadata =
+        fs::symlink_metadata(ready.socket_path()).map_err(|_| LocalProcessError::NodeBootstrap)?;
+    if !metadata.file_type().is_socket()
+        || metadata.nlink() != 1
+        || metadata.uid() != ready.runtime_uid()
+        || metadata.gid() != ready.runtime_gid()
+        || metadata.mode() & 0o7777 != DEVELOPER_RUNTIME_CONTROL_SOCKET_MODE
+    {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+    let endpoint_identity = reference_local_control_endpoint_identity_digest_v1(
+        ready.socket_path().as_os_str().as_bytes(),
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode() & 0o7777,
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let process_identity = reference_runtime_peer_credentials_digest_v1(
+        ready.runtime_uid(),
+        ready.runtime_gid(),
+        u64::from(std::process::id()),
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let channel = ReferenceChannelBindingV1::try_new(
+        RuntimeHostId::from_bytes(ready.target()),
+        PrincipalRef::from_bytes(ready.runtime_principal()),
+        endpoint_identity,
+        process_identity,
+    )
+    .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    if channel.binding_digest() != Digest32::from_bytes(ready.channel_binding_digest())
+        || ready.runtime_control_describe_ready().channel() != channel
+    {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+    Ok(channel)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NodeObservationBootstrapFileIdentityV1 {
+    device: u64,
+    inode: u64,
+}
+
+impl NodeObservationBootstrapFileIdentityV1 {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        self.device == metadata.dev() && self.inode == metadata.ino()
+    }
+}
+
+struct LockedNodeObservationBootstrapFileV1 {
+    file: fs::File,
+    identity: NodeObservationBootstrapFileIdentityV1,
+}
+
+fn read_private_runtime_observation_bootstrap_v2(
+    path: &Path,
+) -> Result<
+    (
+        RuntimeObservationBootstrapV1,
+        LockedNodeObservationBootstrapFileV1,
+    ),
+    LocalProcessError,
+> {
+    let mut lease =
+        lock_private_runtime_observation_bootstrap(path, LocalProcessError::NodeBootstrap)?;
+    let mut wire = Zeroizing::new(Vec::new());
+    Read::by_ref(&mut lease.file)
+        .take(u64::try_from(MAX_RUNTIME_OBSERVATION_BOOTSTRAP_BYTES).unwrap_or(u64::MAX) + 1)
+        .read_to_end(&mut wire)
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    let after = fs::symlink_metadata(path).map_err(|_| LocalProcessError::NodeBootstrap)?;
+    validate_private_observation_bootstrap_metadata(
+        &after,
+        Uid::effective().as_raw(),
+        Gid::effective().as_raw(),
+    )?;
+    if !lease.identity.matches(&after)
+        || wire.is_empty()
+        || wire.len() > MAX_RUNTIME_OBSERVATION_BOOTSTRAP_BYTES
+    {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+    let bootstrap = RuntimeObservationBootstrapV1::decode_canonical_wire(&wire)
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
+    Ok((bootstrap, lease))
+}
+
+fn lock_private_runtime_observation_bootstrap(
+    path: &Path,
+    error: LocalProcessError,
+) -> Result<LockedNodeObservationBootstrapFileV1, LocalProcessError> {
+    let uid = Uid::effective().as_raw();
+    let gid = Gid::effective().as_raw();
+    let before = fs::symlink_metadata(path).map_err(|_| error)?;
+    validate_private_observation_bootstrap_metadata(&before, uid, gid).map_err(|_| error)?;
+    let owned = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|_| error)?;
+    let file = fs::File::from(owned);
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) | Err(TryLockError::Error(_)) => return Err(error),
+    }
+    let opened = file.metadata().map_err(|_| error)?;
+    validate_private_observation_bootstrap_metadata(&opened, uid, gid).map_err(|_| error)?;
+    let identity = NodeObservationBootstrapFileIdentityV1::from_metadata(&opened);
+    let after = fs::symlink_metadata(path).map_err(|_| error)?;
+    validate_private_observation_bootstrap_metadata(&after, uid, gid).map_err(|_| error)?;
+    if !identity.matches(&before) || !identity.matches(&after) {
+        return Err(error);
+    }
+    Ok(LockedNodeObservationBootstrapFileV1 { file, identity })
+}
+
+fn validate_private_observation_bootstrap_metadata(
+    metadata: &fs::Metadata,
+    uid: u32,
+    gid: u32,
+) -> Result<(), LocalProcessError> {
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != uid
+        || metadata.gid() != gid
+        || metadata.mode() & 0o7777 != DEVELOPER_NODE_PRIVATE_FILE_MODE
+    {
+        return Err(LocalProcessError::NodeBootstrap);
+    }
+    Ok(())
+}
+
+fn capture_private_runtime_observation_bootstrap_identity(
+    path: &Path,
+) -> Result<NodeObservationBootstrapFileIdentityV1, LocalProcessError> {
+    Ok(
+        lock_private_runtime_observation_bootstrap(path, LocalProcessError::NodeBootstrap)?
+            .identity,
+    )
+}
+
+fn write_public_runtime_observation_bootstrap_v2(
+    path: &Path,
+    expected: &RuntimeObservationBootstrapV1,
+) -> Result<(), LocalProcessError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.nlink() == 2 {
+                match expected.write_owner_private_file(path) {
+                    Ok(()) | Err(RuntimeObservationError::BootstrapAlreadyExists) => {}
+                    Err(_) => return Err(LocalProcessError::NodeBootstrap),
+                }
+            }
+            let (stale, lease) = read_private_runtime_observation_bootstrap_v2(path)?;
+            let expected_authorities = expected.authorities();
+            let stale_authorities = stale.authorities();
+            if stale.expected_uid() != expected.expected_uid()
+                || stale.expected_gid() != expected.expected_gid()
+                || stale.node_target() != expected.node_target()
+                || stale.observation_endpoint_ref() != expected.observation_endpoint_ref()
+                || stale.socket_path() != expected.socket_path()
+                || stale_authorities.len() != 1
+                || expected_authorities.len() != 1
+                || stale_authorities[0].runtime_host_id()
+                    != expected_authorities[0].runtime_host_id()
+                || stale_authorities[0].runtime_principal()
+                    != expected_authorities[0].runtime_principal()
+            {
+                return Err(LocalProcessError::NodeBootstrap);
+            }
+            remove_locked_runtime_observation_bootstrap(
+                path,
+                &lease,
+                LocalProcessError::NodeBootstrap,
+            )?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(LocalProcessError::NodeBootstrap),
+    }
+    expected
+        .write_owner_private_file(path)
+        .map_err(|_| LocalProcessError::NodeBootstrap)
+}
+
+fn remove_owned_runtime_observation_bootstrap(
+    path: &Path,
+    identity: NodeObservationBootstrapFileIdentityV1,
+    shutdown: bool,
+) -> Result<(), LocalProcessError> {
+    let error = if shutdown {
+        LocalProcessError::JoinedShutdown
+    } else {
+        LocalProcessError::NodeBootstrap
+    };
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(io_error) if io_error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(error),
+    }
+    let lease = lock_private_runtime_observation_bootstrap(path, error)?;
+    if lease.identity != identity {
+        return Err(error);
+    }
+    remove_locked_runtime_observation_bootstrap(path, &lease, error)
+}
+
+fn remove_locked_runtime_observation_bootstrap(
+    path: &Path,
+    lease: &LockedNodeObservationBootstrapFileV1,
+    error: LocalProcessError,
+) -> Result<(), LocalProcessError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| error)?;
+    validate_private_observation_bootstrap_metadata(
+        &metadata,
+        Uid::effective().as_raw(),
+        Gid::effective().as_raw(),
+    )
+    .map_err(|_| error)?;
+    let opened = lease.file.metadata().map_err(|_| error)?;
+    if !lease.identity.matches(&metadata) || !lease.identity.matches(&opened) {
+        return Err(error);
+    }
+    fs::remove_file(path).map_err(|_| error)?;
+    fs::File::open(path.parent().ok_or(error)?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| error)
 }
 
 fn public_developer_node_feature_report(
@@ -2343,17 +2797,222 @@ fn copy_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Lo
         .ok_or(LocalProcessError::NodeBootstrap)
 }
 
+#[derive(Clone)]
+struct NodeControlControllerVerifierV1 {
+    principal: PrincipalRef,
+    key_ref: ApplyAuthKeyRef,
+    key_fingerprint: Digest32,
+    key: VerifyingKey,
+}
+
+impl NodeControlControllerVerifierV1 {
+    fn try_new(
+        principal: PrincipalRef,
+        key_ref: ApplyAuthKeyRef,
+        public_key: [u8; 32],
+    ) -> Result<Self, LocalProcessError> {
+        let key =
+            VerifyingKey::from_bytes(&public_key).map_err(|_| LocalProcessError::NodeStartup)?;
+        if key.is_weak() {
+            return Err(LocalProcessError::NodeStartup);
+        }
+        let key_fingerprint = ed25519_control_key_fingerprint(&public_key)
+            .map_err(|_| LocalProcessError::NodeStartup)?;
+        Ok(Self {
+            principal,
+            key_ref,
+            key_fingerprint,
+            key,
+        })
+    }
+
+    fn authenticate<'a>(
+        &self,
+        request: &'a NodeControlCarrierRequestV1,
+    ) -> Result<
+        paraegox_node::protocol::ControllerAuthenticatedNodeControlCarrierV1<'a>,
+        NodeManagementProtocolError,
+    > {
+        let claim = request.authentication().claim();
+        if claim.algorithm().value() != DEVELOPER_NODE_CONTROL_ED25519_ALGORITHM
+            || claim.algorithm_version() != DEVELOPER_NODE_CONTROL_ED25519_ALGORITHM_VERSION
+            || request.authentication().signature().len() != DEVELOPER_NODE_CONTROL_SIGNATURE_BYTES
+        {
+            return Err(NodeManagementProtocolError::InvalidCarrierAuthentication);
+        }
+        request.verify_controller_carrier(
+            self.principal,
+            self.key_ref,
+            self.key_fingerprint,
+            |principal, key_ref, fingerprint, transcript, signature| {
+                if principal != self.principal
+                    || key_ref != self.key_ref
+                    || fingerprint != self.key_fingerprint
+                {
+                    return false;
+                }
+                let Ok(signature) =
+                    <[u8; DEVELOPER_NODE_CONTROL_SIGNATURE_BYTES]>::try_from(signature)
+                else {
+                    return false;
+                };
+                self.key
+                    .verify_strict(transcript, &Signature::from_bytes(&signature))
+                    .is_ok()
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodeControlDispatchErrorV1 {
+    Rejected,
+    Fatal,
+}
+
+fn dispatch_authenticated_node_control_v1(
+    canonical_request: &[u8],
+    bridge: &DeveloperLocalNodeControlBridgeV1,
+    verifier: &NodeControlControllerVerifierV1,
+) -> Result<Box<[u8]>, NodeControlDispatchErrorV1> {
+    dispatch_after_controller_authentication_v1(canonical_request, verifier, |authenticated| {
+        bridge.exchange_authenticated(authenticated)
+    })
+}
+
+fn dispatch_after_controller_authentication_v1<T, Dispatch>(
+    canonical_request: &[u8],
+    verifier: &NodeControlControllerVerifierV1,
+    dispatch: Dispatch,
+) -> Result<T, NodeControlDispatchErrorV1>
+where
+    Dispatch: for<'request> FnOnce(
+        paraegox_node::protocol::ControllerAuthenticatedNodeControlCarrierV1<'request>,
+    ) -> Result<T, DeveloperLocalNodeControlBridgeErrorV1>,
+{
+    let request = NodeControlCarrierRequestV1::decode(canonical_request)
+        .map_err(|_| NodeControlDispatchErrorV1::Rejected)?;
+    let authenticated = verifier
+        .authenticate(&request)
+        .map_err(|_| NodeControlDispatchErrorV1::Rejected)?;
+    dispatch(authenticated).map_err(|error| match error {
+        DeveloperLocalNodeControlBridgeErrorV1::Protocol(_)
+        | DeveloperLocalNodeControlBridgeErrorV1::Observation(_) => {
+            NodeControlDispatchErrorV1::Rejected
+        }
+        DeveloperLocalNodeControlBridgeErrorV1::InvalidConfiguration
+        | DeveloperLocalNodeControlBridgeErrorV1::Transport(_) => NodeControlDispatchErrorV1::Fatal,
+    })
+}
+
+struct RunningNodeControlEndpointV1 {
+    endpoint: Option<RestrictedNodeControlEndpointV1>,
+    worker: Option<JoinHandle<Result<(), LocalProcessError>>>,
+}
+
+impl RunningNodeControlEndpointV1 {
+    async fn start(
+        config: RestrictedNodeControlEndpointConfigV1,
+        bridge: DeveloperLocalNodeControlBridgeV1,
+        verifier: NodeControlControllerVerifierV1,
+    ) -> Result<Self, LocalProcessError> {
+        let (endpoint, receiver) = RestrictedNodeControlEndpointV1::start(config)
+            .await
+            .map_err(|_| LocalProcessError::NodeStartup)?;
+        let worker = tokio::spawn(run_node_control_worker_v1(
+            receiver,
+            Arc::new(bridge),
+            Arc::new(verifier),
+        ));
+        tokio::task::yield_now().await;
+        if worker.is_finished() {
+            let _ = endpoint.shutdown().await;
+            let _ = worker.await;
+            return Err(LocalProcessError::NodeStartup);
+        }
+        Ok(Self {
+            endpoint: Some(endpoint),
+            worker: Some(worker),
+        })
+    }
+
+    fn has_exited(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
+    }
+
+    async fn shutdown_and_join(mut self) -> Result<(), LocalProcessError> {
+        let endpoint_result = match self.endpoint.take() {
+            Some(endpoint) => endpoint
+                .shutdown()
+                .await
+                .map_err(|_| LocalProcessError::JoinedShutdown),
+            None => Ok(()),
+        };
+        let worker_result = match self.worker.take() {
+            Some(worker) => worker
+                .await
+                .map_err(|_| LocalProcessError::JoinedShutdown)?
+                .map_err(|_| LocalProcessError::JoinedShutdown),
+            None => Ok(()),
+        };
+        endpoint_result.and(worker_result)
+    }
+}
+
+impl Drop for RunningNodeControlEndpointV1 {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+        }
+        self.endpoint.take();
+    }
+}
+
+async fn run_node_control_worker_v1(
+    mut receiver: RestrictedNodeControlReceiverV1,
+    bridge: Arc<DeveloperLocalNodeControlBridgeV1>,
+    verifier: Arc<NodeControlControllerVerifierV1>,
+) -> Result<(), LocalProcessError> {
+    while let Some(inbound) = receiver.recv().await {
+        let canonical_request = inbound.canonical_request().to_vec();
+        let bridge = Arc::clone(&bridge);
+        let verifier = Arc::clone(&verifier);
+        let response = tokio::task::spawn_blocking(move || {
+            dispatch_authenticated_node_control_v1(
+                &canonical_request,
+                bridge.as_ref(),
+                verifier.as_ref(),
+            )
+        })
+        .await
+        .map_err(|_| LocalProcessError::NodeStartup)?;
+        match response {
+            Ok(response) => inbound
+                .respond(response.into_vec())
+                .map_err(|_| LocalProcessError::NodeStartup)?,
+            Err(NodeControlDispatchErrorV1::Rejected) => drop(inbound),
+            Err(NodeControlDispatchErrorV1::Fatal) => {
+                drop(inbound);
+                return Err(LocalProcessError::NodeStartup);
+            }
+        }
+    }
+    Ok(())
+}
+
 struct RunningNodeDaemon {
     child: Option<Child>,
     status: NodeStatusV1,
     status_observed_at: Instant,
-    observation_bootstrap_path: Option<PathBuf>,
+    observation_bootstrap: Option<(PathBuf, NodeObservationBootstrapFileIdentityV1)>,
 }
 
 impl RunningNodeDaemon {
     fn start(
         bootstrap_path: &Path,
-        bootstrap: DeveloperLocalReferenceBootstrapV1,
+        bootstrap: &DeveloperLocalReferenceBootstrapV1,
         expected_status: NodeStatusV1,
     ) -> Result<Self, LocalProcessError> {
         Self::start_inner(bootstrap_path, None, None, bootstrap, expected_status)
@@ -2363,12 +3022,14 @@ impl RunningNodeDaemon {
         bootstrap_path: &Path,
         observation_bootstrap_path: &Path,
         observation_socket_path: &Path,
-        bootstrap: DeveloperLocalReferenceBootstrapV1,
+        bootstrap: &DeveloperLocalReferenceBootstrapV1,
         expected_status: NodeStatusV1,
     ) -> Result<Self, LocalProcessError> {
+        let bootstrap_identity =
+            capture_private_runtime_observation_bootstrap_identity(observation_bootstrap_path)?;
         let result = Self::start_inner(
             bootstrap_path,
-            Some(observation_bootstrap_path),
+            Some((observation_bootstrap_path, bootstrap_identity)),
             Some(observation_socket_path),
             bootstrap,
             expected_status,
@@ -2377,16 +3038,20 @@ impl RunningNodeDaemon {
             // This invocation wrote PXOB immediately before spawning the
             // child. If spawn itself fails there is no RunningNodeDaemon guard
             // to own that file, so remove only this exact no-replace bootstrap.
-            let _ = fs::remove_file(observation_bootstrap_path);
+            let _ = remove_owned_runtime_observation_bootstrap(
+                observation_bootstrap_path,
+                bootstrap_identity,
+                true,
+            );
         }
         result
     }
 
     fn start_inner(
         bootstrap_path: &Path,
-        observation_bootstrap_path: Option<&Path>,
+        observation_bootstrap: Option<(&Path, NodeObservationBootstrapFileIdentityV1)>,
         observation_socket_path: Option<&Path>,
-        bootstrap: DeveloperLocalReferenceBootstrapV1,
+        bootstrap: &DeveloperLocalReferenceBootstrapV1,
         expected_status: NodeStatusV1,
     ) -> Result<Self, LocalProcessError> {
         let executable = env::current_exe().map_err(|_| LocalProcessError::NodeStartup)?;
@@ -2397,7 +3062,7 @@ impl RunningNodeDaemon {
             .arg(NODE_BOOTSTRAP_FILE_OPTION)
             .arg(bootstrap_path);
         #[cfg(not(test))]
-        if let Some(observation_bootstrap_path) = observation_bootstrap_path {
+        if let Some((observation_bootstrap_path, _)) = observation_bootstrap {
             command
                 .arg(NODE_OBSERVATION_BOOTSTRAP_FILE_OPTION)
                 .arg(observation_bootstrap_path);
@@ -2409,7 +3074,7 @@ impl RunningNodeDaemon {
             .arg("--nocapture")
             .env(NODE_DAEMON_PROBE_BOOTSTRAP_ENVIRONMENT, bootstrap_path);
         #[cfg(test)]
-        if let Some(observation_bootstrap_path) = observation_bootstrap_path {
+        if let Some((observation_bootstrap_path, _)) = observation_bootstrap {
             command.env(
                 NODE_DAEMON_PROBE_OBSERVATION_BOOTSTRAP_ENVIRONMENT,
                 observation_bootstrap_path,
@@ -2428,7 +3093,8 @@ impl RunningNodeDaemon {
             child: Some(child),
             status: expected_status,
             status_observed_at: Instant::now(),
-            observation_bootstrap_path: observation_bootstrap_path.map(Path::to_path_buf),
+            observation_bootstrap: observation_bootstrap
+                .map(|(path, identity)| (path.to_path_buf(), identity)),
         };
         if let Err(error) = running.wait_until_ready(bootstrap, observation_socket_path) {
             let _ = running.shutdown_inner();
@@ -2460,7 +3126,7 @@ impl RunningNodeDaemon {
 
     fn wait_until_ready(
         &mut self,
-        bootstrap: DeveloperLocalReferenceBootstrapV1,
+        bootstrap: &DeveloperLocalReferenceBootstrapV1,
         observation_socket_path: Option<&Path>,
     ) -> Result<(), LocalProcessError> {
         let deadline = Instant::now() + DEVELOPER_NODE_READY_TIMEOUT;
@@ -2496,7 +3162,7 @@ impl RunningNodeDaemon {
         }
 
         let endpoint = DeveloperLocalNodeManagementEndpointV1::try_from_bootstrap(
-            &bootstrap,
+            bootstrap,
             DEVELOPER_NODE_EXCHANGE_TIMEOUT,
         )
         .map_err(|_| LocalProcessError::NodeStartup)?;
@@ -2534,14 +3200,10 @@ impl RunningNodeDaemon {
     }
 
     fn cleanup_observation_bootstrap(&mut self) -> Result<(), LocalProcessError> {
-        let Some(path) = self.observation_bootstrap_path.take() else {
+        let Some((path, identity)) = self.observation_bootstrap.take() else {
             return Ok(());
         };
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(LocalProcessError::JoinedShutdown),
-        }
+        remove_owned_runtime_observation_bootstrap(&path, identity, true)
     }
 
     fn shutdown_inner(&mut self) -> Result<(), LocalProcessError> {
@@ -2596,6 +3258,7 @@ impl Drop for RunningNodeDaemon {
 struct RunningNodeOwners {
     runtime: Option<RuntimeDeveloperLocalLifecycleV1>,
     node: Option<RunningNodeDaemon>,
+    node_control: Option<RunningNodeControlEndpointV1>,
 }
 
 impl RunningNodeOwners {
@@ -2603,7 +3266,15 @@ impl RunningNodeOwners {
         Self {
             runtime: Some(runtime),
             node: None,
+            node_control: None,
         }
+    }
+
+    fn runtime_ready(&self) -> &RuntimeDeveloperLocalReadyV1 {
+        self.runtime
+            .as_ref()
+            .expect("Runtime exists after successful startup")
+            .ready()
     }
 
     fn node_mut(&mut self) -> &mut RunningNodeDaemon {
@@ -2612,7 +3283,17 @@ impl RunningNodeOwners {
             .expect("NodeDaemon exists after successful startup")
     }
 
-    fn shutdown(mut self) -> Result<(), LocalProcessError> {
+    fn node_control_has_exited(&self) -> bool {
+        self.node_control
+            .as_ref()
+            .is_some_and(RunningNodeControlEndpointV1::has_exited)
+    }
+
+    async fn shutdown(mut self) -> Result<(), LocalProcessError> {
+        let node_control_result = match self.node_control.take() {
+            Some(endpoint) => endpoint.shutdown_and_join().await,
+            None => Ok(()),
+        };
         let node_result = self
             .node
             .take()
@@ -2622,12 +3303,15 @@ impl RunningNodeOwners {
             .take()
             .map_or(Ok(()), |runtime| runtime.shutdown_and_join())
             .map_err(|_| LocalProcessError::JoinedShutdown);
-        node_result.and(runtime_result)
+        node_control_result.and(node_result).and(runtime_result)
     }
 }
 
 impl Drop for RunningNodeOwners {
     fn drop(&mut self) {
+        if let Some(endpoint) = self.node_control.take() {
+            drop(endpoint);
+        }
         if let Some(node) = self.node.take() {
             let _ = node.shutdown_and_join();
         }
@@ -2742,6 +3426,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    use ed25519_dalek::Signer as _;
     use paraegox_agent_contracts::{
         AgentConversationRequestId, AgentConversationRequestV1, AgentConversationTerminalResultV1,
         AgentConversationTurnId,
@@ -2757,8 +3442,10 @@ mod tests {
         InspectionFreshnessV1, InspectionHealthV1, InspectionLivenessV1, InspectionReadinessV1,
         InspectionReasonV1, LocalInspectionOverallV1, LocalInspectionSnapshotV2,
     };
-    use paraegox_kernel::identity::RuntimeHostId;
-    use paraegox_kernel::time::BoundedDuration;
+    use paraegox_kernel::digest::Digest32Builder;
+    use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
+    use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
+    use paraegox_node::protocol::{NodeControlCarrierKindV1, NodeControlCarrierRequestDraftV1};
     use paraegox_node::{
         RuntimeApplyEndpointDescriptorV1, RuntimeApplyEndpointRefV1, RuntimeHostLivenessV1,
         RuntimeHostStatusV1,
@@ -2770,6 +3457,7 @@ mod tests {
     use paraegox_runtime_contracts::managed_service::{
         ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
     };
+    use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyRequestAuthClaim};
 
     const TEST_LOOPBACK_ADAPTER_ID_V1: ModelAdapterIdV1 =
         match ModelAdapterIdV1::try_from_bytes(*b"px-test-loopback") {
@@ -2816,6 +3504,316 @@ mod tests {
         write_node_ready(&mut output).expect("node readiness marker");
         assert_eq!(output.bytes, b"paraegox: node ready\n");
         assert_eq!(output.flushes, 1);
+    }
+
+    #[test]
+    fn public_node_control_authenticates_before_dispatch() {
+        let principal = PrincipalRef::from_bytes([0x91; 16]);
+        let key_ref = ApplyAuthKeyRef::from_bytes([0x92; 16]);
+        let signing_key = SigningKey::from_bytes(&[0x93; 32]);
+        let verifier = NodeControlControllerVerifierV1::try_new(
+            principal,
+            key_ref,
+            signing_key.verifying_key().to_bytes(),
+        )
+        .expect("controller verifier");
+        let claim = ApplyRequestAuthClaim::try_new(
+            principal,
+            key_ref,
+            ApplyAuthAlgorithm::try_new(DEVELOPER_NODE_CONTROL_ED25519_ALGORITHM)
+                .expect("Ed25519 algorithm"),
+            DEVELOPER_NODE_CONTROL_ED25519_ALGORITHM_VERSION,
+            &[0x94; 32],
+        )
+        .expect("Controller auth claim");
+        let draft = NodeControlCarrierRequestDraftV1::try_describe([0x95; 16], claim)
+            .expect("Describe draft");
+        let signature = signing_key.sign(
+            draft
+                .signing_transcript()
+                .expect("Describe signing transcript")
+                .as_bytes(),
+        );
+        let request = draft
+            .finalize(&signature.to_bytes())
+            .expect("signed Describe");
+        let dispatches = AtomicUsize::new(0);
+        let kind = dispatch_after_controller_authentication_v1(
+            request.canonical_wire(),
+            &verifier,
+            |authenticated| {
+                dispatches.fetch_add(1, Ordering::AcqRel);
+                Ok::<_, DeveloperLocalNodeControlBridgeErrorV1>(authenticated.kind())
+            },
+        )
+        .expect("authenticated dispatch");
+        assert_eq!(kind, NodeControlCarrierKindV1::Describe);
+        assert_eq!(dispatches.load(Ordering::Acquire), 1);
+
+        let mut invalid_signature = request.canonical_wire().to_vec();
+        let last = invalid_signature
+            .last_mut()
+            .expect("canonical PXNR has a signature");
+        *last ^= 1;
+        let rejected_dispatches = AtomicUsize::new(0);
+        assert_eq!(
+            dispatch_after_controller_authentication_v1(
+                &invalid_signature,
+                &verifier,
+                |authenticated| {
+                    let _ = authenticated;
+                    rejected_dispatches.fetch_add(1, Ordering::AcqRel);
+                    Ok::<_, DeveloperLocalNodeControlBridgeErrorV1>(())
+                },
+            ),
+            Err(NodeControlDispatchErrorV1::Rejected)
+        );
+        assert_eq!(rejected_dispatches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn public_node_observation_bootstrap_cleanup_requires_the_exact_inode() {
+        let state_root = fresh_state_root("public-node-pxob-cleanup");
+        fs::create_dir(&state_root).expect("private test directory");
+        let _cleanup = TestCleanup {
+            state_root: state_root.clone(),
+            socket_directory: None,
+        };
+        let path = state_root.join("node-observation.pxob");
+        fs::write(&path, b"first").expect("first private bootstrap");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("first private mode");
+        let first = capture_private_runtime_observation_bootstrap_identity(&path)
+            .expect("first bootstrap identity");
+        let held_first = fs::File::open(&path).expect("hold first inode through replacement");
+
+        fs::remove_file(&path).expect("replace first bootstrap");
+        fs::write(&path, b"replacement").expect("replacement private bootstrap");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("replacement private mode");
+        assert_eq!(
+            remove_owned_runtime_observation_bootstrap(&path, first, true),
+            Err(LocalProcessError::JoinedShutdown)
+        );
+        assert_eq!(
+            fs::read(&path).expect("replacement bootstrap remains"),
+            b"replacement"
+        );
+        drop(held_first);
+
+        let replacement = capture_private_runtime_observation_bootstrap_identity(&path)
+            .expect("replacement bootstrap identity");
+        remove_owned_runtime_observation_bootstrap(&path, replacement, true)
+            .expect("exact replacement cleanup");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn public_node_observation_bootstrap_cleanup_refuses_a_live_owner_lock() {
+        let state_root = fresh_state_root("public-node-pxob-live-owner");
+        fs::create_dir(&state_root).expect("private test directory");
+        let _cleanup = TestCleanup {
+            state_root: state_root.clone(),
+            socket_directory: None,
+        };
+        let path = state_root.join("node-observation.pxob");
+        fs::write(&path, b"live-owner").expect("private bootstrap");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private mode");
+        let identity = capture_private_runtime_observation_bootstrap_identity(&path)
+            .expect("bootstrap identity");
+        let live_owner = fs::File::open(&path).expect("open live owner lease");
+        live_owner.try_lock().expect("claim live owner lease");
+
+        assert!(matches!(
+            read_private_runtime_observation_bootstrap_v2(&path),
+            Err(LocalProcessError::NodeBootstrap)
+        ));
+        assert_eq!(
+            remove_owned_runtime_observation_bootstrap(&path, identity, true),
+            Err(LocalProcessError::JoinedShutdown)
+        );
+        assert_eq!(
+            fs::read(&path).expect("live bootstrap remains"),
+            b"live-owner"
+        );
+
+        drop(live_owner);
+        remove_owned_runtime_observation_bootstrap(&path, identity, true)
+            .expect("released exact lease cleanup");
+        assert!(!path.exists());
+    }
+
+    fn runtime_observation_bootstrap_file_fixture(
+        socket_directory: &Path,
+    ) -> RuntimeObservationBootstrapV1 {
+        let node_id = NodeId::try_from_bytes([0xa1; 16]).expect("Node identity");
+        let node_incarnation =
+            NodeIncarnation::try_from_bytes([0xa2; 16]).expect("Node incarnation");
+        let node_target = NodeManagementTargetV1::try_new(
+            node_id,
+            NodeManagementEndpointRefV1::try_from_bytes([0xa3; 16])
+                .expect("Node management endpoint"),
+            node_incarnation,
+            1,
+        )
+        .expect("Node target");
+        let runtime_host_id = RuntimeHostId::from_bytes([0xa4; 16]);
+        let runtime_signing_key = SigningKey::from_bytes(&[0xa5; 32]);
+        let channel = ReferenceChannelBindingV1::try_new(
+            runtime_host_id,
+            PrincipalRef::from_bytes([0xa6; 16]),
+            Digest32::from_bytes([0xa7; 32]),
+            Digest32::from_bytes([0xa8; 32]),
+        )
+        .expect("Runtime channel");
+        let serving = ReferenceBootstrapServingIdentityV1::try_new(
+            runtime_host_id,
+            [0xa9; 32],
+            1,
+            1,
+            ClockDomainRef::from_bytes([0xaa; 16]),
+            ClockGeneration::try_new(1).expect("clock generation"),
+        )
+        .expect("Runtime serving identity");
+        let endpoint = RuntimeApplyEndpointDescriptorV1::try_new(
+            RuntimeApplyEndpointRefV1::try_from_bytes([0xab; 16]).expect("Runtime endpoint"),
+            runtime_host_id,
+            1,
+            "paraegox/v1/tests/node/runtime/apply",
+            [0xac; 16],
+            runtime_signing_key.verifying_key().to_bytes(),
+        )
+        .expect("Runtime endpoint descriptor");
+        let authority = RuntimeObservationAuthorityV1::try_new(
+            PrincipalRef::from_bytes([0xa6; 16]),
+            channel,
+            serving,
+            endpoint,
+        )
+        .expect("Runtime observation authority");
+        RuntimeObservationBootstrapV1::try_new(RuntimeObservationBootstrapInputV1 {
+            expected_uid: Uid::effective().as_raw(),
+            expected_gid: Gid::effective().as_raw(),
+            generation_token: [0xad; 32],
+            node_target,
+            observation_endpoint_ref: RuntimeObservationEndpointRefV1::try_from_bytes([0xae; 16])
+                .expect("observation endpoint"),
+            socket_path: socket_directory.join("observation.sock"),
+            authorities: vec![authority],
+        })
+        .expect("Runtime observation bootstrap")
+    }
+
+    fn authoritative_interrupted_bootstrap_path_for_test(path: &Path) -> PathBuf {
+        // Fault-fixture only: duplicate Node's frozen canonical temporary-name
+        // algorithm so Local can prove it delegates recovery to the Node
+        // writer. Production composition never parses or derives this name.
+        let mut builder = Digest32Builder::try_new(
+            b"paraegox.node.developer-local-reference.bootstrap-temp.sha256.v1",
+        )
+        .expect("bootstrap temporary-name domain");
+        builder
+            .field_bytes(path.as_os_str().as_bytes())
+            .expect("bootstrap path field");
+        let digest = builder.finish().into_bytes();
+        let discriminator = u64::from_be_bytes(
+            digest[..8]
+                .try_into()
+                .expect("digest prefix has eight bytes"),
+        );
+        path.parent().expect("bootstrap has a parent").join(format!(
+            ".paraegox-noded-{discriminator:016x}-{:08x}.pxnb.next",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn public_node_observation_bootstrap_recovers_authoritative_interrupted_publication() {
+        let state_root = fresh_state_root("public-node-pxob-interrupted-publication");
+        fs::create_dir(&state_root).expect("private test directory");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+            .expect("private test directory mode");
+        let socket_directory = fs::canonicalize(std::env::temp_dir())
+            .expect("canonical temporary root")
+            .join(format!(
+                "pxl-{}-{}",
+                std::process::id(),
+                TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir(&socket_directory).expect("private socket directory");
+        fs::set_permissions(&socket_directory, fs::Permissions::from_mode(0o700))
+            .expect("private socket directory mode");
+        let _cleanup = TestCleanup {
+            state_root: state_root.clone(),
+            socket_directory: Some(socket_directory.clone()),
+        };
+        let path = state_root.join("node-observation.pxob");
+        let expected = runtime_observation_bootstrap_file_fixture(&socket_directory);
+        expected
+            .write_owner_private_file(&path)
+            .expect("initial canonical PXOB");
+        let interrupted = authoritative_interrupted_bootstrap_path_for_test(&path);
+        fs::hard_link(&path, &interrupted).expect("interrupted authority publication link");
+        assert_eq!(
+            fs::symlink_metadata(&path).expect("PXOB metadata").nlink(),
+            2
+        );
+
+        write_public_runtime_observation_bootstrap_v2(&path, &expected)
+            .expect("authority-owned interrupted publication recovers");
+        assert!(!interrupted.exists());
+        assert_eq!(
+            fs::symlink_metadata(&path).expect("PXOB metadata").nlink(),
+            1
+        );
+        let (recovered, lease) =
+            read_private_runtime_observation_bootstrap_v2(&path).expect("strict recovered PXOB");
+        assert_eq!(
+            recovered
+                .canonical_wire()
+                .expect("recovered wire")
+                .as_slice(),
+            expected.canonical_wire().expect("expected wire").as_slice()
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn public_node_observation_bootstrap_rejects_an_unowned_second_hard_link() {
+        let state_root = fresh_state_root("public-node-pxob-unowned-hard-link");
+        fs::create_dir(&state_root).expect("private test directory");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+            .expect("private test directory mode");
+        let socket_directory = fs::canonicalize(std::env::temp_dir())
+            .expect("canonical temporary root")
+            .join(format!(
+                "pxl-{}-{}",
+                std::process::id(),
+                TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir(&socket_directory).expect("private socket directory");
+        fs::set_permissions(&socket_directory, fs::Permissions::from_mode(0o700))
+            .expect("private socket directory mode");
+        let _cleanup = TestCleanup {
+            state_root: state_root.clone(),
+            socket_directory: Some(socket_directory.clone()),
+        };
+        let path = state_root.join("node-observation.pxob");
+        let unowned_link = state_root.join("unowned-second-link");
+        let expected = runtime_observation_bootstrap_file_fixture(&socket_directory);
+        expected
+            .write_owner_private_file(&path)
+            .expect("initial canonical PXOB");
+        fs::hard_link(&path, &unowned_link).expect("unowned second hard link");
+
+        assert_eq!(
+            write_public_runtime_observation_bootstrap_v2(&path, &expected),
+            Err(LocalProcessError::NodeBootstrap)
+        );
+        let final_metadata = fs::symlink_metadata(&path).expect("PXOB remains");
+        let unowned_metadata = fs::symlink_metadata(&unowned_link).expect("second link remains");
+        assert_eq!(final_metadata.nlink(), 2);
+        assert_eq!(final_metadata.dev(), unowned_metadata.dev());
+        assert_eq!(final_metadata.ino(), unowned_metadata.ino());
     }
 
     #[test]

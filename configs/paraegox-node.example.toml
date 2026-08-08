@@ -1,12 +1,14 @@
-# Host-local G1 Node example. All hexadecimal values below are non-secret
+# Additive G2 Node example. All hexadecimal values below are non-secret
 # placeholder references or public verification keys. Never place a signing
-# seed, PXNB token, certificate contents, or private-key bytes in this file.
+# seed, PXNB/PXOB token, certificate contents, or private-key bytes in this file.
 #
 # Before launch, create state_root and its credentials child as the non-root service
-# user with mode 0700. The three TLS files must share that exact owner-private
-# credentials directory. The listener private-key file must be mode 0600; the CA and
-# listener certificate must not be group/other writable.
-schema_version = 1
+# user with mode 0700. All six TLS files must share that exact owner-private
+# credentials directory. Both listener private-key files must be mode 0600; CA
+# and listener certificates must not be group/other writable. Use
+# schema_version = 1 and omit [node_control] to retain the exact G1 host-local
+# profile.
+schema_version = 2
 state_root = "/var/lib/paraegox-node"
 
 [control]
@@ -38,3 +40,18 @@ control_transport_profile_ref = "12121212121212121212121212121212"
 root_ca_certificate_file = "/var/lib/paraegox-node/credentials/root-ca.pem"
 runtime_listener_certificate_file = "/var/lib/paraegox-node/credentials/runtime.pem"
 runtime_listener_private_key_file = "/var/lib/paraegox-node/credentials/runtime-key.pem"
+
+[node_control]
+endpoint_ref = "13131313131313131313131313131313"
+endpoint_generation = 1
+tls_listener_locator = "tls/192.0.2.10:7449"
+route = "paraegox/node/control/v1"
+trust_domain_ref = "14141414141414141414141414141414"
+trust_anchor_ref = "15151515151515151515151515151515"
+controller_connector_credential_ref = "16161616161616161616161616161616"
+node_listener_credential_ref = "17171717171717171717171717171717"
+control_transport_profile_ref = "18181818181818181818181818181818"
+node_certificate_principal = "19191919191919191919191919191919"
+root_ca_certificate_file = "/var/lib/paraegox-node/credentials/node-root-ca.pem"
+node_listener_certificate_file = "/var/lib/paraegox-node/credentials/node.pem"
+node_listener_private_key_file = "/var/lib/paraegox-node/credentials/node-key.pem"

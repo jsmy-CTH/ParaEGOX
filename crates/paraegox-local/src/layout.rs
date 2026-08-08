@@ -28,7 +28,9 @@ const NODE_SOCKET_DIRECTORY: &str = "node";
 const AUTHORITY_SOCKET_FILE: &str = "a.sock";
 const RUNTIME_SOCKET_FILE: &str = "r.sock";
 const NODE_MANAGEMENT_SOCKET_FILE: &str = "n.sock";
+const NODE_OBSERVATION_SOCKET_FILE: &str = "o.sock";
 const PXNB_BOOTSTRAP_FILE: &str = "node.pxnb";
+const PXOB_BOOTSTRAP_FILE: &str = "observe.pxob";
 const AGENT_IPC_SOCKET_FILE: &str = "c.sock";
 const AGENT_IPC_BOOTSTRAP_FILE: &str = "c.pxab";
 const INSPECTION_IPC_SOCKET_FILE: &str = "i.sock";
@@ -123,7 +125,9 @@ pub(crate) struct DeveloperNodeLayoutV1 {
     node_socket_directory: PathBuf,
     runtime_socket_path: PathBuf,
     node_management_socket_path: PathBuf,
+    node_observation_socket_path: Option<PathBuf>,
     pxnb_bootstrap_path: PathBuf,
+    pxob_bootstrap_path: Option<PathBuf>,
 }
 
 /// Shared owner paths for the two-target DeveloperLocal composition.
@@ -187,6 +191,9 @@ pub(crate) fn prepare_node(
     config: &DeveloperNodeConfigV1,
     identities: &DeveloperNodeIdentityManifestV1,
 ) -> Result<DeveloperNodeLayoutV1, DeveloperLocalLayoutError> {
+    if config.schema() != identities.schema() {
+        return Err(DeveloperLocalLayoutError::InvalidDerivedPath);
+    }
     let (canonical_state_root, uid, gid) = canonical_private_state_root(config.state_root())?;
     let runtime_state_directory = canonical_state_root.join(RUNTIME_STATE_DIRECTORY);
     let node_owner_directory = canonical_state_root.join(NODE_OWNER_DIRECTORY);
@@ -210,8 +217,17 @@ pub(crate) fn prepare_node(
     ensure_private_directory(&node_socket_directory, uid, gid)?;
     let runtime_socket_path = socket_directory.join(RUNTIME_SOCKET_FILE);
     let node_management_socket_path = node_socket_directory.join(NODE_MANAGEMENT_SOCKET_FILE);
+    let node_observation_socket_path = config
+        .node_control()
+        .map(|_| node_socket_directory.join(NODE_OBSERVATION_SOCKET_FILE));
     let pxnb_bootstrap_path = node_bootstrap_directory.join(PXNB_BOOTSTRAP_FILE);
-    for path in [&runtime_socket_path, &node_management_socket_path] {
+    let pxob_bootstrap_path = config
+        .node_control()
+        .map(|_| node_bootstrap_directory.join(PXOB_BOOTSTRAP_FILE));
+    for path in [&runtime_socket_path, &node_management_socket_path]
+        .into_iter()
+        .chain(node_observation_socket_path.iter())
+    {
         if path.as_os_str().as_bytes().len() > MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES {
             return Err(DeveloperLocalLayoutError::SocketPathTooLong);
         }
@@ -226,7 +242,9 @@ pub(crate) fn prepare_node(
         node_socket_directory,
         runtime_socket_path,
         node_management_socket_path,
+        node_observation_socket_path,
         pxnb_bootstrap_path,
+        pxob_bootstrap_path,
     };
     layout.validate(uid, gid)?;
     Ok(layout)
@@ -706,8 +724,16 @@ impl DeveloperNodeLayoutV1 {
         &self.node_management_socket_path
     }
 
+    pub(crate) fn node_observation_socket_path(&self) -> Option<&Path> {
+        self.node_observation_socket_path.as_deref()
+    }
+
     pub(crate) fn pxnb_bootstrap_path(&self) -> &Path {
         &self.pxnb_bootstrap_path
+    }
+
+    pub(crate) fn pxob_bootstrap_path(&self) -> Option<&Path> {
+        self.pxob_bootstrap_path.as_deref()
     }
 
     #[cfg(test)]
@@ -764,19 +790,37 @@ impl DeveloperNodeLayoutV1 {
             self.node_management_socket_path(),
             self.node_socket_directory(),
         )?;
+        if self.node_observation_socket_path().is_some() != self.pxob_bootstrap_path().is_some() {
+            return Err(DeveloperLocalLayoutError::InvalidDerivedPath);
+        }
+        if let Some(path) = self.node_observation_socket_path() {
+            validate_reserved_path(path, self.node_socket_directory())?;
+        }
         validate_reserved_path(self.pxnb_bootstrap_path(), self.node_bootstrap_directory())?;
+        if let Some(path) = self.pxob_bootstrap_path() {
+            validate_reserved_path(path, self.node_bootstrap_directory())?;
+        }
         for path in [
             self.runtime_socket_path(),
             self.node_management_socket_path(),
-        ] {
+        ]
+        .into_iter()
+        .chain(self.node_observation_socket_path())
+        {
             if path.as_os_str().as_bytes().len() > MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES {
                 return Err(DeveloperLocalLayoutError::SocketPathTooLong);
             }
         }
         if self.runtime_socket_path() == self.node_management_socket_path()
+            || self.node_observation_socket_path().is_some_and(|path| {
+                path == self.runtime_socket_path() || path == self.node_management_socket_path()
+            })
             || self
                 .pxnb_bootstrap_path()
                 .starts_with(self.node_state_directory())
+            || self.pxob_bootstrap_path().is_some_and(|path| {
+                path.starts_with(self.node_state_directory()) || path == self.pxnb_bootstrap_path()
+            })
         {
             return Err(DeveloperLocalLayoutError::OverlappingPath);
         }
@@ -1496,9 +1540,105 @@ mod tests {
                 .join(DISTRIBUTED_PXOB_BOOTSTRAP_FILE)
                 .exists()
         );
+        assert_eq!(first.node_observation_socket_path(), None);
+        assert_eq!(first.pxob_bootstrap_path(), None);
+        assert!(
+            !first
+                .node_socket_directory()
+                .join(NODE_OBSERVATION_SOCKET_FILE)
+                .exists()
+        );
+        assert!(
+            !first
+                .node_bootstrap_directory()
+                .join(PXOB_BOOTSTRAP_FILE)
+                .exists()
+        );
         let second = prepare_node(&config, &identities).expect("stable node-only reopen");
         assert_eq!(first.owned_paths(), second.owned_paths());
+        assert_eq!(second.node_observation_socket_path(), None);
+        assert_eq!(second.pxob_bootstrap_path(), None);
         drop(second);
+        drop(first);
+        drop(cleanup);
+    }
+
+    #[test]
+    fn public_node_v2_layout_adds_only_observation_socket_and_pxob_coordinates() {
+        let directory = TestDirectory::new();
+        let config = crate::config::developer_node_config_v2_for_test(&directory.path);
+        let identities =
+            crate::identity::load_or_create_node(&config).expect("node v2 identity owner");
+        let mut first = prepare_node(&config, &identities).expect("node v2 filesystem layout");
+        let cleanup = SocketDirectoryCleanup([first.socket_directory().to_path_buf()]);
+        let base_paths = first.owned_paths();
+        let observation_socket = first
+            .node_observation_socket_path()
+            .expect("schema v2 observation socket");
+        let pxob_bootstrap = first
+            .pxob_bootstrap_path()
+            .expect("schema v2 PXOB coordinate");
+
+        assert_eq!(
+            observation_socket.parent(),
+            Some(first.node_socket_directory())
+        );
+        assert_eq!(
+            pxob_bootstrap.parent(),
+            Some(first.node_bootstrap_directory())
+        );
+        assert_ne!(observation_socket, first.node_management_socket_path());
+        assert_ne!(pxob_bootstrap, first.pxnb_bootstrap_path());
+        assert!(!pxob_bootstrap.starts_with(first.node_state_directory()));
+        assert!(
+            base_paths
+                .iter()
+                .all(|path| *path != observation_socket && *path != pxob_bootstrap)
+        );
+        for absent in [
+            CONTROLLER_STATE_DIRECTORY,
+            SUCCESSOR_STATE_DIRECTORY,
+            AUTHORITY_STATE_DIRECTORY,
+            DISTRIBUTED_STATE_DIRECTORY,
+        ] {
+            assert!(!first.canonical_state_root().join(absent).exists());
+        }
+        assert!(
+            !first
+                .socket_directory()
+                .join(AGENT_IPC_SOCKET_FILE)
+                .exists()
+        );
+        assert!(
+            !first
+                .socket_directory()
+                .join(INSPECTION_IPC_SOCKET_FILE)
+                .exists()
+        );
+
+        let second = prepare_node(&config, &identities).expect("stable node v2 reopen");
+        assert_eq!(base_paths, second.owned_paths());
+        assert_eq!(
+            Some(observation_socket),
+            second.node_observation_socket_path()
+        );
+        assert_eq!(Some(pxob_bootstrap), second.pxob_bootstrap_path());
+        drop(second);
+
+        let uid = Uid::effective().as_raw();
+        let gid = Gid::effective().as_raw();
+        let original_observation_socket = first.node_observation_socket_path.clone();
+        first.node_observation_socket_path = Some(first.node_management_socket_path.clone());
+        assert_eq!(
+            first.validate(uid, gid).unwrap_err(),
+            DeveloperLocalLayoutError::OverlappingPath
+        );
+        first.node_observation_socket_path = original_observation_socket;
+        first.pxob_bootstrap_path = Some(first.pxnb_bootstrap_path.clone());
+        assert_eq!(
+            first.validate(uid, gid).unwrap_err(),
+            DeveloperLocalLayoutError::OverlappingPath
+        );
         drop(first);
         drop(cleanup);
     }

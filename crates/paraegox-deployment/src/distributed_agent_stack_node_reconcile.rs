@@ -976,38 +976,6 @@ impl TrustedLocalRuntimeObservationEndpointV1 {
     }
 }
 
-/// Complete non-query fields needed to build one canonical PXNO after a
-/// validated Runtime query. There are no optional or inferred fields.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeObservationPublishFieldsV1 {
-    intended_status_sequence: u64,
-    freshness_budget_nanos: u64,
-    runtime_host_id: RuntimeHostId,
-    authority_digest: Digest32,
-    challenge_issued_at_unix_nanos: u64,
-    challenge_expires_at_unix_nanos: u64,
-}
-
-impl RuntimeObservationPublishFieldsV1 {
-    pub(crate) const fn new(
-        intended_status_sequence: u64,
-        freshness_budget_nanos: u64,
-        runtime_host_id: RuntimeHostId,
-        authority_digest: Digest32,
-        challenge_issued_at_unix_nanos: u64,
-        challenge_expires_at_unix_nanos: u64,
-    ) -> Self {
-        Self {
-            intended_status_sequence,
-            freshness_budget_nanos,
-            runtime_host_id,
-            authority_digest,
-            challenge_issued_at_unix_nanos,
-            challenge_expires_at_unix_nanos,
-        }
-    }
-}
-
 /// PXNS plus the exact carrier binding already authenticated by a concrete
 /// transport. This constructor does not perform transport authentication; it
 /// is the handoff boundary after such verification.
@@ -1160,25 +1128,30 @@ pub(crate) struct DistributedAgentStackRuntimeQueryInputV1 {
     challenge_expires_at_unix_nanos: u64,
 }
 
+#[cfg(unix)]
 impl DistributedAgentStackRuntimeQueryInputV1 {
     pub(crate) fn try_new(
         request: ReferenceQueryRequestV1,
         serving_baseline: ReferenceBootstrapServingIdentityV1,
-        observation_endpoint_ref: RuntimeObservationEndpointRefV1,
-        fields: RuntimeObservationPublishFieldsV1,
+        challenge: NodeControlObservationChallengeV1,
     ) -> Result<Self, DistributedAgentStackNodeReconcileError> {
-        if fields.runtime_host_id != request.target() {
+        if request.target() != serving_baseline.target()
+            || serving_baseline.target() != challenge.runtime_host_id()
+        {
             return Err(DistributedAgentStackNodeReconcileError::TargetMismatch);
+        }
+        if request.authentication().claim().nonce() != challenge.query_nonce().as_bytes() {
+            return Err(DistributedAgentStackNodeReconcileError::InvalidState);
         }
         let value = Self {
             request,
             serving_baseline,
-            observation_endpoint_ref,
-            intended_status_sequence: fields.intended_status_sequence,
-            freshness_budget_nanos: fields.freshness_budget_nanos,
-            authority_digest: fields.authority_digest,
-            challenge_issued_at_unix_nanos: fields.challenge_issued_at_unix_nanos,
-            challenge_expires_at_unix_nanos: fields.challenge_expires_at_unix_nanos,
+            observation_endpoint_ref: challenge.observation_endpoint_ref(),
+            intended_status_sequence: challenge.intended_status_sequence(),
+            freshness_budget_nanos: challenge.freshness_budget_nanos(),
+            authority_digest: challenge.authority_digest(),
+            challenge_issued_at_unix_nanos: challenge.issued_at_unix_nanos(),
+            challenge_expires_at_unix_nanos: challenge.expires_at_unix_nanos(),
         };
         validate_runtime_query_input(&value)?;
         Ok(value)
@@ -3754,11 +3727,10 @@ mod tests {
         LOCAL_OBSERVATION_VERSION, NodeObservationProcessGenerationV1,
         RemoteNodeControlAdapterErrorV1, RemoteNodeControlAdapterV1,
         RemoteNodeControlTransportErrorV1, RemoteNodeControlTransportPinV1,
-        RemoteNodeMtlsExchangeSuccessV1, RuntimeObservationPublishFieldsV1,
-        TransportAuthenticatedNodeResponseV1, TrustedLocalNodeEndpointV1,
-        TrustedLocalRuntimeObservationClientFailureV1, TrustedLocalRuntimeObservationEndpointV1,
-        TrustedLocalRuntimeObservationExchangeErrorV1, runtime_query_attempt_is_retry_closed,
-        runtime_reaches_predecessor_snapshot,
+        RemoteNodeMtlsExchangeSuccessV1, TransportAuthenticatedNodeResponseV1,
+        TrustedLocalNodeEndpointV1, TrustedLocalRuntimeObservationClientFailureV1,
+        TrustedLocalRuntimeObservationEndpointV1, TrustedLocalRuntimeObservationExchangeErrorV1,
+        runtime_query_attempt_is_retry_closed, runtime_reaches_predecessor_snapshot,
         validate_distributed_agent_stack_node_wire_successor_v1,
         validate_runtime_observation_peer_credentials,
     };
@@ -4252,11 +4224,15 @@ mod tests {
         (bundle, nodes, state)
     }
 
-    fn durable_query_input(
+    fn durable_query_parts(
         predecessor: &VerifiedDistributedAgentStackPredecessorV1,
         marker: u8,
         endpoint_marker: u8,
-    ) -> DistributedAgentStackRuntimeQueryInputV1 {
+    ) -> (
+        ReferenceQueryRequestV1,
+        ReferenceBootstrapServingIdentityV1,
+        NodeControlObservationChallengeV1,
+    ) {
         let selector = ReferenceQuerySelectorV1::try_new(
             ReferenceQueryIdV1::from_bytes([marker; 16]),
             predecessor.target(),
@@ -4297,21 +4273,33 @@ mod tests {
             temporal.target_clock_generation(),
         )
         .expect("serving baseline");
-        DistributedAgentStackRuntimeQueryInputV1::try_new(
-            request,
-            serving,
-            RuntimeObservationEndpointRefV1::try_from_bytes([endpoint_marker; 16])
+        let challenge =
+            NodeControlObservationChallengeV1::try_new(NodeControlObservationChallengeFieldsV1 {
+                observation_endpoint_ref: RuntimeObservationEndpointRefV1::try_from_bytes(
+                    [endpoint_marker; 16],
+                )
                 .expect("observation endpoint ref"),
-            RuntimeObservationPublishFieldsV1::new(
-                2,
-                1_000,
-                predecessor.target(),
-                Digest32::from_bytes([endpoint_marker.wrapping_add(1); 32]),
-                10_000,
-                11_000,
-            ),
-        )
-        .expect("durable query input")
+                runtime_host_id: predecessor.target(),
+                authority_digest: Digest32::from_bytes([endpoint_marker.wrapping_add(1); 32]),
+                intended_status_sequence: 2,
+                freshness_budget_nanos: 1_000,
+                issued_at_unix_nanos: 10_000,
+                expires_at_unix_nanos: 11_000,
+                query_nonce: Digest32::from_bytes([marker.wrapping_add(1); 32]),
+            })
+            .expect("observation challenge");
+        (request, serving, challenge)
+    }
+
+    fn durable_query_input(
+        predecessor: &VerifiedDistributedAgentStackPredecessorV1,
+        marker: u8,
+        endpoint_marker: u8,
+    ) -> DistributedAgentStackRuntimeQueryInputV1 {
+        let (request, serving, challenge) =
+            durable_query_parts(predecessor, marker, endpoint_marker);
+        DistributedAgentStackRuntimeQueryInputV1::try_new(request, serving, challenge)
+            .expect("durable query input")
     }
 
     fn observe_current(
@@ -4709,6 +4697,49 @@ mod tests {
     }
 
     #[test]
+    fn runtime_query_input_rejects_wrong_nonce_and_cross_target_challenge() {
+        let (bundle, _, _) = initialized();
+        let (request, serving, challenge) =
+            durable_query_parts(&bundle.predecessors[0], 0x91, 0xa1);
+        let wrong_nonce_challenge =
+            NodeControlObservationChallengeV1::try_new(NodeControlObservationChallengeFieldsV1 {
+                observation_endpoint_ref: challenge.observation_endpoint_ref(),
+                runtime_host_id: challenge.runtime_host_id(),
+                authority_digest: challenge.authority_digest(),
+                intended_status_sequence: challenge.intended_status_sequence(),
+                freshness_budget_nanos: challenge.freshness_budget_nanos(),
+                issued_at_unix_nanos: challenge.issued_at_unix_nanos(),
+                expires_at_unix_nanos: challenge.expires_at_unix_nanos(),
+                query_nonce: Digest32::from_bytes([0x93; 32]),
+            })
+            .expect("well-shaped wrong-nonce challenge");
+        assert!(matches!(
+            DistributedAgentStackRuntimeQueryInputV1::try_new(
+                request.clone(),
+                serving,
+                wrong_nonce_challenge,
+            ),
+            Err(DistributedAgentStackNodeReconcileError::InvalidState)
+        ));
+
+        let (_, _, cross_target_challenge) =
+            durable_query_parts(&bundle.predecessors[1], 0x91, 0xa2);
+        assert_eq!(
+            request.authentication().claim().nonce(),
+            cross_target_challenge.query_nonce().as_bytes(),
+            "cross-target case must reach the target fence rather than the nonce fence"
+        );
+        assert!(matches!(
+            DistributedAgentStackRuntimeQueryInputV1::try_new(
+                request,
+                serving,
+                cross_target_challenge,
+            ),
+            Err(DistributedAgentStackNodeReconcileError::TargetMismatch)
+        ));
+    }
+
+    #[test]
     fn query_attempts_are_atomic_append_only_and_reject_identity_reuse() {
         let (bundle, _, initial) = initialized();
         let initial_wire = initial.encode().expect("PXDN v2");
@@ -5085,7 +5116,7 @@ mod tests {
         let endpoint = source
             .split_once("impl TrustedLocalRuntimeObservationEndpointV1")
             .and_then(|(_, tail)| {
-                tail.split_once("pub(crate) struct RuntimeObservationPublishFieldsV1")
+                tail.split_once("pub(crate) struct TransportAuthenticatedNodeResponseV1")
             })
             .map(|(section, _)| section)
             .unwrap_or_else(|| panic!("missing observation endpoint implementation"));

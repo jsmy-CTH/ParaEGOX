@@ -8,7 +8,16 @@ use std::{
 };
 
 use ed25519_dalek::VerifyingKey;
-use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
+use paraegox_fabric::RemoteTlsEndpoint;
+#[cfg(unix)]
+use paraegox_fabric::{
+    ResolvedRemoteMtlsIdentityFiles, RestrictedNodeControlEndpointConfigV1,
+    RestrictedNodeControlTransportPinsV1,
+};
+use paraegox_kernel::{
+    digest::Digest32,
+    identity::{PrincipalRef, RuntimeHostId},
+};
 use paraegox_model_adapters::{
     DeepSeekChatCompletionsProviderConfigV1, DeepSeekChatModelV1, MAX_OPENAI_RESPONSES_MODEL_BYTES,
     OpenAiResponsesProviderConfigV1,
@@ -32,9 +41,13 @@ const DEEPSEEK_CHAT_COMPLETIONS_PROVIDER: &str = "deepseek-chat-completions-v1";
 const OPENAI_SECRET_REF: &str = "env:OPENAI_API_KEY";
 const DEEPSEEK_SECRET_REF: &str = "env:DEEPSEEK_API_KEY";
 const CHAT_CONFIG_SCHEMA_VERSION: u16 = 1;
-const NODE_CONFIG_SCHEMA_VERSION: u16 = 1;
+const NODE_CONFIG_SCHEMA_V1: u16 = 1;
+const NODE_CONFIG_SCHEMA_V2: u16 = 2;
 const MAX_CHAT_CONFIG_BYTES: u64 = 64 * 1024;
-const NODE_CONFIG_COMMITMENT_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v1";
+const NODE_CONFIG_COMMITMENT_V1_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v1";
+const NODE_CONFIG_COMMITMENT_V2_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v2";
+const NODE_CONTROL_ROUTE_CONFIG_DOMAIN: &[u8] =
+    b"paraegox.local.developer-node-control-route-config.sha256.v1";
 const DEVELOPER_NODE_OPERATION_TIMEOUT_NANOS: u64 = 30_000_000_000;
 // In-progress two-target composition is intentionally not a public CLI. Keep
 // its parser reachable only through the same double-underscore convention as
@@ -129,6 +142,7 @@ struct DeveloperNodeConfigDocumentV1 {
     state_root: String,
     control: DeveloperNodeControlDocumentV1,
     restricted_runtime_apply: DeveloperNodeRestrictedRuntimeApplyDocumentV1,
+    node_control: Option<DeveloperNodeRemoteControlDocumentV2>,
 }
 
 #[derive(Deserialize)]
@@ -167,14 +181,49 @@ struct DeveloperNodeRestrictedRuntimeApplyDocumentV1 {
     runtime_listener_private_key_file: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperNodeRemoteControlDocumentV2 {
+    endpoint_ref: String,
+    endpoint_generation: u64,
+    tls_listener_locator: String,
+    route: String,
+    trust_domain_ref: String,
+    trust_anchor_ref: String,
+    controller_connector_credential_ref: String,
+    node_listener_credential_ref: String,
+    control_transport_profile_ref: String,
+    node_certificate_principal: String,
+    root_ca_certificate_file: String,
+    node_listener_certificate_file: String,
+    node_listener_private_key_file: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeveloperNodeConfigSchemaV1 {
+    HostLocalV1,
+    RemoteControlV2,
+}
+
+impl DeveloperNodeConfigSchemaV1 {
+    pub(crate) const fn wire_value(self) -> u16 {
+        match self {
+            Self::HostLocalV1 => NODE_CONFIG_SCHEMA_V1,
+            Self::RemoteControlV2 => NODE_CONFIG_SCHEMA_V2,
+        }
+    }
+}
+
 /// Strict, non-secret input for one host-local Runtime + NodeDaemon process.
 /// Controller and Authority private signing material can never be represented
 /// by this schema.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct DeveloperNodeConfigV1 {
+    schema: DeveloperNodeConfigSchemaV1,
     state_root: PathBuf,
     control: DeveloperNodeControlConfigV1,
     restricted_runtime_apply: DeveloperNodeRestrictedRuntimeApplyConfigV1,
+    node_control: Option<DeveloperNodeRemoteControlConfigV2>,
     config_commitment: [u8; 32],
 }
 
@@ -182,15 +231,21 @@ impl fmt::Debug for DeveloperNodeConfigV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DeveloperNodeConfigV1")
+            .field("schema", &self.schema)
             .field("state_root", &self.state_root)
             .field("control", &self.control)
             .field("restricted_runtime_apply", &self.restricted_runtime_apply)
+            .field("node_control", &self.node_control)
             .field("config_commitment", &"<redacted-digest>")
             .finish()
     }
 }
 
 impl DeveloperNodeConfigV1 {
+    pub(crate) const fn schema(&self) -> DeveloperNodeConfigSchemaV1 {
+        self.schema
+    }
+
     pub(crate) fn state_root(&self) -> &Path {
         &self.state_root
     }
@@ -203,6 +258,10 @@ impl DeveloperNodeConfigV1 {
         &self,
     ) -> &DeveloperNodeRestrictedRuntimeApplyConfigV1 {
         &self.restricted_runtime_apply
+    }
+
+    pub(crate) const fn node_control(&self) -> Option<&DeveloperNodeRemoteControlConfigV2> {
+        self.node_control.as_ref()
     }
 
     pub(crate) const fn config_commitment(&self) -> [u8; 32] {
@@ -330,6 +389,139 @@ impl DeveloperNodeRestrictedRuntimeApplyConfigV1 {
     }
     pub(crate) fn runtime_listener_private_key_file(&self) -> &Path {
         &self.runtime_listener_private_key_file
+    }
+}
+
+/// Node-owned listener input for the additive remote PXNR/PXNE/PXNS/PXNA
+/// control path.
+///
+/// The route/config digest is derived once from the cross-host semantic pins;
+/// it is not caller-provided and deliberately excludes role-local file paths.
+/// Certificate and private-key values cannot be represented by this type.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DeveloperNodeRemoteControlConfigV2 {
+    endpoint_ref: [u8; 16],
+    endpoint_generation: u64,
+    tls_listener_locator: RemoteTlsEndpoint,
+    route: Box<str>,
+    trust_domain_ref: DistributedFabricTrustDomainRefV1,
+    trust_anchor_ref: DistributedFabricTrustAnchorRefV1,
+    controller_connector_credential_ref: DistributedFabricCredentialRefV1,
+    node_listener_credential_ref: DistributedFabricCredentialRefV1,
+    control_transport_profile_ref: [u8; 16],
+    node_certificate_principal: PrincipalRef,
+    route_config_carrier_digest: Digest32,
+    root_ca_certificate_file: PathBuf,
+    node_listener_certificate_file: PathBuf,
+    node_listener_private_key_file: PathBuf,
+}
+
+impl fmt::Debug for DeveloperNodeRemoteControlConfigV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeveloperNodeRemoteControlConfigV2")
+            .field("endpoint", &self.tls_listener_locator)
+            .field("route", &"<owner-selected-route>")
+            .field("semantic_pins", &"<non-secret-pins>")
+            .field("credential_paths", &"<redacted-paths>")
+            .finish()
+    }
+}
+
+impl DeveloperNodeRemoteControlConfigV2 {
+    #[cfg(test)]
+    pub(crate) const fn endpoint_ref(&self) -> [u8; 16] {
+        self.endpoint_ref
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn endpoint_generation(&self) -> u64 {
+        self.endpoint_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tls_listener_locator(&self) -> &str {
+        self.tls_listener_locator.as_str()
+    }
+
+    pub(crate) fn route(&self) -> &str {
+        &self.route
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn trust_domain_ref(&self) -> DistributedFabricTrustDomainRefV1 {
+        self.trust_domain_ref
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn trust_anchor_ref(&self) -> DistributedFabricTrustAnchorRefV1 {
+        self.trust_anchor_ref
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn controller_connector_credential_ref(
+        &self,
+    ) -> DistributedFabricCredentialRefV1 {
+        self.controller_connector_credential_ref
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn node_listener_credential_ref(&self) -> DistributedFabricCredentialRefV1 {
+        self.node_listener_credential_ref
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn control_transport_profile_ref(&self) -> [u8; 16] {
+        self.control_transport_profile_ref
+    }
+
+    pub(crate) const fn node_certificate_principal(&self) -> PrincipalRef {
+        self.node_certificate_principal
+    }
+
+    pub(crate) const fn route_config_carrier_digest(&self) -> Digest32 {
+        self.route_config_carrier_digest
+    }
+
+    pub(crate) fn root_ca_certificate_file(&self) -> &Path {
+        &self.root_ca_certificate_file
+    }
+
+    pub(crate) fn node_listener_certificate_file(&self) -> &Path {
+        &self.node_listener_certificate_file
+    }
+
+    pub(crate) fn node_listener_private_key_file(&self) -> &Path {
+        &self.node_listener_private_key_file
+    }
+
+    /// Reconstructs the exact Fabric listener configuration from already
+    /// parsed pins. Local's credential metadata gate must run before this
+    /// value is handed to Fabric.
+    #[cfg(unix)]
+    pub(crate) fn try_listener_config(
+        &self,
+        controller_principal: PrincipalRef,
+    ) -> Result<RestrictedNodeControlEndpointConfigV1, ConfigError> {
+        let identity = ResolvedRemoteMtlsIdentityFiles::try_new(
+            self.node_listener_certificate_file.clone(),
+            self.node_listener_private_key_file.clone(),
+        )
+        .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+        let pins = RestrictedNodeControlTransportPinsV1::try_new(
+            controller_principal,
+            self.route_config_carrier_digest,
+            DEVELOPER_OPERATION_TIMEOUT,
+        )
+        .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+        RestrictedNodeControlEndpointConfigV1::try_new(
+            self.tls_listener_locator.clone(),
+            self.route.to_string(),
+            self.root_ca_certificate_file.clone(),
+            identity,
+            pins,
+        )
+        .map_err(|_| ConfigError::InvalidNodeConfiguration)
     }
 }
 
@@ -1457,9 +1649,14 @@ pub(crate) fn parse_node_config_toml_for_test(document: &str) -> Result<Command,
 fn parse_node_config_document(
     document: DeveloperNodeConfigDocumentV1,
 ) -> Result<Command, ConfigError> {
-    if document.schema_version != NODE_CONFIG_SCHEMA_VERSION {
-        return Err(ConfigError::UnsupportedConfigSchema);
-    }
+    let schema = match (document.schema_version, document.node_control.is_some()) {
+        (NODE_CONFIG_SCHEMA_V1, false) => DeveloperNodeConfigSchemaV1::HostLocalV1,
+        (NODE_CONFIG_SCHEMA_V2, true) => DeveloperNodeConfigSchemaV1::RemoteControlV2,
+        (NODE_CONFIG_SCHEMA_V1 | NODE_CONFIG_SCHEMA_V2, _) => {
+            return Err(ConfigError::InvalidNodeConfiguration);
+        }
+        _ => return Err(ConfigError::UnsupportedConfigSchema),
+    };
     let state_root = parse_state_root(document.state_root)?;
     let control_document = document.control;
     let control = DeveloperNodeControlConfigV1 {
@@ -1536,14 +1733,150 @@ fn parse_node_config_document(
             restricted.runtime_listener_private_key_file,
         )?,
     };
-    let config_commitment =
-        developer_node_config_commitment(&state_root, &control, &restricted_runtime_apply);
+    let node_control = document
+        .node_control
+        .map(|remote| parse_node_remote_control(remote, &control, &restricted_runtime_apply))
+        .transpose()?;
+    let config_commitment = developer_node_config_commitment(
+        schema,
+        &state_root,
+        &control,
+        &restricted_runtime_apply,
+        node_control.as_ref(),
+    );
     Ok(Command::DeveloperNodeV1(Box::new(DeveloperNodeConfigV1 {
+        schema,
         state_root,
         control,
         restricted_runtime_apply,
+        node_control,
         config_commitment,
     })))
+}
+
+fn parse_node_remote_control(
+    document: DeveloperNodeRemoteControlDocumentV2,
+    control: &DeveloperNodeControlConfigV1,
+    runtime: &DeveloperNodeRestrictedRuntimeApplyConfigV1,
+) -> Result<DeveloperNodeRemoteControlConfigV2, ConfigError> {
+    let endpoint_ref = parse_node_ref(&document.endpoint_ref)?;
+    if document.endpoint_generation == 0 {
+        return Err(ConfigError::InvalidNodeConfiguration);
+    }
+    let tls_listener_locator = RemoteTlsEndpoint::try_new(document.tls_listener_locator)
+        .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let route = document.route.into_boxed_str();
+    let trust_domain_ref = DistributedFabricTrustDomainRefV1::try_from_bytes(parse_node_ref(
+        &document.trust_domain_ref,
+    )?)
+    .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let trust_anchor_ref = DistributedFabricTrustAnchorRefV1::try_from_bytes(parse_node_ref(
+        &document.trust_anchor_ref,
+    )?)
+    .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let controller_connector_credential_ref = DistributedFabricCredentialRefV1::try_from_bytes(
+        parse_node_ref(&document.controller_connector_credential_ref)?,
+    )
+    .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let node_listener_credential_ref = DistributedFabricCredentialRefV1::try_from_bytes(
+        parse_node_ref(&document.node_listener_credential_ref)?,
+    )
+    .map_err(|_| ConfigError::InvalidNodeConfiguration)?;
+    let control_transport_profile_ref = parse_node_ref(&document.control_transport_profile_ref)?;
+    let node_certificate_principal =
+        PrincipalRef::from_bytes(parse_node_ref(&document.node_certificate_principal)?);
+    let root_ca_certificate_file = parse_tls_file_path(document.root_ca_certificate_file)?;
+    let node_listener_certificate_file =
+        parse_tls_file_path(document.node_listener_certificate_file)?;
+    let node_listener_private_key_file =
+        parse_tls_file_path(document.node_listener_private_key_file)?;
+    let node_paths = [
+        &root_ca_certificate_file,
+        &node_listener_certificate_file,
+        &node_listener_private_key_file,
+    ];
+    let runtime_paths = [
+        runtime.root_ca_certificate_file(),
+        runtime.runtime_listener_certificate_file(),
+        runtime.runtime_listener_private_key_file(),
+    ];
+    let semantic_refs = [
+        endpoint_ref,
+        *trust_domain_ref.as_bytes(),
+        *trust_anchor_ref.as_bytes(),
+        *controller_connector_credential_ref.as_bytes(),
+        *node_listener_credential_ref.as_bytes(),
+        control_transport_profile_ref,
+        *node_certificate_principal.as_bytes(),
+    ];
+    if semantic_refs.iter().enumerate().any(|(index, value)| {
+        semantic_refs[index + 1..]
+            .iter()
+            .any(|other| value == other)
+    }) || semantic_refs.iter().any(|value| {
+        control
+            .runtime_identity_refs()
+            .iter()
+            .any(|existing| value == existing)
+    }) || semantic_refs
+        .iter()
+        .any(|value| value == &control.enrollment_issuer_ref)
+        || tls_listener_locator.as_str()
+            == runtime.transport_profile().tls_listener_locator().as_str()
+        || route.as_ref() == runtime.transport_profile().route()
+        || node_paths
+            .iter()
+            .enumerate()
+            .any(|(index, value)| node_paths[index + 1..].contains(value))
+        || node_paths
+            .iter()
+            .any(|path| runtime_paths.contains(&path.as_path()))
+    {
+        return Err(ConfigError::InvalidNodeConfiguration);
+    }
+    let route_config_carrier_digest =
+        developer_node_control_route_config_digest(&DeveloperNodeControlRouteConfigDigestInputV2 {
+            endpoint_ref,
+            endpoint_generation: document.endpoint_generation,
+            tls_listener_locator: &tls_listener_locator,
+            route: route.as_ref(),
+            trust_domain_ref,
+            trust_anchor_ref,
+            controller_connector_credential_ref,
+            node_listener_credential_ref,
+            control_transport_profile_ref,
+            controller_principal: PrincipalRef::from_bytes(control.controller_principal),
+            node_certificate_principal,
+        });
+    let config = DeveloperNodeRemoteControlConfigV2 {
+        endpoint_ref,
+        endpoint_generation: document.endpoint_generation,
+        tls_listener_locator,
+        route,
+        trust_domain_ref,
+        trust_anchor_ref,
+        controller_connector_credential_ref,
+        node_listener_credential_ref,
+        control_transport_profile_ref,
+        node_certificate_principal,
+        route_config_carrier_digest,
+        root_ca_certificate_file,
+        node_listener_certificate_file,
+        node_listener_private_key_file,
+    };
+    #[cfg(unix)]
+    {
+        let listener =
+            config.try_listener_config(PrincipalRef::from_bytes(control.controller_principal))?;
+        if !listener.matches_transport_pins(
+            config.route(),
+            PrincipalRef::from_bytes(control.controller_principal),
+            config.route_config_carrier_digest(),
+        ) {
+            return Err(ConfigError::InvalidNodeConfiguration);
+        }
+    }
+    Ok(config)
 }
 
 fn parse_node_ref(value: &str) -> Result<[u8; 16], ConfigError> {
@@ -1568,13 +1901,18 @@ fn parse_verification_key(value: &str) -> Result<[u8; 32], ConfigError> {
 }
 
 fn developer_node_config_commitment(
+    schema: DeveloperNodeConfigSchemaV1,
     state_root: &Path,
     control: &DeveloperNodeControlConfigV1,
     restricted: &DeveloperNodeRestrictedRuntimeApplyConfigV1,
+    node_control: Option<&DeveloperNodeRemoteControlConfigV2>,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(NODE_CONFIG_COMMITMENT_DOMAIN);
-    digest.update(NODE_CONFIG_SCHEMA_VERSION.to_be_bytes());
+    digest.update(match schema {
+        DeveloperNodeConfigSchemaV1::HostLocalV1 => NODE_CONFIG_COMMITMENT_V1_DOMAIN,
+        DeveloperNodeConfigSchemaV1::RemoteControlV2 => NODE_CONFIG_COMMITMENT_V2_DOMAIN,
+    });
+    digest.update(schema.wire_value().to_be_bytes());
     update_node_commitment_field(&mut digest, state_root.as_os_str().as_encoded_bytes());
     for field in control.runtime_identity_refs() {
         digest.update(field);
@@ -1591,7 +1929,56 @@ fn developer_node_config_commitment(
     ] {
         update_node_commitment_field(&mut digest, path.as_os_str().as_encoded_bytes());
     }
+    if let Some(node_control) = node_control {
+        digest.update(node_control.route_config_carrier_digest.as_bytes());
+        for path in [
+            &node_control.root_ca_certificate_file,
+            &node_control.node_listener_certificate_file,
+            &node_control.node_listener_private_key_file,
+        ] {
+            update_node_commitment_field(&mut digest, path.as_os_str().as_encoded_bytes());
+        }
+    }
     digest.finalize().into()
+}
+
+struct DeveloperNodeControlRouteConfigDigestInputV2<'a> {
+    endpoint_ref: [u8; 16],
+    endpoint_generation: u64,
+    tls_listener_locator: &'a RemoteTlsEndpoint,
+    route: &'a str,
+    trust_domain_ref: DistributedFabricTrustDomainRefV1,
+    trust_anchor_ref: DistributedFabricTrustAnchorRefV1,
+    controller_connector_credential_ref: DistributedFabricCredentialRefV1,
+    node_listener_credential_ref: DistributedFabricCredentialRefV1,
+    control_transport_profile_ref: [u8; 16],
+    controller_principal: PrincipalRef,
+    node_certificate_principal: PrincipalRef,
+}
+
+fn developer_node_control_route_config_digest(
+    input: &DeveloperNodeControlRouteConfigDigestInputV2<'_>,
+) -> Digest32 {
+    let mut digest = Sha256::new();
+    digest.update(NODE_CONTROL_ROUTE_CONFIG_DOMAIN);
+    digest.update(NODE_CONFIG_SCHEMA_V2.to_be_bytes());
+    digest.update(input.endpoint_ref);
+    digest.update(input.endpoint_generation.to_be_bytes());
+    update_node_commitment_field(&mut digest, input.tls_listener_locator.as_str().as_bytes());
+    update_node_commitment_field(&mut digest, input.route.as_bytes());
+    for value in [
+        input.trust_domain_ref.as_bytes(),
+        input.trust_anchor_ref.as_bytes(),
+        input.controller_connector_credential_ref.as_bytes(),
+        input.node_listener_credential_ref.as_bytes(),
+        &input.control_transport_profile_ref,
+        input.controller_principal.as_bytes(),
+        input.node_certificate_principal.as_bytes(),
+    ] {
+        digest.update(value);
+    }
+    digest.update(DEVELOPER_NODE_OPERATION_TIMEOUT_NANOS.to_be_bytes());
+    Digest32::from_bytes(digest.finalize().into())
 }
 
 fn update_node_commitment_field(digest: &mut Sha256, value: &[u8]) {
@@ -1922,6 +2309,20 @@ pub(crate) fn developer_node_config_for_test(state_root: &Path) -> DeveloperNode
 }
 
 #[cfg(test)]
+pub(crate) fn developer_node_config_v2_for_test(state_root: &Path) -> DeveloperNodeConfigV1 {
+    let state_root = state_root.to_str().expect("UTF-8 test state root");
+    match parse_node_config_toml_for_test(&developer_node_document_v2_for_test(state_root))
+        .expect("valid developer node v2 test config")
+    {
+        Command::DeveloperNodeV1(config) => *config,
+        Command::DeveloperFixtureV1(_)
+        | Command::DeveloperDistributedFixtureV1(_)
+        | Command::DeveloperProvisionedV1(_)
+        | Command::Help => panic!("unexpected developer node v2 test command"),
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn developer_node_document_for_test(state_root: &str) -> String {
     format!(
         r#"schema_version = 1
@@ -1956,6 +2357,33 @@ control_transport_profile_ref = "12121212121212121212121212121212"
 root_ca_certificate_file = "{state_root}/credentials/root-ca.pem"
 runtime_listener_certificate_file = "{state_root}/credentials/runtime.pem"
 runtime_listener_private_key_file = "{state_root}/credentials/runtime-key.pem"
+"#
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn developer_node_document_v2_for_test(state_root: &str) -> String {
+    let legacy = developer_node_document_for_test(state_root).replacen(
+        "schema_version = 1",
+        "schema_version = 2",
+        1,
+    );
+    format!(
+        r#"{legacy}
+[node_control]
+endpoint_ref = "13131313131313131313131313131313"
+endpoint_generation = 1
+tls_listener_locator = "tls/192.0.2.10:7449"
+route = "paraegox/node/control/v1"
+trust_domain_ref = "14141414141414141414141414141414"
+trust_anchor_ref = "15151515151515151515151515151515"
+controller_connector_credential_ref = "16161616161616161616161616161616"
+node_listener_credential_ref = "17171717171717171717171717171717"
+control_transport_profile_ref = "18181818181818181818181818181818"
+node_certificate_principal = "19191919191919191919191919191919"
+root_ca_certificate_file = "{state_root}/credentials/node-root-ca.pem"
+node_listener_certificate_file = "{state_root}/credentials/node.pem"
+node_listener_private_key_file = "{state_root}/credentials/node-key.pem"
 "#
     )
 }
@@ -2219,6 +2647,204 @@ mod tests {
             parse(node_config_arguments(document)),
             Ok(Command::DeveloperNodeV1(_))
         ));
+    }
+
+    #[test]
+    fn node_config_v2_adds_only_typed_remote_control_listener_inputs() {
+        let document = developer_node_document_v2_for_test("/var/tmp/paraegox-node-v2-test");
+        let config = parse_node_fixture(&document);
+        assert_eq!(
+            config.schema(),
+            DeveloperNodeConfigSchemaV1::RemoteControlV2
+        );
+        let remote = config.node_control().expect("schema v2 node control");
+        assert_eq!(remote.endpoint_ref(), [0x13; 16]);
+        assert_eq!(remote.endpoint_generation(), 1);
+        assert_eq!(remote.tls_listener_locator(), "tls/192.0.2.10:7449");
+        assert_eq!(remote.route(), "paraegox/node/control/v1");
+        assert_eq!(remote.trust_domain_ref().as_bytes(), &[0x14; 16]);
+        assert_eq!(remote.trust_anchor_ref().as_bytes(), &[0x15; 16]);
+        assert_eq!(
+            remote.controller_connector_credential_ref().as_bytes(),
+            &[0x16; 16]
+        );
+        assert_eq!(
+            remote.node_listener_credential_ref().as_bytes(),
+            &[0x17; 16]
+        );
+        assert_eq!(remote.control_transport_profile_ref(), [0x18; 16]);
+        assert_eq!(remote.node_certificate_principal().as_bytes(), &[0x19; 16]);
+        assert_ne!(remote.route_config_carrier_digest().as_bytes(), &[0; 32]);
+        #[cfg(unix)]
+        {
+            let listener = remote
+                .try_listener_config(PrincipalRef::from_bytes(
+                    config.control().controller_principal(),
+                ))
+                .expect("typed Node listener config");
+            assert!(listener.matches_transport_pins(
+                remote.route(),
+                PrincipalRef::from_bytes(config.control().controller_principal()),
+                remote.route_config_carrier_digest(),
+            ));
+        }
+    }
+
+    #[test]
+    fn node_config_versions_and_secret_fields_fail_closed() {
+        let v1 = developer_node_document_for_test("/var/tmp/paraegox-node-v1-test");
+        let v2 = developer_node_document_v2_for_test("/var/tmp/paraegox-node-v2-test");
+        assert_eq!(
+            parse_node_fixture(&v1).schema(),
+            DeveloperNodeConfigSchemaV1::HostLocalV1
+        );
+        assert!(parse_node_fixture(&v1).node_control().is_none());
+        assert_eq!(
+            parse_node_config_toml_for_test(&v1.replacen(
+                "schema_version = 1",
+                "schema_version = 2",
+                1
+            )),
+            Err(ConfigError::InvalidNodeConfiguration)
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&v2.replacen(
+                "schema_version = 2",
+                "schema_version = 1",
+                1
+            )),
+            Err(ConfigError::InvalidNodeConfiguration)
+        );
+        assert_eq!(
+            parse_node_config_toml_for_test(&v2.replacen(
+                "schema_version = 2",
+                "schema_version = 3",
+                1
+            )),
+            Err(ConfigError::UnsupportedConfigSchema)
+        );
+        for forbidden in [
+            "pxob_token",
+            "inline_token",
+            "controller_signing_seed",
+            "authority_signing_seed",
+            "controller_client_private_key_file",
+            "node_listener_private_key",
+            "route_config_carrier_digest",
+        ] {
+            let injected = v2.replace(
+                "endpoint_ref =",
+                &format!(
+                    "{forbidden} = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\nendpoint_ref ="
+                ),
+            );
+            assert_eq!(
+                parse_node_config_toml_for_test(&injected),
+                Err(ConfigError::InvalidConfigDocument),
+                "unexpectedly accepted {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_control_digest_binds_shared_semantics_but_not_role_local_paths() {
+        let valid = developer_node_document_v2_for_test("/var/tmp/paraegox-node-v2-test");
+        let baseline = parse_node_fixture(&valid);
+        let baseline_remote = baseline.node_control().expect("schema v2");
+        for changed in [
+            valid.replace(
+                "endpoint_ref = \"13131313131313131313131313131313\"",
+                "endpoint_ref = \"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\"",
+            ),
+            valid.replace(
+                "endpoint_ref = \"13131313131313131313131313131313\"\nendpoint_generation = 1",
+                "endpoint_ref = \"13131313131313131313131313131313\"\nendpoint_generation = 2",
+            ),
+            valid.replace("tls/192.0.2.10:7449", "tls/192.0.2.10:7450"),
+            valid.replace("paraegox/node/control/v1", "paraegox/node/control/v2"),
+            valid.replace(
+                "trust_domain_ref = \"14141414141414141414141414141414\"",
+                "trust_domain_ref = \"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\"",
+            ),
+            valid.replace(
+                "trust_anchor_ref = \"15151515151515151515151515151515\"",
+                "trust_anchor_ref = \"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\"",
+            ),
+            valid.replace(
+                "controller_connector_credential_ref = \"16161616161616161616161616161616\"",
+                "controller_connector_credential_ref = \"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\"",
+            ),
+            valid.replace(
+                "node_listener_credential_ref = \"17171717171717171717171717171717\"",
+                "node_listener_credential_ref = \"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\"",
+            ),
+            valid.replace(
+                "control_transport_profile_ref = \"18181818181818181818181818181818\"",
+                "control_transport_profile_ref = \"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\"",
+            ),
+            valid.replace(
+                "controller_principal = \"06060606060606060606060606060606\"",
+                "controller_principal = \"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\"",
+            ),
+            valid.replace(
+                "node_certificate_principal = \"19191919191919191919191919191919\"",
+                "node_certificate_principal = \"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\"",
+            ),
+        ] {
+            let config = parse_node_fixture(&changed);
+            assert_ne!(
+                config
+                    .node_control()
+                    .expect("changed schema v2")
+                    .route_config_carrier_digest(),
+                baseline_remote.route_config_carrier_digest()
+            );
+        }
+
+        for changed in [
+            valid.replace(
+                "/var/tmp/paraegox-node-v2-test",
+                "/var/tmp/paraegox-node-v2-replacement",
+            ),
+            valid.replace("node-root-ca.pem", "replacement-node-root-ca.pem"),
+            valid.replace("node.pem", "replacement-node.pem"),
+            valid.replace("node-key.pem", "replacement-node-key.pem"),
+        ] {
+            let changed_path = parse_node_fixture(&changed);
+            assert_eq!(
+                changed_path
+                    .node_control()
+                    .expect("path-changed schema v2")
+                    .route_config_carrier_digest(),
+                baseline_remote.route_config_carrier_digest()
+            );
+            assert_ne!(
+                changed_path.config_commitment(),
+                baseline.config_commitment()
+            );
+        }
+    }
+
+    #[test]
+    fn node_config_v2_rejects_route_endpoint_identity_and_credential_aliases() {
+        let valid = developer_node_document_v2_for_test("/var/tmp/paraegox-node-v2-test");
+        for changed in [
+            valid.replace("tls/192.0.2.10:7449", "tls/192.0.2.10:7448"),
+            valid.replace(
+                "paraegox/node/control/v1",
+                "paraegox/runtime/target-a/apply",
+            ),
+            valid.replace(
+                "node_certificate_principal = \"19191919191919191919191919191919\"",
+                "node_certificate_principal = \"06060606060606060606060606060606\"",
+            ),
+            valid.replace("node-key.pem", "runtime-key.pem"),
+        ] {
+            assert_eq!(
+                parse_node_config_toml_for_test(&changed),
+                Err(ConfigError::InvalidNodeConfiguration)
+            );
+        }
     }
 
     #[test]
