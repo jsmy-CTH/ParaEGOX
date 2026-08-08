@@ -3088,9 +3088,9 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{
-        ActivationTerminalMode, DistributedAgentStackEvidenceStoreConfigV1,
+        ActivationContext, ActivationTerminalMode, DistributedAgentStackEvidenceStoreConfigV1,
         DistributedAgentStackOwnerConfig, DistributedAgentStackRuntimeCore,
-        DistributedAgentStackRuntimeError, TerminalGenerations,
+        DistributedAgentStackRuntimeError, TerminalGenerations, UncertainCleanupInput,
         ValidatedExperimentalPeerOwnerFacts, ValidatedExperimentalSnapshot,
         append_and_verify_evidence_batch, build_evidence_batch_with, evidence_paths_are_disjoint,
         experimental_snapshot_success_decision, map_runtime_deadline_from_prior_reactor_sample,
