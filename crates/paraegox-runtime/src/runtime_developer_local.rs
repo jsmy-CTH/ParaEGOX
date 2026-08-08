@@ -802,9 +802,7 @@ impl RuntimeDeveloperLocalReadyV1 {
     /// Returns the immutable Runtime-local serving and channel facts that the
     /// same owner signs into a remote PXDR Describe response. This value is
     /// not a TLS channel, signer, or mutation capability.
-    pub const fn runtime_control_describe_ready(
-        &self,
-    ) -> &RuntimeControlDescribeReadyFactsV1 {
+    pub const fn runtime_control_describe_ready(&self) -> &RuntimeControlDescribeReadyFactsV1 {
         &self.runtime_control_describe_ready
     }
 }
@@ -932,8 +930,7 @@ impl ReadyTemplate {
             || serving.runtime_store_instance_id() != self.runtime_store_instance_id
             || runtime_control_describe_ready.manifest_digest()
                 != Digest32::from_bytes(self.manifest_digest)
-            || runtime_control_describe_ready.build_instance_id()
-                != self.compiled_build_instance_id
+            || runtime_control_describe_ready.build_instance_id() != self.compiled_build_instance_id
         {
             return Err(RuntimeBootstrapEndpointError::InvalidStartedState);
         }
