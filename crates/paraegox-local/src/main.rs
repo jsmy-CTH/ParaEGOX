@@ -368,7 +368,7 @@ mod tests {
         assert!(text.contains("never Controller or Authority private\nkeys"));
         assert!(text.contains("does not run Controller, Authority"));
         assert!(text.contains("There is not yet a public Mac Controller connector"));
-        assert!(text.contains("two-host cutover proof"));
+        assert!(text.contains("There is no two-host\ncutover proof"));
         assert!(text.contains("remote Agent conversation"));
         assert!(text.contains("reconnect policy"));
         assert!(text.contains("absolute versioned configuration"));
