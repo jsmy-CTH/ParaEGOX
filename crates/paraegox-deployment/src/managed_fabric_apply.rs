@@ -3593,7 +3593,8 @@ pub(crate) mod tests {
         FreshManagedServingBootstrapV1, ManagedServingBootstrapStateV1,
         ManagedServingControllerError, ManagedServingDescribeIngressV1,
         ManagedServingDescribeReconcileDecodeV1, ManagedServingDescribeReconcilePhaseV1,
-        ManagedServingDescribeVerifierV1, RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+        ManagedServingDescribeVerifierV1, RuntimeAgentControlDurablePhaseV1,
+        RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
         RuntimeManagedServingDescribeTransportErrorV1, RuntimeManagedServingMtlsExchangeSuccessV1,
         RuntimeManagedServingTransportErrorV1,
     };
