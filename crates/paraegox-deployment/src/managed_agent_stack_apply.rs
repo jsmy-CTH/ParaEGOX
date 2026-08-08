@@ -1872,7 +1872,7 @@ impl fmt::Display for ManagedAgentStackApplyControllerError {
 impl std::error::Error for ManagedAgentStackApplyControllerError {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -1910,6 +1910,8 @@ mod tests {
         ManagedAgentStackApplyPhaseV1, ManagedAgentStackRemoteAgentControlActivateInputV1,
     };
     use crate::managed_agent_stack_producer::ManagedAgentStackProducerError;
+    #[cfg(unix)]
+    use crate::managed_fabric_apply::ManagedFabricApplyControllerError;
     use crate::managed_fabric_apply::{
         ManagedFabricApplyJournalV1, ManagedFabricControllerStateV1, tests as fabric_tests,
     };
@@ -2083,6 +2085,43 @@ mod tests {
         draft.finalize(&signature.to_bytes()).expect("signed PXST")
     }
 
+    #[cfg(unix)]
+    fn signed_descriptor_receipt(
+        request: &paraegox_runtime_contracts::managed_serving_bootstrap::RuntimeAgentControlRequestV1,
+        remote: &crate::managed_fabric_producer::ManagedFabricRemoteControllerProvisioningV1,
+        runtime: &SigningKey,
+        fabric_generation: ManagedServiceGeneration,
+        agent_generation: ManagedServiceGeneration,
+    ) -> paraegox_runtime_contracts::managed_serving_bootstrap::RuntimeAgentControlReceiptV1 {
+        let authenticated = request
+            .verify_controller_request(remote.describe().carrier(), |_, _, _, _, _| true)
+            .expect("authenticated descriptor PXAG fixture");
+        let auth = RuntimeAgentControlResponseAuthClaimV1::try_new(
+            remote.describe().carrier(),
+            ApplyAuthKeyRef::from_bytes([0x38; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("descriptor algorithm"),
+            1,
+        )
+        .expect("descriptor Runtime auth claim");
+        let draft = RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
+            authenticated,
+            b"PXAP\0\x01opaque",
+            fabric_generation,
+            agent_generation,
+            auth,
+        )
+        .expect("descriptor PXAH draft");
+        let signature = runtime.sign(
+            draft
+                .signing_transcript()
+                .expect("descriptor PXAH transcript")
+                .as_bytes(),
+        );
+        draft
+            .finalize(&signature.to_bytes())
+            .expect("signed descriptor PXAH")
+    }
+
     fn empty_stack_receipt(
         request: &paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentStackApplyRequestV1,
         runtime: &SigningKey,
@@ -2137,6 +2176,41 @@ mod tests {
             .expect("signed empty PXST")
     }
 
+    #[cfg(unix)]
+    pub(crate) fn prepared_remote_agent_stack_state(
+        fabric: &ManagedFabricControllerStateV1,
+        controller: &SigningKey,
+        remote: &crate::managed_fabric_producer::ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &crate::managed_serving_client::ManagedServingDescribeIngressV1,
+    ) -> super::ManagedAgentStackControllerStateV1 {
+        let requested = activation(
+            fabric,
+            deterministic_provider(),
+            lifecycle_budgets([7, 11, 13, 17, 19]),
+        );
+        let mut journal = ManagedAgentStackApplyJournalV1::new(fabric.clone());
+        journal
+            .prepare_remote_agent_control_activate_with(
+                ManagedAgentStackRemoteAgentControlActivateInputV1 {
+                    controller_signer: controller,
+                    provisioning: remote,
+                    previous: ingress,
+                    activation: &requested,
+                    inner_fresh: fresh(0xd7),
+                    outer_fresh: FreshRuntimeAgentControlV1::try_new([0xd7; 16], [0xda; 32])
+                        .expect("fresh sibling Agent PXAG"),
+                },
+                |_| Ok(()),
+            )
+            .expect("prepare sibling Agent state");
+        journal
+            .state()
+            .agent_stack_state()
+            .expect("prepared sibling Agent state")
+            .clone()
+    }
+
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn remote_agent_and_descriptor_pxag_actions_are_spent_once_and_restart_verified() {
         let controller = fabric_tests::controller_signer();
@@ -2298,6 +2372,122 @@ mod tests {
         assert_eq!(replay.inner(), terminal.inner());
         assert_eq!(replay.outer(), terminal.outer());
 
+        let (_, ready) = journal
+            .state()
+            .verified_current_remote_agent_context(&controller, &remote, &ingress)
+            .expect("descriptor tamper context");
+        let active_pxst_digest = journal
+            .state()
+            .agent_stack_state()
+            .and_then(super::ManagedAgentStackControllerStateV1::receipt)
+            .map(|receipt| receipt.receipt_digest())
+            .expect("active PXST digest");
+        let active_fabric_generation = journal
+            .state()
+            .receipt()
+            .and_then(|receipt| receipt.facts().generation())
+            .expect("active Fabric generation");
+        let active_agent_generation = journal
+            .state()
+            .agent_stack_state()
+            .and_then(super::ManagedAgentStackControllerStateV1::receipt)
+            .and_then(|receipt| receipt.facts().state().agent_generation())
+            .expect("active Agent generation");
+        let assert_descriptor_reopen_rejects =
+            |state: &ManagedFabricControllerStateV1, reason: &str| {
+                let encoded = state.encode().expect("checksum-resigned descriptor state");
+                assert_eq!(
+                    ManagedFabricControllerStateV1::decode_remote(
+                        &encoded,
+                        &controller,
+                        &remote,
+                        &ingress,
+                    )
+                    .expect_err("cross-state descriptor evidence must fail closed"),
+                    ManagedFabricApplyControllerError::AgentControlMismatch,
+                    "{reason}"
+                );
+            };
+
+        let mut wrong_root = *active_pxst_digest.as_bytes();
+        wrong_root[0] ^= 1;
+        let wrong_root_request = remote
+            .describe()
+            .try_build_conversation_port_agent_control(
+                &ready,
+                Digest32::from_bytes(wrong_root),
+                PrincipalRef::from_bytes([0xc1; 16]),
+                FreshRuntimeAgentControlV1::try_new([0xc4; 16], [0xc5; 32])
+                    .expect("fresh wrong-root descriptor PXAG"),
+                &controller,
+            )
+            .expect("validly signed wrong-root descriptor PXAG");
+        let wrong_root_slot = journal
+            .state()
+            .conversation_port_descriptor()
+            .try_prepare(wrong_root_request)
+            .expect("prepared wrong-root descriptor slot");
+        let wrong_root_state = journal
+            .state()
+            .try_with_descriptor_control(wrong_root_slot)
+            .expect("persist wrong-root descriptor fixture");
+        assert_descriptor_reopen_rejects(
+            &wrong_root_state,
+            "descriptor PXAG root must equal the active PXST receipt digest",
+        );
+
+        let wrong_generation_request = remote
+            .describe()
+            .try_build_conversation_port_agent_control(
+                &ready,
+                active_pxst_digest,
+                PrincipalRef::from_bytes([0xc1; 16]),
+                FreshRuntimeAgentControlV1::try_new([0xc6; 16], [0xc7; 32])
+                    .expect("fresh wrong-generation descriptor PXAG"),
+                &controller,
+            )
+            .expect("valid descriptor PXAG");
+        let prepared_slot = journal
+            .state()
+            .conversation_port_descriptor()
+            .try_prepare(wrong_generation_request)
+            .expect("prepared descriptor slot");
+        let prepared_state = journal
+            .state()
+            .try_with_descriptor_control(prepared_slot)
+            .expect("persist prepared descriptor fixture");
+        let claimed_slot = prepared_state
+            .conversation_port_descriptor()
+            .try_claim()
+            .expect("claim descriptor slot");
+        let uncertain_state = prepared_state
+            .try_with_descriptor_control(claimed_slot)
+            .expect("persist uncertain descriptor fixture");
+        let request = uncertain_state
+            .conversation_port_descriptor()
+            .request()
+            .expect("durable descriptor request");
+        let wrong_generation_receipt = signed_descriptor_receipt(
+            request,
+            &remote,
+            &runtime,
+            active_fabric_generation
+                .try_successor()
+                .expect("wrong Fabric generation"),
+            active_agent_generation,
+        );
+        let terminal_slot = uncertain_state
+            .conversation_port_descriptor()
+            .try_terminal(wrong_generation_receipt)
+            .expect("terminal descriptor slot");
+        let wrong_generation_state = uncertain_state
+            .try_with_descriptor_control(terminal_slot)
+            .expect("persist wrong-generation descriptor fixture");
+        assert_descriptor_reopen_rejects(
+            &wrong_generation_state,
+            "descriptor PXAH generations must equal the current Fabric and Agent generations",
+        );
+
         let descriptor_prepared = journal
             .prepare_conversation_port_descriptor_with(
                 &controller,
@@ -2333,34 +2523,13 @@ mod tests {
             .and_then(super::ManagedAgentStackControllerStateV1::receipt)
             .and_then(|receipt| receipt.facts().state().agent_generation())
             .expect("active Agent generation");
-        let authenticated = descriptor_action
-            .request()
-            .verify_controller_request(remote.describe().carrier(), |_, _, _, _, _| true)
-            .expect("authenticated descriptor PXAG fixture");
-        let auth = RuntimeAgentControlResponseAuthClaimV1::try_new(
-            remote.describe().carrier(),
-            ApplyAuthKeyRef::from_bytes([0x38; 16]),
-            ApplyAuthAlgorithm::try_new(1).expect("descriptor algorithm"),
-            1,
-        )
-        .expect("descriptor Runtime auth claim");
-        let draft = RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
-            authenticated,
-            b"PXAP\0\x01opaque",
+        let receipt = signed_descriptor_receipt(
+            descriptor_action.request(),
+            &remote,
+            &runtime,
             fabric_generation,
             agent_generation,
-            auth,
-        )
-        .expect("descriptor PXAH draft");
-        let signature = runtime.sign(
-            draft
-                .signing_transcript()
-                .expect("descriptor PXAH transcript")
-                .as_bytes(),
         );
-        let receipt = draft
-            .finalize(&signature.to_bytes())
-            .expect("signed descriptor PXAH");
         let transport = RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
             remote.describe().carrier().runtime_principal(),
             remote.describe().carrier().binding_digest(),
