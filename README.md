@@ -11,7 +11,7 @@ ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). 
 > presentation path; the retired Rust reference frontend has been removed. Ubuntu r33 commit
 > `7618f6a51c5eb5731874d2cdf3231603e3a824f7` additionally validates the public G1 host-local
 > `paraegox node` substrate. The current source additively wires the G2 host-side node profile
-> described below. Ubuntu r48 `56ae9fe6188bcfe9ef6c89158b5d319e8f4c87ac` is the latest validated G2
+> described below. Ubuntu r51 `b1d1206d2187b85d335ae352c226274d8e9d5827` is the latest validated G2
 > code-and-governance ref; it does not yet supply the public Mac Controller connector or two-host
 > proof. ParaEGOX is adopting a Rust-first core with polyglot managed workloads; no stable release
 > is currently available.
@@ -167,12 +167,19 @@ preserved byte-identical PXNI/PXNB hashes, forced child death made the parent fa
 `PXLC-NODE-CHILD`, and root launch failed before state with `PXLC-EXECUTION-IDENTITY`. These facts
 prove the G1 host-local substrate and cleanup/restart boundary only.
 
-The current G2 ref is r48 `56ae9fe6188bcfe9ef6c89158b5d319e8f4c87ac`. Ubuntu passed workspace
-format checking, the `paraegox-local` all-target check, warnings-denied Clippy, the binary build, and
-the complete governance checker. The six r46 focused G2 Local tests also passed. An earlier r43
-snapshot passed the complete non-root `paraegox-local` unit binary 109/109, but later test/recovery
-changes mean that historical result is not presented as an r48 full-suite pass; broader workspace
-test gates remain pending.
+The current G2 ref is r51 `b1d1206d2187b85d335ae352c226274d8e9d5827`. Ubuntu passed workspace
+format checking, the focused public-help test 1/1, the complete governance checker, workspace
+all-target checking, workspace all-target Clippy with warnings denied, and the complete non-root
+`paraegox-local` suite 111/111. All workspace all-target test executables also compiled and linked
+successfully under `--no-run`. Workspace doc tests passed, including two Fabric, one Kernel, and one
+runtime-contracts compile-fail doctest; other crates had no doctests. `--no-run` is not a claim that
+the complete workspace test suite executed.
+
+Separately, after the PXQR authentication nonce was bound to the exact Node observation challenge,
+the corresponding Deployment source/binary lineage passed the complete non-root Deployment suite
+374/374. No later change through r51 modified Deployment source, but the handoff did not preserve the
+exact immutable ref of that 374/374 invocation. It is therefore lineage evidence, not a claim that
+r51 itself reran the Deployment suite.
 
 The real non-root r48 schema-v2 process smoke reached Ready with exactly one hidden Node child, two
 non-loopback TLS listeners (`172.17.0.2:28448` and `:28449`), and the expected Runtime, management,

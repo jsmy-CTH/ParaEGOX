@@ -10,8 +10,8 @@ ParaEGOX 基于 [PhanthyMotus](https://github.com/4paradigm/phanthymotus) 构建
 > 现在是唯一 DeveloperLocal 展示路径；旧 Rust reference frontend 已删除。Ubuntu r33 commit
 > `7618f6a51c5eb5731874d2cdf3231603e3a824f7` 还验证了公开 G1 host-local
 > `paraegox node` 系统基座。当前源码又增量接入了下文所述的 G2 host-side Node profile，但尚未提供
-> 公开 Mac Controller connector 或真实双主机证明。Ubuntu r48
-> `56ae9fe6188bcfe9ef6c89158b5d319e8f4c87ac` 是当前最新已验证 G2 code-and-governance ref。生产核心机制
+> 公开 Mac Controller connector 或真实双主机证明。Ubuntu r51
+> `b1d1206d2187b85d335ae352c226274d8e9d5827` 是当前最新已验证 G2 code-and-governance ref。生产核心机制
 > 优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
 
 ## 当前可运行切片
@@ -144,11 +144,17 @@ Runtime split-trust/provisioning filter 通过。真实非 root process smoke �
 fail closed；root 启动在写 state 前以 `PXLC-EXECUTION-IDENTITY` 拒绝。这些事实只证明 G1 host-local
 基座及其 cleanup/restart 边界。
 
-当前 G2 ref 是 r48 `56ae9fe6188bcfe9ef6c89158b5d319e8f4c87ac`。Ubuntu 已通过 workspace format、
-`paraegox-local` all-target check、warnings-denied Clippy、binary build 和完整 governance checker；r46 的
-6 个 focused G2 Local tests 也全部通过。更早的 r43 snapshot 以非 root 身份通过完整
-`paraegox-local` unit binary 109/109，但后续仍有 test/recovery 改动，所以该历史结果不能写成 r48
-full-suite pass；更宽 workspace test gates 仍 pending。
+当前 G2 ref 是 r51 `b1d1206d2187b85d335ae352c226274d8e9d5827`。Ubuntu 已通过 workspace format、
+公开 help focused test 1/1、完整 governance checker、workspace all-target check、warnings-denied
+workspace all-target Clippy，以及完整 non-root `paraegox-local` suite 111/111。所有 workspace all-target
+test executable 也已通过 `--no-run` 完成编译和链接。workspace doc tests 已通过，包括 Fabric 2 个、
+Kernel 1 个以及 runtime-contracts 1 个 compile-fail doctest；其他 crate 为 0。`--no-run` 不表示完整
+workspace test suite 已执行。
+
+另有一条独立证据：PXQR authentication nonce 与精确 Node observation challenge 绑定修复后，对应
+Deployment source/binary lineage 的完整 non-root Deployment suite 374/374 通过。此后直到 r51 没有修改
+Deployment 源码，但交接没有保留该 374/374 invocation 的精确 immutable ref；因此这里只把它记为
+lineage evidence，不写成“r51 重新执行了 Deployment 374/374”。
 
 r48 真实 non-root schema-v2 process smoke 已到达 Ready：进程树严格为 parent + 1 个 hidden Node child，
 有两条 non-loopback TLS listener（`172.17.0.2:28448`、`:28449`）以及预期 Runtime、management、
