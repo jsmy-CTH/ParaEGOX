@@ -468,9 +468,7 @@ impl ManagedAgentStackRuntimeCore {
             return Err(RuntimeAgentConversationPortExportErrorV1::InternalInvariant);
         }
         if receipt.receipt_digest() != expected_active_pxst_digest {
-            return Err(
-                RuntimeAgentConversationPortExportErrorV1::ExpectedActiveReceiptMismatch,
-            );
+            return Err(RuntimeAgentConversationPortExportErrorV1::ExpectedActiveReceiptMismatch);
         }
         let broker_handle = self
             .handle_broker

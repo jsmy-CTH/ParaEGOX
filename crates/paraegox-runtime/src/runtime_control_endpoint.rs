@@ -90,9 +90,8 @@ use paraegox_runtime_contracts::{
         RUNTIME_AGENT_CONTROL_REQUEST_MAGIC, RuntimeAgentControlKindV1,
         RuntimeAgentControlReceiptDraftV1, RuntimeAgentControlRequestV1,
         RuntimeAgentControlResponseAuthClaimV1, RuntimeControlCarrierKindV1,
-        RuntimeControlCarrierRequestV1,
-        RuntimeControlDescribeReadyFactsV1, RuntimeControlDescribeReadyPhaseV1,
-        RuntimeControlDescribeReadyResponseDraftV1,
+        RuntimeControlCarrierRequestV1, RuntimeControlDescribeReadyFactsV1,
+        RuntimeControlDescribeReadyPhaseV1, RuntimeControlDescribeReadyResponseDraftV1,
     },
     provenance::{SourcePlanRevision, TargetSliceDigest},
     reference_control::{
@@ -1832,10 +1831,8 @@ impl ManagedFabricControlService {
         {
             return Err(RuntimeControlRequestError::Rejected);
         }
-        let auth_claim = runtime_agent_control_response_auth(
-            &self.provisioning,
-            request.carrier(),
-        )?;
+        let auth_claim =
+            runtime_agent_control_response_auth(&self.provisioning, request.carrier())?;
         let draft = match authenticated.kind() {
             RuntimeAgentControlKindV1::ApplyManagedFabric => {
                 let inner = request
@@ -1860,12 +1857,13 @@ impl ManagedFabricControlService {
                     .managed_agent_stack_apply_request()
                     .ok_or(RuntimeControlRequestError::Rejected)?;
                 let terminal_wire = self.handle_apply(inner.canonical_wire()).await?;
-                let terminal = ManagedAgentStackTerminalReceiptV1::decode(&terminal_wire)
-                    .map_err(|error| {
+                let terminal = ManagedAgentStackTerminalReceiptV1::decode(&terminal_wire).map_err(
+                    |error| {
                         RuntimeControlRequestError::Internal(
                             RuntimeBootstrapEndpointError::ManagedAgentStackContract(error),
                         )
-                    })?;
+                    },
+                )?;
                 RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
                     authenticated,
                     terminal,
@@ -2521,9 +2519,7 @@ fn decode_runtime_control_carrier(
 fn decode_runtime_agent_control_request(
     canonical_pxag: &[u8],
 ) -> Result<RuntimeAgentControlRequestV1, RuntimeControlRequestError> {
-    if canonical_pxag.is_empty()
-        || canonical_pxag.len() > MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES
-    {
+    if canonical_pxag.is_empty() || canonical_pxag.len() > MAX_RUNTIME_AGENT_CONTROL_REQUEST_BYTES {
         return Err(RuntimeControlRequestError::Rejected);
     }
     RuntimeAgentControlRequestV1::decode(canonical_pxag)
@@ -3442,11 +3438,8 @@ async fn handle_developer_restricted_runtime_control_v1(
     };
     if canonical_request.starts_with(RUNTIME_AGENT_CONTROL_REQUEST_MAGIC) {
         let request = decode_runtime_agent_control_request(canonical_request)?;
-        let authenticated = authenticate_runtime_agent_control_request(
-            provisioning,
-            &request,
-            expected_carrier,
-        )?;
+        let authenticated =
+            authenticate_runtime_agent_control_request(provisioning, &request, expected_carrier)?;
         if let DeveloperLocalControlState::Managed(managed) = control {
             return managed
                 .handle_authenticated_runtime_agent_control_request_v1(authenticated)
@@ -5983,8 +5976,9 @@ mod tests {
             ED25519_ALGORITHM,
             ED25519_ALGORITHM_VERSION,
         );
-        let draft = RuntimeAgentControlRequestDraftV1::try_apply_managed_agent_stack(fields, request)
-            .unwrap_or_else(|error| panic!("Agent-control stack draft rejected: {error}"));
+        let draft =
+            RuntimeAgentControlRequestDraftV1::try_apply_managed_agent_stack(fields, request)
+                .unwrap_or_else(|error| panic!("Agent-control stack draft rejected: {error}"));
         finalize_runtime_agent_control_request(draft, ED25519_SIGNATURE_BYTES)
     }
 
@@ -7433,12 +7427,9 @@ mod tests {
             2_000_000_000,
         )
         .unwrap_or_else(|error| panic!("managed Agent ingress rejected: {error}"));
-        let port = ManagedAgentPortPlanV1::try_new_target_scoped(
-            TARGET,
-            service.service_id(),
-            ingress,
-        )
-        .unwrap_or_else(|error| panic!("managed Agent port rejected: {error}"));
+        let port =
+            ManagedAgentPortPlanV1::try_new_target_scoped(TARGET, service.service_id(), ingress)
+                .unwrap_or_else(|error| panic!("managed Agent port rejected: {error}"));
         let provider = ManagedAgentProviderSelectionV1::try_deterministic_fixture(
             ManagedAgentProviderRefV1::try_from_bytes([0xb3; 16])
                 .unwrap_or_else(|error| panic!("managed provider ref rejected: {error}")),
@@ -7919,7 +7910,9 @@ mod tests {
                 &carrier,
                 verify_runtime_agent_response_signature,
             )
-            .unwrap_or_else(|error| panic!("restricted predecessor PXAH verification failed: {error}"));
+            .unwrap_or_else(|error| {
+                panic!("restricted predecessor PXAH verification failed: {error}")
+            });
         let fabric_receipt = fabric_outer_receipt
             .managed_fabric_receipt()
             .unwrap_or_else(|| panic!("restricted predecessor PXAH lost PXFT"));
@@ -7969,10 +7962,7 @@ mod tests {
             .successor_snapshot_sequence;
         assert_eq!(
             control
-                .handle_restricted_runtime_control_frame_v1(
-                    stack_outer.canonical_wire(),
-                    &carrier,
-                )
+                .handle_restricted_runtime_control_frame_v1(stack_outer.canonical_wire(), &carrier)
                 .await
                 .unwrap_or_else(|error| panic!("same PXAG-v2 replay failed: {error:?}")),
             stack_wire,
@@ -8770,11 +8760,9 @@ mod tests {
             map_runtime_agent_port_export_error(
                 RuntimeAgentConversationPortExportErrorV1::InternalInvariant,
             ),
-            RuntimeControlRequestError::Internal(
-                RuntimeBootstrapEndpointError::ManagedAgentStack(
-                    ManagedAgentStackRuntimeError::InvalidDurableState
-                )
-            )
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedAgentStack(
+                ManagedAgentStackRuntimeError::InvalidDurableState
+            ))
         ));
     }
 
@@ -8831,7 +8819,10 @@ mod tests {
             .conversation_port_descriptor()
             .unwrap_or_else(|| panic!("PXAH descriptor payload disappeared"));
         assert!(descriptor.starts_with(b"PXAP\0\x01"));
-        assert_eq!(receipt.expected_active_pxst_digest(), active.receipt_digest());
+        assert_eq!(
+            receipt.expected_active_pxst_digest(),
+            active.receipt_digest()
+        );
         assert_eq!(receipt.intended_client(), intended_client);
         assert_eq!(
             receipt.fabric_generation(),
@@ -8881,10 +8872,7 @@ mod tests {
             );
             assert!(matches!(
                 control
-                    .handle_restricted_runtime_control_frame_v1(
-                        invalid.canonical_wire(),
-                        &carrier,
-                    )
+                    .handle_restricted_runtime_control_frame_v1(invalid.canonical_wire(), &carrier)
                     .await,
                 Err(RuntimeControlRequestError::Rejected)
             ));
