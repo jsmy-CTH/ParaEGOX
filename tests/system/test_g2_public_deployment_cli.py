@@ -589,6 +589,7 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
         )
         deployment: RunningProcess | None = None
         deployment_restart: RunningProcess | None = None
+        node_restart: RunningProcess | None = None
         wrong_pin: RunningProcess | None = None
         node_down: RunningProcess | None = None
         try:
@@ -675,6 +676,19 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
             deployment.close_logs()
             deployment = None
 
+            assert node.process.poll() is None
+            node.process.send_signal(signal.SIGTERM)
+            assert _wait_for_exit(node) == 0, _logs(node)
+            node.close_logs()
+
+            node_restart = _spawn(
+                [*command_prefix, str(binary), "node", "--config", str(node_config)],
+                name="node-restart",
+                root=root,
+                environment=environment,
+            )
+            _wait_for_marker(node_restart, NODE_READY)
+
             deployment_restart = _spawn(
                 [
                     *command_prefix,
@@ -694,9 +708,11 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
             deployment_restart.close_logs()
             deployment_restart = None
 
-            assert node.process.poll() is None
-            node.process.send_signal(signal.SIGTERM)
-            assert _wait_for_exit(node) == 0, _logs(node)
+            assert node_restart.process.poll() is None
+            node_restart.process.send_signal(signal.SIGTERM)
+            assert _wait_for_exit(node_restart) == 0, _logs(node_restart)
+            node_restart.close_logs()
+            node_restart = None
 
             node_down_config = root / "cfg" / "deployment-node-down.toml"
             node_down_socket = root / "authority-node-down-socket" / "authority.sock"
@@ -735,6 +751,13 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
             node_down.close_logs()
             node_down = None
         finally:
-            for process in (node_down, wrong_pin, deployment_restart, deployment, node):
+            for process in (
+                node_down,
+                wrong_pin,
+                deployment_restart,
+                deployment,
+                node_restart,
+                node,
+            ):
                 if process is not None:
                     _stop_process(process)
