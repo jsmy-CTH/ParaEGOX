@@ -7,8 +7,10 @@ ParaEGOX 基于 [PhanthyMotus](https://github.com/4paradigm/phanthymotus) 构建
 > 当前状态：当前工作树已有首个 DeveloperLocal 后端、Textual 对话组合和 typed 单次 Inspection
 > 启动视图。原生 Intel macOS r29 artifact run `31238285076` 已通过真实可搬移 bundle 的 Inspection、
 > Runtime Agent IPC、Echo、Textual Ctrl-C、terminal restoration 和父进程 joined shutdown。Textual
-> 现在是唯一 DeveloperLocal 展示路径；旧 Rust reference frontend 已删除。生产核心机制优先采用
-> Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
+> 现在是唯一 DeveloperLocal 展示路径；旧 Rust reference frontend 已删除。Ubuntu r33 commit
+> `7618f6a51c5eb5731874d2cdf3231603e3a824f7` 还验证了公开 G1 host-local
+> `paraegox node` 系统基座。生产核心机制优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，
+> 暂未提供稳定版本。
 
 ## 当前可运行切片
 
@@ -24,7 +26,7 @@ paraegox chat --config <absolute-paraegox.toml>
 ```
 
 provider、model、state root 和 Fabric listener 由 strict versioned TOML 配置选择，不是 provider 专属
-子命令或 override flags。Secret value 不得进入配置或 argv，配置只保存精确 SecretRef。仓库唯一的
+子命令或 override flags。Secret value 不得进入配置或 argv，配置只保存精确 SecretRef。Chat 配置的
 无凭据示例是 [`configs/paraegox.example.toml`](configs/paraegox.example.toml)；它当前选择 DeepSeek
 作为可替换验证后端，不表示 CLI mode 或默认模型。
 
@@ -92,6 +94,38 @@ launcher 会创建或安全重开精确的本地 Node tenure，提交一份初�
 它**不证明** Runtime discovery、持续 observation/reconciliation、生产 Zenoh carrier、registration
 acquisition、多主机运行或 distributed readiness。正常退出顺序为 Textual child/Agent IPC → Runtime
 内部 Agent→Model→Fabric → NodeDaemon → Authority，并逐个 joined。
+
+## 可运行的 G1 host-local Node 基座
+
+下面这个独立公开命令只启动一个 split-trust Runtime 和一个 feature-only NodeDaemon child：
+
+```text
+paraegox node --config <absolute-node.toml>
+```
+
+它会绑定配置中的 restricted mTLS Runtime-apply listener，并让 listener 保持固定的 legacy generic
+rejection；随后发布 RuntimeHost observation 为零的 Node status，通过一次 authenticated typed Latest
+严格验证 child，最后输出精确 readiness marker：`paraegox: node ready`。它不启动 Authority、
+DeploymentController、managed Fabric、Model、Agent、Inspection、Textual 或 chat 链，也不执行
+Controller apply、registration、remote bootstrap 或 G2/多主机编排。
+
+从 [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml) 开始。把它复制到绝对普通
+文件路径，将仅用于文档的 `192.0.2.10` listener 地址替换为宿主机真实拥有的 IPv4，并同步修改
+`state_root` 和三条 credential path。启动前，同一个非 root 账号必须创建 canonical state root 及其
+精确的 `credentials` 子目录，两者 mode 都是 `0700`。在该目录放入 PEM root CA、listener certificate
+和 key；certificate SAN 必须包含配置 IP，key 必须是 `0600`，CA/certificate 不得允许 group/other
+写入。示例只含非秘密 reference value 和 public verification key；只有 Controller/Authority enrollment
+owner 才能替换这些 pin，绝不能填入 private seed。完整 credential 准备与启动命令见本地
+`docs/runbooks/developer-local.md`。
+
+Ubuntu r33 commit `7618f6a51c5eb5731874d2cdf3231603e3a824f7` 已通过 workspace format、locked
+metadata、workspace all-target check 和 warnings-denied workspace all-target Clippy。完整
+`paraegox-local` unit binary 以非 root 身份 98/98 通过；另有 9 个 focused Local filter 和 3 个非 root
+Runtime split-trust/provisioning filter 通过。真实非 root process smoke 到达 readiness marker，且进程树
+只有一个 child、一个非 loopback TLS listener 和两条预期 private Unix socket。SIGTERM 与 SIGINT 均
+返回 0；restart 保持 PXNI/PXNB hash 逐字相同；强制杀死 child 后 parent 以 `PXLC-NODE-CHILD`
+fail closed；root 启动在写 state 前以 `PXLC-EXECUTION-IDENTITY` 拒绝。这些事实只证明 G1 host-local
+基座及其 cleanup/restart 边界。
 
 在建的双目标 DeveloperLocal composition 仍是内部实现；当前没有公开的
 `developer-distributed-fixture-v1` 命令，也不宣称分布式系统已经可运行。

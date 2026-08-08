@@ -8,8 +8,10 @@ ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). 
 > and typed one-shot Inspection startup view. Native Intel macOS r29 artifact run `31238285076`
 > passed the real relocated-bundle path through Inspection, Runtime Agent IPC, Echo, Textual Ctrl-C,
 > terminal restoration, and joined parent shutdown. Textual is now the sole DeveloperLocal
-> presentation path; the retired Rust reference frontend has been removed. ParaEGOX is adopting a
-> Rust-first core with polyglot managed workloads; no stable release is currently available.
+> presentation path; the retired Rust reference frontend has been removed. Ubuntu r33 commit
+> `7618f6a51c5eb5731874d2cdf3231603e3a824f7` additionally validates the public G1 host-local
+> `paraegox node` substrate. ParaEGOX is adopting a Rust-first core with polyglot managed workloads;
+> no stable release is currently available.
 
 ## Runnable DeveloperLocal slice
 
@@ -27,7 +29,7 @@ paraegox chat --config <absolute-paraegox.toml>
 
 Provider, model, state root, and Fabric listener are selected by the strict versioned TOML config,
 not by provider-specific subcommands or override flags. Secret values never belong in config or
-argv; config contains only an exact SecretRef. The repository keeps one credential-free example at
+argv; config contains only an exact SecretRef. The chat configuration has one credential-free example at
 [`configs/paraegox.example.toml`](configs/paraegox.example.toml). It currently selects DeepSeek as a
 replaceable validation backend, not as a CLI mode or default model.
 
@@ -107,6 +109,43 @@ prove Runtime discovery, continuous observation or reconciliation, a production 
 registration acquisition, multi-host operation, or distributed readiness. Normal exit joins the
 Textual child and Agent IPC boundary first, then Runtime-managed Agent→Model→Fabric shutdown, the
 NodeDaemon, and finally Authority.
+
+## Runnable G1 host-local Node substrate
+
+The separate public command below starts only one split-trust Runtime and one feature-only
+NodeDaemon child:
+
+```text
+paraegox node --config <absolute-node.toml>
+```
+
+It binds the configured restricted mTLS Runtime-apply listener, keeps that listener on its fixed
+legacy generic-rejection behavior, publishes a Node status with zero RuntimeHost observations,
+verifies the child through one authenticated typed Latest exchange, and then prints the exact
+readiness marker `paraegox: node ready`. It does not start Authority, DeploymentController, managed
+Fabric, Model, Agent, Inspection, Textual, or the chat chain. It also does not perform a Controller
+apply, registration, remote bootstrap, or G2/multi-host orchestration.
+
+Start from [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml). Copy it to an
+absolute regular-file path, replace the documentation-only `192.0.2.10` listener address with an
+IPv4 address actually assigned to the host, and update `state_root` plus all three credential paths
+together. Before launch, the same non-root account must create the canonical state root and its
+exact `credentials` child at mode `0700`. Provision a PEM root CA and a listener certificate/key in
+that directory; the listener certificate SAN must contain the configured IP, its key must be mode
+`0600`, and the CA/certificate must not be group- or other-writable. The example contains only
+non-secret reference values and public verification keys; replace those pins only from the owning
+Controller/Authority enrollment workflow, never with private seeds. Full credential preparation and
+launch commands are in the local `docs/runbooks/developer-local.md` runbook.
+
+Ubuntu r33 commit `7618f6a51c5eb5731874d2cdf3231603e3a824f7` passed workspace formatting,
+locked metadata, workspace all-target checking, and workspace all-target Clippy with warnings denied.
+The complete `paraegox-local` unit binary passed 98/98 tests as a non-root user; nine focused Local
+filters and three focused non-root Runtime split-trust/provisioning filters also passed. A real
+non-root process smoke reached the readiness marker with exactly one child, one non-loopback TLS
+listener and the two expected private Unix sockets. SIGTERM and SIGINT each exited zero, restart
+preserved byte-identical PXNI/PXNB hashes, forced child death made the parent fail closed with
+`PXLC-NODE-CHILD`, and root launch failed before state with `PXLC-EXECUTION-IDENTITY`. These facts
+prove the G1 host-local substrate and cleanup/restart boundary only.
 
 The in-progress two-target DeveloperLocal composition remains internal. There is no public
 `developer-distributed-fixture-v1` command and no runnable distributed-system claim yet.
