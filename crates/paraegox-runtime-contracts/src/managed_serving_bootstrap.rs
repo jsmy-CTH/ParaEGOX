@@ -4592,6 +4592,23 @@ mod tests {
         .expect("PXAG Describe");
         assert_eq!(&request.canonical_wire()[..6], b"PXAG\0\x01");
         assert_eq!(request.canonical_wire().len(), 597);
+        let request_transcript = request
+            .signing_transcript()
+            .expect("PXAG signing transcript");
+        eprintln!(
+            "PXAG_REQUEST_DIGEST={:02x?}",
+            request.request_digest().as_bytes()
+        );
+        eprintln!("PXAG_TRANSCRIPT_LEN={}", request_transcript.as_bytes().len());
+        eprintln!(
+            "PXAG_TRANSCRIPT_DIGEST={:02x?}",
+            digest(
+                b"paraegox.test.runtime-agent-control.request-transcript.sha256.v1",
+                request_transcript.as_bytes(),
+            )
+            .expect("PXAG transcript digest")
+            .as_bytes()
+        );
         assert_eq!(
             RuntimeAgentControlRequestV1::decode(request.canonical_wire())
                 .expect("strict PXAG Describe"),
@@ -4640,6 +4657,23 @@ mod tests {
         .expect("PXAH descriptor");
         assert_eq!(&receipt.canonical_wire()[..6], b"PXAH\0\x01");
         assert_eq!(receipt.canonical_wire().len(), 689);
+        let receipt_transcript = receipt
+            .signing_transcript()
+            .expect("PXAH signing transcript");
+        eprintln!(
+            "PXAH_RECEIPT_DIGEST={:02x?}",
+            receipt.receipt_digest().as_bytes()
+        );
+        eprintln!("PXAH_TRANSCRIPT_LEN={}", receipt_transcript.as_bytes().len());
+        eprintln!(
+            "PXAH_TRANSCRIPT_DIGEST={:02x?}",
+            digest(
+                b"paraegox.test.runtime-agent-control.receipt-transcript.sha256.v1",
+                receipt_transcript.as_bytes(),
+            )
+            .expect("PXAH transcript digest")
+            .as_bytes()
+        );
         assert_eq!(
             receipt.conversation_port_descriptor(),
             Some(&descriptor[..])
