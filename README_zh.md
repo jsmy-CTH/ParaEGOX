@@ -205,7 +205,7 @@ all-target Clippy。完整预编译 `paraegox-local` test binary 以 `nobody`、
 `RUST_MIN_STACK=16777216`、`--test-threads=1` 运行时 129/129 通过；完整预编译
 `paraegox-deployment` test binary 在同样条件下 387/387 通过。这是 compile、lint 与 unit evidence。
 真实 Mac→Ubuntu public-process smoke（包括 PXEA transfer/pinning、完整 semantic exchange、Ready、signal、
-owner death 与 restart seams）尚未运行，因此不能把 r73 写成双机 execution 证据。它也尚未提供
+Authority owner failure 与 restart seams）尚未运行，因此不能把 r73 写成双机 execution 证据。它也尚未提供
 target-scoped remote Agent descriptor、remote conversation、remote TUI 或 reconnect policy。
 
 Unix-only `paraegox-noded developer-local-reference-v1` 也能独立重开一份由外部授权的 exact tenure，

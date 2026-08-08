@@ -235,7 +235,7 @@ all-target Clippy. The complete prebuilt `paraegox-local` test binary passed 129
 prebuilt `paraegox-deployment` test binary passed 387/387 as `nobody`, with
 `RUST_MIN_STACK=16777216` and `--test-threads=1`. This is compile, lint, and unit evidence. A real
 Mac-to-Ubuntu public-process smoke—including PXEA transfer/pinning, full semantic exchange, Ready,
-signals, owner death, and restart seams—has not yet run, so r73 is not presented as two-machine
+signals, Authority-owner failure, and restart seams—has not yet run, so r73 is not presented as two-machine
 execution evidence. It also supplies no target-scoped remote Agent descriptor, remote conversation,
 remote TUI, or reconnect policy.
 
