@@ -20,6 +20,10 @@ use nix::unistd::{Gid, Pid, Uid};
 use paraegox_agent_contracts::{AgentConversationDeckRunId, AgentConversationSessionId};
 use paraegox_agent_service::AgentConversationModelServiceProviderV1;
 use paraegox_deployment::{
+    DeveloperDeploymentEnrollmentFactsFieldsV1, DeveloperDeploymentEnrollmentFactsV1,
+    DeveloperDeploymentOwnerV1, DeveloperDeploymentStartFieldsV1,
+    DeveloperDeploymentStartInputV1, DeveloperDeploymentStartModeV1,
+    DeveloperDeploymentStartOutcomeV1,
     DeveloperFixtureAgentStackInputV1, DeveloperFixtureControllerCredentialsV1,
     DeveloperFixtureDerivedIdentityV1, DeveloperFixtureDistributedAgentStackInputV1,
     DeveloperFixtureDistributedCoordinatorV1, DeveloperFixtureDistributedNodeV1,
@@ -32,13 +36,15 @@ use paraegox_deployment::{
     complete_developer_fixture_distributed_agent_stack_v1,
     prepare_developer_fixture_distributed_agent_stack_v1,
     run_developer_fixture_model_agent_stack_v1, run_developer_provisioned_model_agent_stack_v1,
+    start_developer_deployment_v1,
 };
 use paraegox_evidence::EvidenceRetentionPolicyV1;
 use paraegox_evidence::{EvidenceOwnerRefV1, EvidenceStoreEpochV1};
 use paraegox_fabric::{
-    ResolvedRemoteMtlsCredentialFiles, ResolvedRemoteMtlsIdentityFiles,
-    RestrictedNodeControlEndpointConfigV1, RestrictedNodeControlEndpointV1,
-    RestrictedNodeControlReceiverV1,
+    RemoteTlsEndpoint, ResolvedRemoteMtlsCredentialFiles, ResolvedRemoteMtlsIdentityFiles,
+    RestrictedNodeControlClientConfigV1, RestrictedNodeControlEndpointConfigV1,
+    RestrictedNodeControlEndpointV1, RestrictedNodeControlReceiverV1,
+    RestrictedNodeControlTransportPinsV1, RestrictedRuntimeControlClientConfigV1,
 };
 use paraegox_kernel::digest::Digest32;
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
@@ -98,6 +104,7 @@ use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     RestrictedRuntimeApplyCarrierBindingV1, RestrictedRuntimeApplyTransportProfileFieldsV1,
     RestrictedRuntimeApplyTransportProfileV1,
 };
+use paraegox_runtime_contracts::installation::verify_immutable_manifest_ingress;
 use paraegox_runtime_contracts::managed_agent_stack_plan::{
     ManagedAgentProviderRefV1, ManagedAgentProviderSelectionV1, ManagedAgentSecretRefV1,
 };
@@ -127,10 +134,10 @@ use crate::config::{
     DEVELOPER_PROVISIONED_MAX_RESPONSE_BODY_BYTES, DEVELOPER_PROVISIONED_PROVIDER_TIMEOUT_NANOS,
 };
 use crate::config::{
-    DeveloperDistributedFixtureConfigV1, DeveloperDistributedTargetConfigV1,
-    DeveloperFixtureConfigV1, DeveloperLocalProfileV1, DeveloperNodeConfigSchemaV1,
-    DeveloperNodeConfigV1, DeveloperProvisionedConfigV1, ProviderProfileV1,
-    ProvisionedProviderConfigV1, ProvisionedSecretRefV1,
+    DeveloperDeploymentConfigV1, DeveloperDistributedFixtureConfigV1,
+    DeveloperDistributedTargetConfigV1, DeveloperFixtureConfigV1, DeveloperLocalProfileV1,
+    DeveloperNodeConfigSchemaV1, DeveloperNodeConfigV1, DeveloperProvisionedConfigV1,
+    ProviderProfileV1, ProvisionedProviderConfigV1, ProvisionedSecretRefV1,
 };
 use crate::error::LocalProcessError;
 use crate::inspection::{
@@ -160,6 +167,10 @@ const DEVELOPER_NODE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEVELOPER_NODE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
 const DEVELOPER_NODE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const DEVELOPER_NODE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const DEVELOPER_DEPLOYMENT_OWNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DEVELOPER_DEPLOYMENT_CONNECTOR_TIMEOUT: Duration = Duration::from_secs(5);
+const DEVELOPER_DEPLOYMENT_AUTHORITY_OWNER_DOMAIN: &[u8] =
+    b"paraegox.local.developer-deployment-authority-owner.sha256.v1";
 const DEVELOPER_NODE_CONTROL_ED25519_ALGORITHM: u16 = 1;
 const DEVELOPER_NODE_CONTROL_ED25519_ALGORITHM_VERSION: u16 = 1;
 const DEVELOPER_NODE_CONTROL_SIGNATURE_BYTES: usize = 64;
@@ -199,6 +210,277 @@ const LOCAL_DETERMINISTIC_ECHO_ADAPTER_DESCRIPTOR_V1: ModelAdapterDescriptorV1 =
 pub(crate) fn run(config: DeveloperFixtureConfigV1) -> Result<(), LocalProcessError> {
     let peer = current_developer_local_peer()?;
     run_with_runner(config, peer, &mut ChildProcessConversationRunner)
+}
+
+/// Runs the public, single-owner DeploymentController composition. The
+/// current-user identity and both signal handlers are established before any
+/// configured path is resolved or any durable owner is started.
+pub(crate) fn run_deployment(
+    config: DeveloperDeploymentConfigV1,
+) -> Result<(), LocalProcessError> {
+    let peer = DeveloperLocalPeerIdentityV1::current()
+        .map_err(|_| LocalProcessError::UnsafeExecutionIdentity)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|_| LocalProcessError::SignalHandling)?;
+    runtime.block_on(async move {
+        let mut interrupt =
+            signal(SignalKind::interrupt()).map_err(|_| LocalProcessError::SignalHandling)?;
+        let mut terminate =
+            signal(SignalKind::terminate()).map_err(|_| LocalProcessError::SignalHandling)?;
+        run_deployment_with_signals(config, peer, &mut interrupt, &mut terminate).await
+    })
+}
+
+async fn run_deployment_with_signals(
+    config: DeveloperDeploymentConfigV1,
+    peer: DeveloperLocalPeerIdentityV1,
+    interrupt: &mut TokioSignal,
+    terminate: &mut TokioSignal,
+) -> Result<(), LocalProcessError> {
+    let resolved = config
+        .resolve_current_user_inputs()
+        .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let parts = resolved.into_parts();
+    let controller_verification_key = SigningKey::from_bytes(&parts.controller_signing_seed)
+        .verifying_key()
+        .to_bytes();
+    let authority_verification_key = SigningKey::from_bytes(&parts.authority_signing_seed)
+        .verifying_key()
+        .to_bytes();
+    let enrollment = identity::decode_pinned_node_enrollment_artifact_v1(
+        &parts.enrollment_artifact,
+        config.enrollment_artifact_sha256(),
+        controller_verification_key,
+        authority_verification_key,
+    )
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let verified_manifest = verify_immutable_manifest_ingress(
+        enrollment.runtime_manifest_wire(),
+        enrollment.runtime_manifest_digest(),
+    )
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let prepared_layout =
+        layout::prepare_deployment(&config).map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let mode = deployment_start_mode(&prepared_layout, config.authority_state_directory())?;
+
+    let runtime_transport_profile = enrollment.runtime_transport_profile();
+    let runtime_carrier = enrollment.runtime_carrier_binding();
+    let runtime_connector_identity = ResolvedRemoteMtlsIdentityFiles::try_new(
+        config
+            .runtime_connector()
+            .client_certificate_file()
+            .to_path_buf(),
+        config
+            .runtime_connector()
+            .client_private_key_file()
+            .to_path_buf(),
+    )
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let runtime_client = RestrictedRuntimeControlClientConfigV1::try_from_transport_profile(
+        &runtime_transport_profile,
+        enrollment.runtime_transport_profile_ref(),
+        &runtime_carrier,
+        config
+            .runtime_connector()
+            .root_ca_certificate_file()
+            .to_path_buf(),
+        runtime_connector_identity,
+    )
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+
+    let node_connector_identity = ResolvedRemoteMtlsIdentityFiles::try_new(
+        config
+            .node_connector()
+            .client_certificate_file()
+            .to_path_buf(),
+        config
+            .node_connector()
+            .client_private_key_file()
+            .to_path_buf(),
+    )
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let node_transport_pins = RestrictedNodeControlTransportPinsV1::try_new(
+        enrollment.node_principal(),
+        enrollment.node_route_config_digest(),
+        DEVELOPER_DEPLOYMENT_CONNECTOR_TIMEOUT,
+    )
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let node_client = RestrictedNodeControlClientConfigV1::try_new(
+        RemoteTlsEndpoint::try_new(enrollment.node_control_locator().to_owned())
+            .map_err(|_| LocalProcessError::DeploymentPreparation)?,
+        enrollment.node_control_route().to_owned(),
+        config
+            .node_connector()
+            .root_ca_certificate_file()
+            .to_path_buf(),
+        node_connector_identity,
+        node_transport_pins,
+    )
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+
+    let authority_identities = DeveloperLocalTenureAuthorityIdentityBytesV1 {
+        source_scope: *enrollment.source_scope().as_bytes(),
+        writer: *enrollment.writer().as_bytes(),
+        authority: *enrollment.tenure_authority_ref().as_bytes(),
+        authority_key: *enrollment.tenure_key_ref().as_bytes(),
+        controller_principal: *runtime_carrier.controller_principal().as_bytes(),
+        controller_key: *runtime_carrier.controller_request_key().as_bytes(),
+        service_principal: *enrollment.authority_principal().as_bytes(),
+        owner: derive_deployment_authority_owner(config.enrollment_artifact_sha256())?,
+    };
+    let authority = DeveloperLocalTenureAuthorityConfigV1::try_new(
+        config.authority_state_directory().to_path_buf(),
+        config.authority_socket_path().to_path_buf(),
+        authority_identities,
+        parts.authority_signing_seed,
+        controller_verification_key,
+        None,
+        peer,
+    )
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let enrollment_facts = DeveloperDeploymentEnrollmentFactsV1::try_new(
+        DeveloperDeploymentEnrollmentFactsFieldsV1 {
+            configuration_digest: enrollment.node_config_commitment(),
+            verified_manifest,
+            runtime_transport_profile_ref: enrollment.runtime_transport_profile_ref(),
+            runtime_transport_profile,
+            runtime_carrier,
+            runtime_response_public_key: enrollment.runtime_response_public_key(),
+            expected_node_target: enrollment.node_target(),
+            expected_node_principal: enrollment.node_principal(),
+            node_route: enrollment.node_control_route().to_owned(),
+            node_route_config_digest: enrollment.node_route_config_digest(),
+            observation_endpoint_ref: enrollment.runtime_observation_endpoint_ref(),
+            source_scope: enrollment.source_scope(),
+            writer: enrollment.writer(),
+            authority_principal: enrollment.authority_principal(),
+            authority_ref: enrollment.tenure_authority_ref(),
+            authority_key_ref: enrollment.tenure_key_ref(),
+            authority_verification_key,
+        },
+    )
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let input = DeveloperDeploymentStartInputV1::try_new(DeveloperDeploymentStartFieldsV1 {
+        mode,
+        controller_store_directory: prepared_layout
+            .controller_store_state_directory()
+            .to_path_buf(),
+        successor_store_directory: prepared_layout
+            .managed_fabric_successor_store_state_directory()
+            .to_path_buf(),
+        enrollment: enrollment_facts,
+        controller_seed: parts.controller_signing_seed,
+        authority,
+        runtime_client,
+        node_client,
+    })
+    .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let outcome = start_developer_deployment_v1(input)
+        .await
+        .map_err(|_| LocalProcessError::DeploymentStartup)?;
+    match outcome {
+        DeveloperDeploymentStartOutcomeV1::Ready {
+            mut owner,
+            ready: _facade_ready,
+        } => {
+            let process_result = match owner.try_poll_exit() {
+                Ok(false) => match write_deployment_ready(&mut io::stdout().lock()) {
+                    Ok(()) => wait_for_deployment_shutdown(&mut owner, interrupt, terminate).await,
+                    Err(error) => Err(error),
+                },
+                Ok(true) | Err(_) => Err(LocalProcessError::DeploymentOwnerExit),
+            };
+            let cleanup_result = owner
+                .shutdown_and_join()
+                .await
+                .map_err(|_| LocalProcessError::DeploymentJoinedShutdown);
+            process_result.and(cleanup_result)
+        }
+        DeveloperDeploymentStartOutcomeV1::ReconcileRequired(owner) => {
+            owner
+                .shutdown_and_join()
+                .await
+                .map_err(|_| LocalProcessError::DeploymentJoinedShutdown)?;
+            Err(LocalProcessError::DeploymentReconcileRequired)
+        }
+    }
+}
+
+fn deployment_start_mode(
+    prepared_layout: &layout::DeveloperDeploymentLayoutV1,
+    authority_state_directory: &Path,
+) -> Result<DeveloperDeploymentStartModeV1, LocalProcessError> {
+    let controller_has_state =
+        deployment_directory_has_entries(prepared_layout.controller_store_state_directory())?;
+    let successor_has_state = deployment_directory_has_entries(
+        prepared_layout.managed_fabric_successor_store_state_directory(),
+    )?;
+    if controller_has_state || successor_has_state {
+        if !deployment_directory_has_entries(authority_state_directory)? {
+            return Err(LocalProcessError::DeploymentPreparation);
+        }
+        Ok(DeveloperDeploymentStartModeV1::Resume)
+    } else {
+        Ok(DeveloperDeploymentStartModeV1::Fresh)
+    }
+}
+
+fn deployment_directory_has_entries(path: &Path) -> Result<bool, LocalProcessError> {
+    fs::read_dir(path)
+        .map_err(|_| LocalProcessError::DeploymentPreparation)?
+        .next()
+        .transpose()
+        .map(|entry| entry.is_some())
+        .map_err(|_| LocalProcessError::DeploymentPreparation)
+}
+
+fn derive_deployment_authority_owner(
+    enrollment_artifact_sha256: [u8; 32],
+) -> Result<[u8; 16], LocalProcessError> {
+    let mut hasher = Sha256::new();
+    hasher.update(DEVELOPER_DEPLOYMENT_AUTHORITY_OWNER_DOMAIN);
+    hasher.update(enrollment_artifact_sha256);
+    let digest = hasher.finalize();
+    let mut owner = [0; 16];
+    owner.copy_from_slice(&digest[..16]);
+    if owner == [0; 16] {
+        return Err(LocalProcessError::DeploymentPreparation);
+    }
+    Ok(owner)
+}
+
+fn write_deployment_ready(output: &mut impl Write) -> Result<(), LocalProcessError> {
+    output
+        .write_all(b"paraegox: deployment ready\n")
+        .and_then(|()| output.flush())
+        .map_err(|_| LocalProcessError::DeploymentReadyOutput)
+}
+
+async fn wait_for_deployment_shutdown(
+    owner: &mut DeveloperDeploymentOwnerV1,
+    interrupt: &mut TokioSignal,
+    terminate: &mut TokioSignal,
+) -> Result<(), LocalProcessError> {
+    loop {
+        tokio::select! {
+            biased;
+            signal = interrupt.recv() => {
+                return signal.ok_or(LocalProcessError::SignalHandling);
+            }
+            signal = terminate.recv() => {
+                return signal.ok_or(LocalProcessError::SignalHandling);
+            }
+            owner_exit = owner.wait_for_exit(DEVELOPER_DEPLOYMENT_OWNER_POLL_INTERVAL) => {
+                match owner_exit {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => return Err(LocalProcessError::DeploymentOwnerExit),
+                }
+            }
+        }
+    }
 }
 
 /// Runs the public split-trust Node substrate. Schema v1 keeps the host-local
@@ -303,9 +585,9 @@ async fn run_node_with_signals(
                 layout.runtime_state_directory().to_path_buf(),
                 layout.runtime_socket_path().to_path_buf(),
                 runtime_identity,
-                transport_profile,
+                transport_profile.clone(),
                 restricted.control_transport_profile_ref(),
-                expected_carrier,
+                expected_carrier.clone(),
                 (
                     restricted.root_ca_certificate_file().to_path_buf(),
                     listener_identity,
@@ -317,9 +599,9 @@ async fn run_node_with_signals(
                 layout.runtime_state_directory().to_path_buf(),
                 layout.runtime_socket_path().to_path_buf(),
                 runtime_identity,
-                transport_profile,
+                transport_profile.clone(),
                 restricted.control_transport_profile_ref(),
-                expected_carrier,
+                expected_carrier.clone(),
                 (
                     restricted.root_ca_certificate_file().to_path_buf(),
                     listener_identity,
@@ -368,6 +650,19 @@ async fn run_node_with_signals(
                 DEVELOPER_NODE_EXCHANGE_TIMEOUT,
             )
             .map_err(|_| LocalProcessError::NodeStartup)?;
+            let enrollment_artifact_path = layout
+                .node_enrollment_artifact_path()
+                .ok_or(LocalProcessError::LayoutPreparation)?;
+            identity::publish_or_reopen_node_enrollment_artifact_v1(
+                enrollment_artifact_path,
+                &config,
+                &manifest,
+                owners.runtime_ready(),
+                &expected_carrier,
+                observation_bootstrap.node_target(),
+                observation_bootstrap.observation_endpoint_ref(),
+            )
+            .map_err(|_| LocalProcessError::IdentityManifest)?;
             let remote = config
                 .node_control()
                 .ok_or(LocalProcessError::NodeStartup)?;
@@ -3512,6 +3807,124 @@ mod tests {
     }
 
     #[test]
+    fn public_deployment_ready_marker_is_exact_and_flushed() {
+        let mut output = FlushProbe::default();
+        write_deployment_ready(&mut output).expect("Deployment readiness marker");
+        assert_eq!(output.bytes, b"paraegox: deployment ready\n");
+        assert_eq!(output.flushes, 1);
+    }
+
+    #[test]
+    fn deployment_ready_is_authorized_only_by_the_facade_ready_variant() {
+        let source = include_str!("composition.rs");
+        let tests_start = source
+            .rfind("\n#[cfg(test)]\nmod tests {")
+            .expect("composition test module");
+        assert_eq!(
+            source[..tests_start]
+                .matches("write_deployment_ready(")
+                .count(),
+            2,
+            "production has exactly one Ready call plus its function definition"
+        );
+        let local_ready_struct_literal = concat!("DeveloperDeploymentReadyV1", " {");
+        let local_ready_constructor = concat!("DeveloperDeploymentReadyV1", "::");
+        assert!(!source.contains(local_ready_struct_literal));
+        assert!(!source.contains(local_ready_constructor));
+        let ready_branch = source
+            .find("DeveloperDeploymentStartOutcomeV1::Ready")
+            .expect("typed facade Ready branch");
+        let marker_call = source
+            .find("write_deployment_ready(&mut io::stdout().lock())")
+            .expect("Ready marker call");
+        let reconcile_branch = source
+            .find("DeveloperDeploymentStartOutcomeV1::ReconcileRequired")
+            .expect("typed facade ReconcileRequired branch");
+        let outcome_end = source
+            .find("fn deployment_start_mode")
+            .expect("end of outcome handling");
+        let ready_arm = &source[ready_branch..reconcile_branch];
+        let reconcile_arm = &source[reconcile_branch..outcome_end];
+        assert!(source[ready_branch..marker_call].contains("ready: _facade_ready"));
+        assert!(ready_branch < marker_call && marker_call < reconcile_branch);
+        assert_eq!(ready_arm.matches(".shutdown_and_join()").count(), 1);
+        assert_eq!(reconcile_arm.matches(".shutdown_and_join()").count(), 1);
+        assert!(!reconcile_arm.contains("write_deployment_ready"));
+    }
+
+    #[test]
+    fn deployment_authority_owner_is_stable_nonzero_and_artifact_bound() {
+        let first = derive_deployment_authority_owner([0x31; 32])
+            .expect("first Deployment Authority owner");
+        assert_eq!(
+            first,
+            derive_deployment_authority_owner([0x31; 32])
+                .expect("stable Deployment Authority owner")
+        );
+        assert_ne!(first, [0; 16]);
+        assert_ne!(
+            first,
+            derive_deployment_authority_owner([0x32; 32])
+                .expect("distinct Deployment Authority owner")
+        );
+    }
+
+    #[test]
+    fn deployment_start_mode_never_reinitializes_existing_owner_state() {
+        let state_root = fresh_state_root("deployment-start-mode");
+        let external_root = PathBuf::from(format!("{}-external", state_root.display()));
+        fs::create_dir(&state_root).expect("Deployment state root");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+            .expect("Deployment state root mode");
+        fs::create_dir(&external_root).expect("Deployment external root");
+        fs::set_permissions(&external_root, fs::Permissions::from_mode(0o700))
+            .expect("Deployment external root mode");
+        fs::create_dir(external_root.join("authority")).expect("Deployment Authority state");
+        fs::set_permissions(
+            external_root.join("authority"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("Deployment Authority state mode");
+        let _cleanup = TestCleanup {
+            state_root: state_root.clone(),
+            socket_directory: None,
+        };
+        let _external_cleanup = TestCleanup {
+            state_root: external_root,
+            socket_directory: None,
+        };
+        let config = crate::config::developer_deployment_config_for_test(&state_root);
+        let prepared = layout::prepare_deployment(&config).expect("Deployment layout");
+        assert_eq!(
+            deployment_start_mode(&prepared, config.authority_state_directory())
+                .expect("fresh Deployment mode"),
+            DeveloperDeploymentStartModeV1::Fresh
+        );
+
+        fs::write(
+            prepared.controller_store_state_directory().join("controller.lock"),
+            [],
+        )
+        .expect("existing Controller evidence");
+        assert_eq!(
+            deployment_start_mode(&prepared, config.authority_state_directory()).unwrap_err(),
+            LocalProcessError::DeploymentPreparation
+        );
+        fs::write(
+            config
+                .authority_state_directory()
+                .join("tenure-authority.snapshot"),
+            [],
+        )
+        .expect("existing Authority evidence");
+        assert_eq!(
+            deployment_start_mode(&prepared, config.authority_state_directory())
+                .expect("resume Deployment mode"),
+            DeveloperDeploymentStartModeV1::Resume
+        );
+    }
+
+    #[test]
     fn public_node_control_authenticates_before_dispatch() {
         let principal = PrincipalRef::from_bytes([0x91; 16]);
         let key_ref = ApplyAuthKeyRef::from_bytes([0x92; 16]);
@@ -4822,6 +5235,7 @@ mod tests {
         {
             crate::config::Command::DeveloperFixtureV1(config) => config,
             crate::config::Command::DeveloperNodeV1(_)
+            | crate::config::Command::DeveloperDeploymentV1(_)
             | crate::config::Command::DeveloperDistributedFixtureV1(_)
             | crate::config::Command::DeveloperProvisionedV1(_)
             | crate::config::Command::Help => panic!("unexpected command"),
@@ -4844,6 +5258,7 @@ mod tests {
         {
             crate::config::Command::DeveloperProvisionedV1(config) => config,
             crate::config::Command::DeveloperNodeV1(_)
+            | crate::config::Command::DeveloperDeploymentV1(_)
             | crate::config::Command::DeveloperFixtureV1(_)
             | crate::config::Command::DeveloperDistributedFixtureV1(_)
             | crate::config::Command::Help => panic!("unexpected command"),

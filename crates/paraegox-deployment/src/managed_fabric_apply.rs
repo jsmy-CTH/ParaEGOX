@@ -1891,7 +1891,7 @@ impl ManagedFabricApplyJournalV1 {
                 provisioning.describe(),
                 previous,
                 &transport,
-        )?;
+            )?;
         if ready.ingress().request_wire() != action.request.canonical_wire() {
             return Err(
                 ManagedFabricApplyControllerError::ServingDescribeResponseCorrelationMismatch,

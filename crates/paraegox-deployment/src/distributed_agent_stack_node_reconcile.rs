@@ -4420,10 +4420,8 @@ mod tests {
     fn remote_adapter_restores_only_the_typed_verified_target_without_transport() {
         let node = NodeHarness::new(0x30);
         let (_, transport) = remote_transport(node.carrier_binding);
-        let adapter = RemoteNodeControlAdapterV1::from_verified_target(
-            transport,
-            node.management_target,
-        );
+        let adapter =
+            RemoteNodeControlAdapterV1::from_verified_target(transport, node.management_target);
         assert_eq!(adapter.target(), Some(node.management_target));
     }
 

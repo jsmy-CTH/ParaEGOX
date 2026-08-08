@@ -10,7 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use nix::unistd::{Gid, Uid, chown};
 
 use crate::config::{
-    DeveloperFixtureConfigV1, DeveloperNodeConfigV1, DeveloperProvisionedConfigV1,
+    DeveloperDeploymentConfigV1, DeveloperFixtureConfigV1, DeveloperNodeConfigV1,
+    DeveloperProvisionedConfigV1,
 };
 use crate::identity::{
     DeveloperNodeIdentityManifestV1, DistributedDeveloperLocalIdentityManifestV1,
@@ -31,6 +32,9 @@ const NODE_MANAGEMENT_SOCKET_FILE: &str = "n.sock";
 const NODE_OBSERVATION_SOCKET_FILE: &str = "o.sock";
 const PXNB_BOOTSTRAP_FILE: &str = "node.pxnb";
 const PXOB_BOOTSTRAP_FILE: &str = "observe.pxob";
+const NODE_ENROLLMENT_ARTIFACT_FILE: &str = "enrollment-v1.pxea";
+const DEPLOYMENT_CONTROLLER_STORE_DIRECTORY: &str = "controller-store";
+const DEPLOYMENT_MANAGED_FABRIC_SUCCESSOR_STORE_DIRECTORY: &str = "managed-fabric-successor-store";
 const AGENT_IPC_SOCKET_FILE: &str = "c.sock";
 const AGENT_IPC_BOOTSTRAP_FILE: &str = "c.pxab";
 const INSPECTION_IPC_SOCKET_FILE: &str = "i.sock";
@@ -128,6 +132,17 @@ pub(crate) struct DeveloperNodeLayoutV1 {
     node_observation_socket_path: Option<PathBuf>,
     pxnb_bootstrap_path: PathBuf,
     pxob_bootstrap_path: Option<PathBuf>,
+    node_enrollment_artifact_path: Option<PathBuf>,
+}
+
+/// Minimal state ownership for the next Deployment composition slice.
+/// Authority state/socket paths remain owned by the explicit Authority config;
+/// no Agent, Model, inspection, console, or credential paths are derived here.
+#[derive(Debug)]
+pub(crate) struct DeveloperDeploymentLayoutV1 {
+    canonical_state_root: PathBuf,
+    controller_store_state_directory: PathBuf,
+    managed_fabric_successor_store_state_directory: PathBuf,
 }
 
 /// Shared owner paths for the two-target DeveloperLocal composition.
@@ -224,6 +239,9 @@ pub(crate) fn prepare_node(
     let pxob_bootstrap_path = config
         .node_control()
         .map(|_| node_bootstrap_directory.join(PXOB_BOOTSTRAP_FILE));
+    let node_enrollment_artifact_path = config
+        .node_control()
+        .map(|_| node_owner_directory.join(NODE_ENROLLMENT_ARTIFACT_FILE));
     for path in [&runtime_socket_path, &node_management_socket_path]
         .into_iter()
         .chain(node_observation_socket_path.iter())
@@ -245,6 +263,31 @@ pub(crate) fn prepare_node(
         node_observation_socket_path,
         pxnb_bootstrap_path,
         pxob_bootstrap_path,
+        node_enrollment_artifact_path,
+    };
+    layout.validate(uid, gid)?;
+    Ok(layout)
+}
+
+pub(crate) fn prepare_deployment(
+    config: &DeveloperDeploymentConfigV1,
+) -> Result<DeveloperDeploymentLayoutV1, DeveloperLocalLayoutError> {
+    let (canonical_state_root, uid, gid) = canonical_private_state_root(config.state_root())?;
+    validate_deployment_state_root_entries(&canonical_state_root, false)?;
+    let controller_store_state_directory =
+        canonical_state_root.join(DEPLOYMENT_CONTROLLER_STORE_DIRECTORY);
+    let managed_fabric_successor_store_state_directory =
+        canonical_state_root.join(DEPLOYMENT_MANAGED_FABRIC_SUCCESSOR_STORE_DIRECTORY);
+    for directory in [
+        &controller_store_state_directory,
+        &managed_fabric_successor_store_state_directory,
+    ] {
+        ensure_private_directory(directory, uid, gid)?;
+    }
+    let layout = DeveloperDeploymentLayoutV1 {
+        canonical_state_root,
+        controller_store_state_directory,
+        managed_fabric_successor_store_state_directory,
     };
     layout.validate(uid, gid)?;
     Ok(layout)
@@ -736,6 +779,10 @@ impl DeveloperNodeLayoutV1 {
         self.pxob_bootstrap_path.as_deref()
     }
 
+    pub(crate) fn node_enrollment_artifact_path(&self) -> Option<&Path> {
+        self.node_enrollment_artifact_path.as_deref()
+    }
+
     #[cfg(test)]
     fn owned_paths(&self) -> [&Path; 10] {
         [
@@ -790,7 +837,10 @@ impl DeveloperNodeLayoutV1 {
             self.node_management_socket_path(),
             self.node_socket_directory(),
         )?;
-        if self.node_observation_socket_path().is_some() != self.pxob_bootstrap_path().is_some() {
+        if self.node_observation_socket_path().is_some() != self.pxob_bootstrap_path().is_some()
+            || self.node_observation_socket_path().is_some()
+                != self.node_enrollment_artifact_path().is_some()
+        {
             return Err(DeveloperLocalLayoutError::InvalidDerivedPath);
         }
         if let Some(path) = self.node_observation_socket_path() {
@@ -799,6 +849,9 @@ impl DeveloperNodeLayoutV1 {
         validate_reserved_path(self.pxnb_bootstrap_path(), self.node_bootstrap_directory())?;
         if let Some(path) = self.pxob_bootstrap_path() {
             validate_reserved_path(path, self.node_bootstrap_directory())?;
+        }
+        if let Some(path) = self.node_enrollment_artifact_path() {
+            validate_reserved_path(path, self.node_owner_directory())?;
         }
         for path in [
             self.runtime_socket_path(),
@@ -821,10 +874,55 @@ impl DeveloperNodeLayoutV1 {
             || self.pxob_bootstrap_path().is_some_and(|path| {
                 path.starts_with(self.node_state_directory()) || path == self.pxnb_bootstrap_path()
             })
+            || self.node_enrollment_artifact_path().is_some_and(|path| {
+                path.starts_with(self.node_state_directory())
+                    || path.starts_with(self.node_bootstrap_directory())
+                    || path == self.runtime_socket_path()
+                    || path == self.node_management_socket_path()
+                    || self
+                        .node_observation_socket_path()
+                        .is_some_and(|socket| path == socket)
+            })
         {
             return Err(DeveloperLocalLayoutError::OverlappingPath);
         }
         Ok(())
+    }
+}
+
+impl DeveloperDeploymentLayoutV1 {
+    pub(crate) fn canonical_state_root(&self) -> &Path {
+        &self.canonical_state_root
+    }
+
+    pub(crate) fn controller_store_state_directory(&self) -> &Path {
+        &self.controller_store_state_directory
+    }
+
+    pub(crate) fn managed_fabric_successor_store_state_directory(&self) -> &Path {
+        &self.managed_fabric_successor_store_state_directory
+    }
+
+    fn validate(&self, uid: u32, gid: u32) -> Result<(), DeveloperLocalLayoutError> {
+        validate_canonical_path_chain(self.canonical_state_root())?;
+        validate_private_directory(
+            &fs::symlink_metadata(self.canonical_state_root())?,
+            uid,
+            gid,
+        )?;
+        for directory in [
+            self.controller_store_state_directory(),
+            self.managed_fabric_successor_store_state_directory(),
+        ] {
+            validate_existing_child_directory(directory, self.canonical_state_root())?;
+            validate_private_directory(&fs::symlink_metadata(directory)?, uid, gid)?;
+        }
+        if self.controller_store_state_directory()
+            == self.managed_fabric_successor_store_state_directory()
+        {
+            return Err(DeveloperLocalLayoutError::OverlappingPath);
+        }
+        validate_deployment_state_root_entries(self.canonical_state_root(), true)
     }
 }
 
@@ -1139,6 +1237,33 @@ impl DistributedDeveloperLocalLayoutV1 {
 
 fn validate_reserved_path(path: &Path, parent: &Path) -> Result<(), DeveloperLocalLayoutError> {
     if path.parent() != Some(parent) || !is_lexically_canonical_absolute(path) {
+        return Err(DeveloperLocalLayoutError::InvalidDerivedPath);
+    }
+    Ok(())
+}
+
+fn validate_deployment_state_root_entries(
+    state_root: &Path,
+    require_complete: bool,
+) -> Result<(), DeveloperLocalLayoutError> {
+    let mut controller_store_seen = false;
+    let mut successor_store_seen = false;
+    for entry in fs::read_dir(state_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let seen = if name == DEPLOYMENT_CONTROLLER_STORE_DIRECTORY {
+            &mut controller_store_seen
+        } else if name == DEPLOYMENT_MANAGED_FABRIC_SUCCESSOR_STORE_DIRECTORY {
+            &mut successor_store_seen
+        } else {
+            return Err(DeveloperLocalLayoutError::InvalidDerivedPath);
+        };
+        if *seen || !entry.file_type()?.is_dir() {
+            return Err(DeveloperLocalLayoutError::InvalidDerivedPath);
+        }
+        *seen = true;
+    }
+    if require_complete && !(controller_store_seen && successor_store_seen) {
         return Err(DeveloperLocalLayoutError::InvalidDerivedPath);
     }
     Ok(())
@@ -1542,6 +1667,13 @@ mod tests {
         );
         assert_eq!(first.node_observation_socket_path(), None);
         assert_eq!(first.pxob_bootstrap_path(), None);
+        assert_eq!(first.node_enrollment_artifact_path(), None);
+        assert!(
+            !first
+                .node_owner_directory()
+                .join(NODE_ENROLLMENT_ARTIFACT_FILE)
+                .exists()
+        );
         assert!(
             !first
                 .node_socket_directory()
@@ -1558,13 +1690,148 @@ mod tests {
         assert_eq!(first.owned_paths(), second.owned_paths());
         assert_eq!(second.node_observation_socket_path(), None);
         assert_eq!(second.pxob_bootstrap_path(), None);
+        assert_eq!(second.node_enrollment_artifact_path(), None);
         drop(second);
         drop(first);
         drop(cleanup);
     }
 
     #[test]
-    fn public_node_v2_layout_adds_only_observation_socket_and_pxob_coordinates() {
+    fn deployment_layout_creates_only_two_private_stable_store_owners() {
+        let directory = TestDirectory::new();
+        let mut builder = DirBuilder::new();
+        builder
+            .mode(0o700)
+            .create(&directory.path)
+            .expect("Deployment state root");
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("Deployment state root mode");
+        let config = crate::config::developer_deployment_config_for_test(&directory.path);
+        let mut first = prepare_deployment(&config).expect("minimal Deployment layout");
+        for path in [
+            first.canonical_state_root(),
+            first.controller_store_state_directory(),
+            first.managed_fabric_successor_store_state_directory(),
+        ] {
+            assert_eq!(
+                fs::canonicalize(path).expect("canonical Deployment path"),
+                path
+            );
+            assert_eq!(
+                fs::symlink_metadata(path)
+                    .expect("Deployment path metadata")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o700
+            );
+        }
+        let mut entries = fs::read_dir(first.canonical_state_root())
+            .expect("Deployment root entries")
+            .map(|entry| {
+                entry
+                    .expect("Deployment root entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                DEPLOYMENT_CONTROLLER_STORE_DIRECTORY.to_string(),
+                DEPLOYMENT_MANAGED_FABRIC_SUCCESSOR_STORE_DIRECTORY.to_string(),
+            ]
+        );
+        for forbidden in [
+            AUTHORITY_STATE_DIRECTORY,
+            RUNTIME_STATE_DIRECTORY,
+            NODE_OWNER_DIRECTORY,
+            "agent",
+            "model",
+            "inspection",
+            "console",
+        ] {
+            assert!(!first.canonical_state_root().join(forbidden).exists());
+        }
+
+        let second = prepare_deployment(&config).expect("stable Deployment layout reopen");
+        assert_eq!(
+            first.controller_store_state_directory(),
+            second.controller_store_state_directory()
+        );
+        assert_eq!(
+            first.managed_fabric_successor_store_state_directory(),
+            second.managed_fabric_successor_store_state_directory()
+        );
+        drop(second);
+
+        let successor = first.managed_fabric_successor_store_state_directory.clone();
+        first.managed_fabric_successor_store_state_directory =
+            first.controller_store_state_directory.clone();
+        assert_eq!(
+            first
+                .validate(Uid::effective().as_raw(), Gid::effective().as_raw())
+                .unwrap_err(),
+            DeveloperLocalLayoutError::OverlappingPath
+        );
+        first.managed_fabric_successor_store_state_directory = successor;
+    }
+
+    #[test]
+    fn deployment_layout_rejects_unknown_and_symlinked_owner_entries_before_creation() {
+        use std::os::unix::fs::symlink;
+
+        let unknown = TestDirectory::new();
+        let mut builder = DirBuilder::new();
+        builder
+            .mode(0o700)
+            .create(&unknown.path)
+            .expect("Deployment state root");
+        fs::set_permissions(&unknown.path, fs::Permissions::from_mode(0o700))
+            .expect("Deployment state root mode");
+        let config = crate::config::developer_deployment_config_for_test(&unknown.path);
+        fs::create_dir(unknown.path.join("unexpected-owner")).expect("unexpected owner entry");
+        assert_eq!(
+            prepare_deployment(&config).unwrap_err(),
+            DeveloperLocalLayoutError::InvalidDerivedPath
+        );
+        assert!(
+            !unknown
+                .path
+                .join(DEPLOYMENT_CONTROLLER_STORE_DIRECTORY)
+                .exists()
+        );
+        assert!(
+            !unknown
+                .path
+                .join(DEPLOYMENT_MANAGED_FABRIC_SUCCESSOR_STORE_DIRECTORY)
+                .exists()
+        );
+
+        let alias = TestDirectory::new();
+        let mut builder = DirBuilder::new();
+        builder
+            .mode(0o700)
+            .create(&alias.path)
+            .expect("aliased Deployment state root");
+        fs::set_permissions(&alias.path, fs::Permissions::from_mode(0o700))
+            .expect("aliased Deployment state root mode");
+        symlink(
+            &alias.path,
+            alias.path.join(DEPLOYMENT_CONTROLLER_STORE_DIRECTORY),
+        )
+        .expect("Deployment owner symlink");
+        let alias_config = crate::config::developer_deployment_config_for_test(&alias.path);
+        assert_eq!(
+            prepare_deployment(&alias_config).unwrap_err(),
+            DeveloperLocalLayoutError::InvalidDerivedPath
+        );
+    }
+
+    #[test]
+    fn public_node_v2_layout_adds_only_observation_and_enrollment_coordinates() {
         let directory = TestDirectory::new();
         let config = crate::config::developer_node_config_v2_for_test(&directory.path);
         let identities =
@@ -1578,6 +1845,9 @@ mod tests {
         let pxob_bootstrap = first
             .pxob_bootstrap_path()
             .expect("schema v2 PXOB coordinate");
+        let enrollment_artifact = first
+            .node_enrollment_artifact_path()
+            .expect("schema v2 enrollment artifact coordinate");
 
         assert_eq!(
             observation_socket.parent(),
@@ -1587,14 +1857,20 @@ mod tests {
             pxob_bootstrap.parent(),
             Some(first.node_bootstrap_directory())
         );
+        assert_eq!(
+            enrollment_artifact.parent(),
+            Some(first.node_owner_directory())
+        );
         assert_ne!(observation_socket, first.node_management_socket_path());
         assert_ne!(pxob_bootstrap, first.pxnb_bootstrap_path());
+        assert_ne!(enrollment_artifact, first.pxnb_bootstrap_path());
+        assert_ne!(Some(enrollment_artifact), first.pxob_bootstrap_path());
         assert!(!pxob_bootstrap.starts_with(first.node_state_directory()));
-        assert!(
-            base_paths
-                .iter()
-                .all(|path| *path != observation_socket && *path != pxob_bootstrap)
-        );
+        assert!(!enrollment_artifact.starts_with(first.node_state_directory()));
+        assert!(!enrollment_artifact.starts_with(first.node_bootstrap_directory()));
+        assert!(base_paths.iter().all(|path| {
+            *path != observation_socket && *path != pxob_bootstrap && *path != enrollment_artifact
+        }));
         for absent in [
             CONTROLLER_STATE_DIRECTORY,
             SUCCESSOR_STATE_DIRECTORY,
@@ -1623,6 +1899,10 @@ mod tests {
             second.node_observation_socket_path()
         );
         assert_eq!(Some(pxob_bootstrap), second.pxob_bootstrap_path());
+        assert_eq!(
+            Some(enrollment_artifact),
+            second.node_enrollment_artifact_path()
+        );
         drop(second);
 
         let uid = Uid::effective().as_raw();

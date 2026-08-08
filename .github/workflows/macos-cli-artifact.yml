@@ -80,8 +80,18 @@ jobs:
 
           grep -Fqx 'Usage: paraegox chat --config <absolute-paraegox.toml>' "$help_output"
           grep -Fqx '       paraegox node --config <absolute-paraegox-node.toml>' "$help_output"
+          grep -Fqx '       paraegox deployment --config <absolute-paraegox-deployment.toml>' "$help_output"
           grep -Fqx '       paraegox --help' "$help_output"
-          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 3
+          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 4
+
+          if "$binary" controller >/dev/null 2>&1; then
+            printf 'bare controller unexpectedly selected a public command\n' >&2
+            exit 1
+          fi
+          if "$binary" deployment controller >/dev/null 2>&1; then
+            printf 'deployment unexpectedly accepted a bare controller submode\n' >&2
+            exit 1
+          fi
 
           if grep -Eq 'paraegox-local|developer-|fixture-v1|openai-v1|deepseek-v1|__node-daemon-child-v1|--node-bootstrap-file|--node-observation-bootstrap-file' "$help_output"; then
             printf 'hidden or legacy CLI surface is still exposed\n' >&2

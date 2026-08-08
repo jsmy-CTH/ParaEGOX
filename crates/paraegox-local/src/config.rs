@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::{
     ffi::OsString,
     fmt,
@@ -31,9 +33,11 @@ use paraegox_runtime_contracts::distributed_agent_stack_plan::{
 use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentProviderRefV1;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+use zeroize::Zeroizing;
 
 const CHAT_COMMAND: &str = "chat";
 const NODE_COMMAND: &str = "node";
+const DEPLOYMENT_COMMAND: &str = "deployment";
 const CONFIG_OPTION: &str = "--config";
 const DETERMINISTIC_ECHO_PROVIDER: &str = "deterministic-echo-v1";
 const OPENAI_RESPONSES_PROVIDER: &str = "openai-responses-v1";
@@ -43,7 +47,10 @@ const DEEPSEEK_SECRET_REF: &str = "env:DEEPSEEK_API_KEY";
 const CHAT_CONFIG_SCHEMA_VERSION: u16 = 1;
 const NODE_CONFIG_SCHEMA_V1: u16 = 1;
 const NODE_CONFIG_SCHEMA_V2: u16 = 2;
-const MAX_CHAT_CONFIG_BYTES: u64 = 64 * 1024;
+const DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1: u16 = 1;
+const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_DEVELOPER_DEPLOYMENT_ARTIFACT_BYTES: u64 = 1024 * 1024;
+const DEVELOPER_DEPLOYMENT_SIGNING_SEED_BYTES: u64 = 32;
 const NODE_CONFIG_COMMITMENT_V1_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v1";
 const NODE_CONFIG_COMMITMENT_V2_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v2";
 const NODE_CONTROL_ROUTE_CONFIG_DOMAIN: &[u8] =
@@ -113,6 +120,7 @@ pub(crate) const DEVELOPER_PROVISIONED_MAX_OUTPUT_TEXT_BYTES: usize = 32 * 1024;
 pub(crate) enum Command {
     Help,
     DeveloperNodeV1(Box<DeveloperNodeConfigV1>),
+    DeveloperDeploymentV1(Box<DeveloperDeploymentConfigV1>),
     DeveloperFixtureV1(DeveloperFixtureConfigV1),
     DeveloperDistributedFixtureV1(DeveloperDistributedFixtureConfigV1),
     DeveloperProvisionedV1(DeveloperProvisionedConfigV1),
@@ -197,6 +205,29 @@ struct DeveloperNodeRemoteControlDocumentV2 {
     root_ca_certificate_file: String,
     node_listener_certificate_file: String,
     node_listener_private_key_file: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperDeploymentConfigDocumentV1 {
+    schema_version: u16,
+    state_root: String,
+    enrollment_artifact_file: String,
+    enrollment_artifact_sha256: String,
+    controller_signing_seed_file: String,
+    authority_signing_seed_file: String,
+    authority_state_directory: String,
+    authority_socket_path: String,
+    runtime_connector: DeveloperDeploymentConnectorDocumentV1,
+    node_connector: DeveloperDeploymentConnectorDocumentV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperDeploymentConnectorDocumentV1 {
+    root_ca_certificate_file: String,
+    client_certificate_file: String,
+    client_private_key_file: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -429,17 +460,14 @@ impl fmt::Debug for DeveloperNodeRemoteControlConfigV2 {
 }
 
 impl DeveloperNodeRemoteControlConfigV2 {
-    #[cfg(test)]
     pub(crate) const fn endpoint_ref(&self) -> [u8; 16] {
         self.endpoint_ref
     }
 
-    #[cfg(test)]
     pub(crate) const fn endpoint_generation(&self) -> u64 {
         self.endpoint_generation
     }
 
-    #[cfg(test)]
     pub(crate) fn tls_listener_locator(&self) -> &str {
         self.tls_listener_locator.as_str()
     }
@@ -448,29 +476,24 @@ impl DeveloperNodeRemoteControlConfigV2 {
         &self.route
     }
 
-    #[cfg(test)]
     pub(crate) const fn trust_domain_ref(&self) -> DistributedFabricTrustDomainRefV1 {
         self.trust_domain_ref
     }
 
-    #[cfg(test)]
     pub(crate) const fn trust_anchor_ref(&self) -> DistributedFabricTrustAnchorRefV1 {
         self.trust_anchor_ref
     }
 
-    #[cfg(test)]
     pub(crate) const fn controller_connector_credential_ref(
         &self,
     ) -> DistributedFabricCredentialRefV1 {
         self.controller_connector_credential_ref
     }
 
-    #[cfg(test)]
     pub(crate) const fn node_listener_credential_ref(&self) -> DistributedFabricCredentialRefV1 {
         self.node_listener_credential_ref
     }
 
-    #[cfg(test)]
     pub(crate) const fn control_transport_profile_ref(&self) -> [u8; 16] {
         self.control_transport_profile_ref
     }
@@ -523,6 +546,262 @@ impl DeveloperNodeRemoteControlConfigV2 {
         )
         .map_err(|_| ConfigError::InvalidNodeConfiguration)
     }
+}
+
+/// Strict local-only input for the public Deployment composition.
+///
+/// It intentionally contains only filesystem ownership inputs. Runtime/Node
+/// endpoint, route, principal, trust and credential selectors are accepted
+/// solely from the separately SHA-256-pinned enrollment artifact.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DeveloperDeploymentConfigV1 {
+    state_root: PathBuf,
+    enrollment_artifact_file: PathBuf,
+    enrollment_artifact_sha256: [u8; 32],
+    controller_signing_seed_file: PathBuf,
+    authority_signing_seed_file: PathBuf,
+    authority_state_directory: PathBuf,
+    authority_socket_path: PathBuf,
+    runtime_connector: DeveloperDeploymentConnectorConfigV1,
+    node_connector: DeveloperDeploymentConnectorConfigV1,
+}
+
+pub(crate) struct DeveloperDeploymentResolvedInputsV1 {
+    enrollment_artifact: Box<[u8]>,
+    controller_signing_seed: Zeroizing<[u8; 32]>,
+    authority_signing_seed: Zeroizing<[u8; 32]>,
+}
+
+pub(crate) struct DeveloperDeploymentResolvedPartsV1 {
+    pub(crate) enrollment_artifact: Box<[u8]>,
+    pub(crate) controller_signing_seed: Zeroizing<[u8; 32]>,
+    pub(crate) authority_signing_seed: Zeroizing<[u8; 32]>,
+}
+
+impl fmt::Debug for DeveloperDeploymentResolvedInputsV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeveloperDeploymentResolvedInputsV1(<artifact-and-secrets-redacted>)")
+    }
+}
+
+impl DeveloperDeploymentResolvedInputsV1 {
+    pub(crate) fn into_parts(self) -> DeveloperDeploymentResolvedPartsV1 {
+        DeveloperDeploymentResolvedPartsV1 {
+            enrollment_artifact: self.enrollment_artifact,
+            controller_signing_seed: self.controller_signing_seed,
+            authority_signing_seed: self.authority_signing_seed,
+        }
+    }
+}
+
+impl fmt::Debug for DeveloperDeploymentConfigV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeveloperDeploymentConfigV1")
+            .field("schema_version", &DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1)
+            .field("state_root", &self.state_root)
+            .field("enrollment_artifact_sha256", &"<non-secret-pin>")
+            .field("secret_and_connector_paths", &"<redacted-paths>")
+            .finish()
+    }
+}
+
+impl DeveloperDeploymentConfigV1 {
+    pub(crate) fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    pub(crate) fn enrollment_artifact_file(&self) -> &Path {
+        &self.enrollment_artifact_file
+    }
+
+    pub(crate) const fn enrollment_artifact_sha256(&self) -> [u8; 32] {
+        self.enrollment_artifact_sha256
+    }
+
+    pub(crate) fn controller_signing_seed_file(&self) -> &Path {
+        &self.controller_signing_seed_file
+    }
+
+    pub(crate) fn authority_signing_seed_file(&self) -> &Path {
+        &self.authority_signing_seed_file
+    }
+
+    pub(crate) fn authority_state_directory(&self) -> &Path {
+        &self.authority_state_directory
+    }
+
+    pub(crate) fn authority_socket_path(&self) -> &Path {
+        &self.authority_socket_path
+    }
+
+    pub(crate) const fn runtime_connector(&self) -> &DeveloperDeploymentConnectorConfigV1 {
+        &self.runtime_connector
+    }
+
+    pub(crate) const fn node_connector(&self) -> &DeveloperDeploymentConnectorConfigV1 {
+        &self.node_connector
+    }
+
+    /// Revalidates owner, mode, inode and independently pinned artifact bytes
+    /// immediately before a future composition resolves any Secret or opens a
+    /// connector. Parsing alone never turns paths into authority.
+    #[cfg(unix)]
+    pub(crate) fn validate_current_user_files(&self) -> Result<(), ConfigError> {
+        self.resolve_current_user_inputs().map(drop)
+    }
+
+    /// Resolves the three inputs Local must consume itself through the same
+    /// owner/mode/inode gate used by validation. Connector files intentionally
+    /// remain paths for Fabric's role-specific resolver.
+    #[cfg(unix)]
+    pub(crate) fn resolve_current_user_inputs(
+        &self,
+    ) -> Result<DeveloperDeploymentResolvedInputsV1, ConfigError> {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let state_root_identity =
+            validate_deployment_owned_directory(self.state_root(), uid, gid, 0o700)?;
+        let authority_state_identity =
+            validate_deployment_owned_directory(self.authority_state_directory(), uid, gid, 0o700)?;
+        validate_distinct_deployment_owner_directories(
+            state_root_identity,
+            authority_state_identity,
+        )?;
+        validate_deployment_authority_socket_parent(self.authority_socket_path(), uid, gid)?;
+
+        let artifact = open_validated_deployment_file(
+            self.enrollment_artifact_file(),
+            uid,
+            gid,
+            DeploymentFilePolicyV1::PublicPinnedArtifact,
+        )?;
+        let artifact_metadata = artifact
+            .metadata()
+            .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+        if artifact_metadata.len() == 0
+            || artifact_metadata.len() > MAX_DEVELOPER_DEPLOYMENT_ARTIFACT_BYTES
+        {
+            return Err(ConfigError::InvalidDeploymentConfiguration);
+        }
+        let mut bytes = Vec::new();
+        artifact
+            .take(MAX_DEVELOPER_DEPLOYMENT_ARTIFACT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+        let observed: [u8; 32] = Sha256::digest(&bytes).into();
+        if observed != self.enrollment_artifact_sha256 {
+            return Err(ConfigError::InvalidDeploymentConfiguration);
+        }
+
+        let controller_signing_seed =
+            read_deployment_signing_seed(self.controller_signing_seed_file(), uid, gid)?;
+        let authority_signing_seed =
+            read_deployment_signing_seed(self.authority_signing_seed_file(), uid, gid)?;
+        for connector in [self.runtime_connector(), self.node_connector()] {
+            for certificate in [
+                connector.root_ca_certificate_file(),
+                connector.client_certificate_file(),
+            ] {
+                open_validated_deployment_file(
+                    certificate,
+                    uid,
+                    gid,
+                    DeploymentFilePolicyV1::PublicCredential,
+                )?;
+            }
+            open_validated_deployment_file(
+                connector.client_private_key_file(),
+                uid,
+                gid,
+                DeploymentFilePolicyV1::Secret,
+            )?;
+        }
+
+        let files = self.all_file_paths();
+        for (index, left) in files.iter().enumerate() {
+            let left = fs::symlink_metadata(left)
+                .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+            if files[index + 1..].iter().any(|right| {
+                fs::symlink_metadata(right)
+                    .is_ok_and(|right| left.dev() == right.dev() && left.ino() == right.ino())
+            }) {
+                return Err(ConfigError::InvalidDeploymentConfiguration);
+            }
+        }
+        Ok(DeveloperDeploymentResolvedInputsV1 {
+            enrollment_artifact: bytes.into_boxed_slice(),
+            controller_signing_seed,
+            authority_signing_seed,
+        })
+    }
+
+    fn all_file_paths(&self) -> [&Path; 9] {
+        [
+            self.enrollment_artifact_file(),
+            self.controller_signing_seed_file(),
+            self.authority_signing_seed_file(),
+            self.runtime_connector.root_ca_certificate_file(),
+            self.runtime_connector.client_certificate_file(),
+            self.runtime_connector.client_private_key_file(),
+            self.node_connector.root_ca_certificate_file(),
+            self.node_connector.client_certificate_file(),
+            self.node_connector.client_private_key_file(),
+        ]
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DeveloperDeploymentConnectorConfigV1 {
+    root_ca_certificate_file: PathBuf,
+    client_certificate_file: PathBuf,
+    client_private_key_file: PathBuf,
+}
+
+impl fmt::Debug for DeveloperDeploymentConnectorConfigV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeveloperDeploymentConnectorConfigV1(<redacted-paths>)")
+    }
+}
+
+impl DeveloperDeploymentConnectorConfigV1 {
+    pub(crate) fn root_ca_certificate_file(&self) -> &Path {
+        &self.root_ca_certificate_file
+    }
+
+    pub(crate) fn client_certificate_file(&self) -> &Path {
+        &self.client_certificate_file
+    }
+
+    pub(crate) fn client_private_key_file(&self) -> &Path {
+        &self.client_private_key_file
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum DeploymentFilePolicyV1 {
+    PublicPinnedArtifact,
+    PublicCredential,
+    Secret,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeploymentDirectoryIdentityV1 {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn validate_distinct_deployment_owner_directories(
+    state_root: DeploymentDirectoryIdentityV1,
+    authority_state: DeploymentDirectoryIdentityV1,
+) -> Result<(), ConfigError> {
+    if state_root == authority_state {
+        return Err(ConfigError::InvalidDeploymentConfiguration);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1167,6 +1446,7 @@ pub(crate) enum ConfigError {
     UnknownProvider,
     InvalidProviderConfiguration,
     InvalidNodeConfiguration,
+    InvalidDeploymentConfiguration,
     UnexpectedHelpArgument,
     UnknownOption,
     MissingOptionValue,
@@ -1245,6 +1525,7 @@ impl ConfigError {
             Self::UnknownProvider => "PXLC-CONFIG-PROVIDER-UNKNOWN",
             Self::InvalidProviderConfiguration => "PXLC-CONFIG-PROVIDER-INVALID",
             Self::InvalidNodeConfiguration => "PXLC-NODE-CONFIG-INVALID",
+            Self::InvalidDeploymentConfiguration => "PXLC-DEPLOYMENT-CONFIG-INVALID",
             Self::UnexpectedHelpArgument => "PXLC-HELP-EXTRA",
             Self::UnknownOption => "PXLC-OPTION-UNKNOWN",
             Self::MissingOptionValue => "PXLC-OPTION-VALUE-MISSING",
@@ -1316,7 +1597,7 @@ impl ConfigError {
             }
             Self::MissingMode => "an explicit mode is required",
             Self::UnknownMode => "the requested mode is not supported",
-            Self::MissingConfigPath => "chat and node require --config with one path",
+            Self::MissingConfigPath => "chat, node, and deployment require --config with one path",
             Self::InvalidConfigPath => {
                 "config path must name an absolute lexically canonical regular file"
             }
@@ -1330,6 +1611,9 @@ impl ConfigError {
             }
             Self::InvalidNodeConfiguration => {
                 "node config contains invalid or conflicting identity or transport pins"
+            }
+            Self::InvalidDeploymentConfiguration => {
+                "deployment config contains invalid, aliased, unpinned, or insecure paths"
             }
             Self::UnexpectedHelpArgument => "help accepts no additional arguments",
             Self::UnknownOption => "the mode contains an unknown or positional argument",
@@ -1475,6 +1759,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Com
         }
         CHAT_COMMAND => parse_chat(arguments),
         NODE_COMMAND => parse_node(arguments),
+        DEPLOYMENT_COMMAND => parse_deployment(arguments),
         INTERNAL_DISTRIBUTED_FIXTURE_MODE => parse_developer_distributed_fixture_v1(
             arguments,
             DeveloperDistributedFixtureActionV1::Run,
@@ -1521,18 +1806,32 @@ fn parse_node(mut arguments: impl Iterator<Item = String>) -> Result<Command, Co
     parse_node_config_document(document)
 }
 
+fn parse_deployment(mut arguments: impl Iterator<Item = String>) -> Result<Command, ConfigError> {
+    ensure_unix_developer_local()?;
+    if arguments.next().as_deref() != Some(CONFIG_OPTION) {
+        return Err(ConfigError::MissingConfigPath);
+    }
+    let path = arguments.next().ok_or(ConfigError::MissingConfigPath)?;
+    if arguments.next().is_some() {
+        return Err(ConfigError::UnknownOption);
+    }
+    let text = read_config_file(path)?;
+    parse_developer_deployment_config_toml_v1(&text)
+        .map(|config| Command::DeveloperDeploymentV1(Box::new(config)))
+}
+
 fn read_config_file(path: String) -> Result<String, ConfigError> {
     let path = parse_config_path(path)?;
     let file = open_config_file(&path)?;
     let metadata = file.metadata().map_err(|_| ConfigError::ConfigFileRead)?;
-    if metadata.len() > MAX_CHAT_CONFIG_BYTES {
+    if metadata.len() > MAX_CONFIG_BYTES {
         return Err(ConfigError::ConfigFileTooLarge);
     }
     let mut bytes = Vec::new();
-    file.take(MAX_CHAT_CONFIG_BYTES + 1)
+    file.take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| ConfigError::ConfigFileRead)?;
-    if bytes.len() as u64 > MAX_CHAT_CONFIG_BYTES {
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err(ConfigError::ConfigFileTooLarge);
     }
     String::from_utf8(bytes).map_err(|_| ConfigError::InvalidConfigDocument)
@@ -1644,6 +1943,106 @@ pub(crate) fn parse_node_config_toml_for_test(document: &str) -> Result<Command,
     let document = toml::from_str::<DeveloperNodeConfigDocumentV1>(document)
         .map_err(|_| ConfigError::InvalidConfigDocument)?;
     parse_node_config_document(document)
+}
+
+/// Parses the public Deployment configuration without starting any owner.
+/// Composition must call `resolve_current_user_inputs` immediately before
+/// consuming the paths.
+pub(crate) fn parse_developer_deployment_config_toml_v1(
+    document: &str,
+) -> Result<DeveloperDeploymentConfigV1, ConfigError> {
+    ensure_unix_developer_local()?;
+    let document = toml::from_str::<DeveloperDeploymentConfigDocumentV1>(document)
+        .map_err(|_| ConfigError::InvalidConfigDocument)?;
+    if document.schema_version != DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1 {
+        return Err(ConfigError::UnsupportedConfigSchema);
+    }
+    let state_root = parse_deployment_path(document.state_root)?;
+    let enrollment_artifact_file = parse_deployment_path(document.enrollment_artifact_file)?;
+    let enrollment_artifact_sha256 =
+        parse_deployment_sha256_pin(&document.enrollment_artifact_sha256)?;
+    let controller_signing_seed_file =
+        parse_deployment_path(document.controller_signing_seed_file)?;
+    let authority_signing_seed_file = parse_deployment_path(document.authority_signing_seed_file)?;
+    let authority_state_directory = parse_deployment_path(document.authority_state_directory)?;
+    let authority_socket_path = parse_deployment_path(document.authority_socket_path)?;
+    let runtime_connector = parse_deployment_connector(document.runtime_connector)?;
+    let node_connector = parse_deployment_connector(document.node_connector)?;
+    let config = DeveloperDeploymentConfigV1 {
+        state_root,
+        enrollment_artifact_file,
+        enrollment_artifact_sha256,
+        controller_signing_seed_file,
+        authority_signing_seed_file,
+        authority_state_directory,
+        authority_socket_path,
+        runtime_connector,
+        node_connector,
+    };
+    let files = config.all_file_paths();
+    let authority_socket_parent = config
+        .authority_socket_path
+        .parent()
+        .ok_or(ConfigError::InvalidDeploymentConfiguration)?;
+    if deployment_paths_overlap(&config.state_root, &config.authority_state_directory)
+        || deployment_paths_overlap(&config.state_root, authority_socket_parent)
+        || deployment_paths_overlap(&config.authority_state_directory, authority_socket_parent)
+        || files
+            .iter()
+            .enumerate()
+            .any(|(index, path)| files[index + 1..].contains(path))
+        || files.iter().any(|path| {
+            *path == config.state_root
+                || *path == config.authority_state_directory
+                || *path == config.authority_socket_path
+        })
+        || files
+            .iter()
+            .any(|path| deployment_paths_overlap(&config.state_root, path))
+        || files
+            .iter()
+            .any(|path| deployment_paths_overlap(&config.authority_state_directory, path))
+        || files
+            .iter()
+            .any(|path| deployment_paths_overlap(authority_socket_parent, path))
+    {
+        return Err(ConfigError::InvalidDeploymentConfiguration);
+    }
+    Ok(config)
+}
+
+fn deployment_paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn parse_deployment_connector(
+    document: DeveloperDeploymentConnectorDocumentV1,
+) -> Result<DeveloperDeploymentConnectorConfigV1, ConfigError> {
+    Ok(DeveloperDeploymentConnectorConfigV1 {
+        root_ca_certificate_file: parse_deployment_path(document.root_ca_certificate_file)?,
+        client_certificate_file: parse_deployment_path(document.client_certificate_file)?,
+        client_private_key_file: parse_deployment_path(document.client_private_key_file)?,
+    })
+}
+
+fn parse_deployment_path(value: String) -> Result<PathBuf, ConfigError> {
+    parse_tls_file_path(value).map_err(|_| ConfigError::InvalidDeploymentConfiguration)
+}
+
+fn parse_deployment_sha256_pin(value: &str) -> Result<[u8; 32], ConfigError> {
+    if value.len() != 64 {
+        return Err(ConfigError::InvalidDeploymentConfiguration);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] =
+            (hex_nibble(pair[0]).ok_or(ConfigError::InvalidDeploymentConfiguration)? << 4)
+                | hex_nibble(pair[1]).ok_or(ConfigError::InvalidDeploymentConfiguration)?;
+    }
+    if decoded.iter().all(|byte| *byte == 0) {
+        return Err(ConfigError::InvalidDeploymentConfiguration);
+    }
+    Ok(decoded)
 }
 
 fn parse_node_config_document(
@@ -2222,6 +2621,193 @@ fn parse_tls_file_path(value: String) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
+#[cfg(unix)]
+fn validate_deployment_path_chain(path: &Path) -> Result<(), ConfigError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::Normal(value) => {
+                current.push(value);
+                let metadata = fs::symlink_metadata(&current)
+                    .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+                if metadata.file_type().is_symlink() {
+                    return Err(ConfigError::InvalidDeploymentConfiguration);
+                }
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(ConfigError::InvalidDeploymentConfiguration);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_validated_deployment_file(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    policy: DeploymentFilePolicyV1,
+) -> Result<File, ConfigError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    validate_deployment_owned_private_parent(path, expected_uid, expected_gid)?;
+    validate_deployment_path_chain(path)?;
+    let before =
+        fs::symlink_metadata(path).map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let after =
+        fs::symlink_metadata(path).map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let valid_metadata = |metadata: &fs::Metadata| {
+        let mode = metadata.mode() & 0o7777;
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == expected_uid
+            && metadata.gid() == expected_gid
+            && metadata.nlink() == 1
+            && metadata.len() != 0
+            && match policy {
+                DeploymentFilePolicyV1::PublicPinnedArtifact
+                | DeploymentFilePolicyV1::PublicCredential => {
+                    mode & 0o022 == 0 && mode & 0o111 == 0 && mode & 0o400 != 0
+                }
+                DeploymentFilePolicyV1::Secret => mode == 0o600,
+            }
+    };
+    if !valid_metadata(&before)
+        || !valid_metadata(&opened)
+        || !valid_metadata(&after)
+        || before.dev() != opened.dev()
+        || before.ino() != opened.ino()
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+    {
+        return Err(ConfigError::InvalidDeploymentConfiguration);
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn read_deployment_signing_seed(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
+    let mut file = open_validated_deployment_file(
+        path,
+        expected_uid,
+        expected_gid,
+        DeploymentFilePolicyV1::Secret,
+    )?;
+    if file
+        .metadata()
+        .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?
+        .len()
+        != DEVELOPER_DEPLOYMENT_SIGNING_SEED_BYTES
+    {
+        return Err(ConfigError::InvalidDeploymentConfiguration);
+    }
+    let mut seed = Zeroizing::new([0_u8; 32]);
+    file.read_exact(&mut *seed)
+        .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let mut extra = [0_u8; 1];
+    if file
+        .read(&mut extra)
+        .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?
+        != 0
+    {
+        return Err(ConfigError::InvalidDeploymentConfiguration);
+    }
+    Ok(seed)
+}
+
+#[cfg(unix)]
+fn validate_deployment_owned_private_parent(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), ConfigError> {
+    validate_deployment_owned_parent(path, expected_uid, expected_gid, 0o700)
+}
+
+#[cfg(unix)]
+fn validate_deployment_authority_socket_parent(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), ConfigError> {
+    validate_deployment_owned_parent(path, expected_uid, expected_gid, 0o2750)
+}
+
+#[cfg(unix)]
+fn validate_deployment_owned_parent(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+) -> Result<(), ConfigError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(ConfigError::InvalidDeploymentConfiguration)?;
+    validate_deployment_owned_directory(parent, expected_uid, expected_gid, expected_mode).map(drop)
+}
+
+#[cfg(unix)]
+fn validate_deployment_owned_directory(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+) -> Result<DeploymentDirectoryIdentityV1, ConfigError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    validate_deployment_path_chain(path)?;
+    let before =
+        fs::symlink_metadata(path).map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let opened = directory
+        .metadata()
+        .map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let after =
+        fs::symlink_metadata(path).map_err(|_| ConfigError::InvalidDeploymentConfiguration)?;
+    let valid = |metadata: &fs::Metadata| {
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == expected_uid
+            && metadata.gid() == expected_gid
+            && metadata.mode() & 0o7777 == expected_mode
+    };
+    if !valid(&before)
+        || !valid(&opened)
+        || !valid(&after)
+        || before.dev() != opened.dev()
+        || before.ino() != opened.ino()
+        || before.nlink() != opened.nlink()
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.nlink() != opened.nlink()
+    {
+        return Err(ConfigError::InvalidDeploymentConfiguration);
+    }
+    Ok(DeploymentDirectoryIdentityV1 {
+        device: opened.dev(),
+        inode: opened.ino(),
+    })
+}
+
 fn is_canonical_pxrp_route(route: &str) -> bool {
     !route.is_empty()
         && route.len() <= MAX_RESTRICTED_RUNTIME_APPLY_ROUTE_BYTES
@@ -2301,7 +2887,8 @@ pub(crate) fn developer_node_config_for_test(state_root: &Path) -> DeveloperNode
         .expect("valid developer node test config")
     {
         Command::DeveloperNodeV1(config) => *config,
-        Command::DeveloperFixtureV1(_)
+        Command::DeveloperDeploymentV1(_)
+        | Command::DeveloperFixtureV1(_)
         | Command::DeveloperDistributedFixtureV1(_)
         | Command::DeveloperProvisionedV1(_)
         | Command::Help => panic!("unexpected developer node test command"),
@@ -2315,11 +2902,43 @@ pub(crate) fn developer_node_config_v2_for_test(state_root: &Path) -> DeveloperN
         .expect("valid developer node v2 test config")
     {
         Command::DeveloperNodeV1(config) => *config,
-        Command::DeveloperFixtureV1(_)
+        Command::DeveloperDeploymentV1(_)
+        | Command::DeveloperFixtureV1(_)
         | Command::DeveloperDistributedFixtureV1(_)
         | Command::DeveloperProvisionedV1(_)
         | Command::Help => panic!("unexpected developer node v2 test command"),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn developer_deployment_config_for_test(
+    state_root: &Path,
+) -> DeveloperDeploymentConfigV1 {
+    let state_root = state_root.to_str().expect("UTF-8 Deployment state root");
+    let external = format!("{state_root}-external");
+    let document = format!(
+        r#"schema_version = 1
+state_root = {state_root:?}
+enrollment_artifact_file = "{external}/input/enrollment-v1.pxea"
+enrollment_artifact_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+controller_signing_seed_file = "{external}/secrets/controller.seed"
+authority_signing_seed_file = "{external}/secrets/authority.seed"
+authority_state_directory = "{external}/authority"
+authority_socket_path = "{external}/authority-socket/authority.sock"
+
+[runtime_connector]
+root_ca_certificate_file = "{external}/runtime/root-ca.pem"
+client_certificate_file = "{external}/runtime/controller.pem"
+client_private_key_file = "{external}/runtime/controller-key.pem"
+
+[node_connector]
+root_ca_certificate_file = "{external}/node/root-ca.pem"
+client_certificate_file = "{external}/node/controller.pem"
+client_private_key_file = "{external}/node/controller-key.pem"
+"#,
+    );
+    parse_developer_deployment_config_toml_v1(&document)
+        .expect("valid Deployment layout test config")
 }
 
 #[cfg(test)]
@@ -2393,7 +3012,188 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[cfg(unix)]
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
+
     static TEST_CONFIG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(unix)]
+    struct DeploymentConfigFixture {
+        root: PathBuf,
+        artifact: Box<[u8]>,
+    }
+
+    #[cfg(unix)]
+    impl DeploymentConfigFixture {
+        fn new() -> Self {
+            let sequence = TEST_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temporary_root =
+                fs::canonicalize(std::env::temp_dir()).expect("canonical test temp dir");
+            let root = temporary_root.join(format!(
+                "paraegox-deployment-config-test-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).expect("Deployment config test root");
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("Deployment config test root mode");
+            for child in [
+                "state",
+                "authority",
+                "authority-socket",
+                "input",
+                "secrets",
+                "runtime",
+                "node",
+            ] {
+                let path = root.join(child);
+                fs::create_dir(&path).expect("Deployment private directory");
+                let mode = if child == "authority-socket" {
+                    0o2750
+                } else {
+                    0o700
+                };
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                    .expect("Deployment private directory mode");
+            }
+            let fixture = Self {
+                root,
+                artifact: b"canonical-public-enrollment-artifact-v1".as_slice().into(),
+            };
+            fixture.write_file(&fixture.artifact_path(), &fixture.artifact, 0o644);
+            fixture.write_file(&fixture.controller_seed_path(), &[0x31; 32], 0o600);
+            fixture.write_file(&fixture.authority_seed_path(), &[0x32; 32], 0o600);
+            for path in [
+                fixture.runtime_root_ca_path(),
+                fixture.runtime_client_certificate_path(),
+                fixture.node_root_ca_path(),
+                fixture.node_client_certificate_path(),
+            ] {
+                fixture.write_file(&path, b"public-certificate", 0o644);
+            }
+            for path in [
+                fixture.runtime_client_key_path(),
+                fixture.node_client_key_path(),
+            ] {
+                fixture.write_file(&path, b"private-key-material", 0o600);
+            }
+            fixture
+        }
+
+        fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) {
+            fs::write(path, bytes).expect("Deployment fixture file");
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .expect("Deployment fixture file mode");
+        }
+
+        fn state_root(&self) -> PathBuf {
+            self.root.join("state")
+        }
+
+        fn authority_state(&self) -> PathBuf {
+            self.root.join("authority")
+        }
+
+        fn authority_socket(&self) -> PathBuf {
+            self.root.join("authority-socket/authority.sock")
+        }
+
+        fn artifact_path(&self) -> PathBuf {
+            self.root.join("input/enrollment-v1.pxea")
+        }
+
+        fn controller_seed_path(&self) -> PathBuf {
+            self.root.join("secrets/controller.seed")
+        }
+
+        fn authority_seed_path(&self) -> PathBuf {
+            self.root.join("secrets/authority.seed")
+        }
+
+        fn runtime_root_ca_path(&self) -> PathBuf {
+            self.root.join("runtime/root-ca.pem")
+        }
+
+        fn runtime_client_certificate_path(&self) -> PathBuf {
+            self.root.join("runtime/controller.pem")
+        }
+
+        fn runtime_client_key_path(&self) -> PathBuf {
+            self.root.join("runtime/controller-key.pem")
+        }
+
+        fn node_root_ca_path(&self) -> PathBuf {
+            self.root.join("node/root-ca.pem")
+        }
+
+        fn node_client_certificate_path(&self) -> PathBuf {
+            self.root.join("node/controller.pem")
+        }
+
+        fn node_client_key_path(&self) -> PathBuf {
+            self.root.join("node/controller-key.pem")
+        }
+
+        fn document(&self) -> String {
+            let pin = Sha256::digest(&self.artifact)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!(
+                r#"schema_version = 1
+state_root = {:?}
+enrollment_artifact_file = {:?}
+enrollment_artifact_sha256 = {pin:?}
+controller_signing_seed_file = {:?}
+authority_signing_seed_file = {:?}
+authority_state_directory = {:?}
+authority_socket_path = {:?}
+
+[runtime_connector]
+root_ca_certificate_file = {:?}
+client_certificate_file = {:?}
+client_private_key_file = {:?}
+
+[node_connector]
+root_ca_certificate_file = {:?}
+client_certificate_file = {:?}
+client_private_key_file = {:?}
+"#,
+                self.state_root().to_str().expect("UTF-8 state root"),
+                self.artifact_path().to_str().expect("UTF-8 artifact"),
+                self.controller_seed_path().to_str().expect("UTF-8 seed"),
+                self.authority_seed_path().to_str().expect("UTF-8 seed"),
+                self.authority_state()
+                    .to_str()
+                    .expect("UTF-8 Authority state"),
+                self.authority_socket()
+                    .to_str()
+                    .expect("UTF-8 Authority socket"),
+                self.runtime_root_ca_path().to_str().expect("UTF-8 root CA"),
+                self.runtime_client_certificate_path()
+                    .to_str()
+                    .expect("UTF-8 certificate"),
+                self.runtime_client_key_path().to_str().expect("UTF-8 key"),
+                self.node_root_ca_path().to_str().expect("UTF-8 root CA"),
+                self.node_client_certificate_path()
+                    .to_str()
+                    .expect("UTF-8 certificate"),
+                self.node_client_key_path().to_str().expect("UTF-8 key"),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DeploymentConfigFixture {
+        fn drop(&mut self) {
+            assert!(self.root.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("paraegox-deployment-config-test-")
+            }));
+            fs::remove_dir_all(&self.root).expect("remove Deployment config fixture");
+        }
+    }
 
     fn config_arguments(contents: impl AsRef<[u8]>) -> Vec<OsString> {
         let sequence = TEST_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -2425,6 +3225,21 @@ mod tests {
         ]
     }
 
+    fn deployment_config_arguments(contents: impl AsRef<[u8]>) -> Vec<OsString> {
+        let sequence = TEST_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = fs::canonicalize(std::env::temp_dir()).expect("canonical test temp dir");
+        let path = directory.join(format!(
+            "paraegox-deployment-config-input-test-{}-{sequence}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, contents).expect("write test Deployment config");
+        vec![
+            OsString::from(DEPLOYMENT_COMMAND),
+            OsString::from(CONFIG_OPTION),
+            path.into_os_string(),
+        ]
+    }
+
     fn node_document(state_root: &str) -> String {
         developer_node_document_for_test(state_root)
     }
@@ -2432,7 +3247,8 @@ mod tests {
     fn parse_node_fixture(document: &str) -> DeveloperNodeConfigV1 {
         match parse_node_config_toml_for_test(document).expect("valid developer node config") {
             Command::DeveloperNodeV1(config) => *config,
-            Command::DeveloperFixtureV1(_)
+            Command::DeveloperDeploymentV1(_)
+            | Command::DeveloperFixtureV1(_)
             | Command::DeveloperDistributedFixtureV1(_)
             | Command::DeveloperProvisionedV1(_)
             | Command::Help => panic!("unexpected node command"),
@@ -2590,7 +3406,9 @@ mod tests {
     fn parse_fixture(arguments: Vec<OsString>) -> DeveloperFixtureConfigV1 {
         match parse(arguments).expect("valid developer fixture arguments") {
             Command::DeveloperFixtureV1(config) => config,
-            Command::DeveloperNodeV1(_) | Command::DeveloperDistributedFixtureV1(_) => {
+            Command::DeveloperNodeV1(_)
+            | Command::DeveloperDeploymentV1(_)
+            | Command::DeveloperDistributedFixtureV1(_) => {
                 panic!("unexpected distributed fixture command")
             }
             Command::DeveloperProvisionedV1(_) => panic!("unexpected provisioned command"),
@@ -2601,7 +3419,9 @@ mod tests {
     fn parse_provisioned(arguments: Vec<OsString>) -> DeveloperProvisionedConfigV1 {
         match parse(arguments).expect("valid developer provisioned arguments") {
             Command::DeveloperProvisionedV1(config) => config,
-            Command::DeveloperNodeV1(_) | Command::DeveloperFixtureV1(_) => {
+            Command::DeveloperNodeV1(_)
+            | Command::DeveloperDeploymentV1(_)
+            | Command::DeveloperFixtureV1(_) => {
                 panic!("unexpected fixture command")
             }
             Command::DeveloperDistributedFixtureV1(_) => {
@@ -2614,12 +3434,375 @@ mod tests {
     fn parse_distributed(arguments: Vec<OsString>) -> DeveloperDistributedFixtureConfigV1 {
         match parse(arguments).expect("valid developer distributed fixture arguments") {
             Command::DeveloperDistributedFixtureV1(config) => config,
-            Command::DeveloperNodeV1(_) | Command::DeveloperFixtureV1(_) => {
+            Command::DeveloperNodeV1(_)
+            | Command::DeveloperDeploymentV1(_)
+            | Command::DeveloperFixtureV1(_) => {
                 panic!("unexpected fixture command")
             }
             Command::DeveloperProvisionedV1(_) => panic!("unexpected provisioned command"),
             Command::Help => panic!("unexpected help command"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_config_is_path_only_strict_and_resolves_pinned_inputs() {
+        let fixture = DeploymentConfigFixture::new();
+        let document = fixture.document();
+        assert!(matches!(
+            parse(deployment_config_arguments(&document)),
+            Ok(Command::DeveloperDeploymentV1(_))
+        ));
+        let mut extra = deployment_config_arguments(&document);
+        extra.push(OsString::from("extra"));
+        assert_eq!(parse(extra), Err(ConfigError::UnknownOption));
+        let config =
+            parse_developer_deployment_config_toml_v1(&document).expect("strict Deployment config");
+        assert_eq!(config.state_root(), fixture.state_root());
+        assert_eq!(config.enrollment_artifact_file(), fixture.artifact_path());
+        let expected_artifact_sha256: [u8; 32] = Sha256::digest(&fixture.artifact).into();
+        assert_eq!(
+            config.enrollment_artifact_sha256(),
+            expected_artifact_sha256
+        );
+        assert_eq!(
+            config.controller_signing_seed_file(),
+            fixture.controller_seed_path()
+        );
+        assert_eq!(
+            config.authority_signing_seed_file(),
+            fixture.authority_seed_path()
+        );
+        assert_eq!(
+            config.authority_state_directory(),
+            fixture.authority_state()
+        );
+        assert_eq!(config.authority_socket_path(), fixture.authority_socket());
+        assert_eq!(
+            config.runtime_connector().root_ca_certificate_file(),
+            fixture.runtime_root_ca_path()
+        );
+        assert_eq!(
+            config.node_connector().client_private_key_file(),
+            fixture.node_client_key_path()
+        );
+        config
+            .validate_current_user_files()
+            .expect("Deployment input metadata gate");
+        let resolved = config
+            .resolve_current_user_inputs()
+            .expect("Deployment pinned input resolver");
+        let debug = format!("{config:?} {resolved:?}");
+        assert!(!debug.contains("controller.seed"));
+        assert!(!debug.contains("authority.seed"));
+        assert!(!debug.contains("canonical-public-enrollment"));
+        let parts = resolved.into_parts();
+        assert_eq!(
+            parts.enrollment_artifact.as_ref(),
+            fixture.artifact.as_ref()
+        );
+        assert_eq!(&*parts.controller_signing_seed, &[0x31; 32]);
+        assert_eq!(&*parts.authority_signing_seed, &[0x32; 32]);
+
+        let unknown = document.replacen(
+            "[runtime_connector]",
+            "endpoint = \"tls/192.0.2.10:7448\"\nroute = \"paraegox/runtime/apply\"\nprincipal = \"forbidden\"\n\n[runtime_connector]",
+            1,
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&unknown).unwrap_err(),
+            ConfigError::InvalidConfigDocument
+        );
+        let relative = document.replace(
+            &format!(
+                "state_root = {:?}",
+                fixture.state_root().to_str().expect("UTF-8 state root")
+            ),
+            "state_root = \"relative/deployment\"",
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&relative).unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+        let uppercase_pin = document
+            .lines()
+            .map(|line| {
+                if line.starts_with("enrollment_artifact_sha256 = ") {
+                    format!("enrollment_artifact_sha256 = {:?}", "AA".repeat(32))
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&uppercase_pin).unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+        let alias = document.replace(
+            &format!(
+                "authority_signing_seed_file = {:?}",
+                fixture.authority_seed_path().to_str().expect("UTF-8 seed")
+            ),
+            &format!(
+                "authority_signing_seed_file = {:?}",
+                fixture.controller_seed_path().to_str().expect("UTF-8 seed")
+            ),
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&alias).unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_resolver_defers_stale_authority_socket_to_authority_owner() {
+        let fixture = DeploymentConfigFixture::new();
+        let listener = UnixListener::bind(fixture.authority_socket())
+            .expect("bind stale Deployment Authority socket");
+        fs::set_permissions(
+            fixture.authority_socket(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("stale Deployment Authority socket mode");
+        drop(listener);
+        assert!(
+            fs::symlink_metadata(fixture.authority_socket())
+                .expect("stale Deployment Authority socket metadata")
+                .file_type()
+                .is_socket()
+        );
+
+        let config = parse_developer_deployment_config_toml_v1(&fixture.document())
+            .expect("strict Deployment config with stale Authority socket");
+        config
+            .resolve_current_user_inputs()
+            .expect("resolver must defer the stale socket to the Authority owner");
+        assert!(fixture.authority_socket().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_owner_directory_identity_rejects_same_inode() {
+        let state_root = DeploymentDirectoryIdentityV1 {
+            device: 7,
+            inode: 11,
+        };
+        assert_eq!(
+            validate_distinct_deployment_owner_directories(state_root, state_root).unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+        assert!(
+            validate_distinct_deployment_owner_directories(
+                state_root,
+                DeploymentDirectoryIdentityV1 {
+                    device: 7,
+                    inode: 12,
+                },
+            )
+            .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_config_rejects_owner_tree_overlap_during_parse() {
+        let fixture = DeploymentConfigFixture::new();
+        let document = fixture.document();
+        let nested_authority = document.replace(
+            &format!(
+                "authority_state_directory = {:?}",
+                fixture
+                    .authority_state()
+                    .to_str()
+                    .expect("UTF-8 Authority state")
+            ),
+            &format!(
+                "authority_state_directory = {:?}",
+                fixture
+                    .state_root()
+                    .join("authority")
+                    .to_str()
+                    .expect("UTF-8 nested Authority")
+            ),
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&nested_authority).unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+
+        let ancestor_authority = document.replace(
+            &format!(
+                "authority_state_directory = {:?}",
+                fixture
+                    .authority_state()
+                    .to_str()
+                    .expect("UTF-8 Authority state")
+            ),
+            &format!(
+                "authority_state_directory = {:?}",
+                fixture
+                    .root
+                    .parent()
+                    .expect("fixture parent")
+                    .to_str()
+                    .expect("UTF-8 parent")
+            ),
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&ancestor_authority).unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+
+        let nested_socket = document.replace(
+            &format!(
+                "authority_socket_path = {:?}",
+                fixture
+                    .authority_socket()
+                    .to_str()
+                    .expect("UTF-8 Authority socket")
+            ),
+            &format!(
+                "authority_socket_path = {:?}",
+                fixture
+                    .state_root()
+                    .join("authority/authority.sock")
+                    .to_str()
+                    .expect("UTF-8 nested socket")
+            ),
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&nested_socket).unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+
+        let nested_secret = document.replace(
+            &format!(
+                "controller_signing_seed_file = {:?}",
+                fixture.controller_seed_path().to_str().expect("UTF-8 seed")
+            ),
+            &format!(
+                "controller_signing_seed_file = {:?}",
+                fixture
+                    .state_root()
+                    .join("controller.seed")
+                    .to_str()
+                    .expect("UTF-8 nested seed")
+            ),
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&nested_secret).unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+
+        let authority_store_secret = document.replace(
+            &format!(
+                "controller_signing_seed_file = {:?}",
+                fixture.controller_seed_path().to_str().expect("UTF-8 seed")
+            ),
+            &format!(
+                "controller_signing_seed_file = {:?}",
+                fixture
+                    .authority_state()
+                    .join("controller.seed")
+                    .to_str()
+                    .expect("UTF-8 Authority store seed")
+            ),
+        );
+        assert_eq!(
+            parse_developer_deployment_config_toml_v1(&authority_store_secret).unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_resolver_rejects_modes_writable_parents_digest_and_inode_aliases() {
+        let fixture = DeploymentConfigFixture::new();
+        let config = parse_developer_deployment_config_toml_v1(&fixture.document())
+            .expect("strict Deployment config");
+
+        fs::set_permissions(
+            fixture.controller_seed_path(),
+            fs::Permissions::from_mode(0o644),
+        )
+        .expect("broaden Controller seed");
+        assert_eq!(
+            config.resolve_current_user_inputs().unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+        fs::set_permissions(
+            fixture.controller_seed_path(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("restore Controller seed");
+
+        fs::set_permissions(
+            fixture.root.join("secrets"),
+            fs::Permissions::from_mode(0o770),
+        )
+        .expect("broaden secret parent");
+        assert_eq!(
+            config.resolve_current_user_inputs().unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+        fs::set_permissions(
+            fixture.root.join("secrets"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore secret parent");
+
+        fs::set_permissions(
+            fixture.root.join("runtime"),
+            fs::Permissions::from_mode(0o707),
+        )
+        .expect("broaden connector parent");
+        assert_eq!(
+            config.resolve_current_user_inputs().unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+        fs::set_permissions(
+            fixture.root.join("runtime"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore connector parent");
+
+        fs::set_permissions(
+            fixture.root.join("authority-socket"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("remove Authority socket setgid/group-read contract");
+        assert_eq!(
+            config.resolve_current_user_inputs().unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+        fs::set_permissions(
+            fixture.root.join("authority-socket"),
+            fs::Permissions::from_mode(0o2750),
+        )
+        .expect("restore Authority socket parent contract");
+
+        fs::write(fixture.artifact_path(), b"field-tampered-public-artifact")
+            .expect("tamper artifact");
+        assert_eq!(
+            config.resolve_current_user_inputs().unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
+
+        let alias_fixture = DeploymentConfigFixture::new();
+        let alias_config = parse_developer_deployment_config_toml_v1(&alias_fixture.document())
+            .expect("alias Deployment config");
+        fs::remove_file(alias_fixture.authority_seed_path()).expect("remove Authority seed");
+        fs::hard_link(
+            alias_fixture.controller_seed_path(),
+            alias_fixture.authority_seed_path(),
+        )
+        .expect("alias signing seeds");
+        assert_eq!(
+            alias_config.resolve_current_user_inputs().unwrap_err(),
+            ConfigError::InvalidDeploymentConfiguration
+        );
     }
 
     #[test]
@@ -3358,6 +4541,10 @@ mod tests {
             parse([OsString::from("developer-distributed-fixture-v1")]),
             Err(ConfigError::UnknownMode)
         );
+        assert_eq!(
+            parse([OsString::from("controller")]),
+            Err(ConfigError::UnknownMode)
+        );
     }
 
     #[test]
@@ -3377,6 +4564,64 @@ mod tests {
             parse([OsString::from(CHAT_COMMAND), OsString::from(CONFIG_OPTION)]),
             Err(ConfigError::MissingConfigPath)
         );
+    }
+
+    #[test]
+    fn deployment_requires_exactly_one_absolute_config_path() {
+        assert_eq!(
+            parse([OsString::from(DEPLOYMENT_COMMAND)]),
+            Err(ConfigError::MissingConfigPath)
+        );
+        assert_eq!(
+            parse([
+                OsString::from(DEPLOYMENT_COMMAND),
+                OsString::from("controller"),
+            ]),
+            Err(ConfigError::MissingConfigPath)
+        );
+        assert_eq!(
+            parse([
+                OsString::from(DEPLOYMENT_COMMAND),
+                OsString::from(CONFIG_OPTION),
+            ]),
+            Err(ConfigError::MissingConfigPath)
+        );
+        assert_eq!(
+            parse([
+                OsString::from(DEPLOYMENT_COMMAND),
+                OsString::from(CONFIG_OPTION),
+                OsString::from("paraegox-deployment.toml"),
+            ]),
+            Err(ConfigError::InvalidConfigPath)
+        );
+        assert_eq!(
+            parse(deployment_config_arguments(vec![
+                b'x';
+                MAX_CONFIG_BYTES as usize + 1
+            ])),
+            Err(ConfigError::ConfigFileTooLarge)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_config_path_rejects_a_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = DeploymentConfigFixture::new();
+        let arguments = deployment_config_arguments(fixture.document());
+        let target = PathBuf::from(arguments[2].clone());
+        let link = target.with_extension("symlink.toml");
+        symlink(&target, &link).expect("create test Deployment config symlink");
+
+        let result = parse([
+            OsString::from(DEPLOYMENT_COMMAND),
+            OsString::from(CONFIG_OPTION),
+            link.clone().into_os_string(),
+        ]);
+        fs::remove_file(&link).expect("remove test Deployment config symlink");
+
+        assert_eq!(result, Err(ConfigError::InvalidConfigPath));
     }
 
     #[test]
@@ -3974,7 +5219,7 @@ mod tests {
         assert_eq!(
             parse(config_arguments(vec![
                 b'x';
-                MAX_CHAT_CONFIG_BYTES as usize + 1
+                MAX_CONFIG_BYTES as usize + 1
             ])),
             Err(ConfigError::ConfigFileTooLarge)
         );
@@ -4046,6 +5291,8 @@ mod tests {
             ConfigError::UnsupportedConfigSchema,
             ConfigError::UnknownProvider,
             ConfigError::InvalidProviderConfiguration,
+            ConfigError::InvalidNodeConfiguration,
+            ConfigError::InvalidDeploymentConfiguration,
             ConfigError::UnexpectedHelpArgument,
             ConfigError::UnknownOption,
             ConfigError::MissingOptionValue,

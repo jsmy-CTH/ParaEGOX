@@ -7920,8 +7920,8 @@ pub(crate) mod tests {
     };
     #[cfg(unix)]
     use paraegox_node::observation::{
-        RuntimeObservationAckV1, RuntimeObservationEndpointRefV1,
-        RuntimeObservationRequestInputV1, RuntimeObservationRequestV1,
+        RuntimeObservationAckV1, RuntimeObservationEndpointRefV1, RuntimeObservationRequestInputV1,
+        RuntimeObservationRequestV1,
     };
     #[cfg(unix)]
     use paraegox_node::protocol::{
@@ -7933,10 +7933,9 @@ pub(crate) mod tests {
     #[cfg(unix)]
     use paraegox_node::{
         EnrollmentIssuerRefV1, NodeArchitectureV1, NodeDaemonV1, NodeFeatureReportInputV1,
-        NodeFeatureReportV1, NodeId, NodeIdentityV1, NodeIncarnation,
-        NodeManagementEndpointRefV1, NodeOperatingSystemV1, NodeRegistrationTenureV1,
-        RuntimeApplyEndpointDescriptorV1, RuntimeApplyEndpointRefV1, RuntimeHostLivenessV1,
-        RuntimeHostStatusV1,
+        NodeFeatureReportV1, NodeId, NodeIdentityV1, NodeIncarnation, NodeManagementEndpointRefV1,
+        NodeOperatingSystemV1, NodeRegistrationTenureV1, RuntimeApplyEndpointDescriptorV1,
+        RuntimeApplyEndpointRefV1, RuntimeHostLivenessV1, RuntimeHostStatusV1,
     };
     use paraegox_runtime_contracts::apply::{
         ApplyOperationId, ExpectedActive, PlanWriterContext, PlanWriterEpoch, RuntimeApplyControl,
@@ -8141,10 +8140,8 @@ pub(crate) mod tests {
         wire[24..56].copy_from_slice(status_digest.as_bytes());
         wire[56..88].copy_from_slice(runtime_status_digest.as_bytes());
         wire[88..120].copy_from_slice(request.request_digest().as_bytes());
-        let mut builder = Digest32Builder::try_new(
-            b"paraegox.node.runtime-observation-ack.v1",
-        )
-        .expect("PXNA digest domain");
+        let mut builder = Digest32Builder::try_new(b"paraegox.node.runtime-observation-ack.v1")
+            .expect("PXNA digest domain");
         builder.field_bytes(&wire).expect("PXNA digest input");
         wire[128..].copy_from_slice(builder.finish().as_bytes());
         RuntimeObservationAckV1::decode(&wire).expect("canonical PXNA")
@@ -8180,25 +8177,19 @@ pub(crate) mod tests {
             NodeIncarnation::try_from_bytes([0x72; 16]).expect("Node incarnation");
         let management_endpoint = NodeManagementEndpointRefV1::try_from_bytes([0x73; 16])
             .expect("Node management endpoint");
-        let node_target = NodeManagementTargetV1::try_new(
-            node_id,
-            management_endpoint,
-            node_incarnation,
-            1,
-        )
-        .expect("Node target");
+        let node_target =
+            NodeManagementTargetV1::try_new(node_id, management_endpoint, node_incarnation, 1)
+                .expect("Node target");
 
         let node_describe_request = remote_node_describe_wire(0x10);
         let decoded_node_describe = NodeControlCarrierRequestV1::decode(&node_describe_request)
             .expect("Node Describe request");
-        let node_describe_response = NodeControlDescribeResponseDraftV1::try_describe(
-            &decoded_node_describe,
-            node_target,
-        )
-        .and_then(NodeControlDescribeResponseDraftV1::finalize)
-        .expect("Node Describe response")
-        .canonical_wire()
-        .into();
+        let node_describe_response =
+            NodeControlDescribeResponseDraftV1::try_describe(&decoded_node_describe, node_target)
+                .and_then(NodeControlDescribeResponseDraftV1::finalize)
+                .expect("Node Describe response")
+                .canonical_wire()
+                .into();
 
         let manifest = super::controller_test_manifest(target);
         let projection = ManagedFabricManifestProjectionV1::try_from_verified_legacy_manifest(
@@ -8253,13 +8244,14 @@ pub(crate) mod tests {
             ),
         )
         .expect("Runtime serving facts");
-        let channel = paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1::try_new(
-            target,
-            carrier.runtime_principal(),
-            digest(0x57),
-            digest(0x58),
-        )
-        .expect("Runtime channel");
+        let channel =
+            paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1::try_new(
+                target,
+                carrier.runtime_principal(),
+                digest(0x57),
+                digest(0x58),
+            )
+            .expect("Runtime channel");
         let runtime_describe_facts = RuntimeControlDescribeReadyFactsV1::try_new(
             RuntimeControlDescribeReadyPhaseV1::LegacyReady,
             serving,
@@ -8289,11 +8281,11 @@ pub(crate) mod tests {
             .finalize(&runtime_describe_response_signature.to_bytes())
             .expect("Runtime Describe response");
 
-        let challenge = NodeControlObservationChallengeV1::try_new(
-            NodeControlObservationChallengeFieldsV1 {
-                observation_endpoint_ref: RuntimeObservationEndpointRefV1::try_from_bytes([
-                    0x31; 16
-                ])
+        let challenge =
+            NodeControlObservationChallengeV1::try_new(NodeControlObservationChallengeFieldsV1 {
+                observation_endpoint_ref: RuntimeObservationEndpointRefV1::try_from_bytes(
+                    [0x31; 16],
+                )
                 .expect("observation endpoint"),
                 runtime_host_id: target,
                 authority_digest: digest(0x32),
@@ -8302,9 +8294,8 @@ pub(crate) mod tests {
                 issued_at_unix_nanos: 1_000,
                 expires_at_unix_nanos: 1_050,
                 query_nonce: digest(0x33),
-            },
-        )
-        .expect("Node challenge");
+            })
+            .expect("Node challenge");
         let node_challenge = finalize_remote_node_request(
             NodeControlCarrierRequestDraftV1::try_observation_challenge(
                 [0x30; 16],
@@ -8330,9 +8321,7 @@ pub(crate) mod tests {
             ReferenceQueryIdV1::from_bytes([0x41; 16]),
             target,
             SourceScopeRef::from_bytes([0x42; 16]),
-            runtime_describe_facts
-                .serving()
-                .runtime_store_instance_id(),
+            runtime_describe_facts.serving().runtime_store_instance_id(),
             ApplyOperationId::from_bytes([0x43; 16]),
             None,
         )
@@ -8340,8 +8329,10 @@ pub(crate) mod tests {
         let query_draft = ReferenceQueryRequestDraftV1::try_new(
             query_selector,
             remote_connector_auth_claim(challenge.query_nonce().as_bytes()),
-            u32::try_from(paraegox_runtime_contracts::reference_control::MAX_REFERENCE_QUERY_RESPONSE_BYTES)
-                .expect("query response bound"),
+            u32::try_from(
+                paraegox_runtime_contracts::reference_control::MAX_REFERENCE_QUERY_RESPONSE_BYTES,
+            )
+            .expect("query response bound"),
         )
         .expect("query request draft");
         let query_signature = controller.sign(
@@ -8373,9 +8364,7 @@ pub(crate) mod tests {
         let runtime_query_request = runtime_query.canonical_wire().into();
         let query_serving = ReferenceBootstrapServingIdentityV1::try_new(
             target,
-            runtime_describe_facts
-                .serving()
-                .runtime_store_instance_id(),
+            runtime_describe_facts.serving().runtime_store_instance_id(),
             runtime_describe_facts.serving().snapshot_sequence(),
             runtime_describe_facts.serving().runtime_host_epoch(),
             runtime_describe_facts.serving().clock_domain(),
@@ -8431,8 +8420,8 @@ pub(crate) mod tests {
             .finalize(&query_response_signature.to_bytes())
             .expect("query response");
 
-        let observation_request = RuntimeObservationRequestV1::try_new(
-            RuntimeObservationRequestInputV1 {
+        let observation_request =
+            RuntimeObservationRequestV1::try_new(RuntimeObservationRequestInputV1 {
                 intended_status_sequence: challenge.intended_status_sequence(),
                 freshness_budget_nanos: challenge.freshness_budget_nanos(),
                 runtime_host_id: target,
@@ -8441,9 +8430,8 @@ pub(crate) mod tests {
                 challenge_expires_at_unix_nanos: challenge.expires_at_unix_nanos(),
                 query_request: query_request.clone(),
                 query_response: query_response.clone(),
-            },
-        )
-        .expect("Runtime observation request");
+            })
+            .expect("Runtime observation request");
         let node_publish = finalize_remote_node_request(
             NodeControlCarrierRequestDraftV1::try_publish_runtime_observation(
                 [0x50; 16],
@@ -8456,8 +8444,7 @@ pub(crate) mod tests {
         let node_publish_request = node_publish.canonical_wire().into();
 
         let runtime_endpoint = RuntimeApplyEndpointDescriptorV1::try_new(
-            RuntimeApplyEndpointRefV1::try_from_bytes([0x74; 16])
-                .expect("Runtime endpoint ref"),
+            RuntimeApplyEndpointRefV1::try_from_bytes([0x74; 16]).expect("Runtime endpoint ref"),
             target,
             3,
             "paraegox/runtime-a/apply",
@@ -8478,8 +8465,8 @@ pub(crate) mod tests {
             EnrollmentIssuerRefV1::try_from_bytes([0x76; 16]).expect("enrollment issuer"),
         )
         .expect("Node identity");
-        let tenure = NodeRegistrationTenureV1::try_new(node_id, 1, node_incarnation)
-            .expect("Node tenure");
+        let tenure =
+            NodeRegistrationTenureV1::try_new(node_id, 1, node_incarnation).expect("Node tenure");
         let feature = NodeFeatureReportV1::try_new(NodeFeatureReportInputV1 {
             node_id,
             node_incarnation,
@@ -8505,8 +8492,8 @@ pub(crate) mod tests {
             runtime_status.status_digest(),
         );
 
-        let latest_management = NodeManagementRequestV1::try_latest([0x60; 16], node_target)
-            .expect("Latest request");
+        let latest_management =
+            NodeManagementRequestV1::try_latest([0x60; 16], node_target).expect("Latest request");
         let node_latest = finalize_remote_node_request(
             NodeControlCarrierRequestDraftV1::try_latest(
                 [0x60; 16],
@@ -12486,18 +12473,11 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_connector_partial_resume_projection_replays_every_stage_and_valid_round_abandon() {
-        use super::{
-            ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorStepV1,
-        };
+        use super::{ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorStepV1};
 
         let fixture = remote_connector_projection_fixture();
         let initialized = initial_snapshot()
-            .try_initialize_remote_connector(
-                digest(0xa1),
-                fixture.target,
-                [0xa2; 32],
-                [0xa3; 32],
-            )
+            .try_initialize_remote_connector(digest(0xa1), fixture.target, [0xa2; 32], [0xa3; 32])
             .expect("remote connector identity");
         let node_described = remote_connector_response_durable(
             &initialized,
@@ -12682,7 +12662,10 @@ pub(crate) mod tests {
             .remote_connector_resume_projection()
             .expect("PXQS projection")
             .expect("remote extension");
-        assert_eq!(query_projection.query_request(), Some(&fixture.query_request));
+        assert_eq!(
+            query_projection.query_request(),
+            Some(&fixture.query_request)
+        );
         assert_eq!(
             query_projection.query_response(),
             Some(&fixture.query_response)
@@ -12766,16 +12749,11 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_connector_partial_resume_projection_rejects_each_stage_tamper() {
-        use super::{ControllerRemoteConnectorStepV1, ControllerRemoteConnectorStateV1};
+        use super::{ControllerRemoteConnectorStateV1, ControllerRemoteConnectorStepV1};
 
         let fixture = remote_connector_projection_fixture();
         let mut terminal = initial_snapshot()
-            .try_initialize_remote_connector(
-                digest(0xb1),
-                fixture.target,
-                [0xb2; 32],
-                [0xb3; 32],
-            )
+            .try_initialize_remote_connector(digest(0xb1), fixture.target, [0xb2; 32], [0xb3; 32])
             .expect("remote connector identity");
         for (step, request, response) in [
             (

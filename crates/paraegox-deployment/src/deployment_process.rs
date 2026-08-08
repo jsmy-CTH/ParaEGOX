@@ -314,8 +314,8 @@ mod platform {
         MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
     };
     use paraegox_node::observation::{
-        MAX_RUNTIME_OBSERVATION_CHALLENGE_NANOS, RuntimeObservationAuthorityV1,
-        RuntimeObservationAckV1, RuntimeObservationEndpointRefV1,
+        MAX_RUNTIME_OBSERVATION_CHALLENGE_NANOS, RuntimeObservationAckV1,
+        RuntimeObservationAuthorityV1, RuntimeObservationEndpointRefV1,
         RuntimeObservationRequestInputV1, RuntimeObservationRequestV1,
         derive_runtime_observation_query_nonce_v1,
     };
@@ -798,11 +798,7 @@ mod platform {
         let authority_public_pins = authority
             .public_pins()
             .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
-        validate_authority_public_pins(
-            &enrollment,
-            &controller_signer,
-            authority_public_pins,
-        )?;
+        validate_authority_public_pins(&enrollment, &controller_signer, authority_public_pins)?;
         let authority = DeveloperLocalTenureAuthorityV1::start(authority)
             .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)?;
         let mut runtime_client = match RestrictedRuntimeControlClientV1::start(runtime_client).await
@@ -821,8 +817,8 @@ mod platform {
                 return Err(DeveloperDeploymentErrorV1::NodeExchangeFailed);
             }
         };
-        let result = enroll_and_cutover_developer_deployment_v1(
-            DeveloperDeploymentPipelineInputV1 {
+        let result =
+            enroll_and_cutover_developer_deployment_v1(DeveloperDeploymentPipelineInputV1 {
                 mode,
                 controller_store_directory: &controller_store_directory,
                 successor_store_directory: &successor_store_directory,
@@ -831,9 +827,8 @@ mod platform {
                 authority_facts: authority.facts(),
                 node_client: &mut node_client,
                 runtime_client: &mut runtime_client,
-            },
-        )
-        .await;
+            })
+            .await;
         match result {
             Ok(DeveloperDeploymentPipelineOutcomeV1::Ready { store, ready }) => {
                 Ok(DeveloperDeploymentStartOutcomeV1::Ready {
@@ -854,12 +849,12 @@ mod platform {
                 };
                 Ok(DeveloperDeploymentStartOutcomeV1::ReconcileRequired(
                     DeveloperDeploymentOwnerV1 {
-                    authority: Some(authority),
-                    node_client: Some(node_client),
-                    runtime_client: Some(runtime_client),
-                    controller_store,
-                    successor_store,
-                },
+                        authority: Some(authority),
+                        node_client: Some(node_client),
+                        runtime_client: Some(runtime_client),
+                        controller_store,
+                        successor_store,
+                    },
                 ))
             }
             Err(error) => {
@@ -877,7 +872,8 @@ mod platform {
         successor_store_directory: &'a Path,
         enrollment: &'a DeveloperDeploymentEnrollmentFactsV1,
         controller_signer: &'a SigningKey,
-        authority_facts: &'a crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
+        authority_facts:
+            &'a crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
         node_client: &'a mut RestrictedNodeControlClientV1,
         runtime_client: &'a mut RestrictedRuntimeControlClientV1,
     }
@@ -1139,7 +1135,8 @@ mod platform {
         successor_store_directory: &'a Path,
         enrollment: &'a DeveloperDeploymentEnrollmentFactsV1,
         controller_signer: &'a SigningKey,
-        authority_facts: &'a crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
+        authority_facts:
+            &'a crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
         owner_identity: ControllerOwnerIdentityFingerprint,
         request_auth: ControllerRequestAuthPin,
         provisioning: &'a ManagedFabricRemoteControllerProvisioningV1,
@@ -1174,7 +1171,6 @@ mod platform {
             validate_resumed_controller_snapshot(
                 successor.state().legacy_snapshot(),
                 enrollment,
-                authority_facts,
                 request_auth,
             )?;
             let ingress = remote_describe_ingress_from_successor(&successor, provisioning)?;
@@ -1198,7 +1194,7 @@ mod platform {
             });
         }
 
-        let store = ControllerStore::open_developer_local_observed_identity(
+        let mut store = ControllerStore::open_developer_local_observed_identity(
             controller_store_directory,
             owner_identity,
         )
@@ -1206,7 +1202,7 @@ mod platform {
         let snapshot = store
             .snapshot()
             .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
-        validate_resumed_controller_snapshot(snapshot, enrollment, authority_facts, request_auth)?;
+        validate_resumed_controller_snapshot(snapshot, enrollment, request_auth)?;
         acquire_developer_tenure_once(
             &mut store,
             DeveloperTenurePinsV1::from_enrollment(enrollment),
@@ -1300,7 +1296,6 @@ mod platform {
     fn validate_resumed_controller_snapshot(
         snapshot: &ControllerJournalSnapshot,
         enrollment: &DeveloperDeploymentEnrollmentFactsV1,
-        authority_facts: &crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
         request_auth: ControllerRequestAuthPin,
     ) -> Result<(), DeveloperDeploymentErrorV1> {
         let state = snapshot.state();
@@ -1381,8 +1376,7 @@ mod platform {
                 ControllerRemoteConnectorRestartRequirementV1::None => {}
             }
             if let Some(current) = projection.current_exchange()
-                && current.phase()
-                    == ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
+                && current.phase() == ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
             {
                 send_exact_resumed_remote_request(ExactResumedRemoteRequestInputV1 {
                     store: &mut store,
@@ -1480,10 +1474,8 @@ mod platform {
                     let target = projection
                         .node_target()
                         .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
-                    let node = RemoteNodeControlAdapterV1::from_verified_target(
-                        node_transport,
-                        target,
-                    );
+                    let node =
+                        RemoteNodeControlAdapterV1::from_verified_target(node_transport, target);
                     let ingress = resume_remote_describe_ingress(&projection, provisioning)?;
                     let authority = runtime_observation_authority(enrollment, &ingress)?;
                     node_challenge_exchange(
@@ -1516,10 +1508,8 @@ mod platform {
                     let target = projection
                         .node_target()
                         .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
-                    let node = RemoteNodeControlAdapterV1::from_verified_target(
-                        node_transport,
-                        target,
-                    );
+                    let node =
+                        RemoteNodeControlAdapterV1::from_verified_target(node_transport, target);
                     let challenge = projection
                         .challenge()
                         .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
@@ -1531,8 +1521,8 @@ mod platform {
                         .query_response()
                         .cloned()
                         .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
-                    let observation = RuntimeObservationRequestV1::try_new(
-                        RuntimeObservationRequestInputV1 {
+                    let observation =
+                        RuntimeObservationRequestV1::try_new(RuntimeObservationRequestInputV1 {
                             intended_status_sequence: challenge.intended_status_sequence(),
                             freshness_budget_nanos: challenge.freshness_budget_nanos(),
                             runtime_host_id: challenge.runtime_host_id(),
@@ -1541,9 +1531,8 @@ mod platform {
                             challenge_expires_at_unix_nanos: challenge.expires_at_unix_nanos(),
                             query_request,
                             query_response,
-                        },
-                    )
-                    .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+                        })
+                        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
                     node_publish_exchange(
                         &mut store,
                         node_client,
@@ -1558,10 +1547,8 @@ mod platform {
                     let target = projection
                         .node_target()
                         .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
-                    let node = RemoteNodeControlAdapterV1::from_verified_target(
-                        node_transport,
-                        target,
-                    );
+                    let node =
+                        RemoteNodeControlAdapterV1::from_verified_target(node_transport, target);
                     node_latest_exchange(
                         &mut store,
                         node_client,
@@ -1776,9 +1763,7 @@ mod platform {
                 )
                 .map_err(|_| DeveloperDeploymentErrorV1::NodeExchangeFailed)?;
             let expected_kind = match step {
-                ControllerRemoteConnectorStepV1::NodeDescribe => {
-                    NodeControlCarrierKindV1::Describe
-                }
+                ControllerRemoteConnectorStepV1::NodeDescribe => NodeControlCarrierKindV1::Describe,
                 ControllerRemoteConnectorStepV1::NodeChallenge => {
                     NodeControlCarrierKindV1::ObservationChallenge
                 }
@@ -1934,12 +1919,10 @@ mod platform {
                 let ingress = resume_remote_describe_ingress(projection, provisioning)?;
                 let authority = runtime_observation_authority(enrollment, &ingress)?;
                 if request.kind() != NodeControlCarrierKindV1::ObservationChallenge
-                    || response.kind()
-                        != NodeControlDescribeResponseKindV1::ObservationChallenge
+                    || response.kind() != NodeControlDescribeResponseKindV1::ObservationChallenge
                     || response.target() != enrollment.expected_node_target
                     || challenge.runtime_host_id() != authority.runtime_host_id()
-                    || challenge.observation_endpoint_ref()
-                        != enrollment.observation_endpoint_ref
+                    || challenge.observation_endpoint_ref() != enrollment.observation_endpoint_ref
                     || challenge.authority_digest() != authority.authority_digest()
                 {
                     return Err(DeveloperDeploymentErrorV1::NodeExchangeFailed);
@@ -2146,12 +2129,10 @@ mod platform {
             )
         };
         let prepared = match unresolved {
-            Some(canonical_request) => recover_tenure_request(
-                &canonical_request,
-                &profile,
-                &signer.verifying_key(),
-            )
-            .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)?,
+            Some(canonical_request) => {
+                recover_tenure_request(&canonical_request, &profile, &signer.verifying_key())
+                    .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)?
+            }
             None if committed => return Ok(()),
             None => fresh_tenure_request(&profile, signer)
                 .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)?,
@@ -2176,8 +2157,7 @@ mod platform {
             DeveloperLocalTenureAuthorityPublicPinsV1 {
                 identities: authority.identities(),
                 authority_verification_key: authority.authority_verification_key(),
-                controller_public_key_fingerprint: authority
-                    .controller_public_key_fingerprint(),
+                controller_public_key_fingerprint: authority.controller_public_key_fingerprint(),
             },
         )
     }
@@ -2207,8 +2187,7 @@ mod platform {
             || authority.controller_public_key_fingerprint
                 != *controller_public_key_fingerprint.as_bytes()
             || authority.authority_verification_key != enrollment.authority_verification_key
-            || controller_signer.verifying_key().to_bytes()
-                == authority.authority_verification_key
+            || controller_signer.verifying_key().to_bytes() == authority.authority_verification_key
         {
             return Err(DeveloperDeploymentErrorV1::InvalidEnrollmentFacts);
         }
@@ -9337,32 +9316,34 @@ mod platform {
         use paraegox_kernel::time::BoundedDuration;
         use paraegox_node::protocol::NodeManagementTargetV1;
         use paraegox_node::{NodeId, NodeIncarnation, NodeManagementEndpointRefV1};
-        use paraegox_runtime_contracts::apply::{
-            PlanWriterRef, TenureAuthorityRef, TenureKeyRef,
-        };
+        use paraegox_runtime_contracts::apply::{PlanWriterRef, TenureAuthorityRef, TenureKeyRef};
         use paraegox_runtime_contracts::distributed_agent_stack_plan::{
             DistributedFabricCredentialRefV1, DistributedFabricTrustAnchorRefV1,
             DistributedFabricTrustDomainRefV1, RestrictedRuntimeApplyTransportProfileFieldsV1,
             RestrictedRuntimeApplyTransportProfileV1,
         };
-        use paraegox_runtime_contracts::reference_control::ValidatedReferenceLifecycleBudgetsV1;
         use paraegox_runtime_contracts::provenance::SourceScopeRef;
+        use paraegox_runtime_contracts::reference_control::ValidatedReferenceLifecycleBudgetsV1;
         use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
         use zeroize::Zeroizing;
 
+        use crate::controller_initializer::{
+            ControllerInitializationInput, initialize_controller_store_developer_local,
+        };
         use crate::controller_journal::{
             ControllerAuthKeyFingerprint, ControllerJournalError, ControllerJournalState,
             ControllerOperationId, ControllerOwnerIdentityFingerprint, ControllerRequestAuthPin,
             ControllerTenureAuthorityDomainFingerprint, controller_test_manifest,
             tests::{decided_snapshot, direct_active_snapshot},
         };
-        use crate::controller_initializer::{
-            ControllerInitializationInput, initialize_controller_store_developer_local,
-        };
         use crate::controller_store::{
             ControllerCommitFailpoint, ControllerFilesystemPolicy, ControllerStore,
             create_and_lock_controller_initializer_lock, ensure_fresh_controller_directory,
             open_controller_directory, publish_initial_controller_snapshot,
+        };
+        use crate::developer_local_tenure_authority::{
+            DeveloperLocalPeerIdentityV1, DeveloperLocalTenureAuthorityConfigV1,
+            DeveloperLocalTenureAuthorityIdentityBytesV1, DeveloperLocalTenureAuthorityV1,
         };
         use crate::plan::{DeploymentId, DeploymentScopeId, DeploymentWriterRef};
         use crate::planner::StableAllocationSnapshot;
@@ -9370,24 +9351,18 @@ mod platform {
             ControllerAcquireKeyRef, ControllerPublicKeyFingerprint,
             MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
         };
-        use crate::developer_local_tenure_authority::{
-            DeveloperLocalPeerIdentityV1, DeveloperLocalTenureAuthorityConfigV1,
-            DeveloperLocalTenureAuthorityIdentityBytesV1, DeveloperLocalTenureAuthorityV1,
-        };
-
         use super::{
-            APPLY_ENTROPY_BYTES, BootstrapArguments, CommonArguments,
+            APPLY_ENTROPY_BYTES, BootstrapArguments, CommonArguments, DeveloperTenurePinsV1,
             DistributedAgentStackRolloutStatusV1, DistributedCoordinatorCapabilityV1,
             DistributedLocalCapabilityV1, DistributedNodeCapabilityV1,
             DistributedPredecessorCapabilityV1,
             DistributedRestrictedControllerConnectorCapabilityV1, DurableTenureRequest,
             FileLengthPolicy, FileRole, FreshControllerApplyRequestV1, ManagedServingArguments,
             ProcessCommand, ProcessErrorKind, TENURE_ENTROPY_BYTES, TenureRequestProfile,
-            build_empty_commit_receipt, build_reference_candidate, build_reference_empty_candidate,
-            commit_reference_empty_in_store,
+            acquire_developer_tenure_once, build_empty_commit_receipt, build_reference_candidate,
+            build_reference_empty_candidate, commit_reference_empty_in_store,
             distributed_owner_terminal_runtime_observation_is_admissible,
-            fresh_apply_request_from_entropy, fresh_tenure_request_from_entropy,
-            acquire_developer_tenure_once, DeveloperTenurePinsV1, parse_arguments,
+            fresh_apply_request_from_entropy, fresh_tenure_request_from_entropy, parse_arguments,
             parse_nonzero_hex, read_pinned_file, recover_tenure_request,
             select_durable_tenure_request, validate_committed_empty_state,
         };
@@ -10109,19 +10084,17 @@ mod platform {
             let controller_directory = directory.path.join("controller");
             let authority_directory = directory.path.join("authority");
             let socket_directory = directory.path.join("authority-run");
-            for path in [&controller_directory, &authority_directory, &socket_directory] {
+            for path in [
+                &controller_directory,
+                &authority_directory,
+                &socket_directory,
+            ] {
                 fs::create_dir(path).expect("create developer owner directory");
             }
-            fs::set_permissions(
-                &controller_directory,
-                fs::Permissions::from_mode(0o700),
-            )
-            .expect("controller mode");
-            fs::set_permissions(
-                &authority_directory,
-                fs::Permissions::from_mode(0o700),
-            )
-            .expect("Authority state mode");
+            fs::set_permissions(&controller_directory, fs::Permissions::from_mode(0o700))
+                .expect("controller mode");
+            fs::set_permissions(&authority_directory, fs::Permissions::from_mode(0o700))
+                .expect("Authority state mode");
             fs::set_permissions(&socket_directory, fs::Permissions::from_mode(0o2750))
                 .expect("Authority socket parent mode");
 
@@ -10176,11 +10149,9 @@ mod platform {
                 owner_identity,
             )
             .expect("Controller initialization");
-            let receipt = initialize_controller_store_developer_local(
-                &controller_directory,
-                initialization,
-            )
-            .expect("Controller store initialized");
+            let receipt =
+                initialize_controller_store_developer_local(&controller_directory, initialization)
+                    .expect("Controller store initialized");
             let mut store = ControllerStore::open_developer_local(
                 &controller_directory,
                 *receipt.store_instance_id(),
@@ -10219,12 +10190,13 @@ mod platform {
                 scope: DeploymentScopeId::from_bytes(*pins.source_scope.as_bytes()),
                 writer: DeploymentWriterRef::from_bytes(*pins.writer.as_bytes()),
                 controller_principal: pins.controller_principal,
-                controller_key: ControllerAcquireKeyRef::from_bytes(*pins.controller_key.as_bytes()),
-                controller_public_key_fingerprint:
-                    ControllerPublicKeyFingerprint::for_ed25519_key(
-                        &controller_signer.verifying_key().to_bytes(),
-                    )
-                    .expect("tenure Controller fingerprint"),
+                controller_key: ControllerAcquireKeyRef::from_bytes(
+                    *pins.controller_key.as_bytes(),
+                ),
+                controller_public_key_fingerprint: ControllerPublicKeyFingerprint::for_ed25519_key(
+                    &controller_signer.verifying_key().to_bytes(),
+                )
+                .expect("tenure Controller fingerprint"),
                 max_response_payload_bytes: u32::try_from(
                     MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
                 )

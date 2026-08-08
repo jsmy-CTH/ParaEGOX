@@ -7,8 +7,9 @@ use std::{
 };
 
 use config::{
-    Command, DeveloperDistributedFixtureActionV1, DeveloperDistributedFixtureConfigV1,
-    DeveloperFixtureConfigV1, DeveloperNodeConfigV1, DeveloperProvisionedConfigV1,
+    Command, DeveloperDeploymentConfigV1, DeveloperDistributedFixtureActionV1,
+    DeveloperDistributedFixtureConfigV1, DeveloperFixtureConfigV1, DeveloperNodeConfigV1,
+    DeveloperProvisionedConfigV1,
 };
 use error::LocalProcessError;
 
@@ -56,6 +57,7 @@ fn dispatch(arguments: impl IntoIterator<Item = OsString>) -> Result<(), LocalPr
             Ok(())
         }
         Command::DeveloperNodeV1(config) => compose_real_node(*config),
+        Command::DeveloperDeploymentV1(config) => compose_real_deployment(*config),
         Command::DeveloperFixtureV1(config) => compose_real_local_stack(config),
         Command::DeveloperDistributedFixtureV1(config) => match config.action() {
             DeveloperDistributedFixtureActionV1::Run => {
@@ -66,6 +68,20 @@ fn dispatch(arguments: impl IntoIterator<Item = OsString>) -> Result<(), LocalPr
             }
         },
         Command::DeveloperProvisionedV1(config) => compose_real_provisioned_stack(config),
+    }
+}
+
+fn compose_real_deployment(
+    config: DeveloperDeploymentConfigV1,
+) -> Result<(), LocalProcessError> {
+    #[cfg(unix)]
+    {
+        composition::run_deployment(config)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        unreachable!("configuration rejects DeveloperLocal before Deployment composition")
     }
 }
 
@@ -225,6 +241,7 @@ fn print_usage_to_stderr() {
 fn usage() -> &'static str {
     r"Usage: paraegox chat --config <absolute-paraegox.toml>
        paraegox node --config <absolute-paraegox-node.toml>
+       paraegox deployment --config <absolute-paraegox-deployment.toml>
        paraegox --help
 
 chat starts the configured ParaEGOX conversation owner chain and Textual console.
@@ -241,8 +258,13 @@ ingress/observation bridge. Both schemas contain verification keys, opaque
 references, and credential file paths, never Controller or Authority private
 keys. This command does not run Controller, Authority, the managed Fabric
 CoreService, Agent, Model, Inspection, or Textual.
-There is not yet a public Mac Controller connector. There is no two-host
-cutover proof, remote Agent conversation, or reconnect policy."
+
+deployment consumes one independently SHA-256-pinned enrollment artifact and
+starts the single DeploymentController, tenure Authority, Runtime-control
+connector, and Node-control connector owner graph. It prints readiness only
+after the durable managed-successor reconciliation reports ManagedReady. This
+bounded command is not evidence of a two-host system proof, remote Agent
+conversation, remote TUI, or reconnect policy."
 }
 
 #[cfg(test)]
@@ -284,6 +306,31 @@ mod tests {
         .expect_err("a relative node config path must fail before composition");
 
         assert!(matches!(error, LocalProcessError::Configuration(_)));
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn deployment_rejects_a_non_absolute_config_path_before_composition() {
+        let error = dispatch([
+            OsString::from("deployment"),
+            OsString::from("--config"),
+            OsString::from("paraegox-deployment.toml"),
+        ])
+        .expect_err("a relative Deployment config path must fail before composition");
+
+        assert!(matches!(error, LocalProcessError::Configuration(_)));
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn bare_controller_is_not_a_public_command() {
+        let error = dispatch([OsString::from("controller")])
+            .expect_err("bare controller must not select Deployment");
+
+        assert_eq!(
+            error,
+            LocalProcessError::Configuration(config::ConfigError::UnknownMode)
+        );
         assert_eq!(error.exit_code(), 2);
     }
 
@@ -357,19 +404,35 @@ mod tests {
     }
 
     #[test]
-    fn usage_exposes_exact_chat_and_node_config_commands_only() {
+    fn usage_exposes_exact_chat_node_and_deployment_config_commands_only() {
         let text = usage();
+        assert_eq!(
+            text.lines().take(4).collect::<Vec<_>>(),
+            [
+                "Usage: paraegox chat --config <absolute-paraegox.toml>",
+                "       paraegox node --config <absolute-paraegox-node.toml>",
+                "       paraegox deployment --config <absolute-paraegox-deployment.toml>",
+                "       paraegox --help",
+            ]
+        );
         assert!(text.contains("paraegox chat --config <absolute-paraegox.toml>"));
         assert!(text.contains("paraegox node --config <absolute-paraegox-node.toml>"));
+        assert!(
+            text.contains("paraegox deployment --config <absolute-paraegox-deployment.toml>")
+        );
         assert!(text.contains("split-trust local Runtime and one NodeDaemon"));
         assert!(text.contains("schema v1 retains the G1 host-local feature-only profile"));
         assert!(text.contains("schema v2\nstarts the G2 host-side Runtime-control listener"));
         assert!(text.contains("authenticated Node-control\ningress/observation bridge"));
         assert!(text.contains("never Controller or Authority private\nkeys"));
         assert!(text.contains("does not run Controller, Authority"));
-        assert!(text.contains("There is not yet a public Mac Controller connector"));
-        assert!(text.contains("There is no two-host\ncutover proof"));
+        assert!(text.contains("independently SHA-256-pinned enrollment artifact"));
+        assert!(text.contains("single DeploymentController"));
+        assert!(text.contains("It prints readiness only\nafter the durable managed-successor"));
+        assert!(text.contains("reports ManagedReady"));
+        assert!(text.contains("not evidence of a two-host system proof"));
         assert!(text.contains("remote Agent conversation"));
+        assert!(text.contains("remote TUI"));
         assert!(text.contains("reconnect policy"));
         assert!(text.contains("absolute versioned configuration"));
         assert!(text.contains("provider and\nmodel selection"));
@@ -382,6 +445,7 @@ mod tests {
         assert!(!text.contains("chat fixture-v1"));
         assert!(!text.contains("chat openai-v1"));
         assert!(!text.contains("chat deepseek-v1"));
+        assert!(!text.contains("paraegox controller"));
         assert!(!text.contains("developer-distributed-fixture-v1"));
         assert!(!text.contains("developer-fixture-v1"));
         assert!(!text.contains("developer-openai-v1"));

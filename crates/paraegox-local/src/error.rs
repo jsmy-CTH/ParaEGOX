@@ -15,6 +15,12 @@ pub(crate) enum LocalProcessError {
     NodeBootstrap,
     NodeCredentialFiles,
     NodeStartup,
+    DeploymentPreparation,
+    DeploymentStartup,
+    DeploymentReconcileRequired,
+    DeploymentOwnerExit,
+    DeploymentReadyOutput,
+    DeploymentJoinedShutdown,
     DeploymentActivation,
     ConversationConfiguration,
     ConversationCapability,
@@ -52,6 +58,12 @@ impl LocalProcessError {
             Self::NodeBootstrap => "PXLC-NODE-BOOTSTRAP",
             Self::NodeCredentialFiles => "PXLC-NODE-CREDENTIAL-FILES",
             Self::NodeStartup => "PXLC-NODE-STARTUP",
+            Self::DeploymentPreparation => "PXLC-DEPLOYMENT-PREPARATION",
+            Self::DeploymentStartup => "PXLC-DEPLOYMENT-STARTUP",
+            Self::DeploymentReconcileRequired => "PXLC-DEPLOYMENT-RECONCILE-REQUIRED",
+            Self::DeploymentOwnerExit => "PXLC-DEPLOYMENT-OWNER-EXIT",
+            Self::DeploymentReadyOutput => "PXLC-DEPLOYMENT-READY-OUTPUT",
+            Self::DeploymentJoinedShutdown => "PXLC-DEPLOYMENT-JOINED-SHUTDOWN",
             Self::DeploymentActivation => "PXLC-DEPLOYMENT-ACTIVATION",
             Self::ConversationConfiguration => "PXLC-CONVERSATION-CONFIGURATION",
             Self::ConversationCapability => "PXLC-CONVERSATION-CAPABILITY",
@@ -78,7 +90,7 @@ impl LocalProcessError {
         match self {
             Self::Configuration(error) => error.message(),
             Self::UnsafeExecutionIdentity => {
-                "DeveloperLocal node must run as a non-root user and group"
+                "DeveloperLocal commands require a non-root user and group"
             }
             Self::SignalHandling => "DeveloperLocal process signal handling failed closed",
             Self::IdentityManifest => "DeveloperLocal identity manifest failed closed",
@@ -91,6 +103,24 @@ impl LocalProcessError {
             Self::NodeBootstrap => "DeveloperLocal Node registration bootstrap failed closed",
             Self::NodeCredentialFiles => "DeveloperLocal Node TLS credential files failed closed",
             Self::NodeStartup => "DeveloperLocal NodeDaemon failed to start",
+            Self::DeploymentPreparation => {
+                "DeveloperLocal DeploymentController inputs or owner layout failed closed"
+            }
+            Self::DeploymentStartup => {
+                "DeveloperLocal DeploymentController owner graph failed to start"
+            }
+            Self::DeploymentReconcileRequired => {
+                "DeveloperLocal DeploymentController requires explicit reconciliation before readiness"
+            }
+            Self::DeploymentOwnerExit => {
+                "DeveloperLocal DeploymentController owner exited before process shutdown"
+            }
+            Self::DeploymentReadyOutput => {
+                "DeveloperLocal DeploymentController readiness output failed"
+            }
+            Self::DeploymentJoinedShutdown => {
+                "DeveloperLocal DeploymentController owners did not complete joined shutdown"
+            }
             Self::DeploymentActivation => {
                 "DeploymentController failed to activate the Fabric and Agent stack"
             }
@@ -193,5 +223,29 @@ mod tests {
             assert!(!stage.message().is_empty());
             assert_eq!(stage.exit_code(), 1);
         }
+    }
+
+    #[test]
+    fn public_deployment_lifecycle_failures_are_distinct_and_never_claim_ready() {
+        let stages = [
+            LocalProcessError::DeploymentPreparation,
+            LocalProcessError::DeploymentStartup,
+            LocalProcessError::DeploymentReconcileRequired,
+            LocalProcessError::DeploymentOwnerExit,
+            LocalProcessError::DeploymentReadyOutput,
+            LocalProcessError::DeploymentJoinedShutdown,
+        ];
+        let mut codes = std::collections::BTreeSet::new();
+        for stage in stages {
+            assert!(stage.code().starts_with("PXLC-DEPLOYMENT-"));
+            assert!(codes.insert(stage.code()), "duplicate Deployment stage code");
+            assert_eq!(stage.exit_code(), 1);
+        }
+        assert!(!LocalProcessError::DeploymentReconcileRequired
+            .message()
+            .contains("is ready"));
+        assert!(!LocalProcessError::DeploymentOwnerExit
+            .message()
+            .contains("is ready"));
     }
 }
