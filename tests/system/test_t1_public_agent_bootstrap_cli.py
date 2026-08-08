@@ -258,7 +258,7 @@ def test_public_agent_bootstrap_fresh_resume_and_fail_closed() -> None:
             "--clear-groups",
             "--",
         ]
-        node = g2._spawn(
+        node: g2.RunningProcess | None = g2._spawn(
             [*command_prefix, str(binary), "node", "--config", str(node_config)],
             name="t1-node-fresh",
             root=root,
@@ -270,6 +270,7 @@ def test_public_agent_bootstrap_fresh_resume_and_fail_closed() -> None:
         wrong_pin: g2.RunningProcess | None = None
         node_down: g2.RunningProcess | None = None
         try:
+            assert node is not None
             _assert_ready_and_no_error(node, g2.NODE_READY)
             artifact_source = root / "node" / "node" / "enrollment-v2.pxea"
             assert artifact_source.is_file() and artifact_source.stat().st_size > 0
@@ -351,6 +352,7 @@ def test_public_agent_bootstrap_fresh_resume_and_fail_closed() -> None:
             assert node.process.poll() is None
             _assert_joined_sigterm(node, g2.NODE_READY)
             node.close_logs()
+            node = None
 
             node_restart = g2._spawn(
                 [*command_prefix, str(binary), "node", "--config", str(node_config)],

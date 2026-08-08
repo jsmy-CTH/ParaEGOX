@@ -444,7 +444,7 @@ mod tests {
         assert!(text.contains("not evidence of a\ntwo-host system proof"));
         assert!(text.contains("remote Agent conversation, remote TUI"));
         assert!(text.contains("remote TUI"));
-        assert!(text.contains("reconnect policy"));
+        assert!(text.contains("reconnect\npolicy"));
         assert!(text.contains("absolute versioned configuration"));
         assert!(text.contains("provider and\nmodel selection"));
         assert!(text.contains("Fabric settings"));
