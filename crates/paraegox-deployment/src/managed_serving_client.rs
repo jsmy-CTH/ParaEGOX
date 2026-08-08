@@ -2659,6 +2659,27 @@ mod tests {
             Err(ManagedServingControllerError::DescribeEpochRegression)
         ));
 
+        let lower_epoch_request = describe_request(&carrier, &controller, 0x8c);
+        let lower_epoch_response = describe_response(ResponseInput {
+            request: &lower_epoch_request,
+            projection: projection.clone(),
+            channel: first.channel(),
+            store: STORE,
+            epoch: 2,
+            snapshot: 99,
+            phase: RuntimeControlDescribeReadyPhaseV1::ManagedReady,
+            runtime: &runtime,
+        });
+        assert!(matches!(
+            ManagedServingDescribeIngressV1::try_accept(
+                &verifier,
+                Some(&first),
+                lower_epoch_request,
+                &lower_epoch_response,
+            ),
+            Err(ManagedServingControllerError::DescribeEpochRegression)
+        ));
+
         let restart_request = describe_request(&carrier, &controller, 0x8a);
         let restarted_channel = channel(projection.target(), 0x8a);
         let restart_response = describe_response(ResponseInput {
@@ -2679,6 +2700,27 @@ mod tests {
         )
         .expect("higher-epoch channel rebind");
         assert_eq!(restarted.channel(), restarted_channel);
+
+        let phase_regression_request = describe_request(&carrier, &controller, 0x8d);
+        let phase_regression_response = describe_response(ResponseInput {
+            request: &phase_regression_request,
+            projection: projection.clone(),
+            channel: restarted_channel,
+            store: STORE,
+            epoch: 5,
+            snapshot: 1,
+            phase: RuntimeControlDescribeReadyPhaseV1::LegacyReady,
+            runtime: &runtime,
+        });
+        assert!(matches!(
+            ManagedServingDescribeIngressV1::try_accept(
+                &verifier,
+                Some(&restarted),
+                phase_regression_request,
+                &phase_regression_response,
+            ),
+            Err(ManagedServingControllerError::DescribePhaseRegression)
+        ));
 
         let wrong_store_request = describe_request(&carrier, &controller, 0x8b);
         let wrong_store_response = describe_response(ResponseInput {

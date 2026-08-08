@@ -1675,6 +1675,54 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_observation_expiry_hides_every_runtime_and_retains_each_fence() {
+        let root = TestRoot::new();
+        let mut store = open(&root);
+        store
+            .commit_fresh_authenticated_runtime_observation_at(
+                1,
+                runtime_for(21, 2, 4, 2),
+                200,
+                digest(99),
+                100,
+            )
+            .expect("publish first Runtime observation");
+        let aggregate = store
+            .commit_fresh_authenticated_runtime_observation_at(
+                2,
+                runtime_for(31, 3, 5, 3),
+                400,
+                digest(100),
+                150,
+            )
+            .expect("publish second Runtime observation");
+        assert_eq!(aggregate.status.runtime_hosts().len(), 2);
+        assert_eq!(aggregate.status.valid_until_unix_nanos(), Some(200));
+
+        let node_only = store
+            .current_status_or_expire_runtime_observations_at(1_000, 200)
+            .expect("expire aggregate observation")
+            .expect("replacement status");
+        assert_eq!(node_only.status_sequence(), 3);
+        assert!(node_only.runtime_hosts().is_empty());
+        assert_eq!(node_only.valid_until_unix_nanos(), None);
+        assert_eq!(store.last_runtime_observation, None);
+        assert!(store.runtime_observation_valid_until.is_empty());
+        assert_eq!(
+            store
+                .observe_runtime_host(runtime_for(21, 1, 99, 2))
+                .expect_err("first Runtime epoch fence must survive"),
+            NodeDaemonStoreError::Contract(crate::NodeContractError::StaleRuntimeHostEpoch)
+        );
+        assert_eq!(
+            store
+                .observe_runtime_host(runtime_for(31, 2, 99, 3))
+                .expect_err("second Runtime epoch fence must survive"),
+            NodeDaemonStoreError::Contract(crate::NodeContractError::StaleRuntimeHostEpoch)
+        );
+    }
+
+    #[test]
     fn one_runtime_can_renew_its_own_deadline_before_expiry() {
         let root = TestRoot::new();
         let mut store = open(&root);
