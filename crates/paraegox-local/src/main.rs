@@ -234,11 +234,15 @@ contain references only; Secret values are obtained from the configured
 resolver and injected at the owning boundary. Secret values are neither CLI
 inputs nor persisted in the versioned configuration.
 
-node starts only one split-trust local Runtime restricted listener and one
-feature-only NodeDaemon. Its strict config contains remote verification keys,
-opaque references, and credential file paths, never Controller or Authority
-private keys. This command does not perform remote bootstrap, Runtime apply,
-Fabric activation, Agent/Model startup, Inspection, or distributed readiness."
+node starts one split-trust local Runtime and one NodeDaemon. Node config
+schema v1 retains the G1 host-local feature-only profile. Additive schema v2
+starts the G2 host-side Runtime-control listener and authenticated Node-control
+ingress/observation bridge. Both schemas contain verification keys, opaque
+references, and credential file paths, never Controller or Authority private
+keys. This command does not run Controller, Authority, the managed Fabric
+CoreService, Agent, Model, Inspection, or Textual.
+There is not yet a public Mac Controller connector. There is no two-host
+cutover proof, remote Agent conversation, or reconnect policy."
 }
 
 #[cfg(test)]
@@ -357,9 +361,16 @@ mod tests {
         let text = usage();
         assert!(text.contains("paraegox chat --config <absolute-paraegox.toml>"));
         assert!(text.contains("paraegox node --config <absolute-paraegox-node.toml>"));
-        assert!(text.contains("split-trust local Runtime restricted listener"));
+        assert!(text.contains("split-trust local Runtime and one NodeDaemon"));
+        assert!(text.contains("schema v1 retains the G1 host-local feature-only profile"));
+        assert!(text.contains("schema v2\nstarts the G2 host-side Runtime-control listener"));
+        assert!(text.contains("authenticated Node-control\ningress/observation bridge"));
         assert!(text.contains("never Controller or Authority\nprivate keys"));
-        assert!(text.contains("does not perform remote bootstrap"));
+        assert!(text.contains("does not run Controller, Authority"));
+        assert!(text.contains("There is not yet a public Mac Controller connector"));
+        assert!(text.contains("two-host cutover proof"));
+        assert!(text.contains("remote Agent conversation"));
+        assert!(text.contains("reconnect policy"));
         assert!(text.contains("absolute versioned configuration"));
         assert!(text.contains("provider and\nmodel selection"));
         assert!(text.contains("Fabric settings"));

@@ -10,8 +10,11 @@ ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). 
 > terminal restoration, and joined parent shutdown. Textual is now the sole DeveloperLocal
 > presentation path; the retired Rust reference frontend has been removed. Ubuntu r33 commit
 > `7618f6a51c5eb5731874d2cdf3231603e3a824f7` additionally validates the public G1 host-local
-> `paraegox node` substrate. ParaEGOX is adopting a Rust-first core with polyglot managed workloads;
-> no stable release is currently available.
+> `paraegox node` substrate. The current source additively wires the G2 host-side node profile
+> described below. Ubuntu r48 `56ae9fe6188bcfe9ef6c89158b5d319e8f4c87ac` is the latest validated G2
+> code-and-governance ref; it does not yet supply the public Mac Controller connector or two-host
+> proof. ParaEGOX is adopting a Rust-first core with polyglot managed workloads; no stable release
+> is currently available.
 
 ## Runnable DeveloperLocal slice
 
@@ -110,29 +113,46 @@ registration acquisition, multi-host operation, or distributed readiness. Normal
 Textual child and Agent IPC boundary first, then Runtime-managed Agent→Model→Fabric shutdown, the
 NodeDaemon, and finally Authority.
 
-## Runnable G1 host-local Node substrate
+## Runnable Node host substrate: G1 schema v1 and G2 host-side schema v2
 
-The separate public command below starts only one split-trust Runtime and one feature-only
-NodeDaemon child:
+The separate public command below always starts one split-trust Runtime and one NodeDaemon child.
+Its strict config schema selects the host profile; there is no second G2 command:
 
 ```text
 paraegox node --config <absolute-node.toml>
 ```
 
-It binds the configured restricted mTLS Runtime-apply listener, keeps that listener on its fixed
-legacy generic-rejection behavior, publishes a Node status with zero RuntimeHost observations,
-verifies the child through one authenticated typed Latest exchange, and then prints the exact
-readiness marker `paraegox: node ready`. It does not start Authority, DeploymentController, managed
-Fabric, Model, Agent, Inspection, Textual, or the chat chain. It also does not perform a Controller
-apply, registration, remote bootstrap, or G2/multi-host orchestration.
+With `schema_version = 1`, the command retains the validated G1 path: it binds the restricted mTLS
+Runtime-apply listener on its fixed legacy generic-rejection behavior, publishes a feature-only Node
+status with zero RuntimeHost observations, and verifies the child through one authenticated typed
+Latest exchange.
+
+With `schema_version = 2`, the same command additively starts the G2 **host-side** path. The Runtime
+listener accepts the bounded Controller-signed PXCC control carrier and returns Runtime-signed PXDR
+Describe facts; while LegacyReady it also carries the frozen PXQR query and accepts the authenticated
+PXFB one-way cutover. A separate Node listener authenticates the Controller before dispatching
+Describe, Latest, Watch, observation-challenge, or Runtime-observation publication through the
+existing sole-owner NodeDaemon store and observation capability. Runtime readiness facts are
+cross-checked before the observation bridge is created. Schema v2 therefore provides the real
+Ubuntu-side listeners, durable owners, and bridge needed by a later external Controller; it does not
+embed that Controller in the node process.
+
+Both schemas print `paraegox: node ready` only after their configured local owners and listeners have
+started. The marker does not prove that a Controller connected, PXFB cutover completed, a Runtime
+observation was published, or a desired Agent stack was applied. Neither schema starts Authority,
+DeploymentController, managed Fabric, Model, Agent, Inspection, Textual, or the chat chain. The
+repository still has no public Mac Controller connector, end-to-end two-host cutover evidence,
+remote Agent conversation path, or partition/reconnect policy.
 
 Start from [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml). Copy it to an
-absolute regular-file path, replace the documentation-only `192.0.2.10` listener address with an
-IPv4 address actually assigned to the host, and update `state_root` plus all three credential paths
-together. Before launch, the same non-root account must create the canonical state root and its
-exact `credentials` child at mode `0700`. Provision a PEM root CA and a listener certificate/key in
-that directory; the listener certificate SAN must contain the configured IP, its key must be mode
-`0600`, and the CA/certificate must not be group- or other-writable. The example contains only
+absolute regular-file path, replace both documentation-only `192.0.2.10` listener addresses with
+IPv4 addresses actually assigned to the host, and update `state_root` plus all six credential paths
+together. Before launch, the same non-root account must create the canonical state root and its exact
+`credentials` child at mode `0700`. Provision distinct PEM CA/certificate/key files for the Runtime
+and Node listeners in that one directory; both certificate SANs must contain their configured IP,
+both keys must be mode `0600`, and CA/certificate files must not be group- or other-writable. The
+example selects schema v2. To retain G1, set `schema_version = 1`, remove the complete
+`[node_control]` table, and provision only the three Runtime-listener files. The example contains only
 non-secret reference values and public verification keys; replace those pins only from the owning
 Controller/Authority enrollment workflow, never with private seeds. Full credential preparation and
 launch commands are in the local `docs/runbooks/developer-local.md` runbook.
@@ -147,8 +167,25 @@ preserved byte-identical PXNI/PXNB hashes, forced child death made the parent fa
 `PXLC-NODE-CHILD`, and root launch failed before state with `PXLC-EXECUTION-IDENTITY`. These facts
 prove the G1 host-local substrate and cleanup/restart boundary only.
 
-The in-progress two-target DeveloperLocal composition remains internal. There is no public
-`developer-distributed-fixture-v1` command and no runnable distributed-system claim yet.
+The current G2 ref is r48 `56ae9fe6188bcfe9ef6c89158b5d319e8f4c87ac`. Ubuntu passed workspace
+format checking, the `paraegox-local` all-target check, warnings-denied Clippy, the binary build, and
+the complete governance checker. The six r46 focused G2 Local tests also passed. An earlier r43
+snapshot passed the complete non-root `paraegox-local` unit binary 109/109, but later test/recovery
+changes mean that historical result is not presented as an r48 full-suite pass; broader workspace
+test gates remain pending.
+
+The real non-root r48 schema-v2 process smoke reached Ready with exactly one hidden Node child, two
+non-loopback TLS listeners (`172.17.0.2:28448` and `:28449`), and the expected Runtime, management,
+and observation Unix sockets. A provisioned Controller client certificate completed a TLS handshake
+with each listener; both rejected a client without a certificate. SIGTERM exited zero and cleaned
+up; a same-state restart reached Ready and exited zero with stable PXNI/PXNB/PXND digests. Killing the
+Node child made the parent exit one with `PXLC-NODE-CHILD` and removed listeners, PXOB, and processes;
+the same state then restarted successfully and SIGINT exited zero. Root launch failed before state
+mutation with `PXLC-EXECUTION-IDENTITY`. This proves the host process and mTLS/lifecycle boundary,
+not a PXCC/PXNR semantic exchange or cutover: there is still no public Mac Controller connector,
+two-host control sequence, remote Agent conversation, or reconnect evidence. The older two-target
+DeveloperLocal fixture remains internal; there is no public `developer-distributed-fixture-v1`
+command and no runnable full distributed-system claim yet.
 
 A Unix-only `paraegox-noded developer-local-reference-v1` process can also reopen one externally
 authorized exact tenure and serve its last committed status through a same-user, token-bound local socket.

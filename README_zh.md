@@ -9,8 +9,10 @@ ParaEGOX 基于 [PhanthyMotus](https://github.com/4paradigm/phanthymotus) 构建
 > Runtime Agent IPC、Echo、Textual Ctrl-C、terminal restoration 和父进程 joined shutdown。Textual
 > 现在是唯一 DeveloperLocal 展示路径；旧 Rust reference frontend 已删除。Ubuntu r33 commit
 > `7618f6a51c5eb5731874d2cdf3231603e3a824f7` 还验证了公开 G1 host-local
-> `paraegox node` 系统基座。生产核心机制优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，
-> 暂未提供稳定版本。
+> `paraegox node` 系统基座。当前源码又增量接入了下文所述的 G2 host-side Node profile，但尚未提供
+> 公开 Mac Controller connector 或真实双主机证明。Ubuntu r48
+> `56ae9fe6188bcfe9ef6c89158b5d319e8f4c87ac` 是当前最新已验证 G2 code-and-governance ref。生产核心机制
+> 优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
 
 ## 当前可运行切片
 
@@ -95,27 +97,42 @@ launcher 会创建或安全重开精确的本地 Node tenure，提交一份初�
 acquisition、多主机运行或 distributed readiness。正常退出顺序为 Textual child/Agent IPC → Runtime
 内部 Agent→Model→Fabric → NodeDaemon → Authority，并逐个 joined。
 
-## 可运行的 G1 host-local Node 基座
+## 可运行的 Node 宿主基座：G1 schema v1 与 G2 host-side schema v2
 
-下面这个独立公开命令只启动一个 split-trust Runtime 和一个 feature-only NodeDaemon child：
+下面这个独立公开命令总是启动一个 split-trust Runtime 和一个 NodeDaemon child。严格配置 schema
+决定宿主 profile；G2 没有另一条启动命令：
 
 ```text
 paraegox node --config <absolute-node.toml>
 ```
 
-它会绑定配置中的 restricted mTLS Runtime-apply listener，并让 listener 保持固定的 legacy generic
-rejection；随后发布 RuntimeHost observation 为零的 Node status，通过一次 authenticated typed Latest
-严格验证 child，最后输出精确 readiness marker：`paraegox: node ready`。它不启动 Authority、
-DeploymentController、managed Fabric、Model、Agent、Inspection、Textual 或 chat 链，也不执行
-Controller apply、registration、remote bootstrap 或 G2/多主机编排。
+当 `schema_version = 1` 时，命令保留已验证的 G1 路径：restricted mTLS Runtime-apply listener 固定
+执行 legacy generic rejection；NodeDaemon 发布 RuntimeHost observation 为零的 feature-only status，
+parent 再通过一次 authenticated typed Latest 严格验证 child。
+
+当 `schema_version = 2` 时，同一命令增量启动 G2 **host-side** 路径。Runtime listener 接收有界、由
+Controller 签名的 PXCC control carrier，并返回 Runtime 签名的 PXDR Describe facts；在 LegacyReady
+阶段还承载冻结的 PXQR query，并接收 authenticated PXFB 单向 cutover。另一条 Node listener 会先
+认证 Controller，再把 Describe、Latest、Watch、observation challenge 或 Runtime observation
+publication 交给既有唯一 NodeDaemon store 与 observation capability；创建 observation bridge 前还会
+交叉验证 Runtime readiness facts。因此 schema v2 已提供后续外部 Controller 所需的真实 Ubuntu-side
+listener、durable owner 与 bridge，但不会把 Controller 偷塞进 Node 进程。
+
+两个 schema 都只在已配置的本地 owner 和 listener 启动后输出 `paraegox: node ready`。这个 marker
+不证明 Controller 已连接、PXFB cutover 已完成、Runtime observation 已发布，或目标 Agent stack 已
+apply。两种模式都不启动 Authority、DeploymentController、managed Fabric、Model、Agent、Inspection、
+Textual 或 chat 链。仓库当前仍没有公开 Mac Controller connector、真实双主机端到端 cutover 证据、
+remote Agent conversation 路径或 partition/reconnect policy。
 
 从 [`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml) 开始。把它复制到绝对普通
-文件路径，将仅用于文档的 `192.0.2.10` listener 地址替换为宿主机真实拥有的 IPv4，并同步修改
-`state_root` 和三条 credential path。启动前，同一个非 root 账号必须创建 canonical state root 及其
-精确的 `credentials` 子目录，两者 mode 都是 `0700`。在该目录放入 PEM root CA、listener certificate
-和 key；certificate SAN 必须包含配置 IP，key 必须是 `0600`，CA/certificate 不得允许 group/other
-写入。示例只含非秘密 reference value 和 public verification key；只有 Controller/Authority enrollment
-owner 才能替换这些 pin，绝不能填入 private seed。完整 credential 准备与启动命令见本地
+文件路径，将两处仅用于文档的 `192.0.2.10` listener 地址替换为宿主机真实拥有的 IPv4，并同步修改
+`state_root` 和六条 credential path。启动前，同一个非 root 账号必须创建 canonical state root 及其
+精确的 `credentials` 子目录，两者 mode 都是 `0700`。Runtime 与 Node listener 分别使用不同的 PEM
+CA/certificate/key 文件，但六个文件都必须放在这一个目录；两张 certificate 的 SAN 都必须包含对应
+配置 IP，两把 key 必须是 `0600`，CA/certificate 不得允许 group/other 写入。示例默认选择 schema v2；
+若要保留 G1，设置 `schema_version = 1`、完整删除 `[node_control]` 表，并只准备三条 Runtime-listener
+credential。示例只含非秘密 reference value 和 public verification key；只有 Controller/Authority
+enrollment owner 才能替换这些 pin，绝不能填入 private seed。完整准备与启动命令见本地
 `docs/runbooks/developer-local.md`。
 
 Ubuntu r33 commit `7618f6a51c5eb5731874d2cdf3231603e3a824f7` 已通过 workspace format、locked
@@ -127,8 +144,22 @@ Runtime split-trust/provisioning filter 通过。真实非 root process smoke �
 fail closed；root 启动在写 state 前以 `PXLC-EXECUTION-IDENTITY` 拒绝。这些事实只证明 G1 host-local
 基座及其 cleanup/restart 边界。
 
-在建的双目标 DeveloperLocal composition 仍是内部实现；当前没有公开的
-`developer-distributed-fixture-v1` 命令，也不宣称分布式系统已经可运行。
+当前 G2 ref 是 r48 `56ae9fe6188bcfe9ef6c89158b5d319e8f4c87ac`。Ubuntu 已通过 workspace format、
+`paraegox-local` all-target check、warnings-denied Clippy、binary build 和完整 governance checker；r46 的
+6 个 focused G2 Local tests 也全部通过。更早的 r43 snapshot 以非 root 身份通过完整
+`paraegox-local` unit binary 109/109，但后续仍有 test/recovery 改动，所以该历史结果不能写成 r48
+full-suite pass；更宽 workspace test gates 仍 pending。
+
+r48 真实 non-root schema-v2 process smoke 已到达 Ready：进程树严格为 parent + 1 个 hidden Node child，
+有两条 non-loopback TLS listener（`172.17.0.2:28448`、`:28449`）以及预期 Runtime、management、
+observation UDS。使用已配置 Controller client certificate 时，两条 TLS handshake 都成功；不带 client
+certificate 时两端都拒绝。SIGTERM exit 0 并完成清理；同 state restart 再次 Ready/exit 0，PXNI/PXNB/
+PXND digest 稳定。杀死 Node child 后 parent exit 1 并报告 `PXLC-NODE-CHILD`，listener、PXOB 与进程全部
+清理；同 state 随后仍能再次 Ready，并以 SIGINT exit 0。root 启动在 state mutation 前以
+`PXLC-EXECUTION-IDENTITY` 拒绝。它证明 host process、mTLS 和 lifecycle boundary，不证明 PXCC/PXNR
+语义 exchange 或 cutover：当前仍没有公开 Mac Controller connector、真实双主机 control sequence、
+remote Agent conversation 或 reconnect 证据。旧的双目标 DeveloperLocal fixture 仍是内部实现；当前没有
+公开的 `developer-distributed-fixture-v1` 命令，也不宣称完整分布式系统已经可运行。
 
 Unix-only `paraegox-noded developer-local-reference-v1` 也能独立重开一份由外部授权的 exact tenure，
 并通过 same-user、token-bound 本地 socket 返回最后一次已提交状态。新增的
