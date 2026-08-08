@@ -32,10 +32,16 @@ use crate::distributed_agent_stack_producer::{
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 #[cfg(unix)]
+use ed25519_dalek::{Signer, SigningKey};
+#[cfg(unix)]
 use nix::unistd::{getegid, geteuid};
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
+#[cfg(unix)]
+use paraegox_kernel::identity::PrincipalRef;
 use paraegox_kernel::identity::RuntimeHostId;
 use paraegox_kernel::time::{ClockDomainRef, ClockGeneration};
+#[cfg(unix)]
+use paraegox_node::observation::RuntimeObservationError;
 use paraegox_node::observation::{
     MAX_RUNTIME_OBSERVATION_REQUEST_BYTES, RUNTIME_OBSERVATION_ACK_BYTES,
     RUNTIME_OBSERVATION_REQUEST_HEADER_BYTES, RUNTIME_OBSERVATION_TOKEN_BYTES,
@@ -47,13 +53,26 @@ use paraegox_node::protocol::{
     NodeManagementRequestV1, NodeManagementResponseOutcomeV1, NodeManagementResponseV1,
     NodeManagementTargetV1, NodeStatusCursorV1,
 };
+#[cfg(unix)]
+use paraegox_node::protocol::{
+    NodeControlCarrierKindV1, NodeControlCarrierRequestDraftV1, NodeControlCarrierRequestV1,
+    NodeControlDescribeResponseKindV1, NodeControlDescribeResponseV1,
+    NodeControlObservationChallengeV1, NodeManagementProtocolError,
+};
 use paraegox_node::{
     NodeId, NodeIncarnation, NodeManagementEndpointRefV1, RuntimeApplyEndpointDescriptorV1,
     RuntimeHostLivenessV1, RuntimeHostStatusV1,
 };
+#[cfg(unix)]
+use paraegox_runtime_contracts::reference_control::ed25519_control_key_fingerprint;
 use paraegox_runtime_contracts::reference_control::{
     MAX_REFERENCE_QUERY_REQUEST_BYTES, MAX_REFERENCE_QUERY_RESPONSE_BYTES,
     ReferenceBootstrapServingIdentityV1, ReferenceQueryRequestV1, ReferenceQueryResponseV1,
+};
+#[cfg(unix)]
+use paraegox_runtime_contracts::wire::ApplyAuthError;
+use paraegox_runtime_contracts::wire::{
+    ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
 };
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -157,6 +176,390 @@ impl NodeObservationProcessGenerationV1 {
         }
         Ok(Self(value))
     }
+}
+
+/// Fresh Controller identity consumed by exactly one remote Node exchange.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FreshRemoteNodeControlRequestV1 {
+    request_id: [u8; 16],
+    authentication_nonce: [u8; 32],
+}
+
+#[cfg(unix)]
+impl FreshRemoteNodeControlRequestV1 {
+    pub(crate) fn try_new(
+        request_id: [u8; 16],
+        authentication_nonce: [u8; 32],
+    ) -> Result<Self, RemoteNodeControlAdapterErrorV1> {
+        if bytes_are_zero(&request_id) || bytes_are_zero(&authentication_nonce) {
+            return Err(RemoteNodeControlAdapterErrorV1::InvalidFreshIdentity);
+        }
+        Ok(Self {
+            request_id,
+            authentication_nonce,
+        })
+    }
+}
+
+/// Static trust and route pins for one remote Node control adapter.
+///
+/// PXNE is intentionally unsigned. A decoded PXNE therefore has no authority
+/// until the concrete transport reports the expected certificate principal
+/// and exact route/config carrier digest for the same one-shot exchange.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteNodeControlTransportPinV1 {
+    expected_node_certificate_principal: PrincipalRef,
+    route_config_carrier_digest: Digest32,
+    controller_principal: PrincipalRef,
+    controller_key: ApplyAuthKeyRef,
+    controller_key_fingerprint: Digest32,
+    controller_public_key: [u8; 32],
+}
+
+#[cfg(unix)]
+impl RemoteNodeControlTransportPinV1 {
+    pub(crate) fn try_new(
+        expected_node_certificate_principal: PrincipalRef,
+        route_config_carrier_digest: Digest32,
+        controller_principal: PrincipalRef,
+        controller_key: ApplyAuthKeyRef,
+        controller_key_fingerprint: Digest32,
+        controller_public_key: [u8; 32],
+    ) -> Result<Self, RemoteNodeControlAdapterErrorV1> {
+        let verifying_key = VerifyingKey::from_bytes(&controller_public_key)
+            .map_err(|_| RemoteNodeControlAdapterErrorV1::InvalidConfiguration)?;
+        let actual_fingerprint = ed25519_control_key_fingerprint(&controller_public_key)
+            .map_err(|_| RemoteNodeControlAdapterErrorV1::InvalidConfiguration)?;
+        if bytes_are_zero(expected_node_certificate_principal.as_bytes())
+            || digest_is_zero(route_config_carrier_digest)
+            || bytes_are_zero(controller_principal.as_bytes())
+            || expected_node_certificate_principal == controller_principal
+            || bytes_are_zero(controller_key.as_bytes())
+            || digest_is_zero(controller_key_fingerprint)
+            || controller_key_fingerprint != actual_fingerprint
+            || verifying_key.is_weak()
+        {
+            return Err(RemoteNodeControlAdapterErrorV1::InvalidConfiguration);
+        }
+        Ok(Self {
+            expected_node_certificate_principal,
+            route_config_carrier_digest,
+            controller_principal,
+            controller_key,
+            controller_key_fingerprint,
+            controller_public_key,
+        })
+    }
+}
+
+/// Raw bytes returned only after a concrete one-shot mTLS transport has
+/// observed its peer and selected route/config carrier.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteNodeMtlsExchangeSuccessV1 {
+    observed_node_certificate_principal: PrincipalRef,
+    observed_route_config_carrier_digest: Digest32,
+    response_wire: Box<[u8]>,
+}
+
+#[cfg(unix)]
+impl RemoteNodeMtlsExchangeSuccessV1 {
+    pub(crate) fn try_new(
+        observed_node_certificate_principal: PrincipalRef,
+        observed_route_config_carrier_digest: Digest32,
+        response_wire: Box<[u8]>,
+    ) -> Result<Self, RemoteNodeControlAdapterErrorV1> {
+        if bytes_are_zero(observed_node_certificate_principal.as_bytes())
+            || digest_is_zero(observed_route_config_carrier_digest)
+            || response_wire.is_empty()
+        {
+            return Err(RemoteNodeControlAdapterErrorV1::UnauthenticatedTransport);
+        }
+        Ok(Self {
+            observed_node_certificate_principal,
+            observed_route_config_carrier_digest,
+            response_wire,
+        })
+    }
+}
+
+/// Deployment-side one-shot remote Node control adapter.
+///
+/// The adapter owns no reconnect loop, retry budget, Node state or PXOB token.
+/// Describe is the only operation available before a transport-authenticated
+/// PXNE supplies the complete current Node target. Every later operation pins
+/// that exact tenure and uses only C1's kind-specific request constructors.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteNodeControlAdapterV1 {
+    transport: RemoteNodeControlTransportPinV1,
+    target: Option<NodeManagementTargetV1>,
+}
+
+#[cfg(unix)]
+impl RemoteNodeControlAdapterV1 {
+    #[must_use]
+    pub(crate) const fn new(transport: RemoteNodeControlTransportPinV1) -> Self {
+        Self {
+            transport,
+            target: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> Option<NodeManagementTargetV1> {
+        self.target
+    }
+
+    /// Performs exactly one Controller-signed PXNR Describe exchange. The
+    /// complete target becomes usable only after the same exchange supplies a
+    /// pinned-mTLS PXNE and strict request correlation succeeds.
+    pub(crate) async fn describe_once<Exchange, ExchangeFuture>(
+        &mut self,
+        fresh: FreshRemoteNodeControlRequestV1,
+        controller_signer: &SigningKey,
+        exchange: Exchange,
+    ) -> Result<NodeManagementTargetV1, RemoteNodeControlAdapterErrorV1>
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<RemoteNodeMtlsExchangeSuccessV1, RemoteNodeControlTransportErrorV1>,
+        >,
+    {
+        if self.target.is_some() {
+            return Err(RemoteNodeControlAdapterErrorV1::TargetAlreadyDiscovered);
+        }
+        let claim = self.controller_claim(fresh.authentication_nonce)?;
+        let draft = NodeControlCarrierRequestDraftV1::try_describe(fresh.request_id, claim)?;
+        let request = self.sign_request(draft, controller_signer)?;
+        let response_wire = self.exchange_once(&request, exchange).await?;
+        let response = NodeControlDescribeResponseV1::decode(&response_wire)?;
+        response.validate_for(&request)?;
+        if response.kind() != NodeControlDescribeResponseKindV1::Describe
+            || response.observation_challenge().is_some()
+        {
+            return Err(RemoteNodeControlAdapterErrorV1::ResponseKindMismatch);
+        }
+        let target = response.target();
+        self.target = Some(target);
+        Ok(target)
+    }
+
+    /// Requests one Node-local PXOB-derived nonce and accepts it only for the
+    /// exact discovered tenure, Runtime authority and observation endpoint.
+    pub(crate) async fn observation_challenge_once<Exchange, ExchangeFuture>(
+        &self,
+        fresh: FreshRemoteNodeControlRequestV1,
+        controller_signer: &SigningKey,
+        authority: &RuntimeObservationAuthorityV1,
+        expected_observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+        freshness_budget_nanos: u64,
+        exchange: Exchange,
+    ) -> Result<NodeControlObservationChallengeV1, RemoteNodeControlAdapterErrorV1>
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<RemoteNodeMtlsExchangeSuccessV1, RemoteNodeControlTransportErrorV1>,
+        >,
+    {
+        let target = self.discovered_target()?;
+        let claim = self.controller_claim(fresh.authentication_nonce)?;
+        let draft = NodeControlCarrierRequestDraftV1::try_observation_challenge(
+            fresh.request_id,
+            target,
+            authority.runtime_host_id(),
+            freshness_budget_nanos,
+            claim,
+        )?;
+        let request = self.sign_request(draft, controller_signer)?;
+        let response_wire = self.exchange_once(&request, exchange).await?;
+        let response = NodeControlDescribeResponseV1::decode(&response_wire)?;
+        response.validate_for(&request)?;
+        let challenge = response
+            .observation_challenge()
+            .ok_or(RemoteNodeControlAdapterErrorV1::ResponseKindMismatch)?;
+        if response.kind() != NodeControlDescribeResponseKindV1::ObservationChallenge
+            || response.target() != target
+            || challenge.runtime_host_id() != authority.runtime_host_id()
+            || challenge.observation_endpoint_ref() != expected_observation_endpoint_ref
+            || challenge.authority_digest() != authority.authority_digest()
+        {
+            return Err(RemoteNodeControlAdapterErrorV1::ChallengeMismatch);
+        }
+        Ok(challenge)
+    }
+
+    /// Sends one Latest or Watch carrier and returns only the existing PXDN
+    /// reducer token after transport pins and exact PXNS correlation verify.
+    pub(crate) async fn observe_management_once<Exchange, ExchangeFuture, Observe>(
+        &self,
+        fresh: FreshRemoteNodeControlRequestV1,
+        controller_signer: &SigningKey,
+        request: NodeManagementRequestV1,
+        process_generation: NodeObservationProcessGenerationV1,
+        observe: Observe,
+        exchange: Exchange,
+    ) -> Result<TransportAuthenticatedNodeResponseV1, RemoteNodeControlAdapterErrorV1>
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<RemoteNodeMtlsExchangeSuccessV1, RemoteNodeControlTransportErrorV1>,
+        >,
+        Observe: FnOnce() -> u64,
+    {
+        let target = self.discovered_target()?;
+        if request.target() != target || request.request_id() != fresh.request_id {
+            return Err(RemoteNodeControlAdapterErrorV1::TargetMismatch);
+        }
+        let claim = self.controller_claim(fresh.authentication_nonce)?;
+        let draft = match request.kind() {
+            NodeManagementRequestKindV1::Latest => NodeControlCarrierRequestDraftV1::try_latest(
+                fresh.request_id,
+                target,
+                request.clone(),
+                claim,
+            )?,
+            NodeManagementRequestKindV1::Watch => NodeControlCarrierRequestDraftV1::try_watch(
+                fresh.request_id,
+                target,
+                request.clone(),
+                claim,
+            )?,
+        };
+        let carrier_request = self.sign_request(draft, controller_signer)?;
+        if !matches!(
+            carrier_request.kind(),
+            NodeControlCarrierKindV1::Latest | NodeControlCarrierKindV1::Watch
+        ) {
+            return Err(RemoteNodeControlAdapterErrorV1::ResponseKindMismatch);
+        }
+        let response_wire = self.exchange_once(&carrier_request, exchange).await?;
+        TransportAuthenticatedNodeResponseV1::try_from_verified_carrier(
+            &response_wire,
+            &request,
+            self.transport.route_config_carrier_digest,
+            process_generation,
+            observe(),
+        )
+        .map_err(RemoteNodeControlAdapterErrorV1::Reconcile)
+    }
+
+    /// Sends one strict frozen PXNO and accepts only its complete correlated
+    /// PXNA. The adapter never receives or forwards apply or Agent payloads.
+    pub(crate) async fn publish_runtime_observation_once<Exchange, ExchangeFuture>(
+        &self,
+        fresh: FreshRemoteNodeControlRequestV1,
+        controller_signer: &SigningKey,
+        observation: RuntimeObservationRequestV1,
+        exchange: Exchange,
+    ) -> Result<RuntimeObservationAckV1, RemoteNodeControlAdapterErrorV1>
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<RemoteNodeMtlsExchangeSuccessV1, RemoteNodeControlTransportErrorV1>,
+        >,
+    {
+        let target = self.discovered_target()?;
+        let claim = self.controller_claim(fresh.authentication_nonce)?;
+        let draft = NodeControlCarrierRequestDraftV1::try_publish_runtime_observation(
+            fresh.request_id,
+            target,
+            observation.clone(),
+            claim,
+        )?;
+        let request = self.sign_request(draft, controller_signer)?;
+        if request.kind() != NodeControlCarrierKindV1::PublishRuntimeObservation {
+            return Err(RemoteNodeControlAdapterErrorV1::ResponseKindMismatch);
+        }
+        let response_wire = self.exchange_once(&request, exchange).await?;
+        let ack = RuntimeObservationAckV1::decode(&response_wire)?;
+        ack.validate_for(&observation)?;
+        Ok(ack)
+    }
+
+    fn controller_claim(
+        &self,
+        authentication_nonce: [u8; 32],
+    ) -> Result<ApplyRequestAuthClaim, RemoteNodeControlAdapterErrorV1> {
+        Ok(ApplyRequestAuthClaim::try_new(
+            self.transport.controller_principal,
+            self.transport.controller_key,
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .map_err(|_| RemoteNodeControlAdapterErrorV1::InvalidConfiguration)?,
+            ED25519_ALGORITHM_VERSION,
+            &authentication_nonce,
+        )?)
+    }
+
+    fn sign_request(
+        &self,
+        draft: NodeControlCarrierRequestDraftV1,
+        controller_signer: &SigningKey,
+    ) -> Result<NodeControlCarrierRequestV1, RemoteNodeControlAdapterErrorV1> {
+        if controller_signer.verifying_key().to_bytes() != self.transport.controller_public_key {
+            return Err(RemoteNodeControlAdapterErrorV1::ControllerKeyMismatch);
+        }
+        let signature = controller_signer.sign(draft.signing_transcript()?.as_bytes());
+        let request = draft.finalize(&signature.to_bytes())?;
+        if request.authentication().claim().algorithm().value() != ED25519_ALGORITHM
+            || request.authentication().claim().algorithm_version() != ED25519_ALGORITHM_VERSION
+            || request.authentication().signature().len() != ED25519_SIGNATURE_BYTES
+        {
+            return Err(RemoteNodeControlAdapterErrorV1::ControllerKeyMismatch);
+        }
+        let verifying_key = VerifyingKey::from_bytes(&self.transport.controller_public_key)
+            .map_err(|_| RemoteNodeControlAdapterErrorV1::InvalidConfiguration)?;
+        request.verify_controller_carrier(
+            self.transport.controller_principal,
+            self.transport.controller_key,
+            self.transport.controller_key_fingerprint,
+            |principal, key, fingerprint, transcript, signature| {
+                principal == self.transport.controller_principal
+                    && key == self.transport.controller_key
+                    && fingerprint == self.transport.controller_key_fingerprint
+                    && verify_node_carrier_signature(&verifying_key, transcript, signature)
+            },
+        )?;
+        Ok(request)
+    }
+
+    async fn exchange_once<Exchange, ExchangeFuture>(
+        &self,
+        request: &NodeControlCarrierRequestV1,
+        exchange: Exchange,
+    ) -> Result<Box<[u8]>, RemoteNodeControlAdapterErrorV1>
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<RemoteNodeMtlsExchangeSuccessV1, RemoteNodeControlTransportErrorV1>,
+        >,
+    {
+        let response = exchange(request.canonical_wire().into()).await?;
+        if response.observed_node_certificate_principal
+            != self.transport.expected_node_certificate_principal
+            || response.observed_route_config_carrier_digest
+                != self.transport.route_config_carrier_digest
+        {
+            return Err(RemoteNodeControlAdapterErrorV1::TransportPinMismatch);
+        }
+        Ok(response.response_wire)
+    }
+
+    fn discovered_target(&self) -> Result<NodeManagementTargetV1, RemoteNodeControlAdapterErrorV1> {
+        self.target
+            .ok_or(RemoteNodeControlAdapterErrorV1::TargetNotDiscovered)
+    }
+}
+
+#[cfg(unix)]
+fn verify_node_carrier_signature(key: &VerifyingKey, transcript: &[u8], signature: &[u8]) -> bool {
+    let Ok(signature) = <[u8; ED25519_SIGNATURE_BYTES]>::try_from(signature) else {
+        return false;
+    };
+    key.verify_strict(transcript, &Signature::from_bytes(&signature))
+        .is_ok()
 }
 
 /// Exact owner-private local PXNL endpoint selected by deploymentd. The token
@@ -3094,6 +3497,86 @@ async fn bounded_runtime_observation_read_exact(
     }
 }
 
+/// Delivery classification supplied by the concrete remote mTLS transport.
+/// The adapter performs one call and never interprets an uncertain outcome as
+/// permission to retry.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteNodeControlTransportErrorV1 {
+    NotSent,
+    Uncertain,
+    Rejected,
+}
+
+/// Fail-closed boundary errors for Controller-to-Node remote control.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum RemoteNodeControlAdapterErrorV1 {
+    Contract(NodeManagementProtocolError),
+    Observation(RuntimeObservationError),
+    Authentication(ApplyAuthError),
+    Reconcile(DistributedAgentStackNodeReconcileError),
+    Transport(RemoteNodeControlTransportErrorV1),
+    InvalidFreshIdentity,
+    InvalidConfiguration,
+    ControllerKeyMismatch,
+    UnauthenticatedTransport,
+    TransportPinMismatch,
+    TargetAlreadyDiscovered,
+    TargetNotDiscovered,
+    TargetMismatch,
+    ResponseKindMismatch,
+    ChallengeMismatch,
+}
+
+#[cfg(unix)]
+impl From<NodeManagementProtocolError> for RemoteNodeControlAdapterErrorV1 {
+    fn from(value: NodeManagementProtocolError) -> Self {
+        Self::Contract(value)
+    }
+}
+
+#[cfg(unix)]
+impl From<RuntimeObservationError> for RemoteNodeControlAdapterErrorV1 {
+    fn from(value: RuntimeObservationError) -> Self {
+        Self::Observation(value)
+    }
+}
+
+#[cfg(unix)]
+impl From<ApplyAuthError> for RemoteNodeControlAdapterErrorV1 {
+    fn from(value: ApplyAuthError) -> Self {
+        Self::Authentication(value)
+    }
+}
+
+#[cfg(unix)]
+impl From<RemoteNodeControlTransportErrorV1> for RemoteNodeControlAdapterErrorV1 {
+    fn from(value: RemoteNodeControlTransportErrorV1) -> Self {
+        Self::Transport(value)
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for RemoteNodeControlAdapterErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "remote Node control exchange failed: {self:?}")
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for RemoteNodeControlAdapterErrorV1 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Contract(error) => Some(error),
+            Self::Observation(error) => Some(error),
+            Self::Authentication(error) => Some(error),
+            Self::Reconcile(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrustedLocalNodeClientErrorV1 {
@@ -3230,10 +3713,15 @@ mod tests {
     use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
     use paraegox_kernel::time::{ClockDomainRef, ClockGeneration};
     use paraegox_node::observation::{
-        RUNTIME_OBSERVATION_ACK_BYTES, RuntimeObservationEndpointRefV1,
-        RuntimeObservationRequestInputV1, RuntimeObservationRequestV1,
+        RUNTIME_OBSERVATION_ACK_BYTES, RuntimeObservationAuthorityV1,
+        RuntimeObservationEndpointRefV1, RuntimeObservationError, RuntimeObservationRequestInputV1,
+        RuntimeObservationRequestV1,
     };
-    use paraegox_node::protocol::{NodeManagementRequestKindV1, NodeManagementResponseV1};
+    use paraegox_node::protocol::{
+        NodeControlCarrierKindV1, NodeControlCarrierRequestV1, NodeControlDescribeResponseDraftV1,
+        NodeControlObservationChallengeFieldsV1, NodeControlObservationChallengeV1,
+        NodeManagementRequestKindV1, NodeManagementResponseV1,
+    };
     use paraegox_node::{
         EnrollmentIssuerRefV1, NodeArchitectureV1, NodeDaemonV1, NodeFeatureReportInputV1,
         NodeFeatureReportV1, NodeIdentityV1, NodeIncarnation, NodeManagementEndpointRefV1,
@@ -3249,7 +3737,7 @@ mod tests {
         ReferenceQueryLiveStateV1, ReferenceQueryOperationLookupV1, ReferenceQueryOperationStateV1,
         ReferenceQueryOwnerStateV1, ReferenceQueryRequestDraftV1, ReferenceQueryRequestV1,
         ReferenceQueryResponseAuthClaimV1, ReferenceQueryResponseDraftV1, ReferenceQueryResponseV1,
-        ReferenceQuerySelectorV1,
+        ReferenceQuerySelectorV1, ed25519_control_key_fingerprint,
     };
     use paraegox_runtime_contracts::wire::{
         ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
@@ -3262,8 +3750,11 @@ mod tests {
         DistributedAgentStackNodeAvailabilityV1, DistributedAgentStackNodeDiscoveryStateV1,
         DistributedAgentStackNodeReconcileError, DistributedAgentStackNodeTargetV1,
         DistributedAgentStackRuntimeQueryInputV1, DistributedAgentStackRuntimeQueryPhaseV1,
-        LOCAL_OBSERVATION_HEADER_BYTES, LOCAL_OBSERVATION_MAGIC, LOCAL_OBSERVATION_VERSION,
-        NodeObservationProcessGenerationV1, RuntimeObservationPublishFieldsV1,
+        FreshRemoteNodeControlRequestV1, LOCAL_OBSERVATION_HEADER_BYTES, LOCAL_OBSERVATION_MAGIC,
+        LOCAL_OBSERVATION_VERSION, NodeObservationProcessGenerationV1,
+        RemoteNodeControlAdapterErrorV1, RemoteNodeControlAdapterV1,
+        RemoteNodeControlTransportErrorV1, RemoteNodeControlTransportPinV1,
+        RemoteNodeMtlsExchangeSuccessV1, RuntimeObservationPublishFieldsV1,
         TransportAuthenticatedNodeResponseV1, TrustedLocalNodeEndpointV1,
         TrustedLocalRuntimeObservationClientFailureV1, TrustedLocalRuntimeObservationEndpointV1,
         TrustedLocalRuntimeObservationExchangeErrorV1, runtime_query_attempt_is_retry_closed,
@@ -3287,7 +3778,64 @@ mod tests {
     const OBSERVATION_TOKEN: [u8; 32] = [0x1a; 32];
     const OBSERVATION_ENDPOINT_REF_BYTES: [u8; 16] = [0x1b; 16];
     const OBSERVATION_ACK_DIGEST_DOMAIN: &[u8] = b"paraegox.node.runtime-observation-ack.v1";
+    const REMOTE_CONTROLLER_SEED: [u8; 32] = [0x91; 32];
+    const REMOTE_NODE_CERTIFICATE_PRINCIPAL: PrincipalRef = PrincipalRef::from_bytes([0x92; 16]);
     static NEXT_OBSERVATION_SOCKET: AtomicU64 = AtomicU64::new(1);
+
+    fn remote_fresh(marker: u8) -> FreshRemoteNodeControlRequestV1 {
+        FreshRemoteNodeControlRequestV1::try_new([marker; 16], [marker.wrapping_add(1); 32])
+            .unwrap_or_else(|error| panic!("fresh remote request failed: {error}"))
+    }
+
+    fn remote_transport(
+        route_config_carrier_digest: Digest32,
+    ) -> (SigningKey, RemoteNodeControlTransportPinV1) {
+        let signer = SigningKey::from_bytes(&REMOTE_CONTROLLER_SEED);
+        let public_key = signer.verifying_key().to_bytes();
+        let pin = RemoteNodeControlTransportPinV1::try_new(
+            REMOTE_NODE_CERTIFICATE_PRINCIPAL,
+            route_config_carrier_digest,
+            PrincipalRef::from_bytes([0x93; 16]),
+            ApplyAuthKeyRef::from_bytes([0x94; 16]),
+            ed25519_control_key_fingerprint(&public_key)
+                .unwrap_or_else(|error| panic!("remote Controller fingerprint failed: {error}")),
+            public_key,
+        )
+        .unwrap_or_else(|error| panic!("remote transport pin failed: {error}"));
+        (signer, pin)
+    }
+
+    async fn bind_remote_adapter(
+        adapter: &mut RemoteNodeControlAdapterV1,
+        controller: &SigningKey,
+        target: paraegox_node::protocol::NodeManagementTargetV1,
+        route_config_carrier_digest: Digest32,
+        marker: u8,
+    ) {
+        let discovered = adapter
+            .describe_once(remote_fresh(marker), controller, move |wire| async move {
+                let request = NodeControlCarrierRequestV1::decode(&wire)
+                    .unwrap_or_else(|error| panic!("remote Describe decode failed: {error}"));
+                assert_eq!(request.kind(), NodeControlCarrierKindV1::Describe);
+                assert_eq!(request.target(), None);
+                assert!(request.management_request().is_none());
+                let response = NodeControlDescribeResponseDraftV1::try_describe(&request, target)
+                    .and_then(NodeControlDescribeResponseDraftV1::finalize)
+                    .unwrap_or_else(|error| panic!("remote Describe response failed: {error}"));
+                Ok::<_, RemoteNodeControlTransportErrorV1>(
+                    RemoteNodeMtlsExchangeSuccessV1::try_new(
+                        REMOTE_NODE_CERTIFICATE_PRINCIPAL,
+                        route_config_carrier_digest,
+                        response.canonical_wire().into(),
+                    )
+                    .unwrap_or_else(|error| panic!("remote mTLS result failed: {error}")),
+                )
+            })
+            .await
+            .unwrap_or_else(|error| panic!("remote Describe failed: {error}"));
+        assert_eq!(discovered, target);
+        assert_eq!(adapter.target(), Some(target));
+    }
 
     struct ObservationSocketFixture {
         root: PathBuf,
@@ -3480,6 +4028,39 @@ mod tests {
             query_response,
         })
         .unwrap_or_else(|error| panic!("observation request failed: {error}"))
+    }
+
+    fn remote_runtime_authority(
+        predecessor: &VerifiedDistributedAgentStackPredecessorV1,
+        node_seed: u8,
+    ) -> RuntimeObservationAuthorityV1 {
+        let temporal = predecessor.request().temporal();
+        let serving = ReferenceBootstrapServingIdentityV1::try_new(
+            predecessor.target(),
+            predecessor.request().expected_runtime_store_instance_id(),
+            predecessor.predecessor_completion_snapshot_sequence(),
+            predecessor.predecessor_runtime_host_epoch(),
+            temporal.target_clock_domain(),
+            temporal.target_clock_generation(),
+        )
+        .unwrap_or_else(|error| panic!("remote serving authority failed: {error}"));
+        let endpoint = RuntimeApplyEndpointDescriptorV1::try_new(
+            RuntimeApplyEndpointRefV1::try_from_bytes([node_seed.wrapping_add(7); 16])
+                .unwrap_or_else(|error| panic!("remote Runtime endpoint ref failed: {error}")),
+            predecessor.target(),
+            5,
+            &format!("paraegox/v1/nodes/{}/runtime/apply", u64::from(node_seed)),
+            *predecessor.runtime_response_key().as_bytes(),
+            predecessor.runtime_response_public_key().to_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("remote Runtime endpoint failed: {error}"));
+        RuntimeObservationAuthorityV1::try_new(
+            predecessor.runtime_principal(),
+            predecessor.runtime_channel(),
+            serving,
+            endpoint,
+        )
+        .unwrap_or_else(|error| panic!("remote Runtime authority failed: {error}"))
     }
 
     fn observation_ack_wire(
@@ -3760,6 +4341,371 @@ mod tests {
         state
             .try_observe_authenticated(target, &request, authenticated)
             .expect("reduced Node response")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_describe_binds_only_after_exact_mtls_pins() {
+        let node = NodeHarness::new(0x31);
+        let route_digest = node.carrier_binding;
+        let target = node.management_target;
+        let (controller, transport) = remote_transport(route_digest);
+        let mut adapter = RemoteNodeControlAdapterV1::new(transport.clone());
+        let calls = AtomicU64::new(0);
+        let discovered = adapter
+            .describe_once(remote_fresh(0xa1), &controller, |wire| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    let request = NodeControlCarrierRequestV1::decode(&wire)
+                        .unwrap_or_else(|error| panic!("one-shot Describe decode failed: {error}"));
+                    assert_eq!(request.kind(), NodeControlCarrierKindV1::Describe);
+                    assert_eq!(request.target(), None);
+                    let response =
+                        NodeControlDescribeResponseDraftV1::try_describe(&request, target)
+                            .and_then(NodeControlDescribeResponseDraftV1::finalize)
+                            .unwrap_or_else(|error| {
+                                panic!("one-shot Describe response failed: {error}")
+                            });
+                    Ok::<_, RemoteNodeControlTransportErrorV1>(
+                        RemoteNodeMtlsExchangeSuccessV1::try_new(
+                            REMOTE_NODE_CERTIFICATE_PRINCIPAL,
+                            route_digest,
+                            response.canonical_wire().into(),
+                        )
+                        .unwrap_or_else(|error| panic!("mTLS Describe result failed: {error}")),
+                    )
+                }
+            })
+            .await
+            .unwrap_or_else(|error| panic!("one-shot Describe failed: {error}"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(discovered, target);
+        assert_eq!(adapter.target(), Some(target));
+
+        let mut rejected = RemoteNodeControlAdapterV1::new(transport);
+        let rejected_calls = AtomicU64::new(0);
+        let result = rejected
+            .describe_once(remote_fresh(0xa2), &controller, |wire| {
+                rejected_calls.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    let request = NodeControlCarrierRequestV1::decode(&wire)
+                        .unwrap_or_else(|error| panic!("rejected Describe decode failed: {error}"));
+                    let response =
+                        NodeControlDescribeResponseDraftV1::try_describe(&request, target)
+                            .and_then(NodeControlDescribeResponseDraftV1::finalize)
+                            .unwrap_or_else(|error| {
+                                panic!("rejected Describe response failed: {error}")
+                            });
+                    Ok::<_, RemoteNodeControlTransportErrorV1>(
+                        RemoteNodeMtlsExchangeSuccessV1::try_new(
+                            PrincipalRef::from_bytes([0xaf; 16]),
+                            route_digest,
+                            response.canonical_wire().into(),
+                        )
+                        .unwrap_or_else(|error| panic!("wrong-peer result failed: {error}")),
+                    )
+                }
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(RemoteNodeControlAdapterErrorV1::TransportPinMismatch)
+        ));
+        assert_eq!(rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(rejected.target(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_observation_challenge_pins_ready_authority_and_endpoint() {
+        let (bundle, nodes, _) = initialized();
+        let route_digest = nodes[0].carrier_binding;
+        let target = nodes[0].management_target;
+        let (controller, transport) = remote_transport(route_digest);
+        let mut adapter = RemoteNodeControlAdapterV1::new(transport);
+        bind_remote_adapter(&mut adapter, &controller, target, route_digest, 0xb1).await;
+
+        let authority = remote_runtime_authority(&bundle.predecessors[0], nodes[0].seed);
+        let endpoint_ref = RuntimeObservationEndpointRefV1::try_from_bytes([0xb2; 16])
+            .expect("remote observation endpoint ref");
+        let expected_authority_digest = authority.authority_digest();
+        let challenge = adapter
+            .observation_challenge_once(
+                remote_fresh(0xb3),
+                &controller,
+                &authority,
+                endpoint_ref,
+                1_000,
+                move |wire| async move {
+                    let request = NodeControlCarrierRequestV1::decode(&wire)
+                        .unwrap_or_else(|error| panic!("remote challenge decode failed: {error}"));
+                    assert_eq!(
+                        request.kind(),
+                        NodeControlCarrierKindV1::ObservationChallenge
+                    );
+                    assert_eq!(request.target(), Some(target));
+                    let challenge = NodeControlObservationChallengeV1::try_new(
+                        NodeControlObservationChallengeFieldsV1 {
+                            observation_endpoint_ref: endpoint_ref,
+                            runtime_host_id: bundle.predecessors[0].target(),
+                            authority_digest: expected_authority_digest,
+                            intended_status_sequence: 2,
+                            freshness_budget_nanos: 1_000,
+                            issued_at_unix_nanos: 10_000,
+                            expires_at_unix_nanos: 11_000,
+                            query_nonce: Digest32::from_bytes([0xb4; 32]),
+                        },
+                    )
+                    .unwrap_or_else(|error| panic!("remote challenge failed: {error}"));
+                    let response = NodeControlDescribeResponseDraftV1::try_observation_challenge(
+                        &request, challenge,
+                    )
+                    .and_then(NodeControlDescribeResponseDraftV1::finalize)
+                    .unwrap_or_else(|error| panic!("remote challenge response failed: {error}"));
+                    Ok::<_, RemoteNodeControlTransportErrorV1>(
+                        RemoteNodeMtlsExchangeSuccessV1::try_new(
+                            REMOTE_NODE_CERTIFICATE_PRINCIPAL,
+                            route_digest,
+                            response.canonical_wire().into(),
+                        )
+                        .unwrap_or_else(|error| panic!("challenge mTLS result failed: {error}")),
+                    )
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("remote challenge exchange failed: {error}"));
+        assert_eq!(challenge.observation_endpoint_ref(), endpoint_ref);
+        assert_eq!(challenge.authority_digest(), authority.authority_digest());
+        assert_eq!(challenge.query_nonce(), Digest32::from_bytes([0xb4; 32]));
+
+        for (marker, wrong_endpoint, wrong_authority) in [(0xb5, true, false), (0xb6, false, true)]
+        {
+            let response_endpoint = if wrong_endpoint {
+                RuntimeObservationEndpointRefV1::try_from_bytes([0xbe; 16])
+                    .expect("wrong endpoint ref")
+            } else {
+                endpoint_ref
+            };
+            let response_authority = if wrong_authority {
+                Digest32::from_bytes([0xbf; 32])
+            } else {
+                authority.authority_digest()
+            };
+            let result = adapter
+                .observation_challenge_once(
+                    remote_fresh(marker),
+                    &controller,
+                    &authority,
+                    endpoint_ref,
+                    1_000,
+                    move |wire| async move {
+                        let request =
+                            NodeControlCarrierRequestV1::decode(&wire).unwrap_or_else(|error| {
+                                panic!("mismatched challenge decode failed: {error}")
+                            });
+                        let challenge = NodeControlObservationChallengeV1::try_new(
+                            NodeControlObservationChallengeFieldsV1 {
+                                observation_endpoint_ref: response_endpoint,
+                                runtime_host_id: request
+                                    .runtime_host_id()
+                                    .expect("challenge Runtime target"),
+                                authority_digest: response_authority,
+                                intended_status_sequence: 2,
+                                freshness_budget_nanos: 1_000,
+                                issued_at_unix_nanos: 10_000,
+                                expires_at_unix_nanos: 11_000,
+                                query_nonce: Digest32::from_bytes([marker; 32]),
+                            },
+                        )
+                        .unwrap_or_else(|error| panic!("mismatched challenge failed: {error}"));
+                        let response =
+                            NodeControlDescribeResponseDraftV1::try_observation_challenge(
+                                &request, challenge,
+                            )
+                            .and_then(NodeControlDescribeResponseDraftV1::finalize)
+                            .unwrap_or_else(|error| {
+                                panic!("mismatched challenge response failed: {error}")
+                            });
+                        Ok::<_, RemoteNodeControlTransportErrorV1>(
+                            RemoteNodeMtlsExchangeSuccessV1::try_new(
+                                REMOTE_NODE_CERTIFICATE_PRINCIPAL,
+                                route_digest,
+                                response.canonical_wire().into(),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("mismatched challenge mTLS result failed: {error}")
+                            }),
+                        )
+                    },
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(RemoteNodeControlAdapterErrorV1::ChallengeMismatch)
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_latest_watch_and_publish_admit_only_correlated_raw_protocols() {
+        let (bundle, mut nodes, state) = initialized();
+        nodes[0].publish();
+        let route_digest = nodes[0].carrier_binding;
+        let target = nodes[0].management_target;
+        let runtime_target = bundle.predecessors[0].target();
+        let (controller, transport) = remote_transport(route_digest);
+        let mut adapter = RemoteNodeControlAdapterV1::new(transport);
+        bind_remote_adapter(&mut adapter, &controller, target, route_digest, 0xc1).await;
+
+        let generation = NodeObservationProcessGenerationV1::try_from_bytes([0xc2; 16])
+            .expect("remote process generation");
+        let state = state
+            .try_begin_observation_process(generation)
+            .expect("begin remote observation process");
+        let latest = state
+            .request_for(runtime_target, [0xc3; 16])
+            .expect("remote Latest");
+        assert_eq!(latest.kind(), NodeManagementRequestKindV1::Latest);
+        let latest_response = nodes[0]
+            .daemon
+            .answer_read_only_v1(&latest)
+            .expect("raw Latest response");
+        let expected_latest = latest.clone();
+        let authenticated = adapter
+            .observe_management_once(
+                FreshRemoteNodeControlRequestV1::try_new([0xc3; 16], [0xc4; 32])
+                    .expect("fresh Latest carrier"),
+                &controller,
+                latest.clone(),
+                generation,
+                || 41,
+                move |wire| async move {
+                    let carrier = NodeControlCarrierRequestV1::decode(&wire)
+                        .unwrap_or_else(|error| panic!("Latest carrier decode failed: {error}"));
+                    assert_eq!(carrier.kind(), NodeControlCarrierKindV1::Latest);
+                    assert_eq!(carrier.target(), Some(target));
+                    assert_eq!(carrier.management_request(), Some(&expected_latest));
+                    Ok::<_, RemoteNodeControlTransportErrorV1>(
+                        RemoteNodeMtlsExchangeSuccessV1::try_new(
+                            REMOTE_NODE_CERTIFICATE_PRINCIPAL,
+                            route_digest,
+                            latest_response.canonical_wire().into(),
+                        )
+                        .unwrap_or_else(|error| panic!("Latest mTLS result failed: {error}")),
+                    )
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("remote Latest failed: {error}"));
+        let state = state
+            .try_observe_authenticated(runtime_target, &latest, authenticated)
+            .expect("reduce remote Latest");
+        assert_eq!(
+            state.rows[0].availability,
+            DistributedAgentStackNodeAvailabilityV1::Current
+        );
+
+        let watch = state
+            .request_for(runtime_target, [0xc5; 16])
+            .expect("remote Watch");
+        assert_eq!(watch.kind(), NodeManagementRequestKindV1::Watch);
+        let watch_response = nodes[0]
+            .daemon
+            .answer_read_only_v1(&watch)
+            .expect("raw Watch response");
+        let expected_watch = watch.clone();
+        let authenticated = adapter
+            .observe_management_once(
+                FreshRemoteNodeControlRequestV1::try_new([0xc5; 16], [0xc6; 32])
+                    .expect("fresh Watch carrier"),
+                &controller,
+                watch.clone(),
+                generation,
+                || 42,
+                move |wire| async move {
+                    let carrier = NodeControlCarrierRequestV1::decode(&wire)
+                        .unwrap_or_else(|error| panic!("Watch carrier decode failed: {error}"));
+                    assert_eq!(carrier.kind(), NodeControlCarrierKindV1::Watch);
+                    assert_eq!(carrier.management_request(), Some(&expected_watch));
+                    Ok::<_, RemoteNodeControlTransportErrorV1>(
+                        RemoteNodeMtlsExchangeSuccessV1::try_new(
+                            REMOTE_NODE_CERTIFICATE_PRINCIPAL,
+                            route_digest,
+                            watch_response.canonical_wire().into(),
+                        )
+                        .unwrap_or_else(|error| panic!("Watch mTLS result failed: {error}")),
+                    )
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("remote Watch failed: {error}"));
+        let state = state
+            .try_observe_authenticated(runtime_target, &watch, authenticated)
+            .expect("reduce remote Watch");
+        assert_eq!(
+            state.rows[0].availability,
+            DistributedAgentStackNodeAvailabilityV1::Current
+        );
+
+        let observation = observation_request(7, 0xc7);
+        let ack_wire = observation_ack_wire(&observation, observation.request_digest());
+        let expected_observation = observation.clone();
+        let ack = adapter
+            .publish_runtime_observation_once(
+                remote_fresh(0xc8),
+                &controller,
+                observation.clone(),
+                move |wire| async move {
+                    let carrier = NodeControlCarrierRequestV1::decode(&wire)
+                        .unwrap_or_else(|error| panic!("Publish carrier decode failed: {error}"));
+                    assert_eq!(
+                        carrier.kind(),
+                        NodeControlCarrierKindV1::PublishRuntimeObservation
+                    );
+                    assert_eq!(carrier.target(), Some(target));
+                    assert_eq!(
+                        carrier.runtime_observation_request(),
+                        Some(&expected_observation)
+                    );
+                    Ok::<_, RemoteNodeControlTransportErrorV1>(
+                        RemoteNodeMtlsExchangeSuccessV1::try_new(
+                            REMOTE_NODE_CERTIFICATE_PRINCIPAL,
+                            route_digest,
+                            Box::new(ack_wire),
+                        )
+                        .unwrap_or_else(|error| panic!("Publish mTLS result failed: {error}")),
+                    )
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("remote Publish failed: {error}"));
+        ack.validate_for(&observation)
+            .expect("strict raw PXNA correlation");
+
+        let mismatched_ack = observation_ack_wire(&observation, Digest32::from_bytes([0xcf; 32]));
+        let result = adapter
+            .publish_runtime_observation_once(
+                remote_fresh(0xc9),
+                &controller,
+                observation,
+                move |_| async move {
+                    Ok::<_, RemoteNodeControlTransportErrorV1>(
+                        RemoteNodeMtlsExchangeSuccessV1::try_new(
+                            REMOTE_NODE_CERTIFICATE_PRINCIPAL,
+                            route_digest,
+                            Box::new(mismatched_ack),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("mismatched PXNA mTLS result failed: {error}")
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(RemoteNodeControlAdapterErrorV1::Observation(
+                RuntimeObservationError::AckMismatch
+            ))
+        ));
     }
 
     #[test]

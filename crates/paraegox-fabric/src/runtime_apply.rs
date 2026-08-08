@@ -1,10 +1,11 @@
-//! Restricted Controller-to-Runtime raw-query transport.
+//! Restricted Controller raw-query transports for Runtime and Node owners.
 //!
 //! This module owns only transport mechanics. It never decodes, authenticates,
-//! signs, admits, or persists PXCC, PXDR, PXRC, PXAR, or PXDS values. The Controller side
-//! has one connector-only TLS session and the Runtime side has one
-//! listener-only TLS session. Their application-message ACL exposes one exact
-//! query route; Zenoh still owns its internal control-plane and link maintenance.
+//! signs, admits, or persists PXCC, PXDR, PXRC, PXAR, PXDS, PXNR, PXNE, PXNS,
+//! or PXNA values. Each Controller side has one connector-only TLS session and
+//! each Runtime or Node side has one listener-only TLS session. Their
+//! application-message ACL exposes one exact query route; Zenoh still owns its
+//! internal control-plane and link maintenance.
 //! The configured custom CA is not an exclusive trust store in Zenoh 1.9, so
 //! the ACL additionally binds the exact peer certificate common name. PXRC and
 //! PXDS signature verification remains mandatory in the owning composition.
@@ -16,6 +17,16 @@ use paraegox_kernel::{
     digest::Digest32,
     identity::{PrincipalRef, RuntimeHostId},
 };
+#[cfg(unix)]
+use paraegox_node::{
+    observation::RUNTIME_OBSERVATION_ACK_BYTES,
+    protocol::{
+        MAX_NODE_CONTROL_CARRIER_REQUEST_BYTES, MAX_NODE_CONTROL_DESCRIBE_RESPONSE_BYTES,
+        MAX_NODE_MANAGEMENT_RESPONSE_BYTES,
+    },
+};
+#[cfg(unix)]
+use paraegox_runtime_contracts::distributed_agent_stack_plan::MAX_RESTRICTED_RUNTIME_APPLY_OPERATION_TIMEOUT_NANOS;
 use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES,
     MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES,
@@ -84,10 +95,33 @@ impl RestrictedRawQueryFrameBounds {
             },
         }
     }
+
+    #[cfg(unix)]
+    const fn node_control() -> Self {
+        Self {
+            request: MAX_NODE_CONTROL_CARRIER_REQUEST_BYTES,
+            response: if MAX_NODE_CONTROL_DESCRIBE_RESPONSE_BYTES
+                > MAX_NODE_MANAGEMENT_RESPONSE_BYTES
+                && MAX_NODE_CONTROL_DESCRIBE_RESPONSE_BYTES > RUNTIME_OBSERVATION_ACK_BYTES
+            {
+                MAX_NODE_CONTROL_DESCRIBE_RESPONSE_BYTES
+            } else if MAX_NODE_MANAGEMENT_RESPONSE_BYTES > RUNTIME_OBSERVATION_ACK_BYTES {
+                MAX_NODE_MANAGEMENT_RESPONSE_BYTES
+            } else {
+                RUNTIME_OBSERVATION_ACK_BYTES
+            },
+        }
+    }
 }
 
 struct RestrictedRuntimeApplyPeerExpectation {
     expected_target: RuntimeHostId,
+    expected_peer_principal: PrincipalRef,
+    expected_carrier_binding_digest: Digest32,
+    timeout: Duration,
+}
+
+struct RestrictedRawQueryPeerExpectation {
     expected_peer_principal: PrincipalRef,
     expected_carrier_binding_digest: Digest32,
     timeout: Duration,
@@ -100,7 +134,7 @@ pub struct RestrictedRuntimeApplyClientConfigV1 {
     route: OwnedNonWildKeyExpr,
     root_ca_certificate_file: Box<str>,
     connector_identity: ResolvedRemoteMtlsIdentityFiles,
-    expected_target: RuntimeHostId,
+    expected_target: Option<RuntimeHostId>,
     expected_runtime_principal: PrincipalRef,
     expected_carrier_binding_digest: Digest32,
     operation_timeout: Duration,
@@ -213,8 +247,37 @@ impl RestrictedRuntimeApplyClientConfigV1 {
             expected_carrier_binding_digest,
             timeout: operation_timeout,
         } = peer_expectation;
-        let operation_timeout = validate_timeout(operation_timeout)?;
         validate_target(expected_target)?;
+        let mut config = Self::try_new_peer_with_frame_bounds(
+            endpoint,
+            route,
+            root_ca_certificate_file,
+            connector_identity,
+            RestrictedRawQueryPeerExpectation {
+                expected_peer_principal: expected_runtime_principal,
+                expected_carrier_binding_digest,
+                timeout: operation_timeout,
+            },
+            frame_bounds,
+        )?;
+        config.expected_target = Some(expected_target);
+        Ok(config)
+    }
+
+    fn try_new_peer_with_frame_bounds(
+        endpoint: RemoteTlsEndpoint,
+        route: impl Into<String>,
+        root_ca_certificate_file: PathBuf,
+        connector_identity: ResolvedRemoteMtlsIdentityFiles,
+        peer_expectation: RestrictedRawQueryPeerExpectation,
+        frame_bounds: RestrictedRawQueryFrameBounds,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        let RestrictedRawQueryPeerExpectation {
+            expected_peer_principal: expected_runtime_principal,
+            expected_carrier_binding_digest,
+            timeout: operation_timeout,
+        } = peer_expectation;
+        let operation_timeout = validate_timeout(operation_timeout)?;
         validate_principal(expected_runtime_principal)?;
         validate_digest(expected_carrier_binding_digest)?;
         Ok(Self {
@@ -224,7 +287,7 @@ impl RestrictedRuntimeApplyClientConfigV1 {
                 .map_err(|_| RestrictedRuntimeApplyConfigErrorV1::InvalidTlsFilePath)?
                 .into(),
             connector_identity,
-            expected_target,
+            expected_target: None,
             expected_runtime_principal,
             expected_carrier_binding_digest,
             operation_timeout,
@@ -276,7 +339,7 @@ pub struct RestrictedRuntimeApplyEndpointConfigV1 {
     route: OwnedNonWildKeyExpr,
     root_ca_certificate_file: Box<str>,
     listener_identity: ResolvedRemoteMtlsIdentityFiles,
-    expected_target: RuntimeHostId,
+    expected_target: Option<RuntimeHostId>,
     expected_controller_principal: PrincipalRef,
     expected_carrier_binding_digest: Digest32,
     handler_timeout: Duration,
@@ -388,8 +451,37 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
             expected_carrier_binding_digest,
             timeout: handler_timeout,
         } = peer_expectation;
-        let handler_timeout = validate_timeout(handler_timeout)?;
         validate_target(expected_target)?;
+        let mut config = Self::try_new_peer_with_frame_bounds(
+            endpoint,
+            route,
+            root_ca_certificate_file,
+            listener_identity,
+            RestrictedRawQueryPeerExpectation {
+                expected_peer_principal: expected_controller_principal,
+                expected_carrier_binding_digest,
+                timeout: handler_timeout,
+            },
+            frame_bounds,
+        )?;
+        config.expected_target = Some(expected_target);
+        Ok(config)
+    }
+
+    fn try_new_peer_with_frame_bounds(
+        endpoint: RemoteTlsEndpoint,
+        route: impl Into<String>,
+        root_ca_certificate_file: PathBuf,
+        listener_identity: ResolvedRemoteMtlsIdentityFiles,
+        peer_expectation: RestrictedRawQueryPeerExpectation,
+        frame_bounds: RestrictedRawQueryFrameBounds,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        let RestrictedRawQueryPeerExpectation {
+            expected_peer_principal: expected_controller_principal,
+            expected_carrier_binding_digest,
+            timeout: handler_timeout,
+        } = peer_expectation;
+        let handler_timeout = validate_timeout(handler_timeout)?;
         validate_principal(expected_controller_principal)?;
         validate_digest(expected_carrier_binding_digest)?;
         restricted_ingress_limits(handler_timeout, frame_bounds)?;
@@ -400,7 +492,7 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
                 .map_err(|_| RestrictedRuntimeApplyConfigErrorV1::InvalidTlsFilePath)?
                 .into(),
             listener_identity,
-            expected_target,
+            expected_target: None,
             expected_controller_principal,
             expected_carrier_binding_digest,
             handler_timeout,
@@ -421,7 +513,7 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
         &self,
         carrier: &RestrictedRuntimeApplyCarrierBindingV1,
     ) -> bool {
-        self.expected_target == carrier.target()
+        self.expected_target == Some(carrier.target())
             && self.route.as_str() == carrier.route()
             && self.expected_controller_principal == carrier.controller_principal()
             && self.expected_carrier_binding_digest == carrier.binding_digest()
@@ -656,6 +748,17 @@ fn validate_timeout(timeout: Duration) -> Result<Duration, RestrictedRuntimeAppl
     Ok(timeout)
 }
 
+#[cfg(unix)]
+fn validate_node_control_timeout(
+    timeout: Duration,
+) -> Result<Duration, RestrictedRuntimeApplyConfigErrorV1> {
+    let timeout = validate_timeout(timeout)?;
+    if timeout > Duration::from_nanos(MAX_RESTRICTED_RUNTIME_APPLY_OPERATION_TIMEOUT_NANOS) {
+        return Err(RestrictedRuntimeApplyConfigErrorV1::TimeoutTooLarge);
+    }
+    Ok(timeout)
+}
+
 fn restricted_ingress_limits(
     handler_timeout: Duration,
     frame_bounds: RestrictedRawQueryFrameBounds,
@@ -722,7 +825,7 @@ impl std::error::Error for RestrictedRuntimeApplyConfigErrorV1 {}
 pub struct RestrictedRuntimeApplyClientV1 {
     session: zenoh::Session,
     route: OwnedNonWildKeyExpr,
-    expected_target: RuntimeHostId,
+    expected_target: Option<RuntimeHostId>,
     expected_runtime_principal: PrincipalRef,
     expected_carrier_binding_digest: Digest32,
     operation_timeout: Duration,
@@ -766,7 +869,7 @@ impl RestrictedRuntimeApplyClientV1 {
         runtime_principal: PrincipalRef,
         carrier_binding_digest: Digest32,
     ) -> bool {
-        self.expected_target == target
+        self.expected_target == Some(target)
             && self.route.as_str() == route
             && self.expected_runtime_principal == runtime_principal
             && self.expected_carrier_binding_digest == carrier_binding_digest
@@ -852,7 +955,11 @@ pub struct RestrictedRuntimeApplyPreflightV1<'client> {
 
 impl RestrictedRuntimeApplyPreflightV1<'_> {
     /// Issues exactly one query and returns the exact bounded reply payload.
-    pub async fn send_once(mut self) -> Result<Box<[u8]>, RestrictedRuntimeApplyErrorV1> {
+    pub async fn send_once(self) -> Result<Box<[u8]>, RestrictedRuntimeApplyErrorV1> {
+        self.issue_once().await
+    }
+
+    async fn issue_once(mut self) -> Result<Box<[u8]>, RestrictedRuntimeApplyErrorV1> {
         self.attempt.claim()?;
         let querier = self
             .querier
@@ -1528,7 +1635,7 @@ pub struct RestrictedRuntimeControlPreflightV1<'client> {
 
 impl RestrictedRuntimeControlPreflightV1<'_> {
     pub async fn send_once(self) -> Result<Box<[u8]>, RestrictedRuntimeApplyErrorV1> {
-        self.inner.send_once().await
+        self.inner.issue_once().await
     }
 }
 
@@ -1623,6 +1730,319 @@ pub type RestrictedRuntimeControlErrorV1 = RestrictedRuntimeApplyErrorV1;
 /// Shared one-shot response handoff error taxonomy.
 pub type RestrictedRuntimeControlRespondErrorV1 = RestrictedRuntimeApplyRespondErrorV1;
 
+/// Exact non-secret transport pins shared by one Node-control connector or
+/// listener configuration. The connector pins the Node certificate principal;
+/// the listener pins the Controller certificate principal. PXNR/PXNE/PXNS/PXNA
+/// authentication and correlation remain outside Fabric.
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct RestrictedNodeControlTransportPinsV1 {
+    expected_peer_principal: PrincipalRef,
+    route_config_carrier_digest: Digest32,
+    operation_timeout: Duration,
+}
+
+#[cfg(unix)]
+impl RestrictedNodeControlTransportPinsV1 {
+    pub fn try_new(
+        expected_peer_principal: PrincipalRef,
+        route_config_carrier_digest: Digest32,
+        operation_timeout: Duration,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        validate_principal(expected_peer_principal)?;
+        validate_digest(route_config_carrier_digest)?;
+        let operation_timeout = validate_node_control_timeout(operation_timeout)?;
+        Ok(Self {
+            expected_peer_principal,
+            route_config_carrier_digest,
+            operation_timeout,
+        })
+    }
+
+    #[must_use]
+    pub const fn expected_peer_principal(self) -> PrincipalRef {
+        self.expected_peer_principal
+    }
+
+    #[must_use]
+    pub const fn route_config_carrier_digest(self) -> Digest32 {
+        self.route_config_carrier_digest
+    }
+
+    #[must_use]
+    pub const fn operation_timeout(self) -> Duration {
+        self.operation_timeout
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for RestrictedNodeControlTransportPinsV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RestrictedNodeControlTransportPinsV1(<redacted>)")
+    }
+}
+
+/// Connector-only PXNR raw-query configuration. Node identity discovery is a
+/// protocol operation, so this configuration intentionally has no RuntimeHost
+/// or Node-management target.
+#[cfg(unix)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct RestrictedNodeControlClientConfigV1(RestrictedRuntimeApplyClientConfigV1);
+
+#[cfg(unix)]
+impl RestrictedNodeControlClientConfigV1 {
+    pub fn try_new(
+        endpoint: RemoteTlsEndpoint,
+        route: impl Into<String>,
+        root_ca_certificate_file: PathBuf,
+        connector_identity: ResolvedRemoteMtlsIdentityFiles,
+        transport_pins: RestrictedNodeControlTransportPinsV1,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        let operation_timeout = validate_node_control_timeout(transport_pins.operation_timeout)?;
+        RestrictedRuntimeApplyClientConfigV1::try_new_peer_with_frame_bounds(
+            endpoint,
+            route,
+            root_ca_certificate_file,
+            connector_identity,
+            RestrictedRawQueryPeerExpectation {
+                expected_peer_principal: transport_pins.expected_peer_principal,
+                expected_carrier_binding_digest: transport_pins.route_config_carrier_digest,
+                timeout: operation_timeout,
+            },
+            RestrictedRawQueryFrameBounds::node_control(),
+        )
+        .map(Self)
+    }
+
+    #[must_use]
+    pub fn route(&self) -> &str {
+        self.0.route()
+    }
+
+    #[must_use]
+    pub const fn expected_peer_principal(&self) -> PrincipalRef {
+        self.0.expected_runtime_principal
+    }
+
+    #[must_use]
+    pub const fn route_config_carrier_digest(&self) -> Digest32 {
+        self.0.expected_carrier_binding_digest
+    }
+
+    #[must_use]
+    pub fn matches_transport_pins(
+        &self,
+        route: &str,
+        peer_principal: PrincipalRef,
+        route_config_carrier_digest: Digest32,
+    ) -> bool {
+        self.route() == route
+            && self.expected_peer_principal() == peer_principal
+            && self.route_config_carrier_digest() == route_config_carrier_digest
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for RestrictedNodeControlClientConfigV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RestrictedNodeControlClientConfigV1(<redacted>)")
+    }
+}
+
+/// Connector-only Node-control lifecycle over the private one-query owner.
+#[cfg(unix)]
+pub struct RestrictedNodeControlClientV1(RestrictedRuntimeApplyClientV1);
+
+#[cfg(unix)]
+impl RestrictedNodeControlClientV1 {
+    pub async fn start(
+        config: RestrictedNodeControlClientConfigV1,
+    ) -> Result<Self, RestrictedRuntimeApplyErrorV1> {
+        RestrictedRuntimeApplyClientV1::start(config.0)
+            .await
+            .map(Self)
+    }
+
+    #[must_use]
+    pub fn route(&self) -> &str {
+        self.0.route.as_str()
+    }
+
+    #[must_use]
+    pub const fn expected_peer_principal(&self) -> PrincipalRef {
+        self.0.expected_runtime_principal
+    }
+
+    #[must_use]
+    pub const fn route_config_carrier_digest(&self) -> Digest32 {
+        self.0.expected_carrier_binding_digest
+    }
+
+    #[must_use]
+    pub fn matches_transport_pins(
+        &self,
+        route: &str,
+        peer_principal: PrincipalRef,
+        route_config_carrier_digest: Digest32,
+    ) -> bool {
+        self.route() == route
+            && self.expected_peer_principal() == peer_principal
+            && self.route_config_carrier_digest() == route_config_carrier_digest
+    }
+
+    pub async fn preflight(
+        &mut self,
+        canonical_request: Vec<u8>,
+    ) -> Result<RestrictedNodeControlPreflightV1<'_>, RestrictedRuntimeApplyErrorV1> {
+        self.0
+            .preflight(canonical_request)
+            .await
+            .map(|inner| RestrictedNodeControlPreflightV1 { inner })
+    }
+
+    pub async fn shutdown(self) -> Result<(), RestrictedRuntimeApplyErrorV1> {
+        self.0.shutdown().await
+    }
+}
+
+/// Move-only authority for one PXNR query under the raw owner's sole absolute
+/// deadline. Consuming this value is the only physical send entrypoint.
+#[cfg(unix)]
+pub struct RestrictedNodeControlPreflightV1<'client> {
+    inner: RestrictedRuntimeApplyPreflightV1<'client>,
+}
+
+#[cfg(unix)]
+impl RestrictedNodeControlPreflightV1<'_> {
+    pub async fn send_once(self) -> Result<Box<[u8]>, RestrictedRuntimeApplyErrorV1> {
+        self.inner.issue_once().await
+    }
+}
+
+/// Listener-only PXNR raw-query configuration. Its expected peer is the exact
+/// Controller certificate principal; no discovered Node target is configured.
+#[cfg(unix)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct RestrictedNodeControlEndpointConfigV1(RestrictedRuntimeApplyEndpointConfigV1);
+
+#[cfg(unix)]
+impl RestrictedNodeControlEndpointConfigV1 {
+    pub fn try_new(
+        endpoint: RemoteTlsEndpoint,
+        route: impl Into<String>,
+        root_ca_certificate_file: PathBuf,
+        listener_identity: ResolvedRemoteMtlsIdentityFiles,
+        transport_pins: RestrictedNodeControlTransportPinsV1,
+    ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        let handler_timeout = validate_node_control_timeout(transport_pins.operation_timeout)?;
+        RestrictedRuntimeApplyEndpointConfigV1::try_new_peer_with_frame_bounds(
+            endpoint,
+            route,
+            root_ca_certificate_file,
+            listener_identity,
+            RestrictedRawQueryPeerExpectation {
+                expected_peer_principal: transport_pins.expected_peer_principal,
+                expected_carrier_binding_digest: transport_pins.route_config_carrier_digest,
+                timeout: handler_timeout,
+            },
+            RestrictedRawQueryFrameBounds::node_control(),
+        )
+        .map(Self)
+    }
+
+    #[must_use]
+    pub fn route(&self) -> &str {
+        self.0.route()
+    }
+
+    #[must_use]
+    pub const fn expected_peer_principal(&self) -> PrincipalRef {
+        self.0.expected_controller_principal
+    }
+
+    #[must_use]
+    pub const fn route_config_carrier_digest(&self) -> Digest32 {
+        self.0.expected_carrier_binding_digest
+    }
+
+    #[must_use]
+    pub fn matches_transport_pins(
+        &self,
+        route: &str,
+        peer_principal: PrincipalRef,
+        route_config_carrier_digest: Digest32,
+    ) -> bool {
+        self.route() == route
+            && self.expected_peer_principal() == peer_principal
+            && self.route_config_carrier_digest() == route_config_carrier_digest
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for RestrictedNodeControlEndpointConfigV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RestrictedNodeControlEndpointConfigV1(<redacted>)")
+    }
+}
+
+/// Listener-only Node-control lifecycle over the private raw-query worker.
+#[cfg(unix)]
+pub struct RestrictedNodeControlEndpointV1(RestrictedRuntimeApplyEndpointV1);
+
+#[cfg(unix)]
+impl RestrictedNodeControlEndpointV1 {
+    pub async fn start(
+        config: RestrictedNodeControlEndpointConfigV1,
+    ) -> Result<(Self, RestrictedNodeControlReceiverV1), RestrictedRuntimeApplyErrorV1> {
+        let (endpoint, receiver) = RestrictedRuntimeApplyEndpointV1::start(config.0).await?;
+        Ok((Self(endpoint), RestrictedNodeControlReceiverV1(receiver)))
+    }
+
+    pub async fn shutdown(self) -> Result<(), RestrictedRuntimeApplyErrorV1> {
+        self.0.shutdown().await
+    }
+}
+
+/// Single-consumer stream for one bounded, still-unauthenticated PXNR frame.
+#[cfg(unix)]
+pub struct RestrictedNodeControlReceiverV1(RestrictedRuntimeApplyReceiverV1);
+
+#[cfg(unix)]
+impl RestrictedNodeControlReceiverV1 {
+    pub async fn recv(&mut self) -> Option<RestrictedNodeControlInboundV1> {
+        self.0.recv().await.map(RestrictedNodeControlInboundV1)
+    }
+}
+
+/// One bounded raw PXNR request and one-shot PXNE/PXNS/PXNA response handoff.
+#[cfg(unix)]
+pub struct RestrictedNodeControlInboundV1(RestrictedRuntimeApplyInboundV1);
+
+#[cfg(unix)]
+impl RestrictedNodeControlInboundV1 {
+    #[must_use]
+    pub fn canonical_request(&self) -> &[u8] {
+        self.0.canonical_request()
+    }
+
+    pub fn respond(
+        self,
+        canonical_response: Vec<u8>,
+    ) -> Result<(), RestrictedRuntimeApplyRespondErrorV1> {
+        self.0.respond(canonical_response)
+    }
+}
+
+/// Shared fail-closed private raw-query configuration taxonomy.
+#[cfg(unix)]
+pub type RestrictedNodeControlConfigErrorV1 = RestrictedRuntimeApplyConfigErrorV1;
+/// Shared fail-closed private raw-query lifecycle taxonomy.
+#[cfg(unix)]
+pub type RestrictedNodeControlErrorV1 = RestrictedRuntimeApplyErrorV1;
+/// Shared one-shot raw-query response handoff taxonomy.
+#[cfg(unix)]
+pub type RestrictedNodeControlRespondErrorV1 = RestrictedRuntimeApplyRespondErrorV1;
+
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, time::Duration};
@@ -1630,6 +2050,14 @@ mod tests {
     use paraegox_kernel::{
         digest::Digest32,
         identity::{PrincipalRef, RuntimeHostId},
+    };
+    #[cfg(unix)]
+    use paraegox_node::{
+        observation::RUNTIME_OBSERVATION_ACK_BYTES,
+        protocol::{
+            MAX_NODE_CONTROL_CARRIER_REQUEST_BYTES, MAX_NODE_CONTROL_DESCRIBE_RESPONSE_BYTES,
+            MAX_NODE_MANAGEMENT_RESPONSE_BYTES,
+        },
     };
 
     use super::{
@@ -1643,7 +2071,14 @@ mod tests {
         restricted_runtime_apply_peer_certificate_common_name_v1, validate_request_frame,
         validate_response_frame,
     };
+    #[cfg(unix)]
+    use super::{
+        RestrictedNodeControlClientConfigV1, RestrictedNodeControlEndpointConfigV1,
+        RestrictedNodeControlTransportPinsV1,
+    };
     use crate::{RemoteTlsEndpoint, ResolvedRemoteMtlsIdentityFiles};
+    #[cfg(unix)]
+    use paraegox_runtime_contracts::distributed_agent_stack_plan::MAX_RESTRICTED_RUNTIME_APPLY_OPERATION_TIMEOUT_NANOS;
     use paraegox_runtime_contracts::distributed_agent_stack_plan::{
         DistributedFabricCredentialRefV1, DistributedFabricTrustAnchorRefV1,
         DistributedFabricTrustDomainRefV1,
@@ -1879,7 +2314,7 @@ mod tests {
         .expect("Controller profile mapping");
         assert_eq!(client.endpoint, endpoint());
         assert_eq!(client.route(), profile.route());
-        assert_eq!(client.expected_target, profile.target());
+        assert_eq!(client.expected_target, Some(profile.target()));
         assert_eq!(
             client.expected_runtime_principal,
             profile.runtime_principal()
@@ -1900,7 +2335,7 @@ mod tests {
         .expect("Runtime profile mapping");
         assert_eq!(runtime.endpoint, endpoint());
         assert_eq!(runtime.route(), profile.route());
-        assert_eq!(runtime.expected_target, profile.target());
+        assert_eq!(runtime.expected_target, Some(profile.target()));
         assert_eq!(
             runtime.expected_controller_principal,
             profile.controller_principal()
@@ -1966,6 +2401,259 @@ mod tests {
         assert_eq!(control.route(), profile.route());
         assert_eq!(client.route(), profile.route());
         assert!(control.matches_restricted_carrier(&carrier));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_control_configs_pin_exact_roles_without_a_discovered_target() {
+        let node_pins = RestrictedNodeControlTransportPinsV1::try_new(
+            principal(0x4e),
+            digest(0x81),
+            Duration::from_secs(5),
+        )
+        .expect("Node connector pins");
+        assert_eq!(node_pins.expected_peer_principal(), principal(0x4e));
+        assert_eq!(node_pins.route_config_carrier_digest(), digest(0x81));
+        assert_eq!(node_pins.operation_timeout(), Duration::from_secs(5));
+        assert_eq!(
+            format!("{node_pins:?}"),
+            "RestrictedNodeControlTransportPinsV1(<redacted>)"
+        );
+        let client = RestrictedNodeControlClientConfigV1::try_new(
+            endpoint(),
+            "paraegox/node-a/control",
+            PathBuf::from("/run/paraegox/root-ca.pem"),
+            identity("controller"),
+            node_pins,
+        )
+        .expect("Node-control connector config");
+        assert_eq!(client.0.expected_target, None);
+        assert_eq!(
+            client.0.frame_bounds,
+            RestrictedRawQueryFrameBounds::node_control()
+        );
+        assert_eq!(client.route(), "paraegox/node-a/control");
+        assert_eq!(client.expected_peer_principal(), principal(0x4e));
+        assert_eq!(client.route_config_carrier_digest(), digest(0x81));
+        assert!(client.matches_transport_pins(
+            "paraegox/node-a/control",
+            principal(0x4e),
+            digest(0x81),
+        ));
+        assert!(!client.matches_transport_pins(
+            "paraegox/node-b/control",
+            principal(0x4e),
+            digest(0x81),
+        ));
+        assert!(!client.matches_transport_pins(
+            "paraegox/node-a/control",
+            principal(0x4f),
+            digest(0x81),
+        ));
+        assert!(!client.matches_transport_pins(
+            "paraegox/node-a/control",
+            principal(0x4e),
+            digest(0x82),
+        ));
+        assert_eq!(
+            format!("{client:?}"),
+            "RestrictedNodeControlClientConfigV1(<redacted>)"
+        );
+        let client_zenoh = client.0.build_zenoh_config().expect("client Zenoh config");
+        assert_eq!(client_zenoh.get_json("mode").unwrap(), "\"client\"");
+        assert_eq!(
+            client_zenoh.get_json("scouting/multicast/enabled").unwrap(),
+            "false"
+        );
+        assert_eq!(
+            client_zenoh.get_json("scouting/gossip/enabled").unwrap(),
+            "false"
+        );
+        assert_eq!(
+            client_zenoh
+                .get_json("transport/unicast/accept_pending")
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            client_zenoh
+                .get_json("transport/unicast/max_sessions")
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            client_zenoh
+                .get_json("transport/unicast/max_links")
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            client_zenoh
+                .get_json("transport/link/rx/max_message_size")
+                .unwrap(),
+            super::restricted_transport_message_limit(
+                RestrictedRawQueryFrameBounds::node_control(),
+            )
+            .to_string()
+        );
+        assert_eq!(
+            config_json_value(&client_zenoh, "access_control")["subjects"][0]["cert_common_names"],
+            serde_json::json!(["paraegox-principal-4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e"])
+        );
+
+        let controller_pins = RestrictedNodeControlTransportPinsV1::try_new(
+            principal(0x43),
+            digest(0x81),
+            Duration::from_secs(5),
+        )
+        .expect("Controller listener pins");
+        let listener = RestrictedNodeControlEndpointConfigV1::try_new(
+            endpoint(),
+            "paraegox/node-a/control",
+            PathBuf::from("/run/paraegox/root-ca.pem"),
+            identity("node"),
+            controller_pins,
+        )
+        .expect("Node-control listener config");
+        assert_eq!(listener.0.expected_target, None);
+        assert_eq!(
+            listener.0.frame_bounds,
+            RestrictedRawQueryFrameBounds::node_control()
+        );
+        assert_eq!(listener.expected_peer_principal(), principal(0x43));
+        assert!(listener.matches_transport_pins(
+            "paraegox/node-a/control",
+            principal(0x43),
+            digest(0x81),
+        ));
+        assert_eq!(
+            format!("{listener:?}"),
+            "RestrictedNodeControlEndpointConfigV1(<redacted>)"
+        );
+        let listener_zenoh = listener
+            .0
+            .build_zenoh_config()
+            .expect("listener Zenoh config");
+        assert_eq!(listener_zenoh.get_json("mode").unwrap(), "\"peer\"");
+        assert_eq!(
+            config_json_value(&listener_zenoh, "access_control")["subjects"][0]["cert_common_names"],
+            serde_json::json!(["paraegox-principal-43434343434343434343434343434343"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_control_pins_route_timeout_and_frame_bounds_fail_closed() {
+        assert_eq!(
+            RestrictedNodeControlTransportPinsV1::try_new(
+                principal(0),
+                digest(0x81),
+                Duration::from_secs(1),
+            ),
+            Err(RestrictedRuntimeApplyConfigErrorV1::ZeroPeerPrincipal)
+        );
+        assert_eq!(
+            RestrictedNodeControlTransportPinsV1::try_new(
+                principal(0x4e),
+                digest(0),
+                Duration::from_secs(1),
+            ),
+            Err(RestrictedRuntimeApplyConfigErrorV1::ZeroCarrierBindingDigest)
+        );
+        assert_eq!(
+            RestrictedNodeControlTransportPinsV1::try_new(
+                principal(0x4e),
+                digest(0x81),
+                Duration::ZERO,
+            ),
+            Err(RestrictedRuntimeApplyConfigErrorV1::ZeroTimeout)
+        );
+        assert_eq!(
+            RestrictedNodeControlTransportPinsV1::try_new(
+                principal(0x4e),
+                digest(0x81),
+                Duration::from_nanos(MAX_RESTRICTED_RUNTIME_APPLY_OPERATION_TIMEOUT_NANOS + 1),
+            ),
+            Err(RestrictedRuntimeApplyConfigErrorV1::TimeoutTooLarge)
+        );
+        let pins = RestrictedNodeControlTransportPinsV1::try_new(
+            principal(0x4e),
+            digest(0x81),
+            Duration::from_secs(5),
+        )
+        .expect("valid Node-control pins");
+        assert_eq!(
+            RestrictedNodeControlClientConfigV1::try_new(
+                endpoint(),
+                "paraegox/*/control",
+                PathBuf::from("/run/paraegox/root-ca.pem"),
+                identity("controller"),
+                pins,
+            ),
+            Err(RestrictedRuntimeApplyConfigErrorV1::InvalidRoute)
+        );
+
+        let legacy = RestrictedRawQueryFrameBounds::legacy_apply();
+        let runtime_control = RestrictedRawQueryFrameBounds::runtime_control();
+        let node_control = RestrictedRawQueryFrameBounds::node_control();
+        assert_ne!(legacy, runtime_control);
+        assert_ne!(legacy, node_control);
+        assert_ne!(runtime_control, node_control);
+        assert_eq!(node_control.request, MAX_NODE_CONTROL_CARRIER_REQUEST_BYTES);
+        assert_eq!(
+            node_control.response,
+            MAX_NODE_CONTROL_DESCRIBE_RESPONSE_BYTES
+                .max(MAX_NODE_MANAGEMENT_RESPONSE_BYTES)
+                .max(RUNTIME_OBSERVATION_ACK_BYTES)
+        );
+        assert_eq!(
+            validate_request_frame(
+                &vec![0_u8; MAX_NODE_CONTROL_CARRIER_REQUEST_BYTES],
+                node_control,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request_frame(
+                &vec![0_u8; MAX_NODE_CONTROL_CARRIER_REQUEST_BYTES + 1],
+                node_control,
+            ),
+            Err(RestrictedRuntimeApplyErrorV1::RequestTooLarge)
+        );
+        assert_eq!(
+            validate_response_frame(&vec![0_u8; node_control.response], node_control),
+            Ok(())
+        );
+        assert_eq!(
+            validate_response_frame(&vec![0_u8; node_control.response + 1], node_control),
+            Err(RestrictedRuntimeApplyErrorV1::ResponseTooLarge)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_control_reuses_one_attempt_and_joined_shutdown_reducers() {
+        let mut attempt = OneQueryAttempt::new();
+        assert_eq!(attempt.claim(), Ok(()));
+        assert_eq!(
+            attempt.claim(),
+            Err(RestrictedRuntimeApplyErrorV1::QueryAlreadySent)
+        );
+        assert_eq!(reduce_client_shutdown_failures(false, false), Ok(()));
+        assert_eq!(
+            reduce_client_shutdown_failures(true, true),
+            Err(RestrictedRuntimeApplyErrorV1::QuerierUndeclarationAndSessionCloseFailed)
+        );
+        assert_eq!(
+            reduce_endpoint_shutdown_failures(false, false, false),
+            Ok(())
+        );
+        assert_eq!(
+            reduce_endpoint_shutdown_failures(true, true, true),
+            Err(
+                RestrictedRuntimeApplyErrorV1::QueryableUndeclarationAndEndpointWorkerAndSessionCloseFailed
+            )
+        );
     }
 
     #[test]

@@ -29,17 +29,23 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::observation::{
     MAX_RUNTIME_OBSERVATION_BOOTSTRAP_BYTES, MAX_RUNTIME_OBSERVATION_REQUEST_BYTES,
-    RUNTIME_OBSERVATION_REQUEST_HEADER_BYTES, RUNTIME_OBSERVATION_TOKEN_BYTES,
-    RuntimeObservationAckOutcomeV1, RuntimeObservationAckV1, RuntimeObservationBootstrapV1,
-    RuntimeObservationError, RuntimeObservationRequestV1,
+    RUNTIME_OBSERVATION_ACK_BYTES, RUNTIME_OBSERVATION_TOKEN_BYTES, RuntimeObservationAckOutcomeV1,
+    RuntimeObservationAckV1, RuntimeObservationBootstrapV1, RuntimeObservationError,
+    RuntimeObservationRequestV1, derive_runtime_observation_query_nonce_v1,
 };
 use crate::protocol::{
-    MAX_NODE_MANAGEMENT_RESPONSE_BYTES, NODE_MANAGEMENT_REQUEST_BYTES,
-    NodeManagementEndpointErrorV1, NodeManagementEndpointV1, NodeManagementRequestV1,
-    NodeManagementResponseV1,
+    ControllerAuthenticatedNodeControlCarrierV1, MAX_NODE_CONTROL_CARRIER_REQUEST_BYTES,
+    MAX_NODE_CONTROL_DESCRIBE_RESPONSE_BYTES, MAX_NODE_MANAGEMENT_RESPONSE_BYTES,
+    NODE_MANAGEMENT_REQUEST_BYTES, NodeControlCarrierKindV1, NodeControlCarrierRequestV1,
+    NodeControlDescribeResponseDraftV1, NodeControlDescribeResponseV1,
+    NodeControlObservationChallengeFieldsV1, NodeControlObservationChallengeV1,
+    NodeManagementEndpointErrorV1, NodeManagementEndpointV1, NodeManagementProtocolError,
+    NodeManagementRequestKindV1, NodeManagementRequestV1, NodeManagementResponseV1,
+    NodeManagementTargetV1,
 };
 use crate::store::{
     DurableNodeDaemonV1, DurableRuntimeObservationCommitOutcome, NodeDaemonStoreError,
@@ -54,7 +60,7 @@ use nix::sys::stat::Mode;
 use nix::unistd::{getegid, geteuid};
 use paraegox_kernel::{
     digest::{Digest32, Digest32Builder},
-    identity::PrincipalRef,
+    identity::{PrincipalRef, RuntimeHostId},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -71,8 +77,17 @@ const BOOTSTRAP_HEADER_BYTES: usize = 224;
 const BOOTSTRAP_DIGEST_OFFSET: usize = 192;
 const LOCAL_REQUEST_HEADER_BYTES: usize = 48;
 const LOCAL_REQUEST_BYTES: usize = LOCAL_REQUEST_HEADER_BYTES + NODE_MANAGEMENT_REQUEST_BYTES;
+const MIN_LOCAL_OBSERVATION_PAYLOAD_BYTES: usize = 4;
+const MAX_LOCAL_OBSERVATION_PAYLOAD_BYTES: usize =
+    if MAX_NODE_CONTROL_CARRIER_REQUEST_BYTES > MAX_RUNTIME_OBSERVATION_REQUEST_BYTES {
+        MAX_NODE_CONTROL_CARRIER_REQUEST_BYTES
+    } else {
+        MAX_RUNTIME_OBSERVATION_REQUEST_BYTES
+    };
 const MAX_LOCAL_OBSERVATION_BYTES: usize =
-    LOCAL_REQUEST_HEADER_BYTES + MAX_RUNTIME_OBSERVATION_REQUEST_BYTES;
+    LOCAL_REQUEST_HEADER_BYTES + MAX_LOCAL_OBSERVATION_PAYLOAD_BYTES;
+const LOCAL_OBSERVATION_LEGACY_REQUEST_MAGIC: &[u8; 4] = b"PXNO";
+const LOCAL_OBSERVATION_CARRIER_REQUEST_MAGIC: &[u8; 4] = b"PXNR";
 const MAX_STATE_ROOT_BYTES: usize = 1_024;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
 const MAX_BOOTSTRAP_BYTES: usize =
@@ -104,6 +119,7 @@ pub enum NodeDaemonProcessError {
     InvalidBootstrap,
     BootstrapDigestMismatch,
     Observation(RuntimeObservationError),
+    Protocol(NodeManagementProtocolError),
     State(NodeDaemonStoreError),
     EndpointAlreadyActive,
     EndpointIdentityChanged,
@@ -140,6 +156,7 @@ impl fmt::Display for NodeDaemonProcessError {
             Self::Observation(_) => {
                 "DeveloperLocal NodeDaemon Runtime observation was rejected"
             }
+            Self::Protocol(_) => "DeveloperLocal NodeDaemon control request was rejected",
             Self::State(_) => "DeveloperLocal NodeDaemon durable state could not be opened",
             Self::EndpointAlreadyActive => {
                 "DeveloperLocal NodeDaemon endpoint is already active"
@@ -159,6 +176,7 @@ impl std::error::Error for NodeDaemonProcessError {
         match self {
             Self::State(error) => Some(error),
             Self::Observation(error) => Some(error),
+            Self::Protocol(error) => Some(error),
             _ => None,
         }
     }
@@ -173,6 +191,12 @@ impl From<NodeDaemonStoreError> for NodeDaemonProcessError {
 impl From<RuntimeObservationError> for NodeDaemonProcessError {
     fn from(error: RuntimeObservationError) -> Self {
         Self::Observation(error)
+    }
+}
+
+impl From<NodeManagementProtocolError> for NodeDaemonProcessError {
+    fn from(error: NodeManagementProtocolError) -> Self {
+        Self::Protocol(error)
     }
 }
 
@@ -556,6 +580,291 @@ impl NodeManagementEndpointV1 for DeveloperLocalNodeManagementEndpointV1 {
     ) -> Result<Box<[u8]>, NodeManagementEndpointErrorV1> {
         self.exchange_canonical(canonical_request)
             .map_err(NodeManagementEndpointErrorV1::from)
+    }
+}
+
+/// Display-safe failure for the narrow DeveloperLocal Node control bridge.
+///
+/// The variants contain no Controller signature, local capability token,
+/// socket path, or response bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeveloperLocalNodeControlBridgeErrorV1 {
+    InvalidConfiguration,
+    Protocol(NodeManagementProtocolError),
+    Observation(RuntimeObservationError),
+    Transport(DeveloperLocalNodeManagementEndpointErrorV1),
+}
+
+impl fmt::Display for DeveloperLocalNodeControlBridgeErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidConfiguration => {
+                "DeveloperLocal Node control bridge configuration is invalid"
+            }
+            Self::Protocol(_) => "DeveloperLocal Node control carrier was rejected",
+            Self::Observation(_) => "DeveloperLocal Runtime observation was rejected",
+            Self::Transport(_) => "DeveloperLocal Node control exchange failed",
+        })
+    }
+}
+
+impl std::error::Error for DeveloperLocalNodeControlBridgeErrorV1 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            Self::Observation(error) => Some(error),
+            Self::Transport(error) => Some(error),
+            Self::InvalidConfiguration => None,
+        }
+    }
+}
+
+impl From<NodeManagementProtocolError> for DeveloperLocalNodeControlBridgeErrorV1 {
+    fn from(error: NodeManagementProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<RuntimeObservationError> for DeveloperLocalNodeControlBridgeErrorV1 {
+    fn from(error: RuntimeObservationError) -> Self {
+        Self::Observation(error)
+    }
+}
+
+impl From<DeveloperLocalNodeManagementEndpointErrorV1> for DeveloperLocalNodeControlBridgeErrorV1 {
+    fn from(error: DeveloperLocalNodeManagementEndpointErrorV1) -> Self {
+        Self::Transport(error)
+    }
+}
+
+/// Narrow same-host consumer for one already Controller-authenticated PXNR.
+///
+/// Describe is answered from the exact PXNB/PXOB target. Latest and Watch use
+/// the existing read-only PXNL endpoint. ObservationChallenge and
+/// PublishRuntimeObservation use the existing PXOL capability socket; the
+/// latter therefore reaches the same child-held durable owner as legacy PXNO.
+/// This bridge has no apply, Agent, fallback, retry, cache, or mutation owner.
+pub struct DeveloperLocalNodeControlBridgeV1 {
+    target: NodeManagementTargetV1,
+    management_endpoint: DeveloperLocalNodeManagementEndpointV1,
+    observation_socket_path: PathBuf,
+    observation_endpoint_ref: crate::observation::RuntimeObservationEndpointRefV1,
+    expected_uid: u32,
+    expected_gid: u32,
+    observation_generation_token: Zeroizing<[u8; RUNTIME_OBSERVATION_TOKEN_BYTES]>,
+    authority_digests: Box<[(RuntimeHostId, Digest32)]>,
+    exchange_timeout: Duration,
+}
+
+impl fmt::Debug for DeveloperLocalNodeControlBridgeV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeveloperLocalNodeControlBridgeV1")
+            .field("target", &self.target)
+            .field("management_endpoint", &self.management_endpoint)
+            .field("observation_socket_path", &"<owner-private>")
+            .field("observation_endpoint_ref", &self.observation_endpoint_ref)
+            .field("expected_uid", &self.expected_uid)
+            .field("expected_gid", &self.expected_gid)
+            .field("observation_generation_token", &"<redacted>")
+            .field("authority_digests", &self.authority_digests)
+            .field("exchange_timeout", &self.exchange_timeout)
+            .finish()
+    }
+}
+
+impl DeveloperLocalNodeControlBridgeV1 {
+    /// Pins one exact PXNB/PXOB pair without exposing either capability token.
+    pub fn try_from_bootstraps(
+        node: &DeveloperLocalReferenceBootstrapV1,
+        observation: &RuntimeObservationBootstrapV1,
+        exchange_timeout: Duration,
+    ) -> Result<Self, DeveloperLocalNodeControlBridgeErrorV1> {
+        if exchange_timeout.is_zero()
+            || exchange_timeout > MAX_DEVELOPER_LOCAL_NODE_MANAGEMENT_EXCHANGE_TIMEOUT
+            || node.expected_uid != observation.expected_uid()
+            || node.expected_gid != observation.expected_gid()
+            || validate_observation_correlation(node, observation).is_err()
+        {
+            return Err(DeveloperLocalNodeControlBridgeErrorV1::InvalidConfiguration);
+        }
+        let management_endpoint =
+            DeveloperLocalNodeManagementEndpointV1::try_from_bootstrap(node, exchange_timeout)?;
+        let authority_digests = observation
+            .authorities()
+            .iter()
+            .map(|authority| (authority.runtime_host_id(), authority.authority_digest()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            target: observation.node_target(),
+            management_endpoint,
+            observation_socket_path: observation.socket_path().to_path_buf(),
+            observation_endpoint_ref: observation.observation_endpoint_ref(),
+            expected_uid: observation.expected_uid(),
+            expected_gid: observation.expected_gid(),
+            observation_generation_token: duplicate_token(observation.generation_token()),
+            authority_digests,
+            exchange_timeout,
+        })
+    }
+
+    /// Dispatches one already authenticated carrier exactly once.
+    pub fn exchange_authenticated(
+        &self,
+        authenticated: ControllerAuthenticatedNodeControlCarrierV1<'_>,
+    ) -> Result<Box<[u8]>, DeveloperLocalNodeControlBridgeErrorV1> {
+        let request = authenticated.request();
+        match authenticated.kind() {
+            NodeControlCarrierKindV1::Describe => {
+                if request.target().is_some() {
+                    return Err(NodeManagementProtocolError::CorrelationMismatch.into());
+                }
+                let response =
+                    NodeControlDescribeResponseDraftV1::try_describe(request, self.target)?
+                        .finalize()?;
+                response.validate_for(request)?;
+                if response.target() != self.target {
+                    return Err(NodeManagementProtocolError::CorrelationMismatch.into());
+                }
+                Ok(response.canonical_wire().into())
+            }
+            NodeControlCarrierKindV1::Latest | NodeControlCarrierKindV1::Watch => {
+                self.validate_target(request)?;
+                let management_request = authenticated
+                    .management_request()
+                    .ok_or(NodeManagementProtocolError::InvalidCarrierPayload)?;
+                let expected_kind = match authenticated.kind() {
+                    NodeControlCarrierKindV1::Latest => NodeManagementRequestKindV1::Latest,
+                    NodeControlCarrierKindV1::Watch => NodeManagementRequestKindV1::Watch,
+                    _ => return Err(NodeManagementProtocolError::UnsupportedCarrierKind.into()),
+                };
+                if management_request.kind() != expected_kind
+                    || management_request.target() != self.target
+                    || management_request.request_id() != request.request_id()
+                {
+                    return Err(NodeManagementProtocolError::CorrelationMismatch.into());
+                }
+                let wire = self
+                    .management_endpoint
+                    .exchange_canonical(management_request.canonical_wire())?;
+                let response = NodeManagementResponseV1::decode(&wire)?;
+                response.validate_for(management_request)?;
+                Ok(wire)
+            }
+            NodeControlCarrierKindV1::ObservationChallenge => {
+                self.validate_target(request)?;
+                let runtime_host_id = request
+                    .runtime_host_id()
+                    .ok_or(NodeManagementProtocolError::InvalidCarrierShape)?;
+                let expected_authority_digest = self.authority_digest(runtime_host_id)?;
+                let wire = self.exchange_observation_carrier(request)?;
+                let response = NodeControlDescribeResponseV1::decode(&wire)?;
+                response.validate_for(request)?;
+                let challenge = response
+                    .observation_challenge()
+                    .ok_or(NodeManagementProtocolError::CorrelationMismatch)?;
+                if response.target() != self.target
+                    || challenge.observation_endpoint_ref() != self.observation_endpoint_ref
+                    || challenge.runtime_host_id() != runtime_host_id
+                    || challenge.authority_digest() != expected_authority_digest
+                    || challenge.freshness_budget_nanos() != request.freshness_budget_nanos()
+                {
+                    return Err(NodeManagementProtocolError::CorrelationMismatch.into());
+                }
+                Ok(wire)
+            }
+            NodeControlCarrierKindV1::PublishRuntimeObservation => {
+                self.validate_target(request)?;
+                let observation_request = authenticated
+                    .runtime_observation_request()
+                    .ok_or(NodeManagementProtocolError::InvalidCarrierPayload)?;
+                if request.runtime_host_id() != Some(observation_request.runtime_host_id())
+                    || observation_request.authority_digest()
+                        != self.authority_digest(observation_request.runtime_host_id())?
+                {
+                    return Err(NodeManagementProtocolError::CorrelationMismatch.into());
+                }
+                let wire = self.exchange_observation_carrier(request)?;
+                let response = RuntimeObservationAckV1::decode(&wire)?;
+                response.validate_for(observation_request)?;
+                Ok(wire)
+            }
+        }
+    }
+
+    fn validate_target(
+        &self,
+        request: &NodeControlCarrierRequestV1,
+    ) -> Result<(), DeveloperLocalNodeControlBridgeErrorV1> {
+        if request.target() != Some(self.target) {
+            return Err(NodeManagementProtocolError::TargetMismatch.into());
+        }
+        Ok(())
+    }
+
+    fn authority_digest(
+        &self,
+        runtime_host_id: RuntimeHostId,
+    ) -> Result<Digest32, DeveloperLocalNodeControlBridgeErrorV1> {
+        self.authority_digests
+            .binary_search_by_key(&runtime_host_id, |(candidate, _)| *candidate)
+            .ok()
+            .map(|index| self.authority_digests[index].1)
+            .ok_or(DeveloperLocalNodeControlBridgeErrorV1::Observation(
+                RuntimeObservationError::UnknownAuthority,
+            ))
+    }
+
+    fn exchange_observation_carrier(
+        &self,
+        request: &NodeControlCarrierRequestV1,
+    ) -> Result<Box<[u8]>, DeveloperLocalNodeControlBridgeErrorV1> {
+        let deadline = Instant::now()
+            .checked_add(self.exchange_timeout)
+            .ok_or(DeveloperLocalNodeControlBridgeErrorV1::InvalidConfiguration)?;
+        let socket_identity = validate_management_socket_metadata(
+            &self.observation_socket_path,
+            self.expected_uid,
+            self.expected_gid,
+        )?;
+        let socket_path = self.observation_socket_path.clone();
+        let expected_uid = self.expected_uid;
+        let expected_gid = self.expected_gid;
+        let generation_token = duplicate_token(&self.observation_generation_token);
+        let request_wire: Box<[u8]> = request.canonical_wire().into();
+        let maximum_response_bytes = match request.kind() {
+            NodeControlCarrierKindV1::ObservationChallenge => {
+                MAX_NODE_CONTROL_DESCRIBE_RESPONSE_BYTES
+            }
+            NodeControlCarrierKindV1::PublishRuntimeObservation => RUNTIME_OBSERVATION_ACK_BYTES,
+            _ => return Err(NodeManagementProtocolError::UnsupportedCarrierKind.into()),
+        };
+        let worker = std::thread::Builder::new()
+            .name("paraegox-node-control-observation-exchange".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .map_err(|_| {
+                        DeveloperLocalNodeManagementEndpointErrorV1::ExecutorUnavailable
+                    })?;
+                runtime.block_on(exchange_developer_local_node_control_observation(
+                    socket_path,
+                    (expected_uid, expected_gid),
+                    generation_token,
+                    request_wire,
+                    socket_identity,
+                    maximum_response_bytes,
+                    deadline,
+                ))
+            })
+            .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::ExecutorUnavailable)?;
+        worker
+            .join()
+            .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::ExecutorUnavailable)?
+            .map_err(DeveloperLocalNodeControlBridgeErrorV1::from)
     }
 }
 
@@ -1801,33 +2110,76 @@ async fn serve_observation_connection(
     blocking_tasks: Arc<TrackedBlockingTasks>,
     bootstrap: Arc<RuntimeObservationBootstrapV1>,
 ) -> Result<(), NodeDaemonProcessError> {
-    let (token, request) = timeout(IO_TIMEOUT, read_local_observation_request(&mut stream))
+    let deadline = Instant::now()
+        .checked_add(IO_TIMEOUT)
+        .ok_or(NodeDaemonProcessError::EndpointUnavailable)?;
+    let (token, request) = timeout_at(deadline, read_local_observation_request(&mut stream))
         .await
         .map_err(|_| NodeDaemonProcessError::EndpointUnavailable)??;
     if !constant_time_eq(token.as_ref(), bootstrap.generation_token().as_ref()) {
         return Err(NodeDaemonProcessError::InvalidBootstrap);
     }
+    let operation_owner = Arc::clone(&owner);
+    let operation_gate = Arc::clone(&blocking_tasks);
+    let operation_bootstrap = Arc::clone(&bootstrap);
+    let response = blocking_tasks
+        .run(move || {
+            let mut owner = operation_owner
+                .lock()
+                .map_err(|_| NodeDaemonProcessError::State(NodeDaemonStoreError::Poisoned))?;
+            operation_gate.ensure_open()?;
+            match request {
+                LocalObservationRequestV1::Legacy(request) => {
+                    commit_runtime_observation(&mut owner, &operation_bootstrap, &request)
+                        .map(|ack| Box::<[u8]>::from(ack.canonical_wire()))
+                }
+                LocalObservationRequestV1::Carrier(request) => match request.kind() {
+                    NodeControlCarrierKindV1::ObservationChallenge => {
+                        build_node_control_observation_challenge(
+                            &owner,
+                            &operation_bootstrap,
+                            &request,
+                        )
+                        .map(|response| Box::<[u8]>::from(response.canonical_wire()))
+                    }
+                    NodeControlCarrierKindV1::PublishRuntimeObservation => {
+                        let observation_request = request
+                            .runtime_observation_request()
+                            .ok_or(NodeManagementProtocolError::InvalidCarrierPayload)?;
+                        if request.target() != Some(operation_bootstrap.node_target()) {
+                            return Err(NodeManagementProtocolError::TargetMismatch.into());
+                        }
+                        commit_runtime_observation(
+                            &mut owner,
+                            &operation_bootstrap,
+                            observation_request,
+                        )
+                        .map(|ack| Box::<[u8]>::from(ack.canonical_wire()))
+                    }
+                    _ => Err(NodeManagementProtocolError::UnsupportedCarrierKind.into()),
+                },
+            }
+        })
+        .await?;
+    timeout_at(deadline, write_response(&mut stream, &response))
+        .await
+        .map_err(|_| NodeDaemonProcessError::EndpointUnavailable)??;
+    Ok(())
+}
+
+fn commit_runtime_observation(
+    owner: &mut DurableNodeDaemonV1,
+    bootstrap: &RuntimeObservationBootstrapV1,
+    request: &RuntimeObservationRequestV1,
+) -> Result<RuntimeObservationAckV1, NodeDaemonProcessError> {
     let intended_status_sequence = request.intended_status_sequence();
     let runtime_host_id = request.runtime_host_id();
     let request_digest = request.request_digest();
-    let replay_owner = Arc::clone(&owner);
-    let replay_gate = Arc::clone(&blocking_tasks);
-    let replay = blocking_tasks
-        .run(move || {
-            let owner = replay_owner
-                .lock()
-                .map_err(|_| NodeDaemonProcessError::State(NodeDaemonStoreError::Poisoned))?;
-            replay_gate.ensure_open()?;
-            owner
-                .recover_exact_runtime_observation_ack(
-                    intended_status_sequence,
-                    runtime_host_id,
-                    request_digest,
-                )
-                .map_err(NodeDaemonProcessError::from)
-        })
-        .await?;
-    let commit = if let Some(replay) = replay {
+    let commit = if let Some(replay) = owner.recover_exact_runtime_observation_ack(
+        intended_status_sequence,
+        runtime_host_id,
+        request_digest,
+    )? {
         replay
     } else {
         let authority = bootstrap.authority(runtime_host_id)?;
@@ -1835,27 +2187,14 @@ async fn serve_observation_connection(
             bootstrap.node_target(),
             bootstrap.observation_endpoint_ref(),
             bootstrap.generation_token(),
-            &request,
+            request,
         )?;
-        let valid_until_unix_nanos = request.challenge_expires_at_unix_nanos();
-        let commit_owner = Arc::clone(&owner);
-        let commit_gate = Arc::clone(&blocking_tasks);
-        blocking_tasks
-            .run(move || {
-                let mut owner = commit_owner
-                    .lock()
-                    .map_err(|_| NodeDaemonProcessError::State(NodeDaemonStoreError::Poisoned))?;
-                commit_gate.ensure_open()?;
-                owner
-                    .commit_authenticated_runtime_observation(
-                        intended_status_sequence,
-                        runtime_status,
-                        valid_until_unix_nanos,
-                        request_digest,
-                    )
-                    .map_err(NodeDaemonProcessError::from)
-            })
-            .await?
+        owner.commit_authenticated_runtime_observation(
+            intended_status_sequence,
+            runtime_status,
+            request.challenge_expires_at_unix_nanos(),
+            request_digest,
+        )?
     };
     let runtime_status_digest = commit
         .status
@@ -1873,14 +2212,77 @@ async fn serve_observation_connection(
         }
     };
     let ack =
-        RuntimeObservationAckV1::try_new(outcome, &request, &commit.status, runtime_status_digest)?;
-    timeout(
-        IO_TIMEOUT,
-        write_response(&mut stream, ack.canonical_wire()),
-    )
-    .await
-    .map_err(|_| NodeDaemonProcessError::EndpointUnavailable)??;
-    Ok(())
+        RuntimeObservationAckV1::try_new(outcome, request, &commit.status, runtime_status_digest)?;
+    Ok(ack)
+}
+
+fn build_node_control_observation_challenge(
+    owner: &DurableNodeDaemonV1,
+    bootstrap: &RuntimeObservationBootstrapV1,
+    request: &NodeControlCarrierRequestV1,
+) -> Result<NodeControlDescribeResponseV1, NodeDaemonProcessError> {
+    let issued_at_unix_nanos = current_unix_time_nanos_for_observation()?;
+    build_node_control_observation_challenge_at(owner, bootstrap, request, issued_at_unix_nanos)
+}
+
+fn build_node_control_observation_challenge_at(
+    owner: &DurableNodeDaemonV1,
+    bootstrap: &RuntimeObservationBootstrapV1,
+    request: &NodeControlCarrierRequestV1,
+    issued_at_unix_nanos: u64,
+) -> Result<NodeControlDescribeResponseV1, NodeDaemonProcessError> {
+    if request.kind() != NodeControlCarrierKindV1::ObservationChallenge
+        || request.target() != Some(bootstrap.node_target())
+    {
+        return Err(NodeManagementProtocolError::TargetMismatch.into());
+    }
+    let runtime_host_id = request
+        .runtime_host_id()
+        .ok_or(NodeManagementProtocolError::InvalidCarrierShape)?;
+    let authority = bootstrap.authority(runtime_host_id)?;
+    let intended_status_sequence = match owner.current_status() {
+        Some(status) => status
+            .status_sequence()
+            .checked_add(1)
+            .ok_or(RuntimeObservationError::InvalidRequest)?,
+        None => 1,
+    };
+    let expires_at_unix_nanos = issued_at_unix_nanos
+        .checked_add(request.freshness_budget_nanos())
+        .ok_or(RuntimeObservationError::ChallengeClockUnavailable)?;
+    let query_nonce = derive_runtime_observation_query_nonce_v1(
+        bootstrap.generation_token(),
+        bootstrap.node_target(),
+        bootstrap.observation_endpoint_ref(),
+        authority,
+        intended_status_sequence,
+        issued_at_unix_nanos,
+        expires_at_unix_nanos,
+    )?;
+    let challenge =
+        NodeControlObservationChallengeV1::try_new(NodeControlObservationChallengeFieldsV1 {
+            observation_endpoint_ref: bootstrap.observation_endpoint_ref(),
+            runtime_host_id,
+            authority_digest: authority.authority_digest(),
+            intended_status_sequence,
+            freshness_budget_nanos: request.freshness_budget_nanos(),
+            issued_at_unix_nanos,
+            expires_at_unix_nanos,
+            query_nonce,
+        })?;
+    let response =
+        NodeControlDescribeResponseDraftV1::try_observation_challenge(request, challenge)?
+            .finalize()?;
+    response.validate_for(request)?;
+    Ok(response)
+}
+
+fn current_unix_time_nanos_for_observation() -> Result<u64, RuntimeObservationError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| RuntimeObservationError::ChallengeClockUnavailable)?;
+    u64::try_from(elapsed.as_nanos())
+        .map_err(|_| RuntimeObservationError::ChallengeClockUnavailable)
 }
 
 fn peer_matches(stream: &UnixStream, expected_uid: u32, expected_gid: u32) -> bool {
@@ -1979,6 +2381,114 @@ async fn exchange_developer_local_node_management(
     Ok(response.into_boxed_slice())
 }
 
+async fn exchange_developer_local_node_control_observation(
+    socket_path: PathBuf,
+    expected_peer: (u32, u32),
+    generation_token: Zeroizing<[u8; RUNTIME_OBSERVATION_TOKEN_BYTES]>,
+    request_wire: Box<[u8]>,
+    socket_identity: FileIdentity,
+    maximum_response_bytes: usize,
+    deadline: Instant,
+) -> Result<Box<[u8]>, DeveloperLocalNodeManagementEndpointErrorV1> {
+    let (expected_uid, expected_gid) = expected_peer;
+    let mut stream = match timeout_at(deadline, UnixStream::connect(&socket_path)).await {
+        Err(_) => {
+            return Err(DeveloperLocalNodeManagementEndpointErrorV1::DeadlineExceeded);
+        }
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Err(DeveloperLocalNodeManagementEndpointErrorV1::Disconnected);
+        }
+        Ok(Err(_)) => return Err(DeveloperLocalNodeManagementEndpointErrorV1::Connect),
+        Ok(Ok(stream)) => stream,
+    };
+    if validate_management_socket_metadata(&socket_path, expected_uid, expected_gid)?
+        != socket_identity
+    {
+        return Err(DeveloperLocalNodeManagementEndpointErrorV1::SocketIdentityChanged);
+    }
+    let peer = stream
+        .peer_cred()
+        .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::PeerCredentialsUnavailable)?;
+    if peer.uid() != expected_uid || peer.gid() != expected_gid {
+        return Err(DeveloperLocalNodeManagementEndpointErrorV1::PeerCredentialsMismatch);
+    }
+
+    let frame = build_local_observation_frame(&generation_token, &request_wire)?;
+    timeout_at(deadline, stream.write_all(frame.as_ref()))
+        .await
+        .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::DeadlineExceeded)?
+        .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::Write)?;
+    timeout_at(deadline, stream.shutdown())
+        .await
+        .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::DeadlineExceeded)?
+        .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::Write)?;
+    drop(frame);
+
+    let mut prefix = [0_u8; 12];
+    read_developer_local_node_management_exact(deadline, &mut stream, &mut prefix).await?;
+    let response_length = usize::try_from(read_u32(&prefix, 8))
+        .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::ResponseTooLarge)?;
+    if !(12..=maximum_response_bytes).contains(&response_length) {
+        return Err(DeveloperLocalNodeManagementEndpointErrorV1::ResponseTooLarge);
+    }
+    let mut response = vec![0_u8; response_length];
+    response[..12].copy_from_slice(&prefix);
+    read_developer_local_node_management_exact(deadline, &mut stream, &mut response[12..]).await?;
+    let mut trailing = [0_u8; 1];
+    let trailing_length = timeout_at(deadline, stream.read(&mut trailing))
+        .await
+        .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::DeadlineExceeded)?
+        .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::Read)?;
+    if trailing_length != 0 {
+        return Err(DeveloperLocalNodeManagementEndpointErrorV1::TrailingResponseBytes);
+    }
+    Ok(response.into_boxed_slice())
+}
+
+fn build_local_observation_frame(
+    generation_token: &[u8; RUNTIME_OBSERVATION_TOKEN_BYTES],
+    payload: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, DeveloperLocalNodeManagementEndpointErrorV1> {
+    if !(MIN_LOCAL_OBSERVATION_PAYLOAD_BYTES..=MAX_LOCAL_OBSERVATION_PAYLOAD_BYTES)
+        .contains(&payload.len())
+        || generation_token.iter().all(|byte| *byte == 0)
+    {
+        return Err(DeveloperLocalNodeManagementEndpointErrorV1::InvalidRequest);
+    }
+    let total = LOCAL_REQUEST_HEADER_BYTES
+        .checked_add(payload.len())
+        .ok_or(DeveloperLocalNodeManagementEndpointErrorV1::InvalidRequest)?;
+    let mut frame = Zeroizing::new(vec![0_u8; total]);
+    frame[..4].copy_from_slice(LOCAL_OBSERVATION_MAGIC);
+    write_u16(frame.as_mut(), 4, PROCESS_VERSION);
+    write_u16(
+        frame.as_mut(),
+        6,
+        u16::try_from(LOCAL_REQUEST_HEADER_BYTES)
+            .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::InvalidRequest)?,
+    );
+    write_u32(
+        frame.as_mut(),
+        8,
+        u32::try_from(total)
+            .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::InvalidRequest)?,
+    );
+    write_u32(
+        frame.as_mut(),
+        12,
+        u32::try_from(payload.len())
+            .map_err(|_| DeveloperLocalNodeManagementEndpointErrorV1::InvalidRequest)?,
+    );
+    frame[16..LOCAL_REQUEST_HEADER_BYTES].copy_from_slice(generation_token);
+    frame[LOCAL_REQUEST_HEADER_BYTES..].copy_from_slice(payload);
+    Ok(frame)
+}
+
 async fn read_developer_local_node_management_exact(
     deadline: Instant,
     stream: &mut UnixStream,
@@ -2067,12 +2577,17 @@ async fn read_local_request(
     Ok(authenticated)
 }
 
+enum LocalObservationRequestV1 {
+    Legacy(Box<RuntimeObservationRequestV1>),
+    Carrier(Box<NodeControlCarrierRequestV1>),
+}
+
 async fn read_local_observation_request(
     stream: &mut UnixStream,
 ) -> Result<
     (
         Zeroizing<[u8; RUNTIME_OBSERVATION_TOKEN_BYTES]>,
-        RuntimeObservationRequestV1,
+        LocalObservationRequestV1,
     ),
     NodeDaemonProcessError,
 > {
@@ -2089,7 +2604,7 @@ async fn read_local_observation_request(
         || read_u16(header.as_ref(), 4) != PROCESS_VERSION
         || usize::from(read_u16(header.as_ref(), 6)) != LOCAL_REQUEST_HEADER_BYTES
         || total != LOCAL_REQUEST_HEADER_BYTES.saturating_add(payload_length)
-        || !(RUNTIME_OBSERVATION_REQUEST_HEADER_BYTES..=MAX_RUNTIME_OBSERVATION_REQUEST_BYTES)
+        || !(MIN_LOCAL_OBSERVATION_PAYLOAD_BYTES..=MAX_LOCAL_OBSERVATION_PAYLOAD_BYTES)
             .contains(&payload_length)
         || total > MAX_LOCAL_OBSERVATION_BYTES
     {
@@ -2111,7 +2626,19 @@ async fn read_local_observation_request(
     }
     let mut token = Zeroizing::new([0_u8; RUNTIME_OBSERVATION_TOKEN_BYTES]);
     token.copy_from_slice(&header[16..LOCAL_REQUEST_HEADER_BYTES]);
-    let request = RuntimeObservationRequestV1::decode(payload.as_ref())?;
+    let request = match payload.get(..4) {
+        Some(magic) if magic == LOCAL_OBSERVATION_LEGACY_REQUEST_MAGIC => {
+            LocalObservationRequestV1::Legacy(Box::new(RuntimeObservationRequestV1::decode(
+                payload.as_ref(),
+            )?))
+        }
+        Some(magic) if magic == LOCAL_OBSERVATION_CARRIER_REQUEST_MAGIC => {
+            LocalObservationRequestV1::Carrier(Box::new(NodeControlCarrierRequestV1::decode(
+                payload.as_ref(),
+            )?))
+        }
+        _ => return Err(NodeDaemonProcessError::InvalidBootstrap),
+    };
     Ok((token, request))
 }
 
@@ -2260,10 +2787,8 @@ fn remove_same_regular_file(path: &Path, identity: FileIdentity) {
     }
 }
 
-fn duplicate_token(
-    token: &Zeroizing<[u8; DEVELOPER_LOCAL_REFERENCE_TOKEN_BYTES]>,
-) -> Zeroizing<[u8; DEVELOPER_LOCAL_REFERENCE_TOKEN_BYTES]> {
-    let mut duplicate = Zeroizing::new([0_u8; DEVELOPER_LOCAL_REFERENCE_TOKEN_BYTES]);
+fn duplicate_token<const BYTES: usize>(token: &Zeroizing<[u8; BYTES]>) -> Zeroizing<[u8; BYTES]> {
+    let mut duplicate = Zeroizing::new([0_u8; BYTES]);
     duplicate.copy_from_slice(token.as_ref());
     duplicate
 }
@@ -2307,4 +2832,842 @@ fn write_u32(wire: &mut [u8], offset: usize, value: u32) {
 
 fn write_u64(wire: &mut [u8], offset: usize, value: u64) {
     wire[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::thread;
+
+    use ed25519_dalek::{Signer, SigningKey};
+    use paraegox_kernel::time::{ClockDomainRef, ClockGeneration};
+    use paraegox_runtime_contracts::{
+        apply::ApplyOperationId,
+        provenance::{SourcePlanRevision, SourceScopeRef},
+        reference_control::{
+            MAX_REFERENCE_QUERY_RESPONSE_BYTES, ReferenceBootstrapServingIdentityV1,
+            ReferenceChannelBindingV1, ReferenceQueryDesiredHeadV1, ReferenceQueryDesiredStateV1,
+            ReferenceQueryFactsV1, ReferenceQueryIdV1, ReferenceQueryLiveFactsV1,
+            ReferenceQueryLiveStateV1, ReferenceQueryOperationLookupV1,
+            ReferenceQueryOperationStateV1, ReferenceQueryOwnerStateV1,
+            ReferenceQueryRequestDraftV1, ReferenceQueryResponseAuthClaimV1,
+            ReferenceQueryResponseDraftV1, ReferenceQuerySelectorV1,
+        },
+        wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim},
+    };
+
+    use crate::observation::{
+        RuntimeObservationAuthorityV1, RuntimeObservationBootstrapInputV1,
+        RuntimeObservationEndpointRefV1, RuntimeObservationRequestInputV1,
+    };
+    use crate::protocol::{NodeControlCarrierRequestDraftV1, NodeManagementResponseOutcomeV1};
+    use crate::{RuntimeApplyEndpointDescriptorV1, RuntimeApplyEndpointRefV1};
+
+    const MANAGEMENT_TOKEN: [u8; DEVELOPER_LOCAL_REFERENCE_TOKEN_BYTES] = [0x71; 32];
+    const OBSERVATION_TOKEN: [u8; RUNTIME_OBSERVATION_TOKEN_BYTES] = [0x72; 32];
+    const RUNTIME_SIGNING_SEED: [u8; 32] = [0x73; 32];
+    const CONTROLLER_PRINCIPAL: PrincipalRef = PrincipalRef::from_bytes([0x81; 16]);
+    const CONTROLLER_KEY: ApplyAuthKeyRef = ApplyAuthKeyRef::from_bytes([0x82; 16]);
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let sequence = NEXT_TEST_ROOT.fetch_add(1, AtomicOrdering::Relaxed);
+            let parent = std::env::temp_dir().canonicalize().expect("canonical temp");
+            let path = parent.join(format!("pxn-process-{}-{sequence}", std::process::id()));
+            DirBuilder::new()
+                .mode(PRIVATE_DIRECTORY_MODE)
+                .create(&path)
+                .expect("private test root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Fixture {
+        _root: TestRoot,
+        node_bootstrap: DeveloperLocalReferenceBootstrapV1,
+        observation_bootstrap: RuntimeObservationBootstrapV1,
+        identity: NodeIdentityV1,
+        tenure: NodeRegistrationTenureV1,
+        management_endpoint_ref: NodeManagementEndpointRefV1,
+        feature: NodeFeatureReportV1,
+        authority: RuntimeObservationAuthorityV1,
+        state_root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = TestRoot::new();
+            let state_root = root.0.join("state");
+            let node_id = NodeId::try_from_bytes([0x11; 16]).expect("node id");
+            let identity = NodeIdentityV1::try_new(
+                node_id,
+                PrincipalRef::from_bytes([0x12; 16]),
+                EnrollmentIssuerRefV1::try_from_bytes([0x13; 16]).expect("issuer"),
+            )
+            .expect("identity");
+            let node_incarnation =
+                NodeIncarnation::try_from_bytes([0x14; 16]).expect("incarnation");
+            let tenure =
+                NodeRegistrationTenureV1::try_new(node_id, 7, node_incarnation).expect("tenure");
+            let management_endpoint_ref = NodeManagementEndpointRefV1::try_from_bytes([0x15; 16])
+                .expect("management endpoint");
+            let feature = NodeFeatureReportV1::try_new(NodeFeatureReportInputV1 {
+                node_id,
+                node_incarnation,
+                report_sequence: 1,
+                operating_system: NodeOperatingSystemV1::Linux,
+                architecture: NodeArchitectureV1::X86_64,
+                platform_profile_digest: Digest32::from_bytes([0x16; 32]),
+                runtime_contract_version: 1,
+                fabric_contract_version: 1,
+            })
+            .expect("feature");
+            let target = NodeManagementTargetV1::try_new(
+                node_id,
+                management_endpoint_ref,
+                node_incarnation,
+                tenure.registration_epoch(),
+            )
+            .expect("target");
+            let node_bootstrap = DeveloperLocalReferenceBootstrapV1::try_new(
+                DeveloperLocalReferenceBootstrapInputV1 {
+                    expected_uid: geteuid().as_raw(),
+                    expected_gid: getegid().as_raw(),
+                    generation_token: MANAGEMENT_TOKEN,
+                    identity,
+                    tenure,
+                    management_endpoint_ref,
+                    initial_feature_report: feature,
+                    state_root: state_root.clone(),
+                    socket_path: root.0.join("management.sock"),
+                },
+            )
+            .expect("node bootstrap");
+
+            let runtime_host_id = RuntimeHostId::from_bytes([0x31; 16]);
+            let runtime_principal = PrincipalRef::from_bytes([0x32; 16]);
+            let runtime_signing_key = SigningKey::from_bytes(&RUNTIME_SIGNING_SEED);
+            let channel = ReferenceChannelBindingV1::try_new(
+                runtime_host_id,
+                runtime_principal,
+                Digest32::from_bytes([0x35; 32]),
+                Digest32::from_bytes([0x36; 32]),
+            )
+            .expect("channel");
+            let serving_baseline = ReferenceBootstrapServingIdentityV1::try_new(
+                runtime_host_id,
+                [0x37; 32],
+                10,
+                5,
+                ClockDomainRef::from_bytes([0x38; 16]),
+                ClockGeneration::try_new(2).expect("clock generation"),
+            )
+            .expect("serving baseline");
+            let endpoint = RuntimeApplyEndpointDescriptorV1::try_new(
+                RuntimeApplyEndpointRefV1::try_from_bytes([0x39; 16]).expect("Runtime endpoint"),
+                runtime_host_id,
+                7,
+                "paraegox/v1/nodes/11/runtime/31/apply",
+                [0x34; 16],
+                runtime_signing_key.verifying_key().to_bytes(),
+            )
+            .expect("endpoint");
+            let authority = RuntimeObservationAuthorityV1::try_new(
+                runtime_principal,
+                channel,
+                serving_baseline,
+                endpoint,
+            )
+            .expect("authority");
+            let observation_bootstrap =
+                RuntimeObservationBootstrapV1::try_new(RuntimeObservationBootstrapInputV1 {
+                    expected_uid: geteuid().as_raw(),
+                    expected_gid: getegid().as_raw(),
+                    generation_token: OBSERVATION_TOKEN,
+                    node_target: target,
+                    observation_endpoint_ref: RuntimeObservationEndpointRefV1::try_from_bytes(
+                        [0x3a; 16],
+                    )
+                    .expect("observation endpoint"),
+                    socket_path: root.0.join("observation.sock"),
+                    authorities: vec![authority.clone()],
+                })
+                .expect("observation bootstrap");
+            Self {
+                _root: root,
+                node_bootstrap,
+                observation_bootstrap,
+                identity,
+                tenure,
+                management_endpoint_ref,
+                feature,
+                authority,
+                state_root,
+            }
+        }
+
+        fn owner(&self) -> DurableNodeDaemonV1 {
+            DurableNodeDaemonV1::open(
+                &self.state_root,
+                self.identity,
+                self.tenure,
+                self.management_endpoint_ref,
+                self.feature,
+            )
+            .expect("durable owner")
+        }
+    }
+
+    fn carrier_auth_claim(marker: u8) -> ApplyRequestAuthClaim {
+        ApplyRequestAuthClaim::try_new(
+            CONTROLLER_PRINCIPAL,
+            CONTROLLER_KEY,
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+            &[marker; 32],
+        )
+        .expect("auth claim")
+    }
+
+    fn finalize_carrier(draft: NodeControlCarrierRequestDraftV1) -> NodeControlCarrierRequestV1 {
+        draft.finalize(&[0x83; 64]).expect("carrier")
+    }
+
+    fn authenticated_carrier(
+        request: &NodeControlCarrierRequestV1,
+    ) -> ControllerAuthenticatedNodeControlCarrierV1<'_> {
+        request
+            .verify_controller_carrier(
+                CONTROLLER_PRINCIPAL,
+                CONTROLLER_KEY,
+                Digest32::from_bytes([0x84; 32]),
+                |_, _, _, _, _| true,
+            )
+            .expect("authenticated carrier")
+    }
+
+    fn challenge_request(
+        target: NodeManagementTargetV1,
+        runtime_host_id: RuntimeHostId,
+        marker: u8,
+    ) -> NodeControlCarrierRequestV1 {
+        finalize_carrier(
+            NodeControlCarrierRequestDraftV1::try_observation_challenge(
+                [marker; 16],
+                target,
+                runtime_host_id,
+                30_000_000_000,
+                carrier_auth_claim(marker),
+            )
+            .expect("challenge draft"),
+        )
+    }
+
+    fn runtime_observation(
+        fixture: &Fixture,
+        challenge: NodeControlObservationChallengeV1,
+        snapshot_sequence: u64,
+        authority_digest: Digest32,
+    ) -> RuntimeObservationRequestV1 {
+        let selector = ReferenceQuerySelectorV1::try_new(
+            ReferenceQueryIdV1::from_bytes([0x41; 16]),
+            fixture.authority.runtime_host_id(),
+            SourceScopeRef::from_bytes([0x43; 16]),
+            fixture
+                .authority
+                .serving_baseline()
+                .runtime_store_instance_id(),
+            ApplyOperationId::from_bytes([0x44; 16]),
+            None,
+        )
+        .expect("selector");
+        let query_claim = ApplyRequestAuthClaim::try_new(
+            PrincipalRef::from_bytes([0x45; 16]),
+            ApplyAuthKeyRef::from_bytes([0x46; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+            challenge.query_nonce().as_bytes(),
+        )
+        .expect("query claim");
+        let query_draft = ReferenceQueryRequestDraftV1::try_new(
+            selector,
+            query_claim,
+            u32::try_from(MAX_REFERENCE_QUERY_RESPONSE_BYTES).expect("response bound"),
+        )
+        .expect("query draft");
+        let query_signer = SigningKey::from_bytes(&[0x47; 32]);
+        let query_signature = query_signer.sign(
+            query_draft
+                .signing_transcript()
+                .expect("query transcript")
+                .as_bytes(),
+        );
+        let query_request = query_draft
+            .finalize(&query_signature.to_bytes())
+            .expect("query request");
+
+        let baseline = fixture.authority.serving_baseline();
+        let serving = ReferenceBootstrapServingIdentityV1::try_new(
+            baseline.target(),
+            baseline.runtime_store_instance_id(),
+            snapshot_sequence,
+            baseline.runtime_host_epoch(),
+            baseline.clock_domain(),
+            baseline.clock_generation(),
+        )
+        .expect("serving facts");
+        let operation = ReferenceQueryOperationStateV1::try_new(
+            ReferenceQueryOwnerStateV1::Operational,
+            None,
+            ReferenceQueryOperationLookupV1::Unknown,
+        )
+        .expect("operation facts");
+        let desired = ReferenceQueryDesiredStateV1::try_new(
+            ReferenceQueryDesiredHeadV1::None,
+            SourcePlanRevision::new(0),
+        )
+        .expect("desired facts");
+        let live = ReferenceQueryLiveFactsV1::try_new(
+            ReferenceQueryLiveStateV1::ExactZero,
+            0,
+            snapshot_sequence,
+            Digest32::from_bytes([0x48; 32]),
+        )
+        .expect("live facts");
+        let facts =
+            ReferenceQueryFactsV1::try_new(serving, operation, desired, live).expect("query facts");
+        let response_claim = ReferenceQueryResponseAuthClaimV1::try_new(
+            fixture.authority.channel(),
+            ApplyAuthKeyRef::from_bytes(
+                fixture
+                    .authority
+                    .apply_endpoint()
+                    .runtime_response_key_ref(),
+            ),
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+        )
+        .expect("response claim");
+        let response_draft = ReferenceQueryResponseDraftV1::try_new(
+            &query_request,
+            facts,
+            fixture.authority.channel(),
+            response_claim,
+        )
+        .expect("response draft");
+        let runtime_signer = SigningKey::from_bytes(&RUNTIME_SIGNING_SEED);
+        let response_signature = runtime_signer.sign(
+            response_draft
+                .signing_transcript()
+                .expect("response transcript")
+                .as_bytes(),
+        );
+        let query_response = response_draft
+            .finalize(&response_signature.to_bytes())
+            .expect("query response");
+        RuntimeObservationRequestV1::try_new(RuntimeObservationRequestInputV1 {
+            intended_status_sequence: challenge.intended_status_sequence(),
+            freshness_budget_nanos: challenge.freshness_budget_nanos(),
+            runtime_host_id: challenge.runtime_host_id(),
+            authority_digest,
+            challenge_issued_at_unix_nanos: challenge.issued_at_unix_nanos(),
+            challenge_expires_at_unix_nanos: challenge.expires_at_unix_nanos(),
+            query_request,
+            query_response,
+        })
+        .expect("observation request")
+    }
+
+    #[test]
+    fn challenge_nonce_sequence_and_publish_share_the_durable_owner() {
+        let fixture = Fixture::new();
+        let mut owner = fixture.owner();
+        let bridge = DeveloperLocalNodeControlBridgeV1::try_from_bootstraps(
+            &fixture.node_bootstrap,
+            &fixture.observation_bootstrap,
+            Duration::from_secs(1),
+        )
+        .expect("bridge");
+        let describe = finalize_carrier(
+            NodeControlCarrierRequestDraftV1::try_describe([0x90; 16], carrier_auth_claim(0x90))
+                .expect("Describe draft"),
+        );
+        let describe_wire = bridge
+            .exchange_authenticated(authenticated_carrier(&describe))
+            .expect("local Describe");
+        let described = NodeControlDescribeResponseV1::decode(&describe_wire)
+            .expect("strict Describe response");
+        described
+            .validate_for(&describe)
+            .expect("Describe correlation");
+        assert_eq!(
+            described.target(),
+            fixture.observation_bootstrap.node_target()
+        );
+
+        let request = challenge_request(
+            fixture.observation_bootstrap.node_target(),
+            fixture.authority.runtime_host_id(),
+            0x91,
+        );
+        let issued_at = current_unix_time_nanos_for_observation().expect("current time");
+        let response = build_node_control_observation_challenge_at(
+            &owner,
+            &fixture.observation_bootstrap,
+            &request,
+            issued_at,
+        )
+        .expect("challenge response");
+        response.validate_for(&request).expect("correlation");
+        let challenge = response.observation_challenge().expect("challenge");
+        assert_eq!(challenge.intended_status_sequence(), 1);
+        assert_eq!(challenge.issued_at_unix_nanos(), issued_at);
+        assert_eq!(
+            challenge.query_nonce(),
+            derive_runtime_observation_query_nonce_v1(
+                &OBSERVATION_TOKEN,
+                fixture.observation_bootstrap.node_target(),
+                fixture.observation_bootstrap.observation_endpoint_ref(),
+                &fixture.authority,
+                1,
+                issued_at,
+                challenge.expires_at_unix_nanos(),
+            )
+            .expect("exact nonce")
+        );
+
+        let observation = runtime_observation(
+            &fixture,
+            challenge,
+            11,
+            fixture.authority.authority_digest(),
+        );
+        let publish = finalize_carrier(
+            NodeControlCarrierRequestDraftV1::try_publish_runtime_observation(
+                [0x92; 16],
+                fixture.observation_bootstrap.node_target(),
+                observation.clone(),
+                carrier_auth_claim(0x92),
+            )
+            .expect("publish draft"),
+        );
+        assert_eq!(publish.runtime_observation_request(), Some(&observation));
+        let ack = commit_runtime_observation(
+            &mut owner,
+            &fixture.observation_bootstrap,
+            publish.runtime_observation_request().expect("PXNO payload"),
+        )
+        .expect("same-owner publish");
+        ack.validate_for(&observation).expect("PXNA correlation");
+        assert_eq!(ack.outcome(), RuntimeObservationAckOutcomeV1::Published);
+
+        let latest_request = NodeManagementRequestV1::try_latest(
+            [0x93; 16],
+            fixture.observation_bootstrap.node_target(),
+        )
+        .expect("latest");
+        let latest_wire = owner
+            .exchange(latest_request.canonical_wire())
+            .expect("same-owner Latest");
+        let latest = NodeManagementResponseV1::decode(&latest_wire).expect("PXNS");
+        latest
+            .validate_for(&latest_request)
+            .expect("Latest correlation");
+        assert_eq!(latest.outcome(), NodeManagementResponseOutcomeV1::Status);
+        let status = latest.status_value().expect("published status");
+        assert_eq!(status.status_sequence(), 1);
+        assert_eq!(status.runtime_hosts().len(), 1);
+        assert_eq!(
+            status.runtime_hosts()[0].runtime_host_id(),
+            fixture.authority.runtime_host_id()
+        );
+        let latest_carrier = finalize_carrier(
+            NodeControlCarrierRequestDraftV1::try_latest(
+                latest_request.request_id(),
+                fixture.observation_bootstrap.node_target(),
+                latest_request.clone(),
+                carrier_auth_claim(0x93),
+            )
+            .expect("Latest carrier"),
+        );
+        let listener = bind_test_observation_listener(fixture.node_bootstrap.socket_path());
+        let served_latest = latest_wire.to_vec();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept Latest client");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read Latest");
+            stream.write_all(&served_latest).expect("write PXNS");
+        });
+        let bridged_latest = bridge
+            .exchange_authenticated(authenticated_carrier(&latest_carrier))
+            .expect("bridge Latest");
+        let bridged_latest =
+            NodeManagementResponseV1::decode(&bridged_latest).expect("bridged PXNS");
+        bridged_latest
+            .validate_for(&latest_request)
+            .expect("bridged Latest correlation");
+        assert_eq!(
+            bridged_latest
+                .status_value()
+                .expect("bridged status")
+                .status_digest(),
+            status.status_digest()
+        );
+        server.join().expect("Latest server");
+
+        let next_request = challenge_request(
+            fixture.observation_bootstrap.node_target(),
+            fixture.authority.runtime_host_id(),
+            0x94,
+        );
+        let next = build_node_control_observation_challenge_at(
+            &owner,
+            &fixture.observation_bootstrap,
+            &next_request,
+            issued_at + 1,
+        )
+        .expect("next challenge");
+        assert_eq!(
+            next.observation_challenge()
+                .expect("next challenge facts")
+                .intended_status_sequence(),
+            2
+        );
+    }
+
+    #[test]
+    fn target_authority_and_cross_kind_fail_closed() {
+        let fixture = Fixture::new();
+        let mut owner = fixture.owner();
+        let target = fixture.observation_bootstrap.node_target();
+        let wrong_target = NodeManagementTargetV1::try_new(
+            NodeId::try_from_bytes([0x99; 16]).expect("other Node"),
+            target.management_endpoint_ref(),
+            target.node_incarnation(),
+            target.registration_epoch(),
+        )
+        .expect("wrong target");
+        let wrong_target_request =
+            challenge_request(wrong_target, fixture.authority.runtime_host_id(), 0xa1);
+        assert_eq!(
+            build_node_control_observation_challenge_at(
+                &owner,
+                &fixture.observation_bootstrap,
+                &wrong_target_request,
+                1,
+            ),
+            Err(NodeDaemonProcessError::Protocol(
+                NodeManagementProtocolError::TargetMismatch
+            ))
+        );
+
+        let unknown_authority =
+            challenge_request(target, RuntimeHostId::from_bytes([0x98; 16]), 0xa2);
+        assert_eq!(
+            build_node_control_observation_challenge_at(
+                &owner,
+                &fixture.observation_bootstrap,
+                &unknown_authority,
+                1,
+            ),
+            Err(NodeDaemonProcessError::Observation(
+                RuntimeObservationError::UnknownAuthority
+            ))
+        );
+
+        let issued_at = current_unix_time_nanos_for_observation().expect("current time");
+        let challenge_request =
+            challenge_request(target, fixture.authority.runtime_host_id(), 0xa3);
+        let challenge = build_node_control_observation_challenge_at(
+            &owner,
+            &fixture.observation_bootstrap,
+            &challenge_request,
+            issued_at,
+        )
+        .expect("challenge")
+        .observation_challenge()
+        .expect("challenge facts");
+        let wrong_authority =
+            runtime_observation(&fixture, challenge, 11, Digest32::from_bytes([0x97; 32]));
+        assert_eq!(
+            commit_runtime_observation(
+                &mut owner,
+                &fixture.observation_bootstrap,
+                &wrong_authority,
+            ),
+            Err(NodeDaemonProcessError::Observation(
+                RuntimeObservationError::AuthorityMismatch
+            ))
+        );
+        assert!(owner.current_status().is_none());
+        let bridge = DeveloperLocalNodeControlBridgeV1::try_from_bootstraps(
+            &fixture.node_bootstrap,
+            &fixture.observation_bootstrap,
+            Duration::from_secs(1),
+        )
+        .expect("bridge");
+        assert_eq!(
+            bridge
+                .exchange_authenticated(authenticated_carrier(&wrong_target_request))
+                .expect_err("bridge rejects wrong target before transport"),
+            DeveloperLocalNodeControlBridgeErrorV1::Protocol(
+                NodeManagementProtocolError::TargetMismatch
+            )
+        );
+        let wrong_authority_publish = finalize_carrier(
+            NodeControlCarrierRequestDraftV1::try_publish_runtime_observation(
+                [0xa5; 16],
+                target,
+                wrong_authority,
+                carrier_auth_claim(0xa5),
+            )
+            .expect("wrong-authority carrier"),
+        );
+        assert_eq!(
+            bridge
+                .exchange_authenticated(authenticated_carrier(&wrong_authority_publish))
+                .expect_err("bridge rejects wrong authority before transport"),
+            DeveloperLocalNodeControlBridgeErrorV1::Protocol(
+                NodeManagementProtocolError::CorrelationMismatch
+            )
+        );
+        drop(owner);
+
+        let latest = NodeManagementRequestV1::try_latest([0xa4; 16], target).expect("latest");
+        let latest_carrier = finalize_carrier(
+            NodeControlCarrierRequestDraftV1::try_latest(
+                [0xa4; 16],
+                target,
+                latest,
+                carrier_auth_claim(0xa4),
+            )
+            .expect("latest carrier"),
+        );
+        let cross_kind_frame =
+            build_local_observation_frame(&OBSERVATION_TOKEN, latest_carrier.canonical_wire())
+                .expect("PXOL/PXNR");
+        assert_eq!(
+            serve_observation_frame_once(&fixture, cross_kind_frame.as_ref()),
+            NodeDaemonProcessError::Protocol(NodeManagementProtocolError::UnsupportedCarrierKind)
+        );
+    }
+
+    #[test]
+    fn local_ingress_preserves_pxno_bytes_and_rejects_token_trailing_and_timeout() {
+        let fixture = Fixture::new();
+        let owner = fixture.owner();
+        let request = challenge_request(
+            fixture.observation_bootstrap.node_target(),
+            fixture.authority.runtime_host_id(),
+            0xb1,
+        );
+        let issued_at = current_unix_time_nanos_for_observation().expect("current time");
+        let challenge = build_node_control_observation_challenge_at(
+            &owner,
+            &fixture.observation_bootstrap,
+            &request,
+            issued_at,
+        )
+        .expect("challenge")
+        .observation_challenge()
+        .expect("challenge facts");
+        drop(owner);
+        let observation = runtime_observation(
+            &fixture,
+            challenge,
+            11,
+            fixture.authority.authority_digest(),
+        );
+        let legacy_frame =
+            build_local_observation_frame(&OBSERVATION_TOKEN, observation.canonical_wire())
+                .expect("legacy frame");
+        let mut expected =
+            vec![0_u8; LOCAL_REQUEST_HEADER_BYTES + observation.canonical_wire().len()];
+        expected[..4].copy_from_slice(b"PXOL");
+        write_u16(&mut expected, 4, PROCESS_VERSION);
+        write_u16(&mut expected, 6, LOCAL_REQUEST_HEADER_BYTES as u16);
+        let expected_length = u32::try_from(expected.len()).expect("frame bound");
+        write_u32(&mut expected, 8, expected_length);
+        write_u32(
+            &mut expected,
+            12,
+            u32::try_from(observation.canonical_wire().len()).expect("payload bound"),
+        );
+        expected[16..LOCAL_REQUEST_HEADER_BYTES].copy_from_slice(&OBSERVATION_TOKEN);
+        expected[LOCAL_REQUEST_HEADER_BYTES..].copy_from_slice(observation.canonical_wire());
+        assert_eq!(legacy_frame.as_ref(), expected);
+        let (_, decoded) = decode_observation_frame_once(legacy_frame.as_ref())
+            .expect("legacy PXNO remains accepted");
+        match decoded {
+            LocalObservationRequestV1::Legacy(decoded) => assert_eq!(*decoded, observation),
+            LocalObservationRequestV1::Carrier(_) => panic!("legacy PXNO changed kind"),
+        }
+
+        let wrong_token_frame = build_local_observation_frame(
+            &[0x96; RUNTIME_OBSERVATION_TOKEN_BYTES],
+            request.canonical_wire(),
+        )
+        .expect("wrong token frame");
+        assert_eq!(
+            serve_observation_frame_once(&fixture, wrong_token_frame.as_ref()),
+            NodeDaemonProcessError::InvalidBootstrap
+        );
+        let mut trailing = legacy_frame.to_vec();
+        trailing.push(0xff);
+        assert!(matches!(
+            decode_observation_frame_once(&trailing),
+            Err(NodeDaemonProcessError::InvalidBootstrap)
+        ));
+
+        let listener = bind_test_observation_listener(fixture.observation_bootstrap.socket_path());
+        let bridge = DeveloperLocalNodeControlBridgeV1::try_from_bootstraps(
+            &fixture.node_bootstrap,
+            &fixture.observation_bootstrap,
+            Duration::from_millis(100),
+        )
+        .expect("bridge");
+        let debug = format!("{bridge:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("113, 113"));
+        assert!(!debug.contains("114, 114"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept timeout client");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read request");
+            thread::sleep(Duration::from_millis(250));
+        });
+        let timeout_error = bridge
+            .exchange_authenticated(authenticated_carrier(&request))
+            .expect_err("single absolute timeout");
+        assert_eq!(
+            timeout_error,
+            DeveloperLocalNodeControlBridgeErrorV1::Transport(
+                DeveloperLocalNodeManagementEndpointErrorV1::DeadlineExceeded
+            )
+        );
+        server.join().expect("timeout server");
+        fs::remove_file(fixture.observation_bootstrap.socket_path()).expect("remove socket");
+
+        let owner = fixture.owner();
+        let response = build_node_control_observation_challenge_at(
+            &owner,
+            &fixture.observation_bootstrap,
+            &request,
+            issued_at,
+        )
+        .expect("correlated response")
+        .canonical_wire()
+        .to_vec();
+        drop(owner);
+        let listener = bind_test_observation_listener(fixture.observation_bootstrap.socket_path());
+        let bridge = DeveloperLocalNodeControlBridgeV1::try_from_bootstraps(
+            &fixture.node_bootstrap,
+            &fixture.observation_bootstrap,
+            Duration::from_secs(1),
+        )
+        .expect("bridge");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept trailing client");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read request");
+            stream.write_all(&response).expect("write response");
+            stream.write_all(&[0xff]).expect("write trailing byte");
+        });
+        assert_eq!(
+            bridge
+                .exchange_authenticated(authenticated_carrier(&request))
+                .expect_err("trailing response rejected"),
+            DeveloperLocalNodeControlBridgeErrorV1::Transport(
+                DeveloperLocalNodeManagementEndpointErrorV1::TrailingResponseBytes
+            )
+        );
+        server.join().expect("trailing server");
+    }
+
+    fn bind_test_observation_listener(path: &Path) -> StdUnixListener {
+        let listener = StdUnixListener::bind(path).expect("bind observation test socket");
+        fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("private observation socket");
+        listener
+    }
+
+    fn decode_observation_frame_once(
+        frame: &[u8],
+    ) -> Result<
+        (
+            Zeroizing<[u8; RUNTIME_OBSERVATION_TOKEN_BYTES]>,
+            LocalObservationRequestV1,
+        ),
+        NodeDaemonProcessError,
+    > {
+        let (server, client) = StdUnixStream::pair().expect("Unix stream pair");
+        server.set_nonblocking(true).expect("server nonblocking");
+        client.set_nonblocking(true).expect("client nonblocking");
+        let frame = frame.to_vec();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async move {
+            let mut server = UnixStream::from_std(server).expect("Tokio server");
+            let mut client = UnixStream::from_std(client).expect("Tokio client");
+            let reader = read_local_observation_request(&mut server);
+            let writer = async move {
+                client.write_all(&frame).await.expect("write frame");
+                client.shutdown().await.expect("finish frame");
+            };
+            let (result, ()) = tokio::join!(reader, writer);
+            result
+        })
+    }
+
+    fn serve_observation_frame_once(fixture: &Fixture, frame: &[u8]) -> NodeDaemonProcessError {
+        let (server, client) = StdUnixStream::pair().expect("Unix stream pair");
+        server.set_nonblocking(true).expect("server nonblocking");
+        client.set_nonblocking(true).expect("client nonblocking");
+        let frame = frame.to_vec();
+        let owner = Arc::new(Mutex::new(fixture.owner()));
+        let blocking_tasks = Arc::new(TrackedBlockingTasks::new());
+        let bootstrap = Arc::new(
+            RuntimeObservationBootstrapV1::decode_canonical_wire(
+                fixture
+                    .observation_bootstrap
+                    .canonical_wire()
+                    .expect("PXOB wire")
+                    .as_ref(),
+            )
+            .expect("PXOB clone"),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async move {
+            let server = UnixStream::from_std(server).expect("Tokio server");
+            let mut client = UnixStream::from_std(client).expect("Tokio client");
+            let serving =
+                serve_observation_connection(server, owner, Arc::clone(&blocking_tasks), bootstrap);
+            let writer = async move {
+                client.write_all(&frame).await.expect("write frame");
+                client.shutdown().await.expect("finish frame");
+            };
+            let (result, ()) = tokio::join!(serving, writer);
+            blocking_tasks.close().expect("close tasks");
+            blocking_tasks.join_closed().await.expect("join tasks");
+            result.expect_err("frame must fail closed")
+        })
+    }
 }

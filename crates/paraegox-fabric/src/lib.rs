@@ -1,8 +1,9 @@
 //! Zenoh-native Fabric ownership for ParaEGOX.
 //!
 //! [`FabricService`] owns its general typed-binding Zenoh session. The narrow
-//! restricted Runtime-apply client and endpoint own separate role-scoped
-//! query-only sessions; every raw transport value remains private. Callers use versioned envelopes, owner-issued
+//! restricted Runtime-apply/Runtime-control and Unix Node-control clients and
+//! endpoints own separate role-scoped query-only sessions; every raw transport
+//! value remains private. Callers use versioned envelopes, owner-issued
 //! [`PortBinding`] tokens, request-only [`ClientPortBindingV1`] routes, and a
 //! bounded typed request receiver. The v1 binary encoding is an experimental,
 //! Fabric-owned contract until a separately governed cross-language consumer
@@ -24,6 +25,14 @@ pub use ingress::{FabricIngressSnapshot, IngressLimitError, IngressLimits};
 pub use port_descriptor::{
     MAX_PORT_BINDING_DESCRIPTOR_BYTES, PORT_BINDING_DESCRIPTOR_HEADER_BYTES,
     PORT_BINDING_DESCRIPTOR_VERSION, PortBindingDescriptorError, PortBindingDescriptorV1,
+};
+#[cfg(unix)]
+pub use runtime_apply::{
+    RestrictedNodeControlClientConfigV1, RestrictedNodeControlClientV1,
+    RestrictedNodeControlConfigErrorV1, RestrictedNodeControlEndpointConfigV1,
+    RestrictedNodeControlEndpointV1, RestrictedNodeControlErrorV1, RestrictedNodeControlInboundV1,
+    RestrictedNodeControlPreflightV1, RestrictedNodeControlReceiverV1,
+    RestrictedNodeControlRespondErrorV1, RestrictedNodeControlTransportPinsV1,
 };
 pub use runtime_apply::{
     RestrictedRuntimeApplyClientConfigV1, RestrictedRuntimeApplyClientV1,
