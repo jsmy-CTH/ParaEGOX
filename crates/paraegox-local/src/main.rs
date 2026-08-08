@@ -427,7 +427,7 @@ mod tests {
         assert!(text.contains("It prints readiness only\nafter the durable managed-successor"));
         assert!(text.contains("reports ManagedReady"));
         assert!(text.contains("not evidence of a two-host system proof"));
-        assert!(text.contains("remote Agent conversation"));
+        assert!(text.contains("remote Agent\nconversation, remote TUI"));
         assert!(text.contains("remote TUI"));
         assert!(text.contains("reconnect policy"));
         assert!(text.contains("absolute versioned configuration"));
