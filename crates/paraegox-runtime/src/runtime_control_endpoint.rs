@@ -66,11 +66,13 @@ use paraegox_runtime_contracts::{
         MANAGED_AGENT_STACK_APPLY_REQUEST_VERSION, MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES,
         MAX_MANAGED_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedAgentStackApplyRequestV1,
         ManagedAgentStackPlanError, ManagedAgentStackProjectionV1,
+        ManagedAgentStackTerminalReceiptV1,
     },
     managed_fabric_plan::{
         MANAGED_FABRIC_APPLY_REQUEST_VERSION, MAX_MANAGED_FABRIC_APPLY_REQUEST_BYTES,
         MAX_MANAGED_FABRIC_APPLY_TERMINAL_RECEIPT_BYTES, ManagedFabricApplyRequestV1,
-        ManagedFabricManifestProjectionV1, ManagedFabricPlanError,
+        ManagedFabricApplyTerminalReceiptV1, ManagedFabricManifestProjectionV1,
+        ManagedFabricPlanError,
     },
     managed_model_agent_stack_plan::{
         MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION,
