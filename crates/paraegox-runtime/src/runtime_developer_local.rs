@@ -1719,6 +1719,21 @@ mod tests {
             channel.binding_digest().as_bytes(),
             &ready.channel_binding_digest()
         );
+        let describe_ready = ready.runtime_control_describe_ready();
+        assert_eq!(describe_ready.channel(), channel);
+        assert_eq!(describe_ready.serving().target(), channel.target());
+        assert_eq!(
+            describe_ready.serving().runtime_store_instance_id(),
+            ready.runtime_store_instance_id()
+        );
+        assert_eq!(
+            describe_ready.manifest_digest().as_bytes(),
+            &ready.manifest_digest()
+        );
+        assert_eq!(
+            describe_ready.build_instance_id(),
+            ready.compiled_build_instance_id()
+        );
         channel
     }
 
