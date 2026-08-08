@@ -973,30 +973,49 @@ fn bind_listener_with_post_bind(
     expected_gid: u32,
     post_bind: impl FnOnce() -> Result<(), DeveloperLocalInspectionErrorV1>,
 ) -> Result<UnixListener, DeveloperLocalInspectionErrorV1> {
-    bind_listener_with_hooks(
+    bind_listener_with_hooks(BindListenerWithHooksInput {
         runtime,
         path,
         directory,
         target,
         expected_uid,
         expected_gid,
-        IO_TIMEOUT,
-        || {},
+        proof_timeout: IO_TIMEOUT,
+        post_raw_bind: || {},
         post_bind,
-    )
+    })
 }
 
-fn bind_listener_with_hooks(
-    runtime: &tokio::runtime::Runtime,
-    path: &Path,
-    directory: &EndpointDirectory,
-    target: &mut EndpointTarget,
+struct BindListenerWithHooksInput<'a, PostRawBind, PostBind> {
+    runtime: &'a tokio::runtime::Runtime,
+    path: &'a Path,
+    directory: &'a EndpointDirectory,
+    target: &'a mut EndpointTarget,
     expected_uid: u32,
     expected_gid: u32,
     proof_timeout: Duration,
-    post_raw_bind: impl FnOnce(),
-    post_bind: impl FnOnce() -> Result<(), DeveloperLocalInspectionErrorV1>,
-) -> Result<UnixListener, DeveloperLocalInspectionErrorV1> {
+    post_raw_bind: PostRawBind,
+    post_bind: PostBind,
+}
+
+fn bind_listener_with_hooks<PostRawBind, PostBind>(
+    input: BindListenerWithHooksInput<'_, PostRawBind, PostBind>,
+) -> Result<UnixListener, DeveloperLocalInspectionErrorV1>
+where
+    PostRawBind: FnOnce(),
+    PostBind: FnOnce() -> Result<(), DeveloperLocalInspectionErrorV1>,
+{
+    let BindListenerWithHooksInput {
+        runtime,
+        path,
+        directory,
+        target,
+        expected_uid,
+        expected_gid,
+        proof_timeout,
+        post_raw_bind,
+        post_bind,
+    } = input;
     let mut listener_proof = Zeroizing::new([0_u8; 64]);
     getrandom::fill(listener_proof.as_mut())
         .map_err(|_| DeveloperLocalInspectionErrorV1::EntropyUnavailable)?;
@@ -1046,7 +1065,7 @@ fn bind_listener_with_hooks(
         UnixListener::from_std(standard_listener)
             .map_err(|_| DeveloperLocalInspectionErrorV1::EndpointFailed)?
     };
-    prove_bound_listener(runtime, &listener, path, &*listener_proof, proof_timeout)?;
+    prove_bound_listener(runtime, &listener, path, &listener_proof, proof_timeout)?;
     let proven_public = fs::symlink_metadata(path)
         .map_err(|error| DeveloperLocalInspectionErrorV1::Io(error.kind()))?;
     let proven_pin = read_target_metadata(directory, identity_pin_name)?
@@ -1101,7 +1120,7 @@ fn prove_bound_listener(
             .await
             .map_err(|_| DeveloperLocalInspectionErrorV1::IoTimedOut)?
             .map_err(|error| DeveloperLocalInspectionErrorV1::Io(error.kind()))?;
-        if &client_proof[..] != &proof[..32] {
+        if client_proof[..] != proof[..32] {
             return Err(DeveloperLocalInspectionErrorV1::InvalidConfiguration);
         }
         timeout_at(deadline, server.write_all(&proof[32..]))
@@ -1113,7 +1132,7 @@ fn prove_bound_listener(
             .await
             .map_err(|_| DeveloperLocalInspectionErrorV1::IoTimedOut)?
             .map_err(|error| DeveloperLocalInspectionErrorV1::Io(error.kind()))?;
-        if &server_proof[..] != &proof[32..] {
+        if server_proof[..] != proof[32..] {
             return Err(DeveloperLocalInspectionErrorV1::InvalidConfiguration);
         }
         Ok(())
@@ -1605,10 +1624,7 @@ fn cleanup_tracked_target(
             }
         }
     };
-    let result = remove_target_if_same_with(directory, target, identity, || {});
-    if result.is_err() {
-        return result;
-    }
+    remove_target_if_same_with(directory, target, identity, || {})?;
     let pin_result = cleanup_path_identity_pin(directory, target, identity);
     if pin_result.is_ok() {
         target.identity = None;
@@ -1752,6 +1768,10 @@ fn read_target_metadata(
     directory: &EndpointDirectory,
     name: &OsStr,
 ) -> Result<Option<TargetMetadata>, DeveloperLocalInspectionErrorV1> {
+    fn unsigned_metadata_value_to_u64<T: Into<u64>>(value: T) -> u64 {
+        value.into()
+    }
+
     let metadata = match fstatat(&directory.file, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
         Ok(metadata) => metadata,
         Err(nix::errno::Errno::ENOENT) => return Ok(None),
@@ -1770,8 +1790,7 @@ fn read_target_metadata(
         mode: u64::from(metadata.st_mode) & u64::from(MODE_MASK),
         length: u64::try_from(metadata.st_size)
             .map_err(|_| DeveloperLocalInspectionErrorV1::InvalidConfiguration)?,
-        link_count: u64::try_from(metadata.st_nlink)
-            .map_err(|_| DeveloperLocalInspectionErrorV1::InvalidConfiguration)?,
+        link_count: unsigned_metadata_value_to_u64(metadata.st_nlink),
     }))
 }
 
@@ -2435,15 +2454,15 @@ mod tests {
                     .as_ref()
                     .expect("replacement-race Inspection socket has an inode pin"),
             );
-            let result = bind_listener_with_hooks(
-                &runtime,
-                &socket_path,
-                &files.directory,
-                &mut files.socket,
-                uid,
-                gid,
-                Duration::from_millis(100),
-                || {
+            let result = bind_listener_with_hooks(BindListenerWithHooksInput {
+                runtime: &runtime,
+                path: &socket_path,
+                directory: &files.directory,
+                target: &mut files.socket,
+                expected_uid: uid,
+                expected_gid: gid,
+                proof_timeout: Duration::from_millis(100),
+                post_raw_bind: || {
                     fs::remove_file(&socket_path).expect("replace raw-bound Inspection socket");
                     let listener = StdUnixListener::bind(&socket_path)
                         .expect("bind replacement before Inspection identity capture");
@@ -2455,8 +2474,8 @@ mod tests {
                     ));
                     replacement_listener = Some(listener);
                 },
-                || Ok(()),
-            );
+                post_bind: || Ok(()),
+            });
             (result, pin_path)
         };
         assert!(matches!(

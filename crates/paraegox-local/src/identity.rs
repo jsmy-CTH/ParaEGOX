@@ -522,6 +522,12 @@ enum IdentityManifestAccessV1 {
     OpenExisting,
 }
 
+struct IdentityManifestLoadOptions<'a> {
+    conflicting_directories: &'a [&'static str],
+    wire_bytes: usize,
+    access: IdentityManifestAccessV1,
+}
+
 impl IdentityPaths {
     #[cfg(test)]
     fn from_state_root(state_root: &Path) -> Self {
@@ -830,17 +836,19 @@ where
         |canonical_state_root| {
             IdentityPaths::from_state_root_for_profile(canonical_state_root, profile)
         },
-        &[
-            conflicting_profiles[0],
-            conflicting_profiles[1],
-            DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
-            LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
-        ],
-        MANIFEST_WIRE_BYTES,
+        IdentityManifestLoadOptions {
+            conflicting_directories: &[
+                conflicting_profiles[0],
+                conflicting_profiles[1],
+                DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
+                LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
+            ],
+            wire_bytes: MANIFEST_WIRE_BYTES,
+            access: IdentityManifestAccessV1::Initialize,
+        },
         || IdentityManifestV1::try_generate_for_profile(profile, expected_provider_digest, entropy),
         IdentityManifestV1::encode,
         |wire| IdentityManifestV1::decode_for_profile(wire, profile, expected_provider_digest),
-        IdentityManifestAccessV1::Initialize,
     )
 }
 
@@ -851,17 +859,19 @@ fn load_or_create_distributed_inner(
     load_or_create_identity_manifest(
         state_root,
         IdentityPaths::distributed,
-        &[
-            IDENTITY_DIRECTORY_NAME,
-            OPENAI_IDENTITY_DIRECTORY_NAME,
-            DEEPSEEK_IDENTITY_DIRECTORY_NAME,
-            LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
-        ],
-        DISTRIBUTED_MANIFEST_WIRE_BYTES,
+        IdentityManifestLoadOptions {
+            conflicting_directories: &[
+                IDENTITY_DIRECTORY_NAME,
+                OPENAI_IDENTITY_DIRECTORY_NAME,
+                DEEPSEEK_IDENTITY_DIRECTORY_NAME,
+                LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
+            ],
+            wire_bytes: DISTRIBUTED_MANIFEST_WIRE_BYTES,
+            access: IdentityManifestAccessV1::Initialize,
+        },
         || DistributedDeveloperLocalIdentityManifestV1::try_generate(entropy),
         DistributedDeveloperLocalIdentityManifestV1::encode,
         DistributedDeveloperLocalIdentityManifestV1::decode,
-        IdentityManifestAccessV1::Initialize,
     )
 }
 
@@ -871,17 +881,19 @@ fn open_distributed_inner(
     load_or_create_identity_manifest(
         state_root,
         IdentityPaths::distributed,
-        &[
-            IDENTITY_DIRECTORY_NAME,
-            OPENAI_IDENTITY_DIRECTORY_NAME,
-            DEEPSEEK_IDENTITY_DIRECTORY_NAME,
-            LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
-        ],
-        DISTRIBUTED_MANIFEST_WIRE_BYTES,
+        IdentityManifestLoadOptions {
+            conflicting_directories: &[
+                IDENTITY_DIRECTORY_NAME,
+                OPENAI_IDENTITY_DIRECTORY_NAME,
+                DEEPSEEK_IDENTITY_DIRECTORY_NAME,
+                LEGACY_DISTRIBUTED_IDENTITY_DIRECTORY_NAME,
+            ],
+            wire_bytes: DISTRIBUTED_MANIFEST_WIRE_BYTES,
+            access: IdentityManifestAccessV1::OpenExisting,
+        },
         || Err(IdentityManifestError::DistributedManifestNotInitialized),
         DistributedDeveloperLocalIdentityManifestV1::encode,
         DistributedDeveloperLocalIdentityManifestV1::decode,
-        IdentityManifestAccessV1::OpenExisting,
     )
 }
 
@@ -904,12 +916,10 @@ impl SensitiveManifestWire for SensitiveDistributedWire {
 fn load_or_create_identity_manifest<M, W, P, G, E, D>(
     state_root: &Path,
     paths_for_root: P,
-    conflicting_directories: &[&str],
-    wire_bytes: usize,
+    options: IdentityManifestLoadOptions<'_>,
     generate: G,
     encode: E,
     decode: D,
-    access: IdentityManifestAccessV1,
 ) -> Result<M, IdentityManifestError>
 where
     W: SensitiveManifestWire,
@@ -918,6 +928,11 @@ where
     E: Fn(&M) -> W,
     D: Fn(&[u8]) -> Result<M, IdentityManifestError>,
 {
+    let IdentityManifestLoadOptions {
+        conflicting_directories,
+        wire_bytes,
+        access,
+    } = options;
     let canonical_state_root = match access {
         IdentityManifestAccessV1::Initialize => ensure_state_root(state_root)?,
         IdentityManifestAccessV1::OpenExisting => open_existing_state_root(state_root)?,

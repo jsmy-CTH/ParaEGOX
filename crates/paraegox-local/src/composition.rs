@@ -196,26 +196,30 @@ pub(crate) fn run_distributed(
     let operation_timeout = config.profile().operation_timeout();
     let target_configs = config.targets();
     let prepared_a = prepare_distributed_target_prestart_v1(
-        &manifest,
-        target_a,
-        target_b,
-        &target_configs[0],
-        &target_configs[1],
-        config.fabric_listen_a(),
-        authority_verification_key,
-        operation_timeout,
-        LocalProcessError::DistributedRuntimeAStartup,
+        PrepareDistributedTargetPrestartInput {
+            manifest: &manifest,
+            target: target_a,
+            peer_target: target_b,
+            target_config: &target_configs[0],
+            peer_config: &target_configs[1],
+            base_loopback_listen_endpoint: config.fabric_listen_a(),
+            authority_verification_key,
+            operation_timeout,
+            runtime_startup_error: LocalProcessError::DistributedRuntimeAStartup,
+        },
     )?;
     let prepared_b = prepare_distributed_target_prestart_v1(
-        &manifest,
-        target_b,
-        target_a,
-        &target_configs[1],
-        &target_configs[0],
-        config.fabric_listen_b(),
-        authority_verification_key,
-        operation_timeout,
-        LocalProcessError::DistributedRuntimeBStartup,
+        PrepareDistributedTargetPrestartInput {
+            manifest: &manifest,
+            target: target_b,
+            peer_target: target_a,
+            target_config: &target_configs[1],
+            peer_config: &target_configs[0],
+            base_loopback_listen_endpoint: config.fabric_listen_b(),
+            authority_verification_key,
+            operation_timeout,
+            runtime_startup_error: LocalProcessError::DistributedRuntimeBStartup,
+        },
     )?;
     let provider = prepare_distributed_fixture_provider(&manifest)
         .map_err(|_| LocalProcessError::DistributedDeploymentActivation)?;
@@ -658,17 +662,32 @@ struct PreparedDistributedTargetPrestartV1 {
     controller_credentials: DeveloperFixtureControllerCredentialsV1,
 }
 
-fn prepare_distributed_target_prestart_v1(
-    manifest: &identity::DistributedDeveloperLocalIdentityManifestV1,
+struct PrepareDistributedTargetPrestartInput<'a> {
+    manifest: &'a identity::DistributedDeveloperLocalIdentityManifestV1,
     target: identity::DistributedDeveloperLocalTargetV1,
     peer_target: identity::DistributedDeveloperLocalTargetV1,
-    target_config: &DeveloperDistributedTargetConfigV1,
-    peer_config: &DeveloperDistributedTargetConfigV1,
-    base_loopback_listen_endpoint: &str,
+    target_config: &'a DeveloperDistributedTargetConfigV1,
+    peer_config: &'a DeveloperDistributedTargetConfigV1,
+    base_loopback_listen_endpoint: &'a str,
     authority_verification_key: [u8; 32],
     operation_timeout: Duration,
     runtime_startup_error: LocalProcessError,
+}
+
+fn prepare_distributed_target_prestart_v1(
+    input: PrepareDistributedTargetPrestartInput<'_>,
 ) -> Result<PreparedDistributedTargetPrestartV1, LocalProcessError> {
+    let PrepareDistributedTargetPrestartInput {
+        manifest,
+        target,
+        peer_target,
+        target_config,
+        peer_config,
+        base_loopback_listen_endpoint,
+        authority_verification_key,
+        operation_timeout,
+        runtime_startup_error,
+    } = input;
     let target_identity = manifest.target(target);
     let peer_identity = manifest.target(peer_target);
     let identities = DeveloperFixtureDerivedIdentityV1::try_from_seed(
