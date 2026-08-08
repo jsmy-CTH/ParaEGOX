@@ -1218,12 +1218,7 @@ impl DistributedAgentStackRuntimeCore {
         let snapshot_result = match snapshot_result {
             Ok(snapshot) if self.evidence_store_config.is_some() => {
                 return self
-                    .commit_snapshot_evidence_and_activate(
-                        owner,
-                        snapshot,
-                        fabric_control,
-                        context,
-                    )
+                    .commit_snapshot_evidence_and_activate(owner, snapshot, fabric_control, context)
                     .await;
             }
             other => other,
@@ -1327,13 +1322,8 @@ impl DistributedAgentStackRuntimeCore {
                 return Err(error);
             }
         };
-        self.start_agent_after_verified_evidence(
-            owner,
-            fabric_control,
-            proofs,
-            context,
-        )
-        .await
+        self.start_agent_after_verified_evidence(owner, fabric_control, proofs, context)
+            .await
     }
 
     async fn start_agent_after_verified_evidence(
@@ -1567,11 +1557,7 @@ impl DistributedAgentStackRuntimeCore {
             agent_cleanup_uncertain = true;
         }
         if agent_cleanup_uncertain {
-            return self.commit_agent_activation_quarantine(
-                owner,
-                proofs,
-                context,
-            );
+            return self.commit_agent_activation_quarantine(owner, proofs, context);
         }
         if self.cleanup_live().await {
             self.complete_exact_cleanup(
