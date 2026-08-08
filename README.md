@@ -5,11 +5,11 @@ ParaEGOX is a distributed Agent OS for robotics and embodied agents, currently b
 ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). The original baseline remains available on the `archive/phanthymotus-baseline` branch, with its license attribution preserved.
 
 > Status: the current worktree contains the first DeveloperLocal backend, Textual chat composition,
-> and typed one-shot Inspection startup view. The r22 macOS run reached typed Inspection markers,
-> Runtime readiness, and a real Echo terminal, but its PTY-timed `/quit` was not consumed and joined
-> exit exceeded 60 seconds. The r23 Ctrl-C smoke revision still awaits CI, so presentation closeout
-> remains pending. ParaEGOX is adopting a Rust-first core with
-> polyglot managed workloads; no stable release is currently available.
+> and typed one-shot Inspection startup view. Native Intel macOS r29 artifact run `31238285076`
+> passed the real relocated-bundle path through Inspection, Runtime Agent IPC, Echo, Textual Ctrl-C,
+> terminal restoration, and joined parent shutdown. Textual is now the sole DeveloperLocal
+> presentation path; the retired Rust reference frontend has been removed. ParaEGOX is adopting a
+> Rust-first core with polyglot managed workloads; no stable release is currently available.
 
 ## Runnable DeveloperLocal slice
 
@@ -33,7 +33,8 @@ replaceable validation backend, not as a CLI mode or default model.
 
 The Textual child is installed from this repository's Python project. In a development checkout,
 prepare and activate the locked environment before starting `paraegox`; the Rust parent deliberately
-has no hidden Ratatui or transport fallback if the internal `paraegox-console` executable is absent:
+has no alternate frontend or transport fallback if the internal `paraegox-console` executable is
+absent:
 
 ```zsh
 uv sync --locked
@@ -62,23 +63,24 @@ unset DEEPSEEK_API_KEY
 Build the native binary on the designated server or GitHub CI and download the complete bundle to
 the Mac. Do not run Cargo on the Mac for this workflow.
 
-Ubuntu validation of r22 source snapshot `ff2d8109` passed workspace formatting, locked metadata,
-and locked all-targets check. It also passed all 39 Inspection tests, all 89 DeveloperLocal tests
-under a non-root identity, and all 364 Deployment tests under a non-root identity. Workspace Clippy
-did not pass because it found approximately 30 historical structural lints. Those findings have
-been fixed in parallel in the Mac source authority, but the fixes still await r23 validation and
-must not be described as passed. The native Intel macOS r22 run reached typed Inspection markers,
-Runtime readiness, and a real Textual-to-Runtime Echo terminal; its PTY-timed `/quit` was not
-consumed, so joined exit exceeded the 60-second budget and the workflow failed. The r23 smoke now
-uses Textual's public priority Ctrl-C binding, but it still awaits CI and is not a passing result.
-A credentialed external
-DeepSeek smoke is also still pending, so the configured DeepSeek path must not yet be described as
-externally validated or production ready. For an offline substrate check, use the same config schema with
+Historical Ubuntu validation of r22 source snapshot `ff2d8109` passed workspace formatting, locked
+metadata, and locked all-targets check. It also passed all 39 Inspection tests, all 89
+DeveloperLocal tests under a non-root identity, and all 364 Deployment tests under a non-root
+identity. That r22 workspace Clippy run exposed approximately 30 historical structural lints rather
+than passing. Their corrections are present in later source snapshots, but the r29 macOS artifact
+workflow did not run workspace Clippy and is not presented as a fresh Clippy pass.
+
+Native Intel macOS r29 commit `944ce332` run `31238285076` passed the locked Textual tests and full
+governance checker, built and verified the public native CLI, staged the relocatable bundle, and ran
+the real PTY path through typed Inspection markers, Runtime readiness, Textual-to-Runtime Echo,
+priority Ctrl-C, terminal restoration, and joined parent shutdown. It also verified the bundle
+checksums, executable modes, archive, and artifact upload. A credentialed external DeepSeek smoke is
+still pending, so the configured DeepSeek path must not yet be described as externally validated or
+production ready. For an offline substrate check, use the same config schema with
 `model.provider = "deterministic-echo-v1"` and omit model/SecretRef; `echo: <message>` proves only the
-DeveloperLocal owner chain. The standalone Rust `paraegox-tui fixture-v1` executable is retained
-temporarily as a retirement reference only: `paraegox-local` no longer depends on or launches it,
-and it is not an alternative public `paraegox chat` entry. It remains until r23 is genuinely green;
-it is not claimed deleted today.
+DeveloperLocal owner chain. The earlier standalone Rust reference frontend has now been removed;
+the internal Textual child is the only current presentation path and there is no alternate public
+`paraegox chat` entry.
 
 The current A2 slice is non-streaming, permits one Model call in flight, and sends only the current
 turn's prompt; conversation-history recall, Memory, Tools, planning, and multi-agent orchestration

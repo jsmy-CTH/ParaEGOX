@@ -14,7 +14,6 @@ members = [
   "crates/paraegox-runtime",
   "crates/paraegox-runtime-contracts",
   "crates/paraegox-runtime-host",
-  "crates/paraegox-tui",
 ]
 resolver = "3"
 
@@ -26,11 +25,9 @@ license = "Apache-2.0"
 repository = "https://github.com/jsmy-CTH/ParaEGOX"
 
 [workspace.dependencies]
-crossterm = "=0.29.0"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 getrandom = { version = "=0.4.3", default-features = false }
 nix = { version = "=0.31.3", default-features = false, features = ["dir", "fs", "process", "signal", "user"] }
-ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"] }
 rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -52,7 +49,6 @@ paraegox-model-adapters = { path = "crates/paraegox-model-adapters" }
 paraegox-node = { path = "crates/paraegox-node" }
 paraegox-runtime = { path = "crates/paraegox-runtime" }
 paraegox-runtime-contracts = { path = "crates/paraegox-runtime-contracts" }
-paraegox-tui = { path = "crates/paraegox-tui" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

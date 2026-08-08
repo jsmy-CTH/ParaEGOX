@@ -4,11 +4,11 @@ ParaEGOX 是一个面向机器人与具身智能体的分布式 Agent OS，目�
 
 ParaEGOX 基于 [PhanthyMotus](https://github.com/4paradigm/phanthymotus) 构建。原始基线保留在 `archive/phanthymotus-baseline` 分支，并保留其许可证归属。
 
-> 当前状态：当前工作树已有首个 DeveloperLocal 后端、Textual 对话组合和 typed 单次
-> Inspection 启动视图。r22 macOS 运行已到达 typed Inspection markers、Runtime ready 和真实 Echo
-> terminal，但 PTY 定时发送的 `/quit` 未被消费，joined exit 超过 60 秒。r23 改用 Ctrl+C
-> smoke 的修订仍待 CI，因此展示层 closeout 仍未完成。生产核心
-> 机制优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
+> 当前状态：当前工作树已有首个 DeveloperLocal 后端、Textual 对话组合和 typed 单次 Inspection
+> 启动视图。原生 Intel macOS r29 artifact run `31238285076` 已通过真实可搬移 bundle 的 Inspection、
+> Runtime Agent IPC、Echo、Textual Ctrl-C、terminal restoration 和父进程 joined shutdown。Textual
+> 现在是唯一 DeveloperLocal 展示路径；旧 Rust reference frontend 已删除。生产核心机制优先采用
+> Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
 
 ## 当前可运行切片
 
@@ -30,7 +30,7 @@ provider、model、state root 和 Fabric listener 由 strict versioned TOML 配�
 
 Textual child 由仓库中的 Python project 安装。开发工作树启动 `paraegox` 前，先准备并激活 locked
 environment；若内部 `paraegox-console` executable 不存在，Rust parent 会直接失败，不会暗中回退到
-Ratatui 或另一套 transport：
+另一套 frontend 或 transport：
 
 ```zsh
 uv sync --locked
@@ -58,19 +58,21 @@ unset DEEPSEEK_API_KEY
 原生 binary 必须在指定服务器或 GitHub CI 构建，Mac 只下载完整 bundle；当前工作流禁止在 Mac 运行
 Cargo。
 
-Ubuntu 对 r22 源码快照 `ff2d8109` 的验证已通过 workspace format、locked metadata 和 locked
+历史 Ubuntu r22 源码快照 `ff2d8109` 已通过 workspace format、locked metadata 和 locked
 all-targets check，并通过 Inspection 39/39、非 root DeveloperLocal 89/89 以及非 root Deployment
-364/364。workspace Clippy 因约 30 个历史结构 lint 未通过；这些问题已在 Mac 源码 authority
-并行修复，但仍待 r23 验证，当前不冒充宣称已通过。原生 Intel macOS r22 运行已到达 typed
-Inspection markers、Runtime ready 和真实 Textual→Runtime Echo terminal；PTY 定时发送的 `/quit`
-未被消费，因此 joined exit 超过 60 秒预算，workflow 失败。r23 smoke 已改用 Textual 公开
-priority Ctrl+C binding，但仍待 CI，不得冒充记为通过。真实 credentialed DeepSeek
-smoke 也仍未完成，因此还不能把配置中的 DeepSeek 路径描述成外部验证通过或 production
-ready。离线验证系统基座时，使用同一个配置 schema，将 `model.provider` 改为
+364/364。该 r22 workspace Clippy 运行暴露了约 30 个历史结构 lint，而不是通过；修正已进入后续源码
+快照，但 r29 macOS artifact workflow 没有运行 workspace Clippy，因此这里不把它冒充为 fresh
+Clippy pass。
+
+原生 Intel macOS r29 commit `944ce332`、run `31238285076` 已通过 locked Textual tests 和完整
+governance checker，构建并验证公开 native CLI，组装可搬移 bundle，并真实走通 PTY 下的 typed
+Inspection markers、Runtime ready、Textual→Runtime Echo、priority Ctrl-C、terminal restoration 和
+父进程 joined shutdown；bundle checksum、executable mode、archive 和 artifact upload 也已通过。
+真实 credentialed DeepSeek smoke 仍未完成，因此还不能把配置中的 DeepSeek 路径描述成外部验证
+通过或 production ready。离线验证系统基座时，使用同一个配置 schema，将 `model.provider` 改为
 `deterministic-echo-v1` 并省略 model/SecretRef；`echo: <你的消息>` 只证明 DeveloperLocal owner 链。
-独立 Rust `paraegox-tui fixture-v1` executable 只作为待退役参考暂存：`paraegox-local` 已不再依赖或
-启动它，它也不是第二个公开 `paraegox chat` 入口。它保留到 r23 真正全绿之后才删除；
-当前不冒充宣称已删除。
+旧的独立 Rust reference frontend 现已删除；内部 Textual child 是唯一当前展示路径，也不存在第二个
+公开 `paraegox chat` 入口。
 
 当前 A2 仍是最小文本链：不流式、同时只允许一个 Model 调用、每轮只把当前输入发给模型；会话历史
 回灌、Memory、Tools、规划和多 Agent 编排仍属于后续 Agent Core。父进程只把 owner-private bootstrap
