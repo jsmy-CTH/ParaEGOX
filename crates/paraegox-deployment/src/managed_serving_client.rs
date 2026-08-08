@@ -16,11 +16,17 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use paraegox_kernel::digest::Digest32;
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_runtime_contracts::distributed_agent_stack_plan::RestrictedRuntimeApplyCarrierBindingV1;
-use paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricManifestProjectionV1;
+use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentStackApplyRequestV1;
+use paraegox_runtime_contracts::managed_fabric_plan::{
+    ManagedFabricApplyRequestV1, ManagedFabricManifestProjectionV1,
+};
 use paraegox_runtime_contracts::managed_serving_bootstrap::{
     ManagedServingBootstrapError, ManagedServingBootstrapFactsV1,
     ManagedServingBootstrapRequestDraftV1, ManagedServingBootstrapRequestIdV1,
     ManagedServingBootstrapRequestV1, ManagedServingBootstrapResponseV1,
+    RuntimeAgentControlKindV1, RuntimeAgentControlReceiptV1,
+    RuntimeAgentControlRequestDraftV1, RuntimeAgentControlRequestFieldsV1,
+    RuntimeAgentControlRequestIdV1, RuntimeAgentControlRequestV1,
     RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestDraftV1,
     RuntimeControlCarrierRequestV1, RuntimeControlDescribeReadyPhaseV1,
     RuntimeControlDescribeReadyResponseV1,
@@ -60,6 +66,200 @@ impl FreshManagedServingBootstrapV1 {
             request_id,
             authentication_nonce,
         })
+    }
+}
+
+/// Fresh outer PXAG identity supplied by one explicit Agent-control invocation.
+///
+/// Apply kinds require `request_id` to equal the independently signed inner
+/// PXAR operation identity. The authentication nonce remains independently
+/// fresh and must differ from the inner PXAR nonce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FreshRuntimeAgentControlV1 {
+    request_id: [u8; 16],
+    authentication_nonce: [u8; 32],
+}
+
+impl FreshRuntimeAgentControlV1 {
+    pub(crate) fn try_new(
+        request_id: [u8; 16],
+        authentication_nonce: [u8; 32],
+    ) -> Result<Self, ManagedServingControllerError> {
+        if bytes_are_zero(&request_id) || bytes_are_zero(&authentication_nonce) {
+            return Err(ManagedServingControllerError::InvalidFreshIdentity);
+        }
+        Ok(Self {
+            request_id,
+            authentication_nonce,
+        })
+    }
+}
+
+/// Durable state of one exact PXAG/PXAH exchange. `Uncertain` has no replay
+/// transition and no method reconstructs transport authority from it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeAgentControlDurablePhaseV1 {
+    Idle,
+    RequestDurableNotSent,
+    Uncertain,
+    ReceiptDurable,
+}
+
+impl RuntimeAgentControlDurablePhaseV1 {
+    #[must_use]
+    pub(crate) const fn wire_value(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::RequestDurableNotSent => 1,
+            Self::Uncertain => 2,
+            Self::ReceiptDurable => 3,
+        }
+    }
+
+    pub(crate) const fn try_from_wire(
+        value: u8,
+    ) -> Result<Self, ManagedServingControllerError> {
+        match value {
+            0 => Ok(Self::Idle),
+            1 => Ok(Self::RequestDurableNotSent),
+            2 => Ok(Self::Uncertain),
+            3 => Ok(Self::ReceiptDurable),
+            _ => Err(ManagedServingControllerError::InvalidAgentControlState),
+        }
+    }
+}
+
+/// Exact outer Agent-control bytes retained by PXFJ. This type owns only the
+/// phase/shape invariant; its caller must additionally verify the expected
+/// kind, current ManagedReady facts, independent inner payload and signatures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeAgentControlDurableSlotV1 {
+    phase: RuntimeAgentControlDurablePhaseV1,
+    request: Option<RuntimeAgentControlRequestV1>,
+    receipt: Option<RuntimeAgentControlReceiptV1>,
+}
+
+impl RuntimeAgentControlDurableSlotV1 {
+    #[must_use]
+    pub(crate) const fn idle() -> Self {
+        Self {
+            phase: RuntimeAgentControlDurablePhaseV1::Idle,
+            request: None,
+            receipt: None,
+        }
+    }
+
+    pub(crate) fn decode(
+        phase: RuntimeAgentControlDurablePhaseV1,
+        request_wire: &[u8],
+        receipt_wire: &[u8],
+    ) -> Result<Self, ManagedServingControllerError> {
+        let (request, receipt) = match phase {
+            RuntimeAgentControlDurablePhaseV1::Idle => {
+                if !request_wire.is_empty() || !receipt_wire.is_empty() {
+                    return Err(ManagedServingControllerError::InvalidAgentControlState);
+                }
+                (None, None)
+            }
+            RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
+            | RuntimeAgentControlDurablePhaseV1::Uncertain => {
+                if request_wire.is_empty() || !receipt_wire.is_empty() {
+                    return Err(ManagedServingControllerError::InvalidAgentControlState);
+                }
+                (Some(RuntimeAgentControlRequestV1::decode(request_wire)?), None)
+            }
+            RuntimeAgentControlDurablePhaseV1::ReceiptDurable => {
+                if request_wire.is_empty() || receipt_wire.is_empty() {
+                    return Err(ManagedServingControllerError::InvalidAgentControlState);
+                }
+                (
+                    Some(RuntimeAgentControlRequestV1::decode(request_wire)?),
+                    Some(RuntimeAgentControlReceiptV1::decode(receipt_wire)?),
+                )
+            }
+        };
+        Ok(Self {
+            phase,
+            request,
+            receipt,
+        })
+    }
+
+    pub(crate) fn try_prepare(
+        &self,
+        request: RuntimeAgentControlRequestV1,
+    ) -> Result<Self, ManagedServingControllerError> {
+        if self.phase != RuntimeAgentControlDurablePhaseV1::Idle
+            || self.request.is_some()
+            || self.receipt.is_some()
+        {
+            return Err(ManagedServingControllerError::InvalidAgentControlPhase);
+        }
+        Ok(Self {
+            phase: RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent,
+            request: Some(request),
+            receipt: None,
+        })
+    }
+
+    pub(crate) fn try_claim(&self) -> Result<Self, ManagedServingControllerError> {
+        if self.phase != RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
+            || self.request.is_none()
+            || self.receipt.is_some()
+        {
+            return Err(ManagedServingControllerError::AgentControlReplayForbidden);
+        }
+        Ok(Self {
+            phase: RuntimeAgentControlDurablePhaseV1::Uncertain,
+            request: self.request.clone(),
+            receipt: None,
+        })
+    }
+
+    pub(crate) fn try_terminal(
+        &self,
+        receipt: RuntimeAgentControlReceiptV1,
+    ) -> Result<Self, ManagedServingControllerError> {
+        if self.phase != RuntimeAgentControlDurablePhaseV1::Uncertain
+            || self.request.is_none()
+            || self.receipt.is_some()
+        {
+            return Err(ManagedServingControllerError::InvalidAgentControlPhase);
+        }
+        Ok(Self {
+            phase: RuntimeAgentControlDurablePhaseV1::ReceiptDurable,
+            request: self.request.clone(),
+            receipt: Some(receipt),
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn phase(&self) -> RuntimeAgentControlDurablePhaseV1 {
+        self.phase
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> Option<&RuntimeAgentControlRequestV1> {
+        self.request.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) const fn receipt(&self) -> Option<&RuntimeAgentControlReceiptV1> {
+        self.receipt.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn request_wire(&self) -> &[u8] {
+        self.request
+            .as_ref()
+            .map_or(&[][..], RuntimeAgentControlRequestV1::canonical_wire)
+    }
+
+    #[must_use]
+    pub(crate) fn receipt_wire(&self) -> &[u8] {
+        self.receipt
+            .as_ref()
+            .map_or(&[][..], RuntimeAgentControlReceiptV1::canonical_wire)
     }
 }
 
@@ -180,6 +380,312 @@ impl ManagedServingDescribeVerifierV1 {
         request: &RuntimeControlCarrierRequestV1,
     ) -> Result<(), ManagedServingControllerError> {
         verify_fresh_describe_request(self, previous, request)
+    }
+
+    /// Builds one Controller-signed PXAG carrying the byte-identical PXAR v6.
+    pub(crate) fn try_build_managed_fabric_agent_control(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+        inner: &ManagedFabricApplyRequestV1,
+        fresh: FreshRuntimeAgentControlV1,
+        controller_signer: &SigningKey,
+    ) -> Result<RuntimeAgentControlRequestV1, ManagedServingControllerError> {
+        let fields = self.runtime_agent_control_fields(ready, fresh, controller_signer)?;
+        let draft = RuntimeAgentControlRequestDraftV1::try_apply_managed_fabric(
+            fields,
+            inner.clone(),
+        )?;
+        let signature = controller_signer.sign(draft.signing_transcript()?.as_bytes());
+        let request = draft.finalize(&signature.to_bytes())?;
+        self.revalidate_runtime_agent_control_request(
+            ready,
+            RuntimeAgentControlKindV1::ApplyManagedFabric,
+            &request,
+        )?;
+        if request.managed_fabric_apply_request() != Some(inner) {
+            return Err(ManagedServingControllerError::AgentControlRequestMismatch);
+        }
+        Ok(request)
+    }
+
+    /// Builds one Controller-signed PXAG carrying the byte-identical PXAR v7.
+    pub(crate) fn try_build_managed_agent_stack_agent_control(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+        inner: &ManagedAgentStackApplyRequestV1,
+        fresh: FreshRuntimeAgentControlV1,
+        controller_signer: &SigningKey,
+    ) -> Result<RuntimeAgentControlRequestV1, ManagedServingControllerError> {
+        let fields = self.runtime_agent_control_fields(ready, fresh, controller_signer)?;
+        let draft = RuntimeAgentControlRequestDraftV1::try_apply_managed_agent_stack(
+            fields,
+            inner.clone(),
+        )?;
+        let signature = controller_signer.sign(draft.signing_transcript()?.as_bytes());
+        let request = draft.finalize(&signature.to_bytes())?;
+        self.revalidate_runtime_agent_control_request(
+            ready,
+            RuntimeAgentControlKindV1::ApplyManagedAgentStack,
+            &request,
+        )?;
+        if request.managed_agent_stack_apply_request() != Some(inner) {
+            return Err(ManagedServingControllerError::AgentControlRequestMismatch);
+        }
+        Ok(request)
+    }
+
+    /// Builds one bootstrap-only PXAG for an opaque PXAP conversation-port
+    /// descriptor rooted in the exact active PXST Receipt.
+    pub(crate) fn try_build_conversation_port_agent_control(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+        expected_active_pxst_digest: Digest32,
+        intended_client: PrincipalRef,
+        fresh: FreshRuntimeAgentControlV1,
+        controller_signer: &SigningKey,
+    ) -> Result<RuntimeAgentControlRequestV1, ManagedServingControllerError> {
+        let fields = self.runtime_agent_control_fields(ready, fresh, controller_signer)?;
+        let draft = RuntimeAgentControlRequestDraftV1::try_describe_conversation_port(
+            fields,
+            expected_active_pxst_digest,
+            intended_client,
+        )?;
+        let signature = controller_signer.sign(draft.signing_transcript()?.as_bytes());
+        let request = draft.finalize(&signature.to_bytes())?;
+        self.revalidate_runtime_agent_control_request(
+            ready,
+            RuntimeAgentControlKindV1::DescribeConversationPort,
+            &request,
+        )?;
+        Ok(request)
+    }
+
+    /// Repeats exact ManagedReady, PXCB and Controller Ed25519 verification for
+    /// one durable PXAG before it authorizes any transition or send token.
+    pub(crate) fn revalidate_runtime_agent_control_request(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+        expected_kind: RuntimeAgentControlKindV1,
+        request: &RuntimeAgentControlRequestV1,
+    ) -> Result<(), ManagedServingControllerError> {
+        self.validate_runtime_agent_control_ready(ready)?;
+        let claim = request.authentication().claim();
+        if request.kind() != expected_kind
+            || request.carrier() != &self.carrier
+            || request.target() != self.target
+            || request.expected_runtime_store_instance_id()
+                != ready.serving_facts().runtime_store_instance_id()
+            || request.expected_runtime_host_epoch()
+                != ready.serving_facts().runtime_host_epoch()
+            || claim.principal() != self.carrier.controller_principal()
+            || claim.key() != self.carrier.controller_request_key()
+            || claim.algorithm().value() != ED25519_ALGORITHM
+            || claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+            || request.authentication().signature().len() != ED25519_SIGNATURE_BYTES
+        {
+            return Err(ManagedServingControllerError::AgentControlRequestMismatch);
+        }
+        let key = VerifyingKey::from_bytes(&self.controller_public_key)
+            .map_err(|_| ManagedServingControllerError::InvalidDescribePin)?;
+        request
+            .verify_controller_request(
+                &self.carrier,
+                |principal, key_ref, fingerprint, transcript, signature| {
+                    principal == self.carrier.controller_principal()
+                        && key_ref == self.carrier.controller_request_key()
+                        && fingerprint == self.carrier.controller_request_key_fingerprint()
+                        && verify_ed25519(&key, transcript, signature)
+                },
+            )
+            .map_err(|_| ManagedServingControllerError::AgentControlRequestMismatch)?;
+        Ok(())
+    }
+
+    /// Accepts an Apply PXAH only after mTLS/PXCB, exact request correlation,
+    /// outer Runtime Ed25519 and current-channel checks all succeed. The caller
+    /// must still verify the independently signed inner PXFT/PXST.
+    pub(crate) fn try_accept_runtime_agent_apply_receipt(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+        request: &RuntimeAgentControlRequestV1,
+        current_channel: ReferenceChannelBindingV1,
+        transport: &RuntimeAgentControlMtlsExchangeSuccessV1,
+    ) -> Result<RuntimeAgentControlReceiptV1, ManagedServingControllerError> {
+        if !matches!(
+            request.kind(),
+            RuntimeAgentControlKindV1::ApplyManagedFabric
+                | RuntimeAgentControlKindV1::ApplyManagedAgentStack
+        ) {
+            return Err(ManagedServingControllerError::AgentControlReceiptMismatch);
+        }
+        self.revalidate_runtime_agent_control_request(ready, request.kind(), request)?;
+        self.validate_runtime_agent_control_transport(transport)?;
+        let receipt = RuntimeAgentControlReceiptV1::decode(&transport.response_wire)?;
+        self.revalidate_runtime_agent_apply_receipt(
+            ready,
+            request,
+            current_channel,
+            &receipt,
+        )?;
+        Ok(receipt)
+    }
+
+    /// Restart-safe counterpart of receipt admission. It repeats every
+    /// persistent PXAG/PXAH and Runtime signature check but does not pretend
+    /// that transient mTLS observations can be recreated after restart.
+    pub(crate) fn revalidate_runtime_agent_apply_receipt(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+        request: &RuntimeAgentControlRequestV1,
+        current_channel: ReferenceChannelBindingV1,
+        receipt: &RuntimeAgentControlReceiptV1,
+    ) -> Result<(), ManagedServingControllerError> {
+        if !matches!(
+            request.kind(),
+            RuntimeAgentControlKindV1::ApplyManagedFabric
+                | RuntimeAgentControlKindV1::ApplyManagedAgentStack
+        ) {
+            return Err(ManagedServingControllerError::AgentControlReceiptMismatch);
+        }
+        self.revalidate_runtime_agent_control_request(ready, request.kind(), request)?;
+        self.validate_runtime_agent_control_receipt_profile(receipt)?;
+        let key = VerifyingKey::from_bytes(&self.runtime_response_public_key)
+            .map_err(|_| ManagedServingControllerError::InvalidDescribePin)?;
+        receipt
+            .verify_runtime_apply_receipt(
+                request,
+                current_channel,
+                &self.carrier,
+                |principal, key_ref, fingerprint, transcript, signature| {
+                    principal == self.carrier.runtime_principal()
+                        && key_ref == self.carrier.runtime_response_key()
+                        && fingerprint == self.carrier.runtime_response_key_fingerprint()
+                        && verify_ed25519(&key, transcript, signature)
+                },
+            )
+            .map_err(|_| ManagedServingControllerError::AgentControlReceiptMismatch)?;
+        Ok(())
+    }
+
+    /// Accepts a bootstrap-only descriptor PXAH. No local Runtime channel is
+    /// interpreted as a public transport or access grant.
+    pub(crate) fn try_accept_runtime_agent_descriptor_receipt(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+        request: &RuntimeAgentControlRequestV1,
+        transport: &RuntimeAgentControlMtlsExchangeSuccessV1,
+    ) -> Result<RuntimeAgentControlReceiptV1, ManagedServingControllerError> {
+        self.revalidate_runtime_agent_control_request(
+            ready,
+            RuntimeAgentControlKindV1::DescribeConversationPort,
+            request,
+        )?;
+        self.validate_runtime_agent_control_transport(transport)?;
+        let receipt = RuntimeAgentControlReceiptV1::decode(&transport.response_wire)?;
+        self.revalidate_runtime_agent_descriptor_receipt(ready, request, &receipt)?;
+        Ok(receipt)
+    }
+
+    /// Restart-safe revalidation for one bootstrap-only descriptor PXAH.
+    pub(crate) fn revalidate_runtime_agent_descriptor_receipt(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+        request: &RuntimeAgentControlRequestV1,
+        receipt: &RuntimeAgentControlReceiptV1,
+    ) -> Result<(), ManagedServingControllerError> {
+        self.revalidate_runtime_agent_control_request(
+            ready,
+            RuntimeAgentControlKindV1::DescribeConversationPort,
+            request,
+        )?;
+        self.validate_runtime_agent_control_receipt_profile(receipt)?;
+        let key = VerifyingKey::from_bytes(&self.runtime_response_public_key)
+            .map_err(|_| ManagedServingControllerError::InvalidDescribePin)?;
+        receipt
+            .verify_runtime_descriptor_receipt(
+                request,
+                &self.carrier,
+                |principal, key_ref, fingerprint, transcript, signature| {
+                    principal == self.carrier.runtime_principal()
+                        && key_ref == self.carrier.runtime_response_key()
+                        && fingerprint == self.carrier.runtime_response_key_fingerprint()
+                        && verify_ed25519(&key, transcript, signature)
+                },
+            )
+            .map_err(|_| ManagedServingControllerError::AgentControlReceiptMismatch)?;
+        Ok(())
+    }
+
+    fn runtime_agent_control_fields(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+        fresh: FreshRuntimeAgentControlV1,
+        controller_signer: &SigningKey,
+    ) -> Result<RuntimeAgentControlRequestFieldsV1, ManagedServingControllerError> {
+        self.validate_runtime_agent_control_ready(ready)?;
+        if controller_signer.verifying_key().to_bytes() != self.controller_public_key {
+            return Err(ManagedServingControllerError::ControllerKeyMismatch);
+        }
+        Ok(RuntimeAgentControlRequestFieldsV1 {
+            request_id: RuntimeAgentControlRequestIdV1::try_from_bytes(fresh.request_id)?,
+            carrier: self.carrier.clone(),
+            target: self.target,
+            expected_runtime_store_instance_id: ready
+                .serving_facts()
+                .runtime_store_instance_id(),
+            expected_runtime_host_epoch: ready.serving_facts().runtime_host_epoch(),
+            auth_claim: ApplyRequestAuthClaim::try_new(
+                self.carrier.controller_principal(),
+                self.carrier.controller_request_key(),
+                ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)?,
+                ED25519_ALGORITHM_VERSION,
+                &fresh.authentication_nonce,
+            )?,
+        })
+    }
+
+    fn validate_runtime_agent_control_ready(
+        &self,
+        ready: &VerifiedManagedServingReadyV1,
+    ) -> Result<(), ManagedServingControllerError> {
+        ready.ingress.revalidate(self)?;
+        if ready.ingress.phase() != RuntimeControlDescribeReadyPhaseV1::ManagedReady
+            || ready.serving_facts().target() != self.target
+            || ready.serving_facts().runtime_store_instance_id() == [0; 32]
+            || ready.serving_facts().runtime_host_epoch() == 0
+        {
+            return Err(ManagedServingControllerError::ManagedReadyDescribeRequired);
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_agent_control_transport(
+        &self,
+        transport: &RuntimeAgentControlMtlsExchangeSuccessV1,
+    ) -> Result<(), ManagedServingControllerError> {
+        if transport.observed_runtime_certificate_principal != self.carrier.runtime_principal()
+            || transport.observed_carrier_binding_digest != self.carrier.binding_digest()
+        {
+            return Err(ManagedServingControllerError::AgentControlTransportPinMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_agent_control_receipt_profile(
+        &self,
+        receipt: &RuntimeAgentControlReceiptV1,
+    ) -> Result<(), ManagedServingControllerError> {
+        let authentication = receipt.authentication();
+        if authentication.runtime_principal() != self.carrier.runtime_principal()
+            || authentication.key() != self.carrier.runtime_response_key()
+            || authentication.algorithm().value() != ED25519_ALGORITHM
+            || authentication.algorithm_version() != ED25519_ALGORITHM_VERSION
+            || authentication.carrier_binding_digest() != self.carrier.binding_digest()
+            || receipt.authentication_signature().len() != ED25519_SIGNATURE_BYTES
+        {
+            return Err(ManagedServingControllerError::AgentControlReceiptMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -354,6 +860,51 @@ pub(crate) struct RuntimeManagedServingDescribeMtlsExchangeSuccessV1 {
     observed_runtime_certificate_principal: PrincipalRef,
     observed_carrier_binding_digest: Digest32,
     response_wire: Box<[u8]>,
+}
+
+/// Raw PXAH bytes returned by one concrete restricted Runtime Agent-control
+/// exchange. TLS evidence remains independent from the Runtime-local channel
+/// used to correlate an inner PXFT/PXST.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeAgentControlMtlsExchangeSuccessV1 {
+    observed_runtime_certificate_principal: PrincipalRef,
+    observed_carrier_binding_digest: Digest32,
+    response_wire: Box<[u8]>,
+}
+
+impl RuntimeAgentControlMtlsExchangeSuccessV1 {
+    pub(crate) fn try_new(
+        observed_runtime_certificate_principal: PrincipalRef,
+        observed_carrier_binding_digest: Digest32,
+        response_wire: Box<[u8]>,
+    ) -> Result<Self, ManagedServingControllerError> {
+        if bytes_are_zero(observed_runtime_certificate_principal.as_bytes())
+            || digest_is_zero(observed_carrier_binding_digest)
+            || response_wire.is_empty()
+        {
+            return Err(ManagedServingControllerError::AgentControlUnauthenticatedTransport);
+        }
+        Ok(Self {
+            observed_runtime_certificate_principal,
+            observed_carrier_binding_digest,
+            response_wire,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn observed_runtime_certificate_principal(&self) -> PrincipalRef {
+        self.observed_runtime_certificate_principal
+    }
+
+    #[must_use]
+    pub(crate) const fn observed_carrier_binding_digest(&self) -> Digest32 {
+        self.observed_carrier_binding_digest
+    }
+
+    #[must_use]
+    pub(crate) fn response_wire(&self) -> &[u8] {
+        &self.response_wire
+    }
 }
 
 impl RuntimeManagedServingDescribeMtlsExchangeSuccessV1 {
@@ -2030,6 +2581,13 @@ pub(crate) enum ManagedServingControllerError {
     ManagedReadyDescribeTransportPinMismatch,
     ManagedReadyDescribeTransport(RuntimeManagedServingDescribeTransportErrorV1),
     ManagedReadyDescribeTransportAuthoritySpent,
+    InvalidAgentControlState,
+    InvalidAgentControlPhase,
+    AgentControlReplayForbidden,
+    AgentControlRequestMismatch,
+    AgentControlReceiptMismatch,
+    AgentControlUnauthenticatedTransport,
+    AgentControlTransportPinMismatch,
     ReferenceQueryRequiresLegacyReady,
     ReferenceQueryRequestMismatch,
     ReferenceQueryUnauthenticatedTransport,
