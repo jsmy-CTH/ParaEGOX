@@ -480,10 +480,11 @@ async fn wait_for_deployment_shutdown(
 }
 
 /// Runs the public split-trust Node substrate. Schema v1 keeps the host-local
-/// feature-only NodeDaemon, while schema v2 also starts the restricted Runtime
-/// and Node-control ingress owned by this process. Neither profile activates
-/// Authority, Deployment, Model, Agent, Evidence, Inspection, or Textual
-/// owners.
+/// feature-only NodeDaemon, schema v2 also starts the restricted Runtime and
+/// Node-control ingress, and schema v3 additionally installs the exact
+/// deterministic Agent provider resolver without activating an Agent. None of
+/// these profiles activates Authority, Deployment, Model, Evidence,
+/// Inspection, or Textual owners.
 pub(crate) fn run_node(config: DeveloperNodeConfigV1) -> Result<(), LocalProcessError> {
     // Zenoh's runtime rejects Tokio's current-thread scheduler. One worker is
     // sufficient because blocking Node/store work stays behind its existing
@@ -604,6 +605,37 @@ async fn run_node_with_signals(
                 ),
             )
         }
+        DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3 => {
+            let selection = config
+                .managed_agent_bootstrap()
+                .ok_or(LocalProcessError::ProviderConfiguration)?
+                .selection();
+            let provider = prepare_fixture_provider_from_values(
+                *selection.provider_ref().as_bytes(),
+                *selection.config_digest().as_bytes(),
+            )?;
+            if !matches!(
+                provider.deployment,
+                DeploymentProvider::Fixture(observed) if observed == selection
+            ) {
+                return Err(LocalProcessError::ProviderConfiguration);
+            }
+            RuntimeDeveloperLocalConfigV1::try_new_with_provider_resolver(
+                layout.runtime_state_directory().to_path_buf(),
+                layout.runtime_socket_path().to_path_buf(),
+                runtime_identity,
+                provider.agent_resolver,
+            )
+            .and_then(|runtime| {
+                runtime.try_with_restricted_runtime_control_endpoint(
+                    transport_profile.clone(),
+                    restricted.control_transport_profile_ref(),
+                    expected_carrier.clone(),
+                    restricted.root_ca_certificate_file().to_path_buf(),
+                    listener_identity,
+                )
+            })
+        }
     }
     .map_err(|_| LocalProcessError::RuntimeStartup)?;
     let runtime = start_runtime_developer_local_v1(runtime_config)
@@ -619,7 +651,8 @@ async fn run_node_with_signals(
                 node_status,
             )?);
         }
-        DeveloperNodeConfigSchemaV1::RemoteControlV2 => {
+        DeveloperNodeConfigSchemaV1::RemoteControlV2
+        | DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3 => {
             let prepared = prepare_public_developer_node_v2(
                 &config,
                 &layout,
@@ -649,15 +682,33 @@ async fn run_node_with_signals(
             let enrollment_artifact_path = layout
                 .node_enrollment_artifact_path()
                 .ok_or(LocalProcessError::LayoutPreparation)?;
-            identity::publish_or_reopen_node_enrollment_artifact_v1(
-                enrollment_artifact_path,
-                &config,
-                &manifest,
-                owners.runtime_ready(),
-                &expected_carrier,
-                observation_bootstrap.node_target(),
-                observation_bootstrap.observation_endpoint_ref(),
-            )
+            match config.schema() {
+                DeveloperNodeConfigSchemaV1::RemoteControlV2 => {
+                    identity::publish_or_reopen_node_enrollment_artifact_v1(
+                        enrollment_artifact_path,
+                        &config,
+                        &manifest,
+                        owners.runtime_ready(),
+                        &expected_carrier,
+                        observation_bootstrap.node_target(),
+                        observation_bootstrap.observation_endpoint_ref(),
+                    )
+                }
+                DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3 => {
+                    identity::publish_or_reopen_node_enrollment_artifact_v2(
+                        enrollment_artifact_path,
+                        &config,
+                        &manifest,
+                        owners.runtime_ready(),
+                        &expected_carrier,
+                        observation_bootstrap.node_target(),
+                        observation_bootstrap.observation_endpoint_ref(),
+                    )
+                }
+                DeveloperNodeConfigSchemaV1::HostLocalV1 => {
+                    return Err(LocalProcessError::LayoutPreparation);
+                }
+            }
             .map_err(|_| LocalProcessError::IdentityManifest)?;
             let remote = config
                 .node_control()
