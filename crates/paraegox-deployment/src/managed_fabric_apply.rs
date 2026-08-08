@@ -40,8 +40,11 @@ use crate::managed_model_agent_stack_apply::{
 use crate::managed_serving_client::{
     FreshManagedServingBootstrapV1, ManagedServingBootstrapPhaseV1, ManagedServingBootstrapStateV1,
     ManagedServingControllerError, ManagedServingDescribeIngressV1,
-    RuntimeManagedServingMtlsExchangeSuccessV1, RuntimeManagedServingTransportErrorV1,
-    VerifiedManagedServingPinV1, VerifiedRuntimeManagedServingResponseV1,
+    ManagedServingDescribeReconcileDecodeV1, ManagedServingDescribeReconcilePhaseV1,
+    RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+    RuntimeManagedServingDescribeTransportErrorV1, RuntimeManagedServingMtlsExchangeSuccessV1,
+    RuntimeManagedServingTransportErrorV1, VerifiedManagedServingPinV1,
+    VerifiedManagedServingReadyV1, VerifiedRuntimeManagedServingResponseV1,
 };
 
 const ED25519_ALGORITHM: u16 = 1;
@@ -54,8 +57,10 @@ const AGENT_STACK_STATE_VERSION: u16 = 3;
 const AGENT_STACK_STATE_FIXED_BYTES: usize = 104;
 const MODEL_STACK_STATE_VERSION: u16 = 4;
 const MODEL_STACK_STATE_FIXED_BYTES: usize = 108;
-const STATE_VERSION: u16 = 5;
-const STATE_FIXED_BYTES: usize = 112;
+const REMOTE_CARRIER_STATE_VERSION: u16 = 5;
+const REMOTE_CARRIER_STATE_FIXED_BYTES: usize = 112;
+const STATE_VERSION: u16 = 6;
+const STATE_FIXED_BYTES: usize = 121;
 const STATE_CHECKSUM_BYTES: usize = 32;
 const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 const STATE_CHECKSUM_DOMAIN: &[u8] =
@@ -192,6 +197,13 @@ impl ManagedFabricControllerStateV1 {
     }
 
     #[must_use]
+    pub(crate) const fn serving_describe_reconcile_phase(
+        &self,
+    ) -> ManagedServingDescribeReconcilePhaseV1 {
+        self.serving.describe_reconcile_phase()
+    }
+
+    #[must_use]
     pub(crate) const fn cutover_marker_digest(&self) -> Digest32 {
         self.cutover_marker_digest
     }
@@ -241,6 +253,8 @@ impl ManagedFabricControllerStateV1 {
         let serving_request = self.serving.request_wire();
         let serving_response = self.serving.response_wire();
         let serving_carrier_request = self.serving.carrier_request_wire();
+        let serving_describe_request = self.serving.describe_request_wire();
+        let serving_describe_response = self.serving.describe_response_wire();
         let (revision, execution) = self.desired.as_ref().map_or((0, &[][..]), |desired| {
             (
                 desired.revision().value(),
@@ -290,6 +304,10 @@ impl ManagedFabricControllerStateV1 {
             .map_err(|_| ManagedFabricApplyControllerError::StateTooLarge)?;
         let serving_carrier_request_length = u32::try_from(serving_carrier_request.len())
             .map_err(|_| ManagedFabricApplyControllerError::StateTooLarge)?;
+        let serving_describe_request_length = u32::try_from(serving_describe_request.len())
+            .map_err(|_| ManagedFabricApplyControllerError::StateTooLarge)?;
+        let serving_describe_response_length = u32::try_from(serving_describe_response.len())
+            .map_err(|_| ManagedFabricApplyControllerError::StateTooLarge)?;
         let execution_length = u32::try_from(execution.len())
             .map_err(|_| ManagedFabricApplyControllerError::StateTooLarge)?;
         let request_length = u32::try_from(request.len())
@@ -319,6 +337,8 @@ impl ManagedFabricControllerStateV1 {
             .and_then(|value| value.checked_add(archived_receipt.len()))
             .and_then(|value| value.checked_add(agent_stack.len()))
             .and_then(|value| value.checked_add(model_stack.len()))
+            .and_then(|value| value.checked_add(serving_describe_request.len()))
+            .and_then(|value| value.checked_add(serving_describe_response.len()))
             .and_then(|value| value.checked_add(STATE_CHECKSUM_BYTES))
             .ok_or(ManagedFabricApplyControllerError::StateTooLarge)?;
         if total > MAX_STATE_BYTES {
@@ -350,6 +370,9 @@ impl ManagedFabricControllerStateV1 {
         encoded.extend_from_slice(&agent_stack_length.to_be_bytes());
         encoded.extend_from_slice(&model_stack_length.to_be_bytes());
         encoded.extend_from_slice(&serving_carrier_request_length.to_be_bytes());
+        encoded.push(self.serving.describe_reconcile_phase().wire_value());
+        encoded.extend_from_slice(&serving_describe_request_length.to_be_bytes());
+        encoded.extend_from_slice(&serving_describe_response_length.to_be_bytes());
         encoded.extend_from_slice(&legacy);
         encoded.extend_from_slice(serving_request);
         encoded.extend_from_slice(serving_response);
@@ -362,6 +385,8 @@ impl ManagedFabricControllerStateV1 {
         encoded.extend_from_slice(archived_receipt);
         encoded.extend_from_slice(&agent_stack);
         encoded.extend_from_slice(&model_stack);
+        encoded.extend_from_slice(serving_describe_request);
+        encoded.extend_from_slice(serving_describe_response);
         let checksum = state_checksum(&encoded)?;
         encoded.extend_from_slice(checksum.as_bytes());
         Ok(encoded.into_boxed_slice())
@@ -416,6 +441,7 @@ impl ManagedFabricControllerStateV1 {
             LEGACY_STATE_VERSION
                 | AGENT_STACK_STATE_VERSION
                 | MODEL_STACK_STATE_VERSION
+                | REMOTE_CARRIER_STATE_VERSION
                 | STATE_VERSION
         ) {
             return Err(ManagedFabricApplyControllerError::InvalidStateEncoding);
@@ -441,26 +467,62 @@ impl ManagedFabricControllerStateV1 {
         let archived_execution_length = cursor.usize_u32()?;
         let archived_request_length = cursor.usize_u32()?;
         let archived_receipt_length = cursor.usize_u32()?;
-        let (agent_stack_length, model_stack_length, serving_carrier_request_length, fixed_bytes) =
-            match state_version {
-                LEGACY_STATE_VERSION => (0, 0, 0, LEGACY_STATE_FIXED_BYTES),
-                AGENT_STACK_STATE_VERSION => {
-                    (cursor.usize_u32()?, 0, 0, AGENT_STACK_STATE_FIXED_BYTES)
-                }
-                MODEL_STACK_STATE_VERSION => (
-                    cursor.usize_u32()?,
-                    cursor.usize_u32()?,
-                    0,
-                    MODEL_STACK_STATE_FIXED_BYTES,
-                ),
-                STATE_VERSION => (
-                    cursor.usize_u32()?,
-                    cursor.usize_u32()?,
-                    cursor.usize_u32()?,
-                    STATE_FIXED_BYTES,
-                ),
-                _ => return Err(ManagedFabricApplyControllerError::InvalidStateEncoding),
-            };
+        let (
+            agent_stack_length,
+            model_stack_length,
+            serving_carrier_request_length,
+            serving_describe_phase,
+            serving_describe_request_length,
+            serving_describe_response_length,
+            fixed_bytes,
+        ) = match state_version {
+            LEGACY_STATE_VERSION => (
+                0,
+                0,
+                0,
+                ManagedServingDescribeReconcilePhaseV1::Idle,
+                0,
+                0,
+                LEGACY_STATE_FIXED_BYTES,
+            ),
+            AGENT_STACK_STATE_VERSION => (
+                cursor.usize_u32()?,
+                0,
+                0,
+                ManagedServingDescribeReconcilePhaseV1::Idle,
+                0,
+                0,
+                AGENT_STACK_STATE_FIXED_BYTES,
+            ),
+            MODEL_STACK_STATE_VERSION => (
+                cursor.usize_u32()?,
+                cursor.usize_u32()?,
+                0,
+                ManagedServingDescribeReconcilePhaseV1::Idle,
+                0,
+                0,
+                MODEL_STACK_STATE_FIXED_BYTES,
+            ),
+            REMOTE_CARRIER_STATE_VERSION => (
+                cursor.usize_u32()?,
+                cursor.usize_u32()?,
+                cursor.usize_u32()?,
+                ManagedServingDescribeReconcilePhaseV1::Idle,
+                0,
+                0,
+                REMOTE_CARRIER_STATE_FIXED_BYTES,
+            ),
+            STATE_VERSION => (
+                cursor.usize_u32()?,
+                cursor.usize_u32()?,
+                cursor.usize_u32()?,
+                ManagedServingDescribeReconcilePhaseV1::try_from_wire(cursor.u8()?)?,
+                cursor.usize_u32()?,
+                cursor.usize_u32()?,
+                STATE_FIXED_BYTES,
+            ),
+            _ => return Err(ManagedFabricApplyControllerError::InvalidStateEncoding),
+        };
         let variable_length = legacy_length
             .checked_add(serving_request_length)
             .and_then(|value| value.checked_add(serving_response_length))
@@ -473,6 +535,8 @@ impl ManagedFabricControllerStateV1 {
             .and_then(|value| value.checked_add(archived_receipt_length))
             .and_then(|value| value.checked_add(agent_stack_length))
             .and_then(|value| value.checked_add(model_stack_length))
+            .and_then(|value| value.checked_add(serving_describe_request_length))
+            .and_then(|value| value.checked_add(serving_describe_response_length))
             .ok_or(ManagedFabricApplyControllerError::StateTooLarge)?;
         let expected_length = fixed_bytes
             .checked_add(variable_length)
@@ -493,6 +557,8 @@ impl ManagedFabricControllerStateV1 {
         let archived_receipt = cursor.take(archived_receipt_length)?;
         let agent_stack = cursor.take(agent_stack_length)?;
         let model_stack = cursor.take(model_stack_length)?;
+        let serving_describe_request = cursor.take(serving_describe_request_length)?;
+        let serving_describe_response = cursor.take(serving_describe_response_length)?;
         let checksum = Digest32::from_bytes(cursor.array::<32>()?);
         cursor.finish()?;
         if state_checksum(&frame[..frame.len() - STATE_CHECKSUM_BYTES])? != checksum {
@@ -507,13 +573,14 @@ impl ManagedFabricControllerStateV1 {
                 Self::try_from_remote_connector_cutover(cutover_marker_digest, legacy_snapshot)?
             }
         };
-        let (base_context, describe_verifier) = match provisioning {
+        let (base_context, describe_verifier, previous_ingress) = match provisioning {
             ManagedFabricDecodeProvisioningV1::Local(provisioning) => (
                 VerifiedManagedFabricProducerContextV1::try_from_provisioning(
                     base.legacy_snapshot.state(),
                     controller_signer,
                     provisioning,
                 )?,
+                None,
                 None,
             ),
             ManagedFabricDecodeProvisioningV1::Remote {
@@ -527,15 +594,22 @@ impl ManagedFabricControllerStateV1 {
                     ingress,
                 )?,
                 Some(provisioning.describe()),
+                Some(ingress),
             ),
         };
-        let serving = ManagedServingBootstrapStateV1::decode_with_remote_carrier(
+        let serving = ManagedServingBootstrapStateV1::decode_with_remote_reconcile(
             serving_phase,
             serving_request,
             serving_response,
             serving_carrier_request,
             &base_context,
             describe_verifier,
+            ManagedServingDescribeReconcileDecodeV1 {
+                phase: serving_describe_phase,
+                request_wire: serving_describe_request,
+                response_wire: serving_describe_response,
+                previous: previous_ingress,
+            },
         )?;
         if phase == ManagedFabricApplyPhaseV1::CutoverReady {
             if sequence == 0
@@ -1049,6 +1123,87 @@ pub(crate) struct PreparedManagedServingBootstrapV1 {
     request_digest: Digest32,
 }
 
+/// Proof that one exact post-PXFB Describe PXCC is durable and unsent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedManagedServingDescribeV1 {
+    state_sequence: u64,
+    cutover_marker_digest: Digest32,
+    request_digest: Digest32,
+}
+
+/// Move-only authorization for exactly one read-only post-PXFB Describe.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ManagedServingDescribeSendActionV1 {
+    state_sequence: u64,
+    cutover_marker_digest: Digest32,
+    request: RuntimeControlCarrierRequestV1,
+    remote_send_available: bool,
+}
+
+impl ManagedServingDescribeSendActionV1 {
+    #[must_use]
+    pub(crate) const fn request(&self) -> &RuntimeControlCarrierRequestV1 {
+        &self.request
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_request_bytes(&self) -> &[u8] {
+        self.request.canonical_wire()
+    }
+
+    /// Spends this action across one `FnOnce` transport boundary. The spent
+    /// action is returned so the journal can durably accept PXDR or close the
+    /// attempt without ever recreating the same send authority.
+    pub(crate) async fn exchange_remote_once<Exchange, ExchangeFuture>(
+        self,
+        exchange: Exchange,
+    ) -> ManagedServingDescribeRemoteExchangeOutcomeV1
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<
+                RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+                RuntimeManagedServingDescribeTransportErrorV1,
+            >,
+        >,
+    {
+        let mut action = self;
+        let response = if action.remote_send_available {
+            action.remote_send_available = false;
+            exchange(action.request.canonical_wire().into())
+                .await
+                .map_err(ManagedServingControllerError::from)
+        } else {
+            Err(ManagedServingControllerError::ManagedReadyDescribeTransportAuthoritySpent)
+        };
+        ManagedServingDescribeRemoteExchangeOutcomeV1 { action, response }
+    }
+}
+
+/// Result of one and only one post-PXFB Describe transport invocation.
+#[derive(Debug)]
+pub(crate) struct ManagedServingDescribeRemoteExchangeOutcomeV1 {
+    action: ManagedServingDescribeSendActionV1,
+    response: Result<
+        RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+        ManagedServingControllerError,
+    >,
+}
+
+impl ManagedServingDescribeRemoteExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedServingDescribeSendActionV1,
+        Result<
+            RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+            ManagedServingControllerError,
+        >,
+    ) {
+        (self.action, self.response)
+    }
+}
+
 /// Move-only authorization for one PXFB transport exchange.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ManagedServingBootstrapSendActionV1 {
@@ -1558,6 +1713,241 @@ impl ManagedFabricApplyJournalV1 {
         commit(&next)?;
         self.state = next;
         Ok(pin)
+    }
+
+    /// Builds and commits one exact fresh post-PXFB Describe PXCC before any
+    /// transport authority exists. A closed prior Describe may be replaced
+    /// only by another explicitly fresh read-only request.
+    pub(crate) fn prepare_remote_managed_ready_describe_with<Commit>(
+        &mut self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+        fresh: FreshManagedServingBootstrapV1,
+        commit: Commit,
+    ) -> Result<PreparedManagedServingDescribeV1, ManagedFabricApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedFabricApplyControllerError>,
+    {
+        if self.state.phase != ManagedFabricApplyPhaseV1::CutoverReady
+            || self.state.desired.is_some()
+            || self.state.request.is_some()
+            || self.state.receipt.is_some()
+            || self.state.archived_active.is_some()
+        {
+            return Err(ManagedFabricApplyControllerError::ServingRefreshForbidden);
+        }
+        let _ = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            self.state.legacy_snapshot.state(),
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        let serving = self.state.serving.try_prepare_managed_ready_describe(
+            provisioning.describe(),
+            previous,
+            fresh,
+            controller_signer,
+        )?;
+        let mut next = self.state.clone();
+        next.sequence = next_sequence(next.sequence)?;
+        next.serving = serving;
+        commit(&next)?;
+        self.state = next;
+        self.prepared_remote_managed_ready_describe()
+    }
+
+    pub(crate) fn prepared_remote_managed_ready_describe(
+        &self,
+    ) -> Result<PreparedManagedServingDescribeV1, ManagedFabricApplyControllerError> {
+        if self.state.phase != ManagedFabricApplyPhaseV1::CutoverReady
+            || self.state.serving.describe_reconcile_phase()
+                != ManagedServingDescribeReconcilePhaseV1::RequestDurable
+        {
+            return Err(ManagedFabricApplyControllerError::InvalidPhase);
+        }
+        let request = self
+            .state
+            .serving
+            .describe_request()
+            .ok_or(ManagedFabricApplyControllerError::InvalidStateEncoding)?;
+        Ok(PreparedManagedServingDescribeV1 {
+            state_sequence: self.state.sequence,
+            cutover_marker_digest: self.state.cutover_marker_digest,
+            request_digest: request.request_digest(),
+        })
+    }
+
+    /// Commits the Describe `AttemptInFlight` fence before releasing its sole
+    /// move-only `FnOnce` transport action.
+    pub(crate) fn claim_remote_managed_ready_describe_with<Commit>(
+        &mut self,
+        prepared: PreparedManagedServingDescribeV1,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+        commit: Commit,
+    ) -> Result<ManagedServingDescribeSendActionV1, ManagedFabricApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedFabricApplyControllerError>,
+    {
+        let request = self
+            .state
+            .serving
+            .describe_request()
+            .ok_or(ManagedFabricApplyControllerError::InvalidStateEncoding)?;
+        if self.state.phase != ManagedFabricApplyPhaseV1::CutoverReady
+            || self.state.serving.describe_reconcile_phase()
+                != ManagedServingDescribeReconcilePhaseV1::RequestDurable
+            || prepared.state_sequence != self.state.sequence
+            || prepared.cutover_marker_digest != self.state.cutover_marker_digest
+            || prepared.request_digest != request.request_digest()
+        {
+            return Err(ManagedFabricApplyControllerError::PreparedServingDescribeTokenMismatch);
+        }
+        provisioning
+            .describe()
+            .revalidate_fresh_request(previous, request)?;
+        let (serving, request) = self.state.serving.try_claim_managed_ready_describe()?;
+        let mut next = self.state.clone();
+        next.sequence = next_sequence(next.sequence)?;
+        next.serving = serving;
+        commit(&next)?;
+        self.state = next;
+        Ok(ManagedServingDescribeSendActionV1 {
+            state_sequence: self.state.sequence,
+            cutover_marker_digest: self.state.cutover_marker_digest,
+            request,
+            remote_send_available: true,
+        })
+    }
+
+    pub(crate) fn close_remote_managed_ready_describe_no_response_with<Commit>(
+        &mut self,
+        action: ManagedServingDescribeSendActionV1,
+        commit: Commit,
+    ) -> Result<(), ManagedFabricApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedFabricApplyControllerError>,
+    {
+        self.validate_serving_describe_action(&action)?;
+        self.close_recovered_remote_managed_ready_describe_with(commit)
+    }
+
+    /// Restart recovery closes the resident in-flight authority without
+    /// reconstructing its action. A later explicit prepare must use fresh
+    /// Describe identity and never obtains authority for the old PXFB/PXCC.
+    pub(crate) fn close_recovered_remote_managed_ready_describe_with<Commit>(
+        &mut self,
+        commit: Commit,
+    ) -> Result<(), ManagedFabricApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedFabricApplyControllerError>,
+    {
+        if self.state.phase != ManagedFabricApplyPhaseV1::CutoverReady
+            || self.state.serving.describe_reconcile_phase()
+                != ManagedServingDescribeReconcilePhaseV1::AttemptInFlight
+        {
+            return Err(ManagedFabricApplyControllerError::InvalidPhase);
+        }
+        let serving = self
+            .state
+            .serving
+            .try_close_managed_ready_describe_no_response()?;
+        let mut next = self.state.clone();
+        next.sequence = next_sequence(next.sequence)?;
+        next.serving = serving;
+        commit(&next)?;
+        self.state = next;
+        Ok(())
+    }
+
+    /// Verifies pinned transport plus the exact current request and commits the
+    /// correlated signed `ManagedReady` PXDR. Invalid or LegacyReady responses
+    /// consume no state transition; the spent action must be durably closed.
+    pub(crate) fn consume_remote_managed_ready_describe_response_with<Commit>(
+        &mut self,
+        action: ManagedServingDescribeSendActionV1,
+        transport: RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+        commit: Commit,
+    ) -> Result<VerifiedManagedServingReadyV1, ManagedFabricApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedFabricApplyControllerError>,
+    {
+        self.validate_serving_describe_action(&action)?;
+        provisioning
+            .describe()
+            .revalidate_fresh_request(previous, &action.request)?;
+        let (serving, ready) = self
+            .state
+            .serving
+            .try_accept_managed_ready_describe_response(
+                provisioning.describe(),
+                previous,
+                &transport,
+            )?;
+        if ready.ingress().request_wire() != action.request.canonical_wire() {
+            return Err(ManagedFabricApplyControllerError::ServingDescribeResponseCorrelationMismatch);
+        }
+        let mut next = self.state.clone();
+        next.sequence = next_sequence(next.sequence)?;
+        next.serving = serving;
+        commit(&next)?;
+        self.state = next;
+        Ok(ready)
+    }
+
+    /// Strictly reconstructs Ready facts from the exact durable PXCC/PXDR and
+    /// repeats all pin, signature, correlation, succession and phase checks.
+    pub(crate) fn current_remote_managed_ready_facts(
+        &self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+    ) -> Result<VerifiedManagedServingReadyV1, ManagedFabricApplyControllerError> {
+        let _ = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            self.state.legacy_snapshot.state(),
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        Ok(self
+            .state
+            .serving
+            .verified_managed_ready(provisioning.describe(), previous)?)
+    }
+
+    fn validate_serving_describe_action(
+        &self,
+        action: &ManagedServingDescribeSendActionV1,
+    ) -> Result<(), ManagedFabricApplyControllerError> {
+        let request = self
+            .state
+            .serving
+            .describe_request()
+            .ok_or(ManagedFabricApplyControllerError::InvalidStateEncoding)?;
+        if self.state.phase != ManagedFabricApplyPhaseV1::CutoverReady
+            || self.state.serving.describe_reconcile_phase()
+                != ManagedServingDescribeReconcilePhaseV1::AttemptInFlight
+            || action.state_sequence != self.state.sequence
+            || action.cutover_marker_digest != self.state.cutover_marker_digest
+            || action.request != *request
+            || action.remote_send_available
+        {
+            return Err(ManagedFabricApplyControllerError::ServingDescribeSendActionMismatch);
+        }
+        Ok(())
     }
 
     fn validate_serving_action(
@@ -2121,9 +2511,12 @@ pub(crate) enum ManagedFabricApplyControllerError {
     DurabilityRejected,
     PreparedTokenMismatch,
     PreparedServingTokenMismatch,
+    PreparedServingDescribeTokenMismatch,
     SendActionMismatch,
     ServingSendActionMismatch,
     ServingResponseCorrelationMismatch,
+    ServingDescribeSendActionMismatch,
+    ServingDescribeResponseCorrelationMismatch,
     ServingRefreshForbidden,
     OpaqueReplayForbidden,
     ReceiptCorrelationMismatch,
@@ -2215,6 +2608,7 @@ pub(crate) mod tests {
         ManagedServingBootstrapRequestIdV1, ManagedServingBootstrapResponseAuthClaimV1,
         ManagedServingBootstrapResponseDraftV1, RuntimeControlDescribeReadyFactsV1,
         RuntimeControlDescribeReadyPhaseV1, RuntimeControlDescribeReadyResponseDraftV1,
+        RuntimeControlDescribeReadyResponseV1,
     };
     use paraegox_runtime_contracts::provenance::SourceScopeRef;
     use paraegox_runtime_contracts::reference_control::{
@@ -2249,7 +2643,8 @@ pub(crate) mod tests {
     use super::{
         AGENT_STACK_STATE_VERSION, LEGACY_STATE_VERSION, MODEL_STACK_STATE_VERSION,
         ManagedFabricApplyControllerError, ManagedFabricApplyJournalV1, ManagedFabricApplyPhaseV1,
-        ManagedFabricControllerStateV1, STATE_CHECKSUM_BYTES, STATE_VERSION, state_checksum,
+        ManagedFabricControllerStateV1, ManagedServingDescribeSendActionV1,
+        REMOTE_CARRIER_STATE_VERSION, STATE_CHECKSUM_BYTES, STATE_VERSION, state_checksum,
     };
     use crate::managed_fabric_producer::{
         FreshManagedFabricApplyV1, ManagedFabricControllerIdentityV1,
@@ -2261,8 +2656,10 @@ pub(crate) mod tests {
     use crate::managed_serving_client::{
         FreshManagedServingBootstrapV1, ManagedServingBootstrapStateV1,
         ManagedServingControllerError, ManagedServingDescribeIngressV1,
-        ManagedServingDescribeVerifierV1, RuntimeManagedServingMtlsExchangeSuccessV1,
-        RuntimeManagedServingTransportErrorV1,
+        ManagedServingDescribeReconcileDecodeV1, ManagedServingDescribeReconcilePhaseV1,
+        ManagedServingDescribeVerifierV1, RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+        RuntimeManagedServingDescribeTransportErrorV1,
+        RuntimeManagedServingMtlsExchangeSuccessV1, RuntimeManagedServingTransportErrorV1,
     };
 
     const TARGET: RuntimeHostId = RuntimeHostId::from_bytes([0x31; 16]);
@@ -2766,6 +3163,53 @@ pub(crate) mod tests {
         )
     }
 
+    fn post_bootstrap_describe_response(
+        request: &paraegox_runtime_contracts::managed_serving_bootstrap::RuntimeControlCarrierRequestV1,
+        phase: RuntimeControlDescribeReadyPhaseV1,
+        snapshot_sequence: u64,
+    ) -> RuntimeControlDescribeReadyResponseV1 {
+        let snapshot = ready_snapshot();
+        let projection =
+            paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricManifestProjectionV1::
+                try_from_verified_legacy_manifest(
+                    snapshot.state().installed_manifest().verified_manifest(),
+                )
+                .expect("managed projection");
+        let serving = ManagedServingBootstrapFactsV1::try_recovered_ready(
+            TARGET,
+            RUNTIME_STORE_ID,
+            projection,
+            12,
+            snapshot_sequence,
+            ClockReading::new(
+                CLOCK_DOMAIN,
+                ClockGeneration::try_new(3).expect("Describe clock generation"),
+                MonotonicInstant::from_ticks(91 + snapshot_sequence),
+            ),
+        )
+        .expect("post-bootstrap serving facts");
+        let ready = RuntimeControlDescribeReadyFactsV1::try_new(phase, serving, channel())
+            .expect("post-bootstrap Describe facts");
+        let auth = ManagedServingBootstrapResponseAuthClaimV1::try_new(
+            channel(),
+            RUNTIME_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+        )
+        .expect("Describe response claim");
+        let draft = RuntimeControlDescribeReadyResponseDraftV1::try_new(request, ready, auth)
+            .expect("Describe response draft");
+        let signature = runtime_signer().sign(
+            draft
+                .signing_transcript()
+                .expect("Describe response transcript")
+                .as_bytes(),
+        );
+        draft
+            .finalize(&signature.to_bytes())
+            .expect("Describe response")
+    }
+
     pub(crate) fn service() -> ManagedServiceSpecV1 {
         let budgets = ManagedServiceLifecycleBudgetsV1::try_new(
             BoundedDuration::from_nanos(1_000_000_000),
@@ -2977,16 +3421,31 @@ pub(crate) mod tests {
             u32::from_be_bytes(frame[108..112].try_into().expect("carrier length")),
             0
         );
+        assert_eq!(
+            frame[112],
+            ManagedServingDescribeReconcilePhaseV1::Idle.wire_value()
+        );
+        assert_eq!(
+            u32::from_be_bytes(frame[113..117].try_into().expect("Describe request length")),
+            0
+        );
+        assert_eq!(
+            u32::from_be_bytes(frame[117..121].try_into().expect("Describe response length")),
+            0
+        );
         let mut body = frame[..frame.len() - STATE_CHECKSUM_BYTES].to_vec();
         match version {
             LEGACY_STATE_VERSION => {
-                body.drain(100..112);
+                body.drain(100..121);
             }
             AGENT_STACK_STATE_VERSION => {
-                body.drain(104..112);
+                body.drain(104..121);
             }
             MODEL_STACK_STATE_VERSION => {
-                body.drain(108..112);
+                body.drain(108..121);
+            }
+            REMOTE_CARRIER_STATE_VERSION => {
+                body.drain(112..121);
             }
             _ => panic!("unsupported downgrade fixture version"),
         }
@@ -2997,20 +3456,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pxfj_v5_roundtrips_and_strictly_reopens_v2_v3_v4_without_siblings() {
+    fn pxfj_v6_roundtrips_and_strictly_reopens_v2_through_v5_without_siblings() {
         let controller = controller_signer();
         let provisioning = provisioning();
         let journal = journal();
-        let encoded = journal.state().encode().expect("PXFJ v5 state");
+        let encoded = journal.state().encode().expect("PXFJ v6 state");
         assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), STATE_VERSION);
         let decoded = ManagedFabricControllerStateV1::decode(&encoded, &controller, &provisioning)
-            .expect("PXFJ v5 reopens");
+            .expect("PXFJ v6 reopens");
         assert_eq!(&decoded, journal.state());
 
         for version in [
             LEGACY_STATE_VERSION,
             AGENT_STACK_STATE_VERSION,
             MODEL_STACK_STATE_VERSION,
+            REMOTE_CARRIER_STATE_VERSION,
         ] {
             let legacy = downgrade_pxfj_without_siblings(&encoded, version);
             let decoded =
@@ -3021,7 +3481,7 @@ pub(crate) mod tests {
             assert_eq!(
                 u16::from_be_bytes([migrated[4], migrated[5]]),
                 STATE_VERSION,
-                "migration-on-write must emit only PXFJ v5"
+                "migration-on-write must emit only PXFJ v6"
             );
         }
     }
@@ -3151,7 +3611,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn remote_px_f_b_persists_exact_outer_px_c_c_and_accepts_one_correlated_px_f_r() {
+    async fn remote_px_f_r_terminal_durably_reconciles_one_fresh_managed_ready_describe() {
         let controller = controller_signer();
         let (remote, ingress) = remote_provisioning_and_ingress();
         let mut journal = ManagedFabricApplyJournalV1::new(
@@ -3208,7 +3668,7 @@ pub(crate) mod tests {
             outer.canonical_wire(),
             "PXFJ must retain the exact signed outer PXCC"
         );
-        let encoded = journal.state().encode().expect("PXFJ v5 encodes");
+        let encoded = journal.state().encode().expect("PXFJ v6 encodes");
         assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), STATE_VERSION);
         assert!(
             encoded
@@ -3313,10 +3773,272 @@ pub(crate) mod tests {
             crate::managed_serving_client::ManagedServingBootstrapPhaseV1::ResponseDurable
         );
         assert_eq!(journal.state().serving.carrier_request(), Some(&outer));
+
+        let describe_request_commit = RefCell::new(None);
+        let prepared_describe = journal
+            .prepare_remote_managed_ready_describe_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xb1; 16], [0xb2; 32])
+                    .expect("fresh post-PXFR Describe"),
+                |next| {
+                    *describe_request_commit.borrow_mut() = Some(next.clone());
+                    Ok(())
+                },
+            )
+            .expect("fresh Describe request durable");
+        let durable_describe = describe_request_commit
+            .into_inner()
+            .expect("Describe crossed request-durable boundary");
+        assert_eq!(
+            durable_describe.serving_describe_reconcile_phase(),
+            ManagedServingDescribeReconcilePhaseV1::RequestDurable
+        );
+        let exact_describe_request = durable_describe.serving.describe_request_wire().to_vec();
+        assert_eq!(&exact_describe_request[..4], b"PXCC");
+
+        let action = journal
+            .claim_remote_managed_ready_describe_with(
+                prepared_describe,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("Describe one-shot action");
+        assert_eq!(
+            journal.state().serving_describe_reconcile_phase(),
+            ManagedServingDescribeReconcilePhaseV1::AttemptInFlight
+        );
+        assert_eq!(action.canonical_request_bytes(), exact_describe_request);
+        let persisted_in_flight = &journal.state().serving;
+        let reopened_in_flight = ManagedServingBootstrapStateV1::decode_with_remote_reconcile(
+            persisted_in_flight.phase(),
+            persisted_in_flight.request_wire(),
+            persisted_in_flight.response_wire(),
+            persisted_in_flight.carrier_request_wire(),
+            &context,
+            Some(remote.describe()),
+            ManagedServingDescribeReconcileDecodeV1 {
+                phase: persisted_in_flight.describe_reconcile_phase(),
+                request_wire: persisted_in_flight.describe_request_wire(),
+                response_wire: persisted_in_flight.describe_response_wire(),
+                previous: Some(&ingress),
+            },
+        )
+        .expect("in-flight Describe strictly reopens without an action");
+        let mut restarted_state = journal.state().clone();
+        restarted_state.serving = reopened_in_flight;
+        let mut restarted = ManagedFabricApplyJournalV1::new(restarted_state);
+        restarted
+            .close_recovered_remote_managed_ready_describe_with(|_| Ok(()))
+            .expect("restart closes resident Describe authority");
+        assert_eq!(
+            restarted.state().serving_describe_reconcile_phase(),
+            ManagedServingDescribeReconcilePhaseV1::AttemptClosedNoResponse
+        );
+        assert_eq!(
+            restarted.prepare_remote_managed_ready_describe_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xb1; 16], [0xb2; 32])
+                    .expect("reused post-restart identity"),
+                |_| Ok(()),
+            ),
+            Err(ManagedFabricApplyControllerError::Serving(
+                ManagedServingControllerError::FreshIdentityReused
+            ))
+        );
+        restarted
+            .prepare_remote_managed_ready_describe_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xb3; 16], [0xb4; 32])
+                    .expect("fresh post-restart Describe"),
+                |_| Ok(()),
+            )
+            .expect("restart permits only explicit fresh read-only Describe");
+        let describe_response = post_bootstrap_describe_response(
+            action.request(),
+            RuntimeControlDescribeReadyPhaseV1::ManagedReady,
+            2,
+        );
+        let exact_describe_response = describe_response.canonical_wire().to_vec();
+        let wrong_peer = RuntimeManagedServingDescribeMtlsExchangeSuccessV1::try_new(
+            PrincipalRef::from_bytes([0xee; 16]),
+            remote.describe().carrier().binding_digest(),
+            exact_describe_response.clone().into_boxed_slice(),
+        )
+        .expect("well-shaped wrong Describe peer");
+        assert_eq!(
+            remote.describe().try_accept_managed_ready_describe_response(
+                &ingress,
+                action.request().clone(),
+                &wrong_peer,
+            ),
+            Err(ManagedServingControllerError::ManagedReadyDescribeTransportPinMismatch)
+        );
+        let legacy_response = post_bootstrap_describe_response(
+            action.request(),
+            RuntimeControlDescribeReadyPhaseV1::LegacyReady,
+            2,
+        );
+        let legacy_transport = RuntimeManagedServingDescribeMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            legacy_response.canonical_wire().into(),
+        )
+        .expect("authenticated LegacyReady PXDR");
+        assert_eq!(
+            remote.describe().try_accept_managed_ready_describe_response(
+                &ingress,
+                action.request().clone(),
+                &legacy_transport,
+            ),
+            Err(ManagedServingControllerError::ManagedReadyDescribeRequired)
+        );
+        let mut forged_response = exact_describe_response.clone();
+        *forged_response.last_mut().expect("PXDR signature") ^= 1;
+        let forged_transport = RuntimeManagedServingDescribeMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            forged_response.into_boxed_slice(),
+        )
+        .expect("well-shaped forged PXDR transport");
+        assert!(
+            remote
+                .describe()
+                .try_accept_managed_ready_describe_response(
+                    &ingress,
+                    action.request().clone(),
+                    &forged_transport,
+                )
+                .is_err()
+        );
+        let other_describe_request = remote
+            .describe()
+            .try_build_request(
+                Some(&ingress),
+                FreshManagedServingBootstrapV1::try_new([0xb5; 16], [0xb6; 32])
+                    .expect("other Describe identity"),
+                &controller,
+            )
+            .expect("other signed Describe");
+        let other_describe_response = post_bootstrap_describe_response(
+            &other_describe_request,
+            RuntimeControlDescribeReadyPhaseV1::ManagedReady,
+            2,
+        );
+        let wrong_correlation = RuntimeManagedServingDescribeMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            other_describe_response.canonical_wire().into(),
+        )
+        .expect("well-shaped wrong Describe correlation");
+        assert!(
+            remote
+                .describe()
+                .try_accept_managed_ready_describe_response(
+                    &ingress,
+                    action.request().clone(),
+                    &wrong_correlation,
+                )
+                .is_err()
+        );
+        let describe_transport = RuntimeManagedServingDescribeMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            exact_describe_response.clone().into_boxed_slice(),
+        )
+        .expect("authenticated Describe transport");
+        let unspent_for_consume = ManagedServingDescribeSendActionV1 {
+            state_sequence: action.state_sequence,
+            cutover_marker_digest: action.cutover_marker_digest,
+            request: action.request.clone(),
+            remote_send_available: true,
+        };
+        assert_eq!(
+            journal.consume_remote_managed_ready_describe_response_with(
+                unspent_for_consume,
+                describe_transport.clone(),
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            ),
+            Err(ManagedFabricApplyControllerError::ServingDescribeSendActionMismatch)
+        );
+        let unspent_for_close = ManagedServingDescribeSendActionV1 {
+            state_sequence: action.state_sequence,
+            cutover_marker_digest: action.cutover_marker_digest,
+            request: action.request.clone(),
+            remote_send_available: true,
+        };
+        assert_eq!(
+            journal.close_remote_managed_ready_describe_no_response_with(
+                unspent_for_close,
+                |_| Ok(()),
+            ),
+            Err(ManagedFabricApplyControllerError::ServingDescribeSendActionMismatch)
+        );
+        let outcome = action
+            .exchange_remote_once(|wire| async move {
+                assert_eq!(wire.as_ref(), exact_describe_request.as_slice());
+                Ok(describe_transport)
+            })
+            .await;
+        let (action, transport) = outcome.into_parts();
+        let ready = journal
+            .consume_remote_managed_ready_describe_response_with(
+                action,
+                transport.expect("one raw PXDR"),
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("ManagedReady PXDR durable");
+        assert_eq!(ready.request_wire(), journal.state().serving.describe_request_wire());
+        assert_eq!(ready.response_wire(), exact_describe_response);
+        assert_eq!(
+            journal.state().serving_describe_reconcile_phase(),
+            ManagedServingDescribeReconcilePhaseV1::ResponseDurable
+        );
+        assert_eq!(
+            journal
+                .current_remote_managed_ready_facts(&controller, &remote, &ingress)
+                .expect("durable Ready facts strictly revalidate"),
+            ready
+        );
+
+        let persisted = &journal.state().serving;
+        let reopened = ManagedServingBootstrapStateV1::decode_with_remote_reconcile(
+            persisted.phase(),
+            persisted.request_wire(),
+            persisted.response_wire(),
+            persisted.carrier_request_wire(),
+            &context,
+            Some(remote.describe()),
+            ManagedServingDescribeReconcileDecodeV1 {
+                phase: persisted.describe_reconcile_phase(),
+                request_wire: persisted.describe_request_wire(),
+                response_wire: persisted.describe_response_wire(),
+                previous: Some(&ingress),
+            },
+        )
+        .expect("exact PXFB/PXFR/PXCC/PXDR state reopens");
+        assert_eq!(&reopened, persisted);
+        let encoded = journal.state().encode().expect("PXFJ v6 encodes Ready facts");
+        assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), STATE_VERSION);
+        assert!(
+            encoded
+                .windows(exact_describe_response.len())
+                .any(|window| window == exact_describe_response)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn remote_uncertain_px_f_b_closes_without_replay_or_old_describe_retry() {
+    async fn remote_uncertain_px_f_b_never_replays_and_only_fresh_describe_can_reconcile() {
         let controller = controller_signer();
         let (remote, ingress) = remote_provisioning_and_ingress();
         let mut journal = ManagedFabricApplyJournalV1::new(
@@ -3435,10 +4157,135 @@ pub(crate) mod tests {
             )
         );
         assert!(journal.prepared_serving_bootstrap().is_err());
+
+        let prepared_describe = journal
+            .prepare_remote_managed_ready_describe_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xc1; 16], [0xc2; 32])
+                    .expect("fresh read-only Describe"),
+                |_| Ok(()),
+            )
+            .expect("uncertain PXFB permits only fresh Describe reconciliation");
+        let describe_action = journal
+            .claim_remote_managed_ready_describe_with(
+                prepared_describe,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("claim one read-only Describe");
+        let first_describe_wire = describe_action.canonical_request_bytes().to_vec();
+        let outcome = describe_action
+            .exchange_remote_once(|wire| async move {
+                assert_eq!(wire.as_ref(), first_describe_wire.as_slice());
+                Err(RuntimeManagedServingDescribeTransportErrorV1::Uncertain)
+            })
+            .await;
+        let (describe_action, response) = outcome.into_parts();
+        assert_eq!(
+            response,
+            Err(ManagedServingControllerError::ManagedReadyDescribeTransport(
+                RuntimeManagedServingDescribeTransportErrorV1::Uncertain
+            ))
+        );
+        let spent = describe_action
+            .exchange_remote_once(|_| async {
+                Err(RuntimeManagedServingDescribeTransportErrorV1::Rejected)
+            })
+            .await;
+        let (describe_action, response) = spent.into_parts();
+        assert_eq!(
+            response,
+            Err(ManagedServingControllerError::ManagedReadyDescribeTransportAuthoritySpent)
+        );
+        journal
+            .close_remote_managed_ready_describe_no_response_with(describe_action, |_| Ok(()))
+            .expect("uncertain Describe closes without replay");
+        assert_eq!(
+            journal.state().serving_describe_reconcile_phase(),
+            ManagedServingDescribeReconcilePhaseV1::AttemptClosedNoResponse
+        );
+        assert!(journal.prepared_remote_managed_ready_describe().is_err());
+        assert_eq!(
+            journal.prepare_remote_managed_ready_describe_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xc1; 16], [0xc2; 32])
+                    .expect("reused Describe identity"),
+                |_| Ok(()),
+            ),
+            Err(ManagedFabricApplyControllerError::Serving(
+                ManagedServingControllerError::FreshIdentityReused
+            ))
+        );
+
+        let prepared_describe = journal
+            .prepare_remote_managed_ready_describe_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xc3; 16], [0xc4; 32])
+                    .expect("second fresh Describe"),
+                |_| Ok(()),
+            )
+            .expect("explicit fresh read-only reconciliation");
+        let describe_action = journal
+            .claim_remote_managed_ready_describe_with(
+                prepared_describe,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("claim second fresh Describe");
+        let describe_response = post_bootstrap_describe_response(
+            describe_action.request(),
+            RuntimeControlDescribeReadyPhaseV1::ManagedReady,
+            2,
+        );
+        let transport = RuntimeManagedServingDescribeMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            describe_response.canonical_wire().into(),
+        )
+        .expect("authenticated ManagedReady PXDR");
+        let outcome = describe_action
+            .exchange_remote_once(|_| async { Ok(transport) })
+            .await;
+        let (describe_action, transport) = outcome.into_parts();
+        let ready = journal
+            .consume_remote_managed_ready_describe_response_with(
+                describe_action,
+                transport.expect("one PXDR"),
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("ManagedReady state is durable");
+        assert_eq!(
+            journal.state().serving_phase(),
+            crate::managed_serving_client::ManagedServingBootstrapPhaseV1::
+                AttemptClosedNoResponse,
+            "fresh Describe must not synthesize a missing PXFR"
+        );
+        assert_eq!(
+            journal.current_remote_serving_pin(&controller, &remote, &ingress),
+            Err(ManagedFabricApplyControllerError::Serving(
+                ManagedServingControllerError::ServingPinRequired
+            ))
+        );
+        assert_eq!(
+            journal
+                .current_remote_managed_ready_facts(&controller, &remote, &ingress)
+                .expect("current ManagedReady facts"),
+            ready
+        );
     }
 
     #[test]
-    fn pxfj_v5_rejects_dual_sibling_payloads() {
+    fn pxfj_v6_rejects_dual_sibling_payloads() {
         let controller = controller_signer();
         let provisioning = provisioning();
         let mut journal = journal();
@@ -3467,7 +4314,7 @@ pub(crate) mod tests {
             )
             .expect("commit active Fabric terminal");
 
-        let encoded = journal.state().encode().expect("PXFJ v5 state");
+        let encoded = journal.state().encode().expect("PXFJ v6 state");
         let mut body = encoded[..encoded.len() - STATE_CHECKSUM_BYTES].to_vec();
         body[100..104].copy_from_slice(&1_u32.to_be_bytes());
         body[104..108].copy_from_slice(&1_u32.to_be_bytes());

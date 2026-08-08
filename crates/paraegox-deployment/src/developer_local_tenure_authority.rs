@@ -381,6 +381,30 @@ impl DeveloperLocalTenureAuthorityV1 {
         &self.facts
     }
 
+    /// Polls for an already-completed service thread without waiting for it.
+    ///
+    /// `Ok(false)` means the Authority still owns its listener and store lock.
+    /// `Ok(true)` means the thread was already complete and has now been joined.
+    /// A completed thread failure is surfaced exactly once and also consumes
+    /// the join handle, so a composition owner can fail closed without an
+    /// unbounded wait in its supervision path.
+    pub fn try_poll_exit(&mut self) -> Result<bool, DeveloperLocalTenureAuthorityError> {
+        let Some(join) = self.join.as_ref() else {
+            return Ok(true);
+        };
+        if !join.is_finished() {
+            return Ok(false);
+        }
+        let join = self
+            .join
+            .take()
+            .ok_or(DeveloperLocalTenureAuthorityError::JoinFailed)?;
+        self.shutdown.take();
+        join.join()
+            .map_err(|_| DeveloperLocalTenureAuthorityError::JoinFailed)??;
+        Ok(true)
+    }
+
     /// Requests cooperative shutdown and joins the sole service thread.
     pub fn shutdown(mut self) -> Result<(), DeveloperLocalTenureAuthorityError> {
         self.shutdown_inner()
@@ -1240,8 +1264,9 @@ mod tests {
     #[test]
     fn real_wire_commits_replays_restarts_and_joins_exactly() {
         let directory = TestDirectory::create();
-        let authority = DeveloperLocalTenureAuthorityV1::start(config(&directory, None))
+        let mut authority = DeveloperLocalTenureAuthorityV1::start(config(&directory, None))
             .unwrap_or_else(|error| panic!("Authority start failed: {error}"));
+        assert_eq!(authority.try_poll_exit(), Ok(false));
         let store = authority.facts().store_instance_id();
         let prepared = prepared_request();
         let first = run_async(client(&authority).exchange(&prepared))

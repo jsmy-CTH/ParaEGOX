@@ -4272,6 +4272,199 @@ impl ControllerRemoteConnectorExchangeV1 {
     }
 }
 
+/// Cloneable exact durable exchange evidence for restart inspection. Holding
+/// these bytes grants no transport authority; a live [`ControllerStore`] claim
+/// remains the sole path that can authorize one physical send.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerRemoteConnectorResumeExchangeV1 {
+    step: ControllerRemoteConnectorStepV1,
+    phase: ControllerRemoteConnectorAttemptPhaseV1,
+    round_abandoned: bool,
+    request_wire: Box<[u8]>,
+    response_wire: Option<Box<[u8]>>,
+}
+
+#[cfg(unix)]
+impl ControllerRemoteConnectorResumeExchangeV1 {
+    pub(crate) const fn step(&self) -> ControllerRemoteConnectorStepV1 {
+        self.step
+    }
+
+    pub(crate) const fn phase(&self) -> ControllerRemoteConnectorAttemptPhaseV1 {
+        self.phase
+    }
+
+    pub(crate) const fn round_abandoned(&self) -> bool {
+        self.round_abandoned
+    }
+
+    pub(crate) fn request_wire(&self) -> &[u8] {
+        &self.request_wire
+    }
+
+    pub(crate) fn response_wire(&self) -> Option<&[u8]> {
+        self.response_wire.as_deref()
+    }
+}
+
+/// Strictly replayed partial PXJR state for one explicit restart command.
+/// Every typed fact comes from the same canonical request/response replay used
+/// to admit terminal PXJR -> PXFS cutover; no partial decoder or send token is
+/// exposed here.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerRemoteConnectorResumeProjectionV1 {
+    configuration_digest: Digest32,
+    target: RuntimeHostId,
+    successor_store_instance_id: [u8; 32],
+    authority_store_instance_id: [u8; 32],
+    exchanges: Box<[ControllerRemoteConnectorResumeExchangeV1]>,
+    next_request_step: Option<ControllerRemoteConnectorStepV1>,
+    restart_requirement: ControllerRemoteConnectorRestartRequirementV1,
+    node_target: Option<NodeManagementTargetV1>,
+    runtime_describe_request: Option<RuntimeControlCarrierRequestV1>,
+    runtime_describe_response: Option<RuntimeControlDescribeReadyResponseV1>,
+    runtime_describe_facts: Option<RuntimeControlDescribeReadyFactsV1>,
+    challenge: Option<NodeControlObservationChallengeV1>,
+    query_request: Option<ReferenceQueryRequestV1>,
+    query_response: Option<ReferenceQueryResponseV1>,
+    observation_request: Option<RuntimeObservationRequestV1>,
+    observation_ack: Option<RuntimeObservationAckV1>,
+    latest_response: Option<NodeManagementResponseV1>,
+}
+
+#[cfg(unix)]
+impl ControllerRemoteConnectorResumeProjectionV1 {
+    pub(crate) const fn configuration_digest(&self) -> Digest32 {
+        self.configuration_digest
+    }
+
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    pub(crate) const fn successor_store_instance_id(&self) -> [u8; 32] {
+        self.successor_store_instance_id
+    }
+
+    pub(crate) const fn authority_store_instance_id(&self) -> [u8; 32] {
+        self.authority_store_instance_id
+    }
+
+    pub(crate) fn exchanges(&self) -> &[ControllerRemoteConnectorResumeExchangeV1] {
+        &self.exchanges
+    }
+
+    pub(crate) fn current_exchange(&self) -> Option<&ControllerRemoteConnectorResumeExchangeV1> {
+        self.exchanges.last()
+    }
+
+    pub(crate) const fn next_request_step(&self) -> Option<ControllerRemoteConnectorStepV1> {
+        self.next_request_step
+    }
+
+    pub(crate) const fn restart_requirement(
+        &self,
+    ) -> ControllerRemoteConnectorRestartRequirementV1 {
+        self.restart_requirement
+    }
+
+    pub(crate) const fn node_target(&self) -> Option<NodeManagementTargetV1> {
+        self.node_target
+    }
+
+    pub(crate) const fn runtime_describe_request(
+        &self,
+    ) -> Option<&RuntimeControlCarrierRequestV1> {
+        self.runtime_describe_request.as_ref()
+    }
+
+    pub(crate) const fn runtime_describe_response(
+        &self,
+    ) -> Option<&RuntimeControlDescribeReadyResponseV1> {
+        self.runtime_describe_response.as_ref()
+    }
+
+    pub(crate) const fn runtime_describe_facts(
+        &self,
+    ) -> Option<&RuntimeControlDescribeReadyFactsV1> {
+        self.runtime_describe_facts.as_ref()
+    }
+
+    pub(crate) const fn challenge(&self) -> Option<NodeControlObservationChallengeV1> {
+        self.challenge
+    }
+
+    pub(crate) const fn query_request(&self) -> Option<&ReferenceQueryRequestV1> {
+        self.query_request.as_ref()
+    }
+
+    pub(crate) const fn query_response(&self) -> Option<&ReferenceQueryResponseV1> {
+        self.query_response.as_ref()
+    }
+
+    pub(crate) const fn observation_request(&self) -> Option<&RuntimeObservationRequestV1> {
+        self.observation_request.as_ref()
+    }
+
+    pub(crate) const fn observation_ack(&self) -> Option<&RuntimeObservationAckV1> {
+        self.observation_ack.as_ref()
+    }
+
+    pub(crate) const fn latest_response(&self) -> Option<&NodeManagementResponseV1> {
+        self.latest_response.as_ref()
+    }
+
+    fn into_cutover_ready_facts(
+        self,
+    ) -> Result<Option<ControllerRemoteConnectorCutoverReadyFactsV1>, ControllerJournalError> {
+        if self.current_exchange().is_none_or(|exchange| {
+            exchange.step != ControllerRemoteConnectorStepV1::NodeLatest
+                || exchange.phase != ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable
+                || exchange.round_abandoned
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(ControllerRemoteConnectorCutoverReadyFactsV1 {
+            configuration_digest: self.configuration_digest,
+            target: self.target,
+            successor_store_instance_id: self.successor_store_instance_id,
+            authority_store_instance_id: self.authority_store_instance_id,
+            node_target: self
+                .node_target
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            runtime_describe_request: self
+                .runtime_describe_request
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            runtime_describe_response: self
+                .runtime_describe_response
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            runtime_describe_facts: self
+                .runtime_describe_facts
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            challenge: self
+                .challenge
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            query_request: self
+                .query_request
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            query_response: self
+                .query_response
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            observation_request: self
+                .observation_request
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            observation_ack: self
+                .observation_ack
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+            latest_response: self
+                .latest_response
+                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
+        }))
+    }
+}
+
 /// Cloneable, transport-authority-free terminal evidence for PXJR -> PXFS.
 /// Every nested value was reconstructed from the exact durable bytes.
 #[cfg(unix)]
@@ -4665,9 +4858,9 @@ impl ControllerRemoteConnectorStateV1 {
         self.validate()
     }
 
-    fn validated_cutover_facts(
+    fn validated_resume_projection(
         &self,
-    ) -> Result<Option<ControllerRemoteConnectorCutoverReadyFactsV1>, ControllerJournalError> {
+    ) -> Result<ControllerRemoteConnectorResumeProjectionV1, ControllerJournalError> {
         if bytes_are_zero(self.configuration_digest.as_bytes())
             || bytes_are_zero(self.target.as_bytes())
             || self.successor_store_instance_id == [0; 32]
@@ -4990,36 +5183,43 @@ impl ControllerRemoteConnectorStateV1 {
             }
         }
 
-        if self.exchanges.last().is_none_or(|exchange| {
-            exchange.step != ControllerRemoteConnectorStepV1::NodeLatest
-                || exchange.phase != ControllerRemoteConnectorAttemptPhaseV1::ResponseDurable
-        }) {
-            return Ok(None);
-        }
-        Ok(Some(ControllerRemoteConnectorCutoverReadyFactsV1 {
+        Ok(ControllerRemoteConnectorResumeProjectionV1 {
             configuration_digest: self.configuration_digest,
             target: self.target,
             successor_store_instance_id: self.successor_store_instance_id,
             authority_store_instance_id: self.authority_store_instance_id,
-            node_target: node_target.ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-            runtime_describe_request: runtime_describe_request
-                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-            runtime_describe_response: runtime_describe_response
-                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-            runtime_describe_facts: runtime_describe_facts
-                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-            challenge: challenge.ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-            query_request: query_request
-                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-            query_response: query_response
-                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-            observation_request: observation_request
-                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-            observation_ack: observation_ack
-                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-            latest_response: latest_response
-                .ok_or(ControllerJournalError::InvalidRemoteConnectorState)?,
-        }))
+            exchanges: self
+                .exchanges
+                .iter()
+                .map(|exchange| ControllerRemoteConnectorResumeExchangeV1 {
+                    step: exchange.step,
+                    phase: exchange.phase,
+                    round_abandoned: exchange.round_abandoned,
+                    request_wire: exchange.request_wire.clone(),
+                    response_wire: exchange.response_wire.clone(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            next_request_step: self.next_request_step(),
+            restart_requirement: self.restart_requirement(),
+            node_target,
+            runtime_describe_request,
+            runtime_describe_response,
+            runtime_describe_facts,
+            challenge,
+            query_request,
+            query_response,
+            observation_request,
+            observation_ack,
+            latest_response,
+        })
+    }
+
+    fn validated_cutover_facts(
+        &self,
+    ) -> Result<Option<ControllerRemoteConnectorCutoverReadyFactsV1>, ControllerJournalError> {
+        self.validated_resume_projection()?
+            .into_cutover_ready_facts()
     }
 
     fn encode_body(&self) -> Result<Box<[u8]>, ControllerJournalError> {
@@ -5791,6 +5991,19 @@ impl ControllerJournalSnapshot {
             .map(ControllerRemoteConnectorStateV1::validated_cutover_facts)
             .transpose()
             .map(Option::flatten)
+    }
+
+    /// Replays the exact durable PXJR extension into a transport-authority-free
+    /// partial projection. `None` means no remote connector extension exists;
+    /// `Some` with no exchanges means its immutable identity is initialized.
+    #[cfg(unix)]
+    pub(crate) fn remote_connector_resume_projection(
+        &self,
+    ) -> Result<Option<ControllerRemoteConnectorResumeProjectionV1>, ControllerJournalError> {
+        self.remote_connector
+            .as_ref()
+            .map(ControllerRemoteConnectorStateV1::validated_resume_projection)
+            .transpose()
     }
 
     #[cfg(unix)]
@@ -11635,10 +11848,31 @@ pub(crate) mod tests {
         for frozen in [b"PXRC", b"PXDE", b"PXDN", b"PXFS"] {
             assert_ne!(super::REMOTE_CONNECTOR_EXTENSION_MAGIC, frozen);
         }
-        let initialized = initial_snapshot()
+        let base = initial_snapshot();
+        assert_eq!(base.remote_connector_resume_projection(), Ok(None));
+        let initialized = base
             .try_initialize_remote_connector(digest(0xa1), TARGET, [0xa2; 32], [0xa3; 32])
             .expect("remote connector identity must initialize");
         assert_eq!(initialized.remote_connector_cutover_ready_facts(), Ok(None));
+        let initialized_projection = initialized
+            .remote_connector_resume_projection()
+            .expect("initialized projection must validate")
+            .expect("remote extension must exist");
+        assert_eq!(initialized_projection.configuration_digest(), digest(0xa1));
+        assert_eq!(initialized_projection.target(), TARGET);
+        assert_eq!(initialized_projection.successor_store_instance_id(), [0xa2; 32]);
+        assert_eq!(initialized_projection.authority_store_instance_id(), [0xa3; 32]);
+        assert!(initialized_projection.exchanges().is_empty());
+        assert_eq!(
+            initialized_projection.next_request_step(),
+            Some(ControllerRemoteConnectorStepV1::NodeDescribe)
+        );
+        assert_eq!(
+            initialized_projection.restart_requirement(),
+            ControllerRemoteConnectorRestartRequirementV1::None
+        );
+        assert_eq!(initialized_projection.node_target(), None);
+        assert_eq!(initialized_projection.runtime_describe_request(), None);
         assert_eq!(
             initialized.try_distributed_agent_stack_successor(&[], &[]),
             Err(ControllerJournalError::RemoteConnectorMutualExclusion)
@@ -11659,6 +11893,21 @@ pub(crate) mod tests {
                 first_wire.as_ref(),
             ))
         );
+        let prepared_projection = prepared
+            .remote_connector_resume_projection()
+            .expect("prepared projection must validate")
+            .expect("remote extension must exist");
+        let prepared_exchange = prepared_projection
+            .current_exchange()
+            .expect("prepared exchange must exist");
+        assert_eq!(prepared_exchange.step(), ControllerRemoteConnectorStepV1::NodeDescribe);
+        assert_eq!(
+            prepared_exchange.phase(),
+            ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
+        );
+        assert!(!prepared_exchange.round_abandoned());
+        assert_eq!(prepared_exchange.request_wire(), first_wire.as_ref());
+        assert_eq!(prepared_exchange.response_wire(), None);
         let encoded = prepared.encode().expect("v9 PXCR snapshot");
         assert_eq!(&encoded[8..10], &9_u16.to_be_bytes());
         assert_eq!(
@@ -11684,6 +11933,23 @@ pub(crate) mod tests {
                 ControllerRemoteConnectorStepV1::NodeDescribe
             )
         );
+        let restarted_projection = restarted
+            .remote_connector_resume_projection()
+            .expect("restarted projection must validate")
+            .expect("remote extension must exist");
+        assert_eq!(
+            restarted_projection.restart_requirement(),
+            ControllerRemoteConnectorRestartRequirementV1::RecoverInFlight(
+                ControllerRemoteConnectorStepV1::NodeDescribe
+            )
+        );
+        assert_eq!(
+            restarted_projection
+                .current_exchange()
+                .expect("in-flight exchange")
+                .phase(),
+            ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+        );
         assert_eq!(
             restarted
                 .try_claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeDescribe),
@@ -11707,6 +11973,19 @@ pub(crate) mod tests {
                 ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent,
                 second_wire.as_ref(),
             ))
+        );
+        let fresh_projection = fresh
+            .remote_connector_resume_projection()
+            .expect("fresh projection must validate")
+            .expect("remote extension must exist");
+        assert_eq!(fresh_projection.exchanges().len(), 2);
+        assert_eq!(
+            fresh_projection.exchanges()[0].phase(),
+            ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+        );
+        assert_eq!(
+            fresh_projection.exchanges()[1].request_wire(),
+            second_wire.as_ref()
         );
     }
 
@@ -11779,6 +12058,33 @@ pub(crate) mod tests {
             reset.next_request_step(),
             Some(ControllerRemoteConnectorStepV1::NodeDescribe),
             "expiry resets Node target plus Runtime epoch/channel discovery, not only challenge"
+        );
+        assert_eq!(
+            reset.validated_resume_projection(),
+            Err(ControllerJournalError::InvalidRemoteConnectorState),
+            "an abandoned round is admitted only by the same complete strict replay as cutover"
+        );
+
+        let mut tampered_request = remote_node_describe_wire(0xf1).into_vec();
+        tampered_request[0] ^= 1;
+        let tampered_state = ControllerRemoteConnectorStateV1 {
+            configuration_digest: digest(0xf2),
+            target: TARGET,
+            successor_store_instance_id: [0xf3; 32],
+            authority_store_instance_id: [0xf4; 32],
+            exchanges: vec![ControllerRemoteConnectorExchangeV1 {
+                step: ControllerRemoteConnectorStepV1::NodeDescribe,
+                phase: ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent,
+                round_abandoned: false,
+                request_wire: tampered_request.into_boxed_slice(),
+                response_wire: None,
+            }]
+            .into_boxed_slice(),
+        };
+        assert_eq!(
+            tampered_state.validated_resume_projection(),
+            Err(ControllerJournalError::InvalidRemoteConnectorState),
+            "projection must not expose exact wires until canonical replay validates"
         );
     }
 

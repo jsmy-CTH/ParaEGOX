@@ -35,8 +35,8 @@ use crate::controller_journal::{
     ControllerJournalPayloadV7Migration, ControllerJournalPayloadV8Migration,
     ControllerJournalSnapshot, ControllerOwnerIdentityFingerprint,
     ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorCutoverReadyFactsV1,
-    ControllerRemoteConnectorRestartRequirementV1, ControllerRemoteConnectorStepV1,
-    MAX_CONTROLLER_SNAPSHOT_BYTES,
+    ControllerRemoteConnectorRestartRequirementV1, ControllerRemoteConnectorResumeProjectionV1,
+    ControllerRemoteConnectorStepV1, MAX_CONTROLLER_SNAPSHOT_BYTES,
 };
 use crate::distributed_agent_stack_apply::{
     DistributedAgentStackApplyError, DistributedAgentStackApplyJournalV1,
@@ -1214,6 +1214,16 @@ impl ControllerStore {
         Ok(self
             .revalidate_current()?
             .remote_connector_restart_requirement())
+    }
+
+    /// Re-reads the active path while retaining the sole writer lock, then
+    /// returns only strictly replayed, transport-authority-free restart facts.
+    pub(crate) fn revalidate_remote_connector_resume_projection(
+        &mut self,
+    ) -> Result<Option<ControllerRemoteConnectorResumeProjectionV1>, ControllerStoreError> {
+        self.revalidate_current()?
+            .remote_connector_resume_projection()
+            .map_err(ControllerStoreError::Codec)
     }
 
     /// Returns terminal facts only after re-reading the active path while this
@@ -5019,6 +5029,12 @@ mod tests {
         let first = remote_node_describe_wire(0xb1);
         {
             let mut store = open_fixture(&directory);
+            assert_eq!(
+                store
+                    .revalidate_remote_connector_resume_projection()
+                    .expect("absent projection must validate"),
+                None
+            );
             store
                 .initialize_remote_connector(
                     digest(0xa1),
@@ -5027,6 +5043,15 @@ mod tests {
                     [0xa3; 32],
                 )
                 .expect("remote connector identity must become durable");
+            let initialized = store
+                .revalidate_remote_connector_resume_projection()
+                .expect("initialized projection must validate")
+                .expect("remote extension must exist");
+            assert!(initialized.exchanges().is_empty());
+            assert_eq!(
+                initialized.next_request_step(),
+                Some(ControllerRemoteConnectorStepV1::NodeDescribe)
+            );
             store
                 .prepare_remote_connector_request(
                     ControllerRemoteConnectorStepV1::NodeDescribe,
@@ -5041,6 +5066,18 @@ mod tests {
                     first.as_ref(),
                 ))
             );
+            let prepared = store
+                .revalidate_remote_connector_resume_projection()
+                .expect("prepared projection must validate")
+                .expect("remote extension must exist");
+            assert_eq!(prepared.exchanges().len(), 1);
+            assert_eq!(
+                prepared
+                    .current_exchange()
+                    .expect("prepared exchange")
+                    .request_wire(),
+                first.as_ref()
+            );
             let claim = store
                 .claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeDescribe)
                 .expect("atomic claim");
@@ -5054,9 +5091,30 @@ mod tests {
                     first.as_ref(),
                 ))
             );
+            let in_flight = store
+                .revalidate_remote_connector_resume_projection()
+                .expect("in-flight projection must validate")
+                .expect("remote extension must exist");
+            assert_eq!(
+                in_flight
+                    .current_exchange()
+                    .expect("in-flight exchange")
+                    .phase(),
+                ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+            );
         }
 
         let mut restarted = open_fixture(&directory);
+        let reopened = restarted
+            .revalidate_remote_connector_resume_projection()
+            .expect("reopened projection must validate")
+            .expect("remote extension must exist");
+        assert_eq!(
+            reopened.restart_requirement(),
+            ControllerRemoteConnectorRestartRequirementV1::RecoverInFlight(
+                ControllerRemoteConnectorStepV1::NodeDescribe
+            )
+        );
         assert_eq!(
             restarted
                 .remote_connector_restart_requirement()

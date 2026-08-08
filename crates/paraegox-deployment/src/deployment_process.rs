@@ -116,6 +116,16 @@ pub fn run_deploymentd_process() -> Result<(), DeploymentdProcessError> {
 }
 
 #[cfg(unix)]
+pub use platform::{
+    DeveloperDeploymentEnrollmentFactsFieldsV1, DeveloperDeploymentEnrollmentFactsV1,
+    DeveloperDeploymentErrorV1,
+    DeveloperDeploymentOwnerV1, DeveloperDeploymentStartFieldsV1,
+    DeveloperDeploymentStartInputV1, DeveloperDeploymentStartModeV1,
+    DeveloperDeploymentReadyV1, DeveloperDeploymentStartOutcomeV1,
+    start_developer_deployment_v1,
+};
+
+#[cfg(unix)]
 pub(crate) use platform::{
     DistributedAgentStackOwnerApplyErrorV1, DistributedAgentStackOwnerApplyOutcomeV1,
     DistributedAgentStackOwnerConnectorInputV1, DistributedAgentStackOwnerNodeInputFieldsV1,
@@ -137,6 +147,7 @@ mod platform {
 
 #[cfg(unix)]
 mod platform {
+    use core::fmt;
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, File, Metadata};
     use std::io::{Read, Write};
@@ -149,12 +160,17 @@ mod platform {
     use nix::fcntl::{OFlag, open};
     use nix::sys::stat::Mode;
     use nix::unistd::{getegid, geteuid};
-    use paraegox_fabric::ResolvedRemoteMtlsIdentityFiles;
+    use paraegox_fabric::{
+        ResolvedRemoteMtlsIdentityFiles, RestrictedNodeControlClientConfigV1,
+        RestrictedNodeControlClientV1, RestrictedRuntimeControlClientConfigV1,
+        RestrictedRuntimeControlClientV1,
+    };
     use paraegox_kernel::digest::{Digest32, Digest32Builder};
     use paraegox_kernel::identity::PrincipalRef;
     use paraegox_kernel::time::BoundedDuration;
     use paraegox_runtime_contracts::apply::{
-        PlanWriterRef, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm, TenureProofAuthority,
+        ApplyOperationId, PlanWriterRef, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm,
+        TenureProofAuthority,
     };
     use paraegox_runtime_contracts::assignment::BindingId;
     use paraegox_runtime_contracts::distributed_agent_stack_plan::{
@@ -164,7 +180,10 @@ mod platform {
         RestrictedRuntimeApplyCarrierBindingFieldsV1, RestrictedRuntimeApplyCarrierBindingV1,
         RestrictedRuntimeApplyTransportProfileV1,
     };
-    use paraegox_runtime_contracts::installation::MAX_INSTALLED_RUNTIME_MANIFEST_BYTES;
+    use paraegox_runtime_contracts::installation::{
+        MAX_INSTALLED_RUNTIME_MANIFEST_BYTES, VerifiedRuntimeManifestIngressV1,
+    };
+    use paraegox_runtime_contracts::provenance::SourceScopeRef;
     use paraegox_runtime_contracts::managed_agent_stack_plan::{
         ManagedAgentIngressLimitsV1, ManagedAgentPortPlanV1, ManagedAgentProviderRefV1,
         ManagedAgentProviderSelectionV1, ManagedAgentSecretRefV1, ManagedAgentSemanticLimitsV1,
@@ -177,8 +196,10 @@ mod platform {
         MAX_REFERENCE_QUERY_RESPONSE_BYTES, ReferenceAdmissionPolicyInputV1,
         ReferenceApplyTerminalHeadV1, ReferenceApplyTerminalLifecycleEffectV1,
         ReferenceApplyTerminalOutcomeV1, ReferenceBootstrapChannelPolicyInputV1,
-        ReferenceBootstrapResponseV1, ReferenceQueryIdV1, ReferenceQueryRequestDraftV1,
-        ReferenceQuerySelectorV1, ValidatedReferenceLifecycleBudgetsV1,
+        ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1, ReferenceQueryIdV1,
+        ReferenceQueryRequestDraftV1, ReferenceQueryRequestV1, ReferenceQueryResponseV1,
+        ReferenceQuerySelectorV1,
+        ValidatedReferenceLifecycleBudgetsV1,
         ed25519_control_key_fingerprint, reference_admission_policy_fingerprint_v1,
         reference_bootstrap_channel_policy_fingerprint_v1,
     };
@@ -198,18 +219,22 @@ mod platform {
         FreshControllerBootstrapRequestV1, bootstrap_runtime_v1,
     };
     use crate::controller_initializer::{
-        ControllerInitializationInput, ControllerInitializationReceipt, initialize_controller_store,
+        ControllerInitializationInput, ControllerInitializationReceipt,
+        initialize_controller_store, initialize_controller_store_developer_local,
     };
     use crate::controller_journal::{
         ControllerAuthKeyFingerprint, ControllerJournalError, ControllerJournalSnapshot,
-        ControllerOperationId, ControllerOwnerIdentityFingerprint, ControllerRequestAuthPin,
+        ControllerOperationId, ControllerOwnerIdentityFingerprint,
+        ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorRestartRequirementV1,
+        ControllerRemoteConnectorStepV1, ControllerRequestAuthPin,
         ControllerTenureAuthorityDomainFingerprint, ControllerTenureTransaction,
     };
     use crate::controller_query::ControllerQueryProvisioningV1;
     use crate::controller_reconcile::{ControllerReconcileOutcomeV1, reconcile_reference_once_v1};
     use crate::controller_store::ControllerStoreOpenError;
     use crate::controller_store::{
-        ControllerDistributedAgentStackOwnerStateV1, ControllerStore,
+        ClaimedControllerRemoteConnectorAttemptV1, ControllerDistributedAgentStackOwnerStateV1,
+        ControllerStore,
         ControllerStoreMigrationDisposition, DistributedRuntimeObservationCommitDispositionV1,
     };
     use crate::controller_tenure::{ControllerAcquiredTenure, acquire_tenure_once};
@@ -222,9 +247,12 @@ mod platform {
     use crate::distributed_agent_stack_node_reconcile::{
         DistributedAgentStackNodeDiscoveryStateV1, DistributedAgentStackNodeTargetV1,
         DistributedAgentStackRuntimeQueryInputV1, DistributedAgentStackRuntimeQueryPhaseV1,
-        NodeObservationProcessGenerationV1, ReadyDistributedAgentStackRuntimeEndpointV1,
-        TransportAuthenticatedNodeResponseV1, TrustedLocalNodeClientErrorV1,
-        TrustedLocalNodeEndpointV1, TrustedLocalRuntimeObservationEndpointV1,
+        FreshRemoteNodeControlRequestV1, NodeObservationProcessGenerationV1,
+        ReadyDistributedAgentStackRuntimeEndpointV1, RemoteNodeControlAdapterV1,
+        RemoteNodeControlTransportErrorV1, RemoteNodeControlTransportPinV1,
+        RemoteNodeMtlsExchangeSuccessV1, TransportAuthenticatedNodeResponseV1,
+        TrustedLocalNodeClientErrorV1, TrustedLocalNodeEndpointV1,
+        TrustedLocalRuntimeObservationEndpointV1,
     };
     use crate::distributed_agent_stack_producer::{
         DistributedAgentStackRolloutIdV1, DistributedAgentStackTargetRolloutInputV1,
@@ -245,14 +273,21 @@ mod platform {
     };
     use crate::managed_fabric_producer::{
         ManagedFabricControllerIdentityV1, ManagedFabricControllerProvisioningV1,
-        ManagedFabricRuntimeChannelPinV1, ManagedFabricServiceAccountsV1,
-        ManagedFabricTenureAuthorityPinV1, VerifiedManagedFabricProducerContextV1,
+        ManagedFabricRemoteControllerProvisioningV1, ManagedFabricRuntimeChannelPinV1,
+        ManagedFabricServiceAccountsV1, ManagedFabricTenureAuthorityPinV1,
+        VerifiedManagedFabricProducerContextV1,
     };
     use crate::managed_fabric_store::{
         ManagedAgentStackDurableStoreV1, ManagedFabricSuccessorStoreV1,
     };
     use crate::managed_serving_client::{
-        FreshManagedServingBootstrapV1, ManagedServingBootstrapPhaseV1, VerifiedManagedServingPinV1,
+        FreshManagedServingBootstrapV1, ManagedServingBootstrapPhaseV1,
+        ManagedServingDescribeIngressV1, ManagedServingDescribeReconcilePhaseV1,
+        ManagedServingDescribeVerifierV1,
+        RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+        RuntimeManagedServingDescribeTransportErrorV1,
+        RuntimeManagedServingMtlsExchangeSuccessV1, RuntimeManagedServingTransportErrorV1,
+        VerifiedManagedServingPinV1,
     };
     use crate::manifest_ingress::ControllerInstalledManifestPin;
     use crate::plan::{DeploymentId, DeploymentScopeId, DeploymentWriterRef};
@@ -264,9 +299,10 @@ mod platform {
     use crate::runtime_control_client::{
         RuntimeApplyResponseVerifier, RuntimeControlSocketAcl,
         RuntimeManagedAgentStackResponseVerifier, RuntimeManagedServingResponseVerifier,
-        RuntimeQueryExchangeError, RuntimeQueryResponseVerifier, RuntimeUnixCredentials,
-        UnixRuntimeApplyClient, UnixRuntimeControlEndpoint, UnixRuntimeManagedAgentStackClient,
-        UnixRuntimeManagedServingClient, UnixRuntimeQueryClient,
+        PreparedRuntimeQueryRequest, RuntimeQueryExchangeError, RuntimeQueryResponseVerifier,
+        RuntimeUnixCredentials, UnixRuntimeApplyClient, UnixRuntimeControlEndpoint,
+        UnixRuntimeManagedAgentStackClient, UnixRuntimeManagedServingClient,
+        UnixRuntimeQueryClient,
     };
     use crate::tenure_client::{
         AcquireTenureRequestToSign, AuthorityProofVerifier, AuthoritySocketAcl,
@@ -281,14 +317,21 @@ mod platform {
     };
     use paraegox_node::observation::{
         MAX_RUNTIME_OBSERVATION_CHALLENGE_NANOS, RuntimeObservationAuthorityV1,
-        RuntimeObservationEndpointRefV1, derive_runtime_observation_query_nonce_v1,
+        RuntimeObservationEndpointRefV1, RuntimeObservationRequestInputV1,
+        RuntimeObservationRequestV1, derive_runtime_observation_query_nonce_v1,
     };
     use paraegox_node::protocol::{
         NodeControlObservationChallengeFieldsV1, NodeControlObservationChallengeV1,
         NodeManagementRequestV1, NodeManagementTargetV1,
     };
     use paraegox_node::{
-        MAX_NODE_STATUS_FRESHNESS_NANOS, NodeId, NodeIncarnation, NodeManagementEndpointRefV1,
+        MAX_NODE_STATUS_FRESHNESS_NANOS, NodeId, NodeIncarnation,
+        NodeManagementEndpointRefV1, RuntimeApplyEndpointDescriptorV1,
+        RuntimeApplyEndpointRefV1,
+    };
+
+    use crate::developer_local_tenure_authority::{
+        DeveloperLocalTenureAuthorityConfigV1, DeveloperLocalTenureAuthorityV1,
     };
 
     use super::{DeploymentdProcessError, ProcessErrorKind};
@@ -338,6 +381,1794 @@ mod platform {
         b"paraegox.deployment.distributed-local-node-carrier.sha256.v1";
     const DISTRIBUTED_OWNER_ANCHOR_DOMAIN: &[u8] =
         b"paraegox.deployment.distributed-agent-stack.owner-anchor.sha256.v1";
+    const DEVELOPER_DEPLOYMENT_PLAN_DOMAIN: &[u8] =
+        b"paraegox.deployment.developer-enrollment.plan.sha256.v1";
+    const DEVELOPER_DEPLOYMENT_MANAGED_READY_DOMAIN: &[u8] =
+        b"paraegox.deployment.developer-managed-ready.sha256.v1";
+
+    /// Typed projection of one already SHA-pinned, decoded, signature-verified
+    /// and cross-pinned PXEA. Deployment never receives the PXEA file bytes.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct DeveloperDeploymentEnrollmentFactsV1 {
+        configuration_digest: Digest32,
+        verified_manifest: VerifiedRuntimeManifestIngressV1,
+        runtime_transport_profile_ref: [u8; 16],
+        runtime_transport_profile: RestrictedRuntimeApplyTransportProfileV1,
+        runtime_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        runtime_response_public_key: [u8; 32],
+        expected_node_target: NodeManagementTargetV1,
+        expected_node_principal: PrincipalRef,
+        node_route: Box<str>,
+        node_route_config_digest: Digest32,
+        observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+        source_scope: SourceScopeRef,
+        writer: PlanWriterRef,
+        authority_principal: PrincipalRef,
+        authority_ref: TenureAuthorityRef,
+        authority_key_ref: TenureKeyRef,
+        authority_verification_key: [u8; 32],
+    }
+
+    /// Named public facts copied only from a verified PXEA token. This bundle
+    /// keeps field provenance reviewable without a positional constructor.
+    pub struct DeveloperDeploymentEnrollmentFactsFieldsV1 {
+        pub configuration_digest: Digest32,
+        pub verified_manifest: VerifiedRuntimeManifestIngressV1,
+        pub runtime_transport_profile_ref: [u8; 16],
+        pub runtime_transport_profile: RestrictedRuntimeApplyTransportProfileV1,
+        pub runtime_carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        pub runtime_response_public_key: [u8; 32],
+        pub expected_node_target: NodeManagementTargetV1,
+        pub expected_node_principal: PrincipalRef,
+        pub node_route: String,
+        pub node_route_config_digest: Digest32,
+        pub observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+        pub source_scope: SourceScopeRef,
+        pub writer: PlanWriterRef,
+        pub authority_principal: PrincipalRef,
+        pub authority_ref: TenureAuthorityRef,
+        pub authority_key_ref: TenureKeyRef,
+        pub authority_verification_key: [u8; 32],
+    }
+
+    impl DeveloperDeploymentEnrollmentFactsV1 {
+        pub fn try_new(
+            fields: DeveloperDeploymentEnrollmentFactsFieldsV1,
+        ) -> Result<Self, DeveloperDeploymentErrorV1> {
+            let DeveloperDeploymentEnrollmentFactsFieldsV1 {
+                configuration_digest,
+                verified_manifest,
+                runtime_transport_profile_ref,
+                runtime_transport_profile,
+                runtime_carrier,
+                runtime_response_public_key,
+                expected_node_target,
+                expected_node_principal,
+                node_route,
+                node_route_config_digest,
+                observation_endpoint_ref,
+                source_scope,
+                writer,
+                authority_principal,
+                authority_ref,
+                authority_key_ref,
+                authority_verification_key,
+            } = fields;
+            let runtime_response_key = VerifyingKey::from_bytes(&runtime_response_public_key)
+                .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+            let authority_key = VerifyingKey::from_bytes(&authority_verification_key)
+                .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+            if configuration_digest.as_bytes().iter().all(|byte| *byte == 0)
+                || runtime_transport_profile_ref.iter().all(|byte| *byte == 0)
+                || verified_manifest.target() != runtime_transport_profile.target()
+                || verified_manifest.target() != runtime_carrier.target()
+                || runtime_transport_profile
+                    .validate_carrier_binding(runtime_transport_profile_ref, &runtime_carrier)
+                    .is_err()
+                || expected_node_principal.as_bytes().iter().all(|byte| *byte == 0)
+                || node_route.is_empty()
+                || node_route_config_digest
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| *byte == 0)
+                || source_scope.as_bytes().iter().all(|byte| *byte == 0)
+                || writer.as_bytes().iter().all(|byte| *byte == 0)
+                || authority_principal.as_bytes().iter().all(|byte| *byte == 0)
+                || authority_ref.as_bytes().iter().all(|byte| *byte == 0)
+                || authority_key_ref.as_bytes().iter().all(|byte| *byte == 0)
+                || runtime_response_key.is_weak()
+                || authority_key.is_weak()
+            {
+                return Err(DeveloperDeploymentErrorV1::InvalidEnrollmentFacts);
+            }
+            Ok(Self {
+                configuration_digest,
+                verified_manifest,
+                runtime_transport_profile_ref,
+                runtime_transport_profile,
+                runtime_carrier,
+                runtime_response_public_key,
+                expected_node_target,
+                expected_node_principal,
+                node_route: node_route.into_boxed_str(),
+                node_route_config_digest,
+                observation_endpoint_ref,
+                source_scope,
+                writer,
+                authority_principal,
+                authority_ref,
+                authority_key_ref,
+                authority_verification_key,
+            })
+        }
+    }
+
+    /// Complete secret-bearing start request. Seeds remain zeroizing until
+    /// their respective Controller and Authority signing owners consume them.
+    pub struct DeveloperDeploymentStartInputV1 {
+        mode: DeveloperDeploymentStartModeV1,
+        controller_store_directory: PathBuf,
+        successor_store_directory: PathBuf,
+        enrollment: DeveloperDeploymentEnrollmentFactsV1,
+        controller_seed: Zeroizing<[u8; 32]>,
+        authority: DeveloperLocalTenureAuthorityConfigV1,
+        runtime_client: RestrictedRuntimeControlClientConfigV1,
+        node_client: RestrictedNodeControlClientConfigV1,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum DeveloperDeploymentStartModeV1 {
+        Fresh,
+        Resume,
+    }
+
+    pub struct DeveloperDeploymentStartFieldsV1 {
+        pub mode: DeveloperDeploymentStartModeV1,
+        pub controller_store_directory: PathBuf,
+        pub successor_store_directory: PathBuf,
+        pub enrollment: DeveloperDeploymentEnrollmentFactsV1,
+        pub controller_seed: Zeroizing<[u8; 32]>,
+        pub authority: DeveloperLocalTenureAuthorityConfigV1,
+        pub runtime_client: RestrictedRuntimeControlClientConfigV1,
+        pub node_client: RestrictedNodeControlClientConfigV1,
+    }
+
+    impl fmt::Debug for DeveloperDeploymentStartInputV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("DeveloperDeploymentStartInputV1")
+                .field("mode", &self.mode)
+                .field("controller_store_directory", &self.controller_store_directory)
+                .field("successor_store_directory", &self.successor_store_directory)
+                .field("enrollment", &self.enrollment)
+                .field("controller_seed", &"<redacted>")
+                .field("authority", &"<redacted>")
+                .field("runtime_client", &"<redacted>")
+                .field("node_client", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl DeveloperDeploymentStartInputV1 {
+        pub fn try_new(
+            fields: DeveloperDeploymentStartFieldsV1,
+        ) -> Result<Self, DeveloperDeploymentErrorV1> {
+            let DeveloperDeploymentStartFieldsV1 {
+                mode,
+                controller_store_directory,
+                successor_store_directory,
+                enrollment,
+                controller_seed,
+                authority,
+                runtime_client,
+                node_client,
+            } = fields;
+            let controller_key = SigningKey::from_bytes(&controller_seed)
+                .verifying_key()
+                .to_bytes();
+            let controller_fingerprint = ed25519_control_key_fingerprint(&controller_key)
+                .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+            if !controller_store_directory.is_absolute()
+                || !successor_store_directory.is_absolute()
+                || controller_store_directory == successor_store_directory
+                || controller_seed.iter().all(|byte| *byte == 0)
+                || controller_fingerprint
+                    != enrollment
+                        .runtime_carrier
+                        .controller_request_key_fingerprint()
+                || runtime_client.route() != enrollment.runtime_transport_profile.route()
+                || !node_client.matches_transport_pins(
+                    &enrollment.node_route,
+                    enrollment.expected_node_principal,
+                    enrollment.node_route_config_digest,
+                )
+            {
+                return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
+            }
+            Ok(Self {
+                mode,
+                controller_store_directory,
+                successor_store_directory,
+                enrollment,
+                controller_seed,
+                authority,
+                runtime_client,
+                node_client,
+            })
+        }
+    }
+
+    /// The real owner graph after PXFS and terminal PXFR are durable. It is
+    /// deliberately not reported Ready until a later durable ManagedReady
+    /// Describe reconciliation seam exists.
+    pub struct DeveloperDeploymentOwnerV1 {
+        authority: Option<DeveloperLocalTenureAuthorityV1>,
+        node_client: Option<RestrictedNodeControlClientV1>,
+        runtime_client: Option<RestrictedRuntimeControlClientV1>,
+        successor_store: Option<ManagedFabricSuccessorStoreV1>,
+    }
+
+    impl fmt::Debug for DeveloperDeploymentOwnerV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("DeveloperDeploymentOwnerV1")
+                .field("authority_running", &self.authority.is_some())
+                .field("node_connector_running", &self.node_client.is_some())
+                .field("runtime_connector_running", &self.runtime_client.is_some())
+                .field("pxfs_owned", &self.successor_store.is_some())
+                .finish()
+        }
+    }
+
+    impl DeveloperDeploymentOwnerV1 {
+        /// Bounded supervision poll. It never waits for a connector or joins a
+        /// live thread; `true` means the Authority owner has already exited.
+        pub fn try_poll_exit(&mut self) -> Result<bool, DeveloperDeploymentErrorV1> {
+            self.authority.as_mut().map_or(Ok(true), |authority| {
+                authority
+                    .try_poll_exit()
+                    .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)
+            })
+        }
+
+        /// Waits for owner death for no longer than the caller's explicit
+        /// bound. `false` is a clean timeout, not an owner failure.
+        pub async fn wait_for_exit(
+            &mut self,
+            max_wait: Duration,
+        ) -> Result<bool, DeveloperDeploymentErrorV1> {
+            if max_wait.is_zero() || max_wait > Duration::from_secs(60) {
+                return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
+            }
+            let deadline = tokio::time::Instant::now()
+                .checked_add(max_wait)
+                .ok_or(DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+            loop {
+                if self.try_poll_exit()? {
+                    return Ok(true);
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Ok(false);
+                }
+                tokio::time::sleep(
+                    Duration::from_millis(20).min(deadline.saturating_duration_since(now)),
+                )
+                .await;
+            }
+        }
+
+        /// Shuts both connector sessions and always joins the Authority owner.
+        pub async fn shutdown_and_join(mut self) -> Result<(), DeveloperDeploymentErrorV1> {
+            let mut failed = false;
+            if let Some(client) = self.node_client.take() {
+                failed |= client.shutdown().await.is_err();
+            }
+            if let Some(client) = self.runtime_client.take() {
+                failed |= client.shutdown().await.is_err();
+            }
+            self.successor_store.take();
+            if let Some(authority) = self.authority.take() {
+                failed |= authority.shutdown().is_err();
+            }
+            if failed {
+                Err(DeveloperDeploymentErrorV1::JoinedShutdownFailed)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Non-secret, post-persistence proof that the fresh successor Describe
+    /// reached ManagedReady. Construction remains inside the owner facade.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct DeveloperDeploymentReadyV1 {
+        target: paraegox_kernel::identity::RuntimeHostId,
+        runtime_store_instance_id: [u8; 32],
+        snapshot_sequence: u64,
+        runtime_host_epoch: u64,
+        managed_ready_digest: Digest32,
+    }
+
+    impl DeveloperDeploymentReadyV1 {
+        #[must_use]
+        pub const fn target(&self) -> paraegox_kernel::identity::RuntimeHostId {
+            self.target
+        }
+
+        #[must_use]
+        pub const fn runtime_store_instance_id(&self) -> [u8; 32] {
+            self.runtime_store_instance_id
+        }
+
+        #[must_use]
+        pub const fn snapshot_sequence(&self) -> u64 {
+            self.snapshot_sequence
+        }
+
+        #[must_use]
+        pub const fn runtime_host_epoch(&self) -> u64 {
+            self.runtime_host_epoch
+        }
+
+        #[must_use]
+        pub const fn managed_ready_digest(&self) -> Digest32 {
+            self.managed_ready_digest
+        }
+    }
+
+    /// Only `Ready` may authorize Local to publish a readiness marker.
+    #[derive(Debug)]
+    #[must_use]
+    pub enum DeveloperDeploymentStartOutcomeV1 {
+        Ready {
+            owner: DeveloperDeploymentOwnerV1,
+            ready: DeveloperDeploymentReadyV1,
+        },
+        ReconcileRequired(DeveloperDeploymentOwnerV1),
+    }
+
+    enum DeveloperDeploymentPipelineOutcomeV1 {
+        Ready {
+            store: ManagedFabricSuccessorStoreV1,
+            ready: DeveloperDeploymentReadyV1,
+        },
+        ReconcileRequired(ManagedFabricSuccessorStoreV1),
+    }
+
+    /// Stable non-sensitive failure for the developer deployment boundary.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[non_exhaustive]
+    pub enum DeveloperDeploymentErrorV1 {
+        InvalidEnrollmentFacts,
+        InvalidConfiguration,
+        AuthorityFailed,
+        ControllerStoreFailed,
+        RestartRequiresExplicitRecovery,
+        NodeExchangeFailed,
+        RuntimeExchangeFailed,
+        PxfsCutoverFailed,
+        ManagedServingFailed,
+        JoinedShutdownFailed,
+    }
+
+    impl fmt::Display for DeveloperDeploymentErrorV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "developer deployment failed closed: {self:?}")
+        }
+    }
+
+    impl std::error::Error for DeveloperDeploymentErrorV1 {}
+
+    /// Starts the real developer Deployment owner graph and performs one
+    /// non-retrying remote enrollment/cutover attempt.
+    pub async fn start_developer_deployment_v1(
+        input: DeveloperDeploymentStartInputV1,
+    ) -> Result<DeveloperDeploymentStartOutcomeV1, DeveloperDeploymentErrorV1> {
+        let DeveloperDeploymentStartInputV1 {
+            mode,
+            controller_store_directory,
+            successor_store_directory,
+            enrollment,
+            controller_seed,
+            authority,
+            runtime_client,
+            node_client,
+        } = input;
+        let authority = DeveloperLocalTenureAuthorityV1::start(authority)
+            .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)?;
+        let mut runtime_client = match RestrictedRuntimeControlClientV1::start(runtime_client).await {
+            Ok(client) => client,
+            Err(_) => {
+                let _ = authority.shutdown();
+                return Err(DeveloperDeploymentErrorV1::RuntimeExchangeFailed);
+            }
+        };
+        let mut node_client = match RestrictedNodeControlClientV1::start(node_client).await {
+            Ok(client) => client,
+            Err(_) => {
+                let _ = runtime_client.shutdown().await;
+                let _ = authority.shutdown();
+                return Err(DeveloperDeploymentErrorV1::NodeExchangeFailed);
+            }
+        };
+        let controller_signer = SigningKey::from_bytes(&controller_seed);
+        drop(controller_seed);
+        let result = enroll_and_cutover_developer_deployment_v1(
+            mode,
+            &controller_store_directory,
+            &successor_store_directory,
+            &enrollment,
+            &controller_signer,
+            authority.facts(),
+            &mut node_client,
+            &mut runtime_client,
+        )
+        .await;
+        match result {
+            Ok(DeveloperDeploymentPipelineOutcomeV1::Ready { store, ready }) => {
+                Ok(DeveloperDeploymentStartOutcomeV1::Ready {
+                    owner: DeveloperDeploymentOwnerV1 {
+                        authority: Some(authority),
+                        node_client: Some(node_client),
+                        runtime_client: Some(runtime_client),
+                        successor_store: Some(store),
+                    },
+                    ready,
+                })
+            }
+            Ok(DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(store)) => {
+                Ok(DeveloperDeploymentStartOutcomeV1::ReconcileRequired(
+                    DeveloperDeploymentOwnerV1 {
+                        authority: Some(authority),
+                        node_client: Some(node_client),
+                        runtime_client: Some(runtime_client),
+                        successor_store: Some(store),
+                    },
+                ))
+            }
+            Err(error) => {
+                let _ = node_client.shutdown().await;
+                let _ = runtime_client.shutdown().await;
+                let _ = authority.shutdown();
+                Err(error)
+            }
+        }
+    }
+
+    async fn enroll_and_cutover_developer_deployment_v1(
+        mode: DeveloperDeploymentStartModeV1,
+        controller_store_directory: &Path,
+        successor_store_directory: &Path,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        controller_signer: &SigningKey,
+        authority_facts: &crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
+        node_client: &mut RestrictedNodeControlClientV1,
+        runtime_client: &mut RestrictedRuntimeControlClientV1,
+    ) -> Result<DeveloperDeploymentPipelineOutcomeV1, DeveloperDeploymentErrorV1> {
+        validate_authority_cross_pins(enrollment, controller_signer, authority_facts)?;
+        enrollment
+            .runtime_transport_profile
+            .validate_carrier_binding(
+                enrollment.runtime_transport_profile_ref,
+                &enrollment.runtime_carrier,
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        if !runtime_client.matches_restricted_target(
+            enrollment.runtime_transport_profile.target(),
+            enrollment.runtime_transport_profile.route(),
+            enrollment.runtime_transport_profile.runtime_principal(),
+            enrollment.runtime_carrier.binding_digest(),
+        ) {
+            return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
+        }
+        let controller = ManagedFabricControllerIdentityV1::try_new(
+            enrollment.runtime_carrier.controller_principal(),
+            DeploymentWriterRef::from_bytes(*enrollment.writer.as_bytes()),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        let authority = ManagedFabricTenureAuthorityPinV1::try_new(
+            enrollment.authority_principal,
+            authority_facts.peer().uid(),
+            authority_facts.peer().gid(),
+            enrollment.authority_ref,
+            enrollment.authority_key_ref,
+            authority_facts.authority_verification_key(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        let describe = ManagedServingDescribeVerifierV1::try_new(
+            enrollment.runtime_transport_profile.target(),
+            enrollment.runtime_carrier.clone(),
+            controller_signer.verifying_key().to_bytes(),
+            enrollment.runtime_response_public_key,
+            enrollment.verified_manifest.manifest_digest(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        let provisioning =
+            ManagedFabricRemoteControllerProvisioningV1::new(controller, authority, describe);
+        let owner_identity = ControllerOwnerIdentityFingerprint::from_stored(
+            authority_facts.owner_identity_fingerprint(),
+        );
+        let request_auth = ControllerRequestAuthPin::try_new(
+            enrollment.runtime_carrier.controller_request_key(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?,
+            ED25519_ALGORITHM_VERSION,
+            ControllerAuthKeyFingerprint::from_stored(
+                enrollment
+                    .runtime_carrier
+                    .controller_request_key_fingerprint(),
+            ),
+            INITIAL_AUTH_ROTATION_GENERATION,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        if mode == DeveloperDeploymentStartModeV1::Resume {
+            return resume_developer_deployment_v1(
+                controller_store_directory,
+                successor_store_directory,
+                enrollment,
+                controller_signer,
+                authority_facts,
+                owner_identity,
+                request_auth,
+                &provisioning,
+                runtime_client,
+            )
+            .await;
+        }
+        let allocation = StableAllocationSnapshot::try_new(
+            enrollment.runtime_transport_profile.target(),
+            0,
+            0,
+            Vec::new(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        let initialization = ControllerInitializationInput::try_new(
+            DeploymentScopeId::from_bytes(*enrollment.source_scope.as_bytes()),
+            DeploymentId::from_bytes(derived_developer_plan_id(enrollment.configuration_digest)?),
+            allocation,
+            ControllerInstalledManifestPin::from_verified_manifest(
+                enrollment.verified_manifest.clone(),
+            ),
+            request_auth,
+            owner_identity,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        let receipt = initialize_controller_store_developer_local(
+            controller_store_directory,
+            initialization,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        let mut store = ControllerStore::open_developer_local(
+            controller_store_directory,
+            *receipt.store_instance_id(),
+            owner_identity,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        acquire_developer_tenure_once(
+            &mut store,
+            DeveloperTenurePinsV1::from_enrollment(enrollment),
+            controller_signer,
+            authority_facts,
+        )
+        .await?;
+        if store
+            .remote_connector_restart_requirement()
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?
+            != ControllerRemoteConnectorRestartRequirementV1::None
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        let successor_store_instance_id = nonzero_system_entropy::<32>()?;
+        store
+            .initialize_remote_connector(
+                enrollment.configuration_digest,
+                enrollment.runtime_transport_profile.target(),
+                successor_store_instance_id,
+                authority_facts.store_instance_id(),
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+
+        let node_transport = RemoteNodeControlTransportPinV1::try_new(
+            enrollment.expected_node_principal,
+            enrollment.node_route_config_digest,
+            enrollment.runtime_carrier.controller_principal(),
+            enrollment.runtime_carrier.controller_request_key(),
+            enrollment
+                .runtime_carrier
+                .controller_request_key_fingerprint(),
+            controller_signer.verifying_key().to_bytes(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        let mut node = RemoteNodeControlAdapterV1::new(node_transport);
+        let target = node_describe_exchange(
+            &mut store,
+            node_client,
+            &mut node,
+            controller_signer,
+            enrollment,
+        )
+        .await?;
+        if target != enrollment.expected_node_target {
+            return Err(DeveloperDeploymentErrorV1::NodeExchangeFailed);
+        }
+        let ingress = runtime_describe_exchange(
+            &mut store,
+            runtime_client,
+            provisioning.describe(),
+            controller_signer,
+            enrollment,
+        )
+        .await?;
+        if ingress.phase()
+            != paraegox_runtime_contracts::managed_serving_bootstrap::RuntimeControlDescribeReadyPhaseV1::LegacyReady
+        {
+            return Err(DeveloperDeploymentErrorV1::RuntimeExchangeFailed);
+        }
+        let runtime_authority = runtime_observation_authority(enrollment, &ingress)?;
+        let challenge = node_challenge_exchange(
+            &mut store,
+            node_client,
+            &node,
+            controller_signer,
+            enrollment,
+            &runtime_authority,
+        )
+        .await?;
+        let verified_query = runtime_query_exchange(
+            &mut store,
+            runtime_client,
+            provisioning.describe(),
+            controller_signer,
+            enrollment,
+            &ingress,
+            challenge,
+        )
+        .await?;
+        let observation = RuntimeObservationRequestV1::try_new(RuntimeObservationRequestInputV1 {
+            intended_status_sequence: challenge.intended_status_sequence(),
+            freshness_budget_nanos: challenge.freshness_budget_nanos(),
+            runtime_host_id: challenge.runtime_host_id(),
+            authority_digest: challenge.authority_digest(),
+            challenge_issued_at_unix_nanos: challenge.issued_at_unix_nanos(),
+            challenge_expires_at_unix_nanos: challenge.expires_at_unix_nanos(),
+            query_request: verified_query.0,
+            query_response: verified_query.1,
+        })
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        node_publish_exchange(
+            &mut store,
+            node_client,
+            &node,
+            controller_signer,
+            enrollment,
+            observation,
+        )
+        .await?;
+        node_latest_exchange(
+            &mut store,
+            node_client,
+            &node,
+            controller_signer,
+            enrollment,
+            target,
+        )
+        .await?;
+        store
+            .revalidate_remote_connector_cutover_ready()
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        let mut successor = ManagedFabricSuccessorStoreV1::cutover_from_remote_connector_developer_local(
+            store,
+            controller_store_directory,
+            successor_store_directory,
+            owner_identity,
+            controller_signer,
+            &provisioning,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::PxfsCutoverFailed)?;
+        let ready = persist_remote_managed_serving_terminal(
+            &mut successor,
+            runtime_client,
+            &provisioning,
+            &ingress,
+            controller_signer,
+            enrollment,
+        )
+        .await?;
+        Ok(match ready {
+            Some(ready) => DeveloperDeploymentPipelineOutcomeV1::Ready {
+                store: successor,
+                ready,
+            },
+            None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(successor),
+        })
+    }
+
+    async fn resume_developer_deployment_v1(
+        controller_store_directory: &Path,
+        successor_store_directory: &Path,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        controller_signer: &SigningKey,
+        authority_facts: &crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
+        owner_identity: ControllerOwnerIdentityFingerprint,
+        request_auth: ControllerRequestAuthPin,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        runtime_client: &mut RestrictedRuntimeControlClientV1,
+    ) -> Result<DeveloperDeploymentPipelineOutcomeV1, DeveloperDeploymentErrorV1> {
+        if let Ok(mut successor) =
+            ManagedFabricSuccessorStoreV1::resume_from_remote_connector_cutover_marker_developer_local(
+                controller_store_directory,
+                successor_store_directory,
+                owner_identity,
+                controller_signer,
+                provisioning,
+            )
+        {
+            validate_resumed_controller_snapshot(
+                successor.state().legacy_snapshot(),
+                enrollment,
+                authority_facts,
+                request_auth,
+            )?;
+            let ingress = remote_describe_ingress_from_successor(&successor, provisioning)?;
+            let ready = persist_remote_managed_serving_terminal(
+                &mut successor,
+                runtime_client,
+                provisioning,
+                &ingress,
+                controller_signer,
+                enrollment,
+            )
+            .await?;
+            return Ok(match ready {
+                Some(ready) => DeveloperDeploymentPipelineOutcomeV1::Ready {
+                    store: successor,
+                    ready,
+                },
+                None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(successor),
+            });
+        }
+
+        let store = ControllerStore::open_developer_local_observed_identity(
+            controller_store_directory,
+            owner_identity,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let snapshot = store
+            .snapshot()
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        validate_resumed_controller_snapshot(
+            snapshot,
+            enrollment,
+            authority_facts,
+            request_auth,
+        )?;
+        let facts = snapshot
+            .remote_connector_cutover_ready_facts()
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let ingress = ManagedServingDescribeIngressV1::try_accept(
+            provisioning.describe(),
+            None,
+            facts.runtime_describe_request().clone(),
+            facts.runtime_describe_response().canonical_wire(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let mut successor =
+            ManagedFabricSuccessorStoreV1::cutover_from_remote_connector_developer_local(
+                store,
+                controller_store_directory,
+                successor_store_directory,
+                owner_identity,
+                controller_signer,
+                provisioning,
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::PxfsCutoverFailed)?;
+        let ready = persist_remote_managed_serving_terminal(
+            &mut successor,
+            runtime_client,
+            provisioning,
+            &ingress,
+            controller_signer,
+            enrollment,
+        )
+        .await?;
+        Ok(match ready {
+            Some(ready) => DeveloperDeploymentPipelineOutcomeV1::Ready {
+                store: successor,
+                ready,
+            },
+            None => DeveloperDeploymentPipelineOutcomeV1::ReconcileRequired(successor),
+        })
+    }
+
+    fn validate_resumed_controller_snapshot(
+        snapshot: &ControllerJournalSnapshot,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        authority_facts: &crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
+        request_auth: ControllerRequestAuthPin,
+    ) -> Result<(), DeveloperDeploymentErrorV1> {
+        let state = snapshot.state();
+        if state.scope() != DeploymentScopeId::from_bytes(*enrollment.source_scope.as_bytes())
+            || state.plan_lineage()
+                != DeploymentId::from_bytes(derived_developer_plan_id(
+                    enrollment.configuration_digest,
+                )?)
+            || state.request_auth() != request_auth
+            || state.installed_manifest().verified_manifest() != &enrollment.verified_manifest
+        {
+            return Err(DeveloperDeploymentErrorV1::InvalidEnrollmentFacts);
+        }
+        let facts = snapshot
+            .remote_connector_cutover_ready_facts()
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        if facts.configuration_digest() != enrollment.configuration_digest
+            || facts.target() != enrollment.runtime_transport_profile.target()
+            || facts.node_target() != enrollment.expected_node_target
+            || facts.authority_store_instance_id() != authority_facts.store_instance_id()
+        {
+            return Err(DeveloperDeploymentErrorV1::InvalidEnrollmentFacts);
+        }
+        Ok(())
+    }
+
+    fn remote_describe_ingress_from_successor(
+        successor: &ManagedFabricSuccessorStoreV1,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+    ) -> Result<ManagedServingDescribeIngressV1, DeveloperDeploymentErrorV1> {
+        let facts = successor
+            .state()
+            .legacy_snapshot()
+            .remote_connector_cutover_ready_facts()
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        ManagedServingDescribeIngressV1::try_accept(
+            provisioning.describe(),
+            None,
+            facts.runtime_describe_request().clone(),
+            facts.runtime_describe_response().canonical_wire(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)
+    }
+
+    #[derive(Clone, Copy)]
+    struct DeveloperTenurePinsV1 {
+        source_scope: SourceScopeRef,
+        writer: PlanWriterRef,
+        authority_ref: TenureAuthorityRef,
+        authority_key_ref: TenureKeyRef,
+        controller_principal: PrincipalRef,
+        controller_key: ApplyAuthKeyRef,
+    }
+
+    impl DeveloperTenurePinsV1 {
+        const fn from_enrollment(enrollment: &DeveloperDeploymentEnrollmentFactsV1) -> Self {
+            Self {
+                source_scope: enrollment.source_scope,
+                writer: enrollment.writer,
+                authority_ref: enrollment.authority_ref,
+                authority_key_ref: enrollment.authority_key_ref,
+                controller_principal: enrollment.runtime_carrier.controller_principal(),
+                controller_key: enrollment.runtime_carrier.controller_request_key(),
+            }
+        }
+    }
+
+    async fn acquire_developer_tenure_once(
+        store: &mut ControllerStore,
+        pins: DeveloperTenurePinsV1,
+        signer: &SigningKey,
+        authority: &crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
+    ) -> Result<(), DeveloperDeploymentErrorV1> {
+        let proof_authority = TenureProofAuthority::try_new(
+            pins.authority_ref,
+            pins.authority_key_ref,
+            TenureProofAlgorithm::try_new(ACQUIRE_TENURE_ED25519_ALGORITHM)
+                .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?,
+            ACQUIRE_TENURE_ED25519_ALGORITHM_VERSION,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        let peer = authority.peer();
+        let endpoint = UnixAuthorityEndpoint::try_new(
+            authority.socket_path().to_path_buf(),
+            AuthoritySocketAcl::new(peer.uid(), peer.gid()),
+            UnixCredentials::new(peer.uid(), peer.gid()),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)?;
+        let verifier = AuthorityProofVerifier::try_new(
+            proof_authority,
+            VerifyingKey::from_bytes(&authority.authority_verification_key())
+                .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)?;
+        let client = UnixTenureAuthorityClient::try_new(endpoint, verifier, TENURE_EXCHANGE_TIMEOUT)
+            .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)?;
+        let profile = TenureRequestProfile {
+            scope: DeploymentScopeId::from_bytes(*pins.source_scope.as_bytes()),
+            writer: DeploymentWriterRef::from_bytes(*pins.writer.as_bytes()),
+            controller_principal: pins.controller_principal,
+            controller_key: ControllerAcquireKeyRef::from_bytes(*pins.controller_key.as_bytes()),
+            controller_public_key_fingerprint: ControllerPublicKeyFingerprint::for_ed25519_key(
+                &signer.verifying_key().to_bytes(),
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?,
+            max_response_payload_bytes: u32::try_from(
+                MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?,
+        };
+        let prepared = fresh_tenure_request(&profile, signer)
+            .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)?;
+        acquire_tenure_once(store, &client, &prepared)
+            .await
+            .map(|_| ())
+            .map_err(|_| DeveloperDeploymentErrorV1::AuthorityFailed)
+    }
+
+    fn validate_authority_cross_pins(
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        controller_signer: &SigningKey,
+        authority: &crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
+    ) -> Result<(), DeveloperDeploymentErrorV1> {
+        let identities = authority.identities();
+        let controller_public_key_fingerprint = ControllerPublicKeyFingerprint::for_ed25519_key(
+            &controller_signer.verifying_key().to_bytes(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        if identities.source_scope != *enrollment.source_scope.as_bytes()
+            || identities.writer != *enrollment.writer.as_bytes()
+            || identities.authority != *enrollment.authority_ref.as_bytes()
+            || identities.authority_key != *enrollment.authority_key_ref.as_bytes()
+            || identities.service_principal != *enrollment.authority_principal.as_bytes()
+            || identities.controller_principal
+                != *enrollment.runtime_carrier.controller_principal().as_bytes()
+            || identities.controller_key
+                != *enrollment
+                    .runtime_carrier
+                    .controller_request_key()
+                    .as_bytes()
+            || authority.controller_public_key_fingerprint()
+                != *controller_public_key_fingerprint.as_bytes()
+            || authority.authority_verification_key() != enrollment.authority_verification_key
+            || controller_signer.verifying_key().to_bytes()
+                == authority.authority_verification_key()
+        {
+            return Err(DeveloperDeploymentErrorV1::InvalidEnrollmentFacts);
+        }
+        Ok(())
+    }
+
+    fn derived_developer_plan_id(
+        configuration_digest: Digest32,
+    ) -> Result<[u8; 16], DeveloperDeploymentErrorV1> {
+        let mut builder = Digest32Builder::try_new(DEVELOPER_DEPLOYMENT_PLAN_DOMAIN)
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        builder
+            .field_digest(&configuration_digest)
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        let digest = builder.finish();
+        let mut value = [0; 16];
+        value.copy_from_slice(&digest.as_bytes()[..16]);
+        if value == [0; 16] {
+            return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
+        }
+        Ok(value)
+    }
+
+    fn nonzero_system_entropy<const N: usize>() -> Result<[u8; N], DeveloperDeploymentErrorV1> {
+        let owned = open(
+            Path::new("/dev/urandom"),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        let mut source = File::from(owned);
+        let mut value = [0; N];
+        source
+            .read_exact(&mut value)
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        if value.iter().all(|byte| *byte == 0) {
+            return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
+        }
+        Ok(value)
+    }
+
+    fn fresh_remote_node_request(
+    ) -> Result<FreshRemoteNodeControlRequestV1, DeveloperDeploymentErrorV1> {
+        FreshRemoteNodeControlRequestV1::try_new(
+            nonzero_system_entropy::<16>()?,
+            nonzero_system_entropy::<32>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::NodeExchangeFailed)
+    }
+
+    fn fresh_remote_runtime_request(
+    ) -> Result<FreshManagedServingBootstrapV1, DeveloperDeploymentErrorV1> {
+        FreshManagedServingBootstrapV1::try_new(
+            nonzero_system_entropy::<16>()?,
+            nonzero_system_entropy::<32>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)
+    }
+
+    struct PendingRemoteResponseV1 {
+        claim: ClaimedControllerRemoteConnectorAttemptV1,
+        response: Box<[u8]>,
+    }
+
+    async fn send_node_wire_once(
+        store: &mut ControllerStore,
+        client: &mut RestrictedNodeControlClientV1,
+        step: ControllerRemoteConnectorStepV1,
+        request_wire: Box<[u8]>,
+    ) -> Result<PendingRemoteResponseV1, DeveloperDeploymentErrorV1> {
+        store
+            .prepare_remote_connector_request(step, &request_wire)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        let preflight = client
+            .preflight(request_wire.into_vec())
+            .await
+            .map_err(|_| DeveloperDeploymentErrorV1::NodeExchangeFailed)?;
+        let claim = store
+            .claim_remote_connector_attempt(step)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        let response = match preflight.send_once().await {
+            Ok(response) => response,
+            Err(_) => {
+                store
+                    .close_remote_connector_attempt(
+                        claim,
+                        ControllerRemoteConnectorAttemptPhaseV1::Uncertain,
+                    )
+                    .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+                return Err(DeveloperDeploymentErrorV1::NodeExchangeFailed);
+            }
+        };
+        Ok(PendingRemoteResponseV1 { claim, response })
+    }
+
+    async fn send_runtime_wire_once(
+        store: &mut ControllerStore,
+        client: &mut RestrictedRuntimeControlClientV1,
+        step: ControllerRemoteConnectorStepV1,
+        request_wire: Box<[u8]>,
+    ) -> Result<PendingRemoteResponseV1, DeveloperDeploymentErrorV1> {
+        store
+            .prepare_remote_connector_request(step, &request_wire)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        let preflight = client
+            .preflight(request_wire.into_vec())
+            .await
+            .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let claim = store
+            .claim_remote_connector_attempt(step)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        let response = match preflight.send_once().await {
+            Ok(response) => response,
+            Err(_) => {
+                store
+                    .close_remote_connector_attempt(
+                        claim,
+                        ControllerRemoteConnectorAttemptPhaseV1::Uncertain,
+                    )
+                    .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+                return Err(DeveloperDeploymentErrorV1::RuntimeExchangeFailed);
+            }
+        };
+        Ok(PendingRemoteResponseV1 { claim, response })
+    }
+
+    async fn node_describe_exchange(
+        store: &mut ControllerStore,
+        client: &mut RestrictedNodeControlClientV1,
+        node: &mut RemoteNodeControlAdapterV1,
+        signer: &SigningKey,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+    ) -> Result<NodeManagementTargetV1, DeveloperDeploymentErrorV1> {
+        let mut boundary_error = None;
+        let mut pending = None;
+        let result = node
+            .describe_once(fresh_remote_node_request()?, signer, |wire| async {
+                match send_node_wire_once(
+                    store,
+                    client,
+                    ControllerRemoteConnectorStepV1::NodeDescribe,
+                    wire,
+                )
+                .await
+                {
+                    Ok(response) => {
+                        let raw = response.response.clone();
+                        pending = Some(response);
+                        RemoteNodeMtlsExchangeSuccessV1::try_new(
+                            enrollment.expected_node_principal,
+                            enrollment.node_route_config_digest,
+                            raw,
+                        )
+                        .map_err(|_| RemoteNodeControlTransportErrorV1::Rejected)
+                    }
+                    Err(error) => {
+                        boundary_error = Some(error);
+                        Err(RemoteNodeControlTransportErrorV1::Rejected)
+                    }
+                }
+            })
+            .await;
+        if let Some(error) = boundary_error {
+            return Err(error);
+        }
+        let target = match result {
+            Ok(target) => target,
+            Err(_) => {
+                if let Some(pending) = pending.take() {
+                    let _ = store.close_remote_connector_attempt(
+                        pending.claim,
+                        ControllerRemoteConnectorAttemptPhaseV1::Rejected,
+                    );
+                }
+                return Err(DeveloperDeploymentErrorV1::NodeExchangeFailed);
+            }
+        };
+        let pending = pending.ok_or(DeveloperDeploymentErrorV1::NodeExchangeFailed)?;
+        store
+            .commit_remote_connector_response(pending.claim, &pending.response)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        Ok(target)
+    }
+
+    async fn runtime_describe_exchange(
+        store: &mut ControllerStore,
+        client: &mut RestrictedRuntimeControlClientV1,
+        verifier: &ManagedServingDescribeVerifierV1,
+        signer: &SigningKey,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+    ) -> Result<ManagedServingDescribeIngressV1, DeveloperDeploymentErrorV1> {
+        let request = verifier
+            .try_build_request(None, fresh_remote_runtime_request()?, signer)
+            .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let pending = send_runtime_wire_once(
+            store,
+            client,
+            ControllerRemoteConnectorStepV1::RuntimeDescribe,
+            request.canonical_wire().into(),
+        )
+        .await?;
+        let ingress = match ManagedServingDescribeIngressV1::try_accept(
+            verifier,
+            None,
+            request,
+            &pending.response,
+        ) {
+            Ok(ingress) => ingress,
+            Err(_) => {
+                let _ = store.close_remote_connector_attempt(
+                    pending.claim,
+                    ControllerRemoteConnectorAttemptPhaseV1::Rejected,
+                );
+                return Err(DeveloperDeploymentErrorV1::RuntimeExchangeFailed);
+            }
+        };
+        store
+            .commit_remote_connector_response(pending.claim, &pending.response)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        Ok(ingress)
+    }
+
+    fn runtime_observation_authority(
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        ingress: &ManagedServingDescribeIngressV1,
+    ) -> Result<RuntimeObservationAuthorityV1, DeveloperDeploymentErrorV1> {
+        let facts = ingress.serving_facts();
+        let serving = ReferenceBootstrapServingIdentityV1::try_new(
+            facts.target(),
+            facts.runtime_store_instance_id(),
+            facts.snapshot_sequence(),
+            facts.runtime_host_epoch(),
+            facts.clock_domain(),
+            facts.clock_generation(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let endpoint = RuntimeApplyEndpointDescriptorV1::try_new(
+            RuntimeApplyEndpointRefV1::try_from_bytes(
+                enrollment.runtime_transport_profile.endpoint_ref(),
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?,
+            enrollment.runtime_transport_profile.target(),
+            enrollment.runtime_transport_profile.endpoint_generation(),
+            enrollment.runtime_transport_profile.route(),
+            *enrollment.runtime_carrier.runtime_response_key().as_bytes(),
+            enrollment.runtime_response_public_key,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        RuntimeObservationAuthorityV1::try_new(
+            enrollment.runtime_carrier.runtime_principal(),
+            ingress.channel(),
+            serving,
+            endpoint,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)
+    }
+
+    async fn node_challenge_exchange(
+        store: &mut ControllerStore,
+        client: &mut RestrictedNodeControlClientV1,
+        node: &RemoteNodeControlAdapterV1,
+        signer: &SigningKey,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        authority: &RuntimeObservationAuthorityV1,
+    ) -> Result<NodeControlObservationChallengeV1, DeveloperDeploymentErrorV1> {
+        let mut boundary_error = None;
+        let mut pending = None;
+        let result = node
+            .observation_challenge_once(
+                fresh_remote_node_request()?,
+                signer,
+                authority,
+                enrollment.observation_endpoint_ref,
+                MAX_RUNTIME_OBSERVATION_CHALLENGE_NANOS.min(MAX_NODE_STATUS_FRESHNESS_NANOS),
+                |wire| async {
+                    match send_node_wire_once(
+                        store,
+                        client,
+                        ControllerRemoteConnectorStepV1::NodeChallenge,
+                        wire,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            let raw = response.response.clone();
+                            pending = Some(response);
+                            RemoteNodeMtlsExchangeSuccessV1::try_new(
+                                enrollment.expected_node_principal,
+                                enrollment.node_route_config_digest,
+                                raw,
+                            )
+                            .map_err(|_| RemoteNodeControlTransportErrorV1::Rejected)
+                        }
+                        Err(error) => {
+                            boundary_error = Some(error);
+                            Err(RemoteNodeControlTransportErrorV1::Rejected)
+                        }
+                    }
+                },
+            )
+            .await;
+        if let Some(error) = boundary_error {
+            return Err(error);
+        }
+        let challenge = match result {
+            Ok(challenge) => challenge,
+            Err(_) => {
+                if let Some(pending) = pending.take() {
+                    let _ = store.close_remote_connector_attempt(
+                        pending.claim,
+                        ControllerRemoteConnectorAttemptPhaseV1::Rejected,
+                    );
+                }
+                return Err(DeveloperDeploymentErrorV1::NodeExchangeFailed);
+            }
+        };
+        let pending = pending.ok_or(DeveloperDeploymentErrorV1::NodeExchangeFailed)?;
+        store
+            .commit_remote_connector_response(pending.claim, &pending.response)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        Ok(challenge)
+    }
+
+    async fn runtime_query_exchange(
+        store: &mut ControllerStore,
+        client: &mut RestrictedRuntimeControlClientV1,
+        verifier: &ManagedServingDescribeVerifierV1,
+        signer: &SigningKey,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        ingress: &ManagedServingDescribeIngressV1,
+        challenge: NodeControlObservationChallengeV1,
+    ) -> Result<(ReferenceQueryRequestV1, ReferenceQueryResponseV1), DeveloperDeploymentErrorV1>
+    {
+        let query_id = ReferenceQueryIdV1::from_bytes(nonzero_system_entropy::<16>()?);
+        let selector = ReferenceQuerySelectorV1::try_new(
+            query_id,
+            enrollment.runtime_transport_profile.target(),
+            enrollment.source_scope,
+            ingress.serving_facts().runtime_store_instance_id(),
+            ApplyOperationId::from_bytes(nonzero_system_entropy::<16>()?),
+            None,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let claim = ApplyRequestAuthClaim::try_new(
+            enrollment.runtime_carrier.controller_principal(),
+            enrollment.runtime_carrier.controller_request_key(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?,
+            ED25519_ALGORITHM_VERSION,
+            challenge.query_nonce().as_bytes(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let draft = ReferenceQueryRequestDraftV1::try_new(
+            selector,
+            claim,
+            u32::try_from(MAX_REFERENCE_QUERY_RESPONSE_BYTES)
+                .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let signature = signer.sign(
+            draft
+                .signing_transcript()
+                .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?
+                .as_bytes(),
+        );
+        let request = draft
+            .finalize(&signature.to_bytes())
+            .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let facts = ingress.serving_facts();
+        let serving = ReferenceBootstrapServingIdentityV1::try_new(
+            facts.target(),
+            facts.runtime_store_instance_id(),
+            facts.snapshot_sequence(),
+            facts.runtime_host_epoch(),
+            facts.clock_domain(),
+            facts.clock_generation(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let prepared = PreparedRuntimeQueryRequest::try_new(
+            request.clone(),
+            ingress.channel(),
+            enrollment.runtime_carrier.runtime_response_key(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?,
+            ED25519_ALGORITHM_VERSION,
+            serving,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let action = verifier
+            .try_build_reference_query(
+                ingress,
+                fresh_remote_runtime_request()?,
+                signer,
+                prepared,
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
+        let pending = send_runtime_wire_once(
+            store,
+            client,
+            ControllerRemoteConnectorStepV1::RuntimeQuery,
+            action.carrier_request().canonical_wire().into(),
+        )
+        .await?;
+        let verified = match verifier.try_accept_reference_query_response(
+                ingress,
+                action.carrier_request(),
+                action.prepared(),
+                enrollment.runtime_carrier.runtime_principal(),
+                enrollment.runtime_carrier.binding_digest(),
+                &pending.response,
+            ) {
+            Ok(verified) => verified,
+            Err(_) => {
+                let _ = store.close_remote_connector_attempt(
+                    pending.claim,
+                    ControllerRemoteConnectorAttemptPhaseV1::Rejected,
+                );
+                return Err(DeveloperDeploymentErrorV1::RuntimeExchangeFailed);
+            }
+        };
+        store
+            .commit_remote_connector_response(pending.claim, &pending.response)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)?;
+        Ok((request, verified.into_response()))
+    }
+
+    async fn node_publish_exchange(
+        store: &mut ControllerStore,
+        client: &mut RestrictedNodeControlClientV1,
+        node: &RemoteNodeControlAdapterV1,
+        signer: &SigningKey,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        observation: RuntimeObservationRequestV1,
+    ) -> Result<(), DeveloperDeploymentErrorV1> {
+        let mut boundary_error = None;
+        let mut pending = None;
+        let result = node
+            .publish_runtime_observation_once(
+                fresh_remote_node_request()?,
+                signer,
+                observation,
+                |wire| async {
+                    match send_node_wire_once(
+                        store,
+                        client,
+                        ControllerRemoteConnectorStepV1::NodePublish,
+                        wire,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            let raw = response.response.clone();
+                            pending = Some(response);
+                            RemoteNodeMtlsExchangeSuccessV1::try_new(
+                                enrollment.expected_node_principal,
+                                enrollment.node_route_config_digest,
+                                raw,
+                            )
+                            .map_err(|_| RemoteNodeControlTransportErrorV1::Rejected)
+                        }
+                        Err(error) => {
+                            boundary_error = Some(error);
+                            Err(RemoteNodeControlTransportErrorV1::Rejected)
+                        }
+                    }
+                },
+            )
+            .await;
+        if let Some(error) = boundary_error {
+            return Err(error);
+        }
+        if result.is_err() {
+            if let Some(pending) = pending.take() {
+                let _ = store.close_remote_connector_attempt(
+                    pending.claim,
+                    ControllerRemoteConnectorAttemptPhaseV1::Rejected,
+                );
+            }
+            return Err(DeveloperDeploymentErrorV1::NodeExchangeFailed);
+        }
+        let pending = pending.ok_or(DeveloperDeploymentErrorV1::NodeExchangeFailed)?;
+        store
+            .commit_remote_connector_response(pending.claim, &pending.response)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)
+    }
+
+    async fn node_latest_exchange(
+        store: &mut ControllerStore,
+        client: &mut RestrictedNodeControlClientV1,
+        node: &RemoteNodeControlAdapterV1,
+        signer: &SigningKey,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        target: NodeManagementTargetV1,
+    ) -> Result<(), DeveloperDeploymentErrorV1> {
+        let request_id = nonzero_system_entropy::<16>()?;
+        let request = NodeManagementRequestV1::try_latest(request_id, target)
+            .map_err(|_| DeveloperDeploymentErrorV1::NodeExchangeFailed)?;
+        // The carrier request id and inner PXNS request id must be identical.
+        let fresh = FreshRemoteNodeControlRequestV1::try_new(
+            request_id,
+            nonzero_system_entropy::<32>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::NodeExchangeFailed)?;
+        let process_generation = NodeObservationProcessGenerationV1::try_from_bytes(
+            nonzero_system_entropy::<16>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::NodeExchangeFailed)?;
+        let mut boundary_error = None;
+        let mut pending = None;
+        let result = node
+            .observe_management_once(
+                fresh,
+                signer,
+                request,
+                process_generation,
+                || {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .and_then(|value| u64::try_from(value.as_nanos()).ok())
+                        .filter(|value| *value != 0)
+                        .unwrap_or(1)
+                },
+                |wire| async {
+                    match send_node_wire_once(
+                        store,
+                        client,
+                        ControllerRemoteConnectorStepV1::NodeLatest,
+                        wire,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            let raw = response.response.clone();
+                            pending = Some(response);
+                            RemoteNodeMtlsExchangeSuccessV1::try_new(
+                                enrollment.expected_node_principal,
+                                enrollment.node_route_config_digest,
+                                raw,
+                            )
+                            .map_err(|_| RemoteNodeControlTransportErrorV1::Rejected)
+                        }
+                        Err(error) => {
+                            boundary_error = Some(error);
+                            Err(RemoteNodeControlTransportErrorV1::Rejected)
+                        }
+                    }
+                },
+            )
+            .await;
+        if let Some(error) = boundary_error {
+            return Err(error);
+        }
+        if result.is_err() {
+            if let Some(pending) = pending.take() {
+                let _ = store.close_remote_connector_attempt(
+                    pending.claim,
+                    ControllerRemoteConnectorAttemptPhaseV1::Rejected,
+                );
+            }
+            return Err(DeveloperDeploymentErrorV1::NodeExchangeFailed);
+        }
+        let pending = pending.ok_or(DeveloperDeploymentErrorV1::NodeExchangeFailed)?;
+        store
+            .commit_remote_connector_response(pending.claim, &pending.response)
+            .map_err(|_| DeveloperDeploymentErrorV1::ControllerStoreFailed)
+    }
+
+    async fn persist_remote_managed_serving_terminal(
+        store: &mut ManagedFabricSuccessorStoreV1,
+        client: &mut RestrictedRuntimeControlClientV1,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+        signer: &SigningKey,
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+    ) -> Result<Option<DeveloperDeploymentReadyV1>, DeveloperDeploymentErrorV1> {
+        let mut journal = ManagedFabricApplyJournalV1::new(store.state().clone());
+        if journal.state().serving_phase() == ManagedServingBootstrapPhaseV1::AttemptInFlight {
+            journal
+                .close_recovered_serving_bootstrap_with(|next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                })
+                .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+        }
+        if matches!(
+            journal.state().serving_phase(),
+            ManagedServingBootstrapPhaseV1::ReadyForRequest
+                | ManagedServingBootstrapPhaseV1::RequestDurable
+        ) {
+            let prepared = if journal.state().serving_phase()
+                == ManagedServingBootstrapPhaseV1::RequestDurable
+            {
+                journal
+                    .prepared_serving_bootstrap()
+                    .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?
+            } else {
+                journal
+                    .prepare_remote_serving_bootstrap_with(
+                        signer,
+                        provisioning,
+                        ingress,
+                        fresh_remote_runtime_request()?,
+                        |next| {
+                            store.commit_state(next).map_err(|_| {
+                                ManagedFabricApplyControllerError::DurabilityRejected
+                            })
+                        },
+                    )
+                    .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?
+            };
+            let action = journal
+                .claim_remote_serving_bootstrap_with(
+                    prepared,
+                    signer,
+                    provisioning,
+                    ingress,
+                    fresh_remote_runtime_request()?,
+                    |next| {
+                        store
+                            .commit_state(next)
+                            .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                    },
+                )
+                .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+            let context = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+                journal.state().legacy_snapshot().state(),
+                signer,
+                provisioning,
+                ingress,
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+            let outcome = action
+                .exchange_remote_once(
+                    provisioning.describe(),
+                    ingress,
+                    &context,
+                    |wire| async {
+                        let preflight = client
+                            .preflight(wire.into_vec())
+                            .await
+                            .map_err(|_| RuntimeManagedServingTransportErrorV1::NotSent)?;
+                        let response = preflight
+                            .send_once()
+                            .await
+                            .map_err(|_| RuntimeManagedServingTransportErrorV1::Uncertain)?;
+                        RuntimeManagedServingMtlsExchangeSuccessV1::try_new(
+                            enrollment.runtime_carrier.runtime_principal(),
+                            enrollment.runtime_carrier.binding_digest(),
+                            response,
+                        )
+                        .map_err(|_| RuntimeManagedServingTransportErrorV1::Rejected)
+                    },
+                )
+                .await;
+            let (action, response) = outcome.into_parts();
+            match response {
+                Ok(response) => {
+                    journal
+                        .consume_remote_serving_bootstrap_response_with(
+                            action,
+                            response,
+                            signer,
+                            provisioning,
+                            ingress,
+                            |next| {
+                                store.commit_state(next).map_err(|_| {
+                                    ManagedFabricApplyControllerError::DurabilityRejected
+                                })
+                            },
+                        )
+                        .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+                }
+                Err(_) => {
+                    journal
+                        .close_serving_bootstrap_no_response_with(action, |next| {
+                            store.commit_state(next).map_err(|_| {
+                                ManagedFabricApplyControllerError::DurabilityRejected
+                            })
+                        })
+                        .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+                }
+            }
+        }
+
+        if journal.state().serving_describe_reconcile_phase()
+            == ManagedServingDescribeReconcilePhaseV1::AttemptInFlight
+        {
+            journal
+                .close_recovered_remote_managed_ready_describe_with(|next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                })
+                .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+        }
+        if journal.state().serving_describe_reconcile_phase()
+            == ManagedServingDescribeReconcilePhaseV1::ResponseDurable
+        {
+            let ready = journal
+                .current_remote_managed_ready_facts(signer, provisioning, ingress)
+                .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+            if journal.state().serving_phase()
+                != ManagedServingBootstrapPhaseV1::ResponseDurable
+            {
+                return Ok(None);
+            }
+            return developer_deployment_ready(&journal, &ready).map(Some);
+        }
+        let prepared = if journal.state().serving_describe_reconcile_phase()
+            == ManagedServingDescribeReconcilePhaseV1::RequestDurable
+        {
+            journal
+                .prepared_remote_managed_ready_describe()
+                .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?
+        } else {
+            journal
+                .prepare_remote_managed_ready_describe_with(
+                    signer,
+                    provisioning,
+                    ingress,
+                    fresh_remote_runtime_request()?,
+                    |next| {
+                        store
+                            .commit_state(next)
+                            .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                    },
+                )
+                .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?
+        };
+        let action = journal
+            .claim_remote_managed_ready_describe_with(
+                prepared,
+                provisioning,
+                ingress,
+                |next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                },
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+        let outcome = action
+            .exchange_remote_once(|wire| async {
+                let preflight = client
+                    .preflight(wire.into_vec())
+                    .await
+                    .map_err(|_| RuntimeManagedServingDescribeTransportErrorV1::NotSent)?;
+                let response = preflight
+                    .send_once()
+                    .await
+                    .map_err(|_| RuntimeManagedServingDescribeTransportErrorV1::Uncertain)?;
+                RuntimeManagedServingDescribeMtlsExchangeSuccessV1::try_new(
+                    enrollment.runtime_carrier.runtime_principal(),
+                    enrollment.runtime_carrier.binding_digest(),
+                    response,
+                )
+                .map_err(|_| RuntimeManagedServingDescribeTransportErrorV1::Rejected)
+            })
+            .await;
+        let (action, response) = outcome.into_parts();
+        let transport = match response {
+            Ok(transport) => transport,
+            Err(_) => {
+                journal
+                    .close_remote_managed_ready_describe_no_response_with(action, |next| {
+                        store.commit_state(next).map_err(|_| {
+                            ManagedFabricApplyControllerError::DurabilityRejected
+                        })
+                    })
+                    .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+                return Ok(None);
+            }
+        };
+        if provisioning
+            .describe()
+            .try_accept_managed_ready_describe_response(
+                ingress,
+                action.request().clone(),
+                &transport,
+            )
+            .is_err()
+        {
+            journal
+                .close_remote_managed_ready_describe_no_response_with(action, |next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                })
+                .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+            return Ok(None);
+        }
+        journal
+            .consume_remote_managed_ready_describe_response_with(
+                action,
+                transport,
+                provisioning,
+                ingress,
+                |next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                },
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+        let ready = journal
+            .current_remote_managed_ready_facts(signer, provisioning, ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+        if journal.state().serving_phase() != ManagedServingBootstrapPhaseV1::ResponseDurable {
+            return Ok(None);
+        }
+        developer_deployment_ready(&journal, &ready).map(Some)
+    }
+
+    fn developer_deployment_ready(
+        journal: &ManagedFabricApplyJournalV1,
+        ready: &crate::managed_serving_client::VerifiedManagedServingReadyV1,
+    ) -> Result<DeveloperDeploymentReadyV1, DeveloperDeploymentErrorV1> {
+        if journal.state().serving_phase() != ManagedServingBootstrapPhaseV1::ResponseDurable {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        let facts = ready.serving_facts();
+        let mut digest = Digest32Builder::try_new(DEVELOPER_DEPLOYMENT_MANAGED_READY_DOMAIN)
+            .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+        digest
+            .field_bytes(ready.response_wire())
+            .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?;
+        Ok(DeveloperDeploymentReadyV1 {
+            target: facts.target(),
+            runtime_store_instance_id: facts.runtime_store_instance_id(),
+            snapshot_sequence: facts.snapshot_sequence(),
+            runtime_host_epoch: facts.runtime_host_epoch(),
+            managed_ready_digest: digest.finish(),
+        })
+    }
 
     pub(super) fn run() -> Result<(), DeploymentdProcessError> {
         let command = parse_arguments(std::env::args_os().skip(1))?;
