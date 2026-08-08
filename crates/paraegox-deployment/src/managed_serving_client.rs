@@ -307,11 +307,7 @@ impl ManagedServingDescribeIngressV1 {
         if next.projection() != prior.projection() {
             return Err(ManagedServingControllerError::DescribeManifestMismatch);
         }
-        if next.runtime_host_epoch() < prior.runtime_host_epoch()
-            || next.snapshot_sequence() < prior.snapshot_sequence()
-        {
-            return Err(ManagedServingControllerError::DescribeEpochRegression);
-        }
+        validate_runtime_observation_succession(prior, next)?;
         if self.channel() != previous.channel()
             && next.runtime_host_epoch() <= prior.runtime_host_epoch()
         {
@@ -1026,6 +1022,19 @@ fn verify_describe_response(
             },
         )
         .map_err(|_| ManagedServingControllerError::DescribeResponseAuthenticationMismatch)?;
+    Ok(())
+}
+
+fn validate_runtime_observation_succession(
+    prior: &ManagedServingBootstrapFactsV1,
+    next: &ManagedServingBootstrapFactsV1,
+) -> Result<(), ManagedServingControllerError> {
+    if next.runtime_host_epoch() < prior.runtime_host_epoch()
+        || (next.runtime_host_epoch() == prior.runtime_host_epoch()
+            && next.snapshot_sequence() < prior.snapshot_sequence())
+    {
+        return Err(ManagedServingControllerError::DescribeEpochRegression);
+    }
     Ok(())
 }
 
@@ -1787,11 +1796,7 @@ impl ManagedServingBootstrapStateV1 {
         if current.projection() != prior.projection() {
             return Err(ManagedServingControllerError::DescribeManifestMismatch);
         }
-        if current.runtime_host_epoch() < prior.runtime_host_epoch()
-            || current.snapshot_sequence() < prior.snapshot_sequence()
-        {
-            return Err(ManagedServingControllerError::DescribeEpochRegression);
-        }
+        validate_runtime_observation_succession(prior, current)?;
         Ok(())
     }
 
@@ -2633,7 +2638,28 @@ mod tests {
             Err(ManagedServingControllerError::DescribeChannelRebindWithoutRestart)
         ));
 
-        let restart_request = describe_request(&carrier, &controller, 0x89);
+        let regressed_request = describe_request(&carrier, &controller, 0x89);
+        let regressed_response = describe_response(ResponseInput {
+            request: &regressed_request,
+            projection: projection.clone(),
+            channel: first.channel(),
+            store: STORE,
+            epoch: 3,
+            snapshot: 4,
+            phase: RuntimeControlDescribeReadyPhaseV1::ManagedReady,
+            runtime: &runtime,
+        });
+        assert!(matches!(
+            ManagedServingDescribeIngressV1::try_accept(
+                &verifier,
+                Some(&first),
+                regressed_request,
+                &regressed_response,
+            ),
+            Err(ManagedServingControllerError::DescribeEpochRegression)
+        ));
+
+        let restart_request = describe_request(&carrier, &controller, 0x8a);
         let restarted_channel = channel(projection.target(), 0x8a);
         let restart_response = describe_response(ResponseInput {
             request: &restart_request,
@@ -2641,7 +2667,7 @@ mod tests {
             channel: restarted_channel,
             store: STORE,
             epoch: 4,
-            snapshot: 6,
+            snapshot: 1,
             phase: RuntimeControlDescribeReadyPhaseV1::ManagedReady,
             runtime: &runtime,
         });
