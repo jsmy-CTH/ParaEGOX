@@ -2514,7 +2514,7 @@ mod tests {
     fn pxcc_describe_and_runtime_signed_pxdr_round_trip_and_verify() {
         let describe = control_describe();
         assert_eq!(&describe.canonical_wire()[..6], b"PXCC\0\x01");
-        assert_eq!(describe.canonical_wire().len(), 487);
+        assert_eq!(describe.canonical_wire().len(), 493);
         assert_eq!(describe.kind(), RuntimeControlCarrierKindV1::Describe);
         assert!(describe.managed_serving_bootstrap_request().is_none());
         assert!(describe.reference_query_request().is_none());
@@ -2567,7 +2567,7 @@ mod tests {
         .finalize(&[0x4e; 64])
         .expect("PXDR");
         assert_eq!(&ready.canonical_wire()[..6], b"PXDR\0\x01");
-        assert_eq!(ready.canonical_wire().len(), 899);
+        assert_eq!(ready.canonical_wire().len(), 905);
         let decoded_ready = RuntimeControlDescribeReadyResponseV1::decode(ready.canonical_wire())
             .expect("strict PXDR");
         assert_eq!(decoded_ready, ready);
