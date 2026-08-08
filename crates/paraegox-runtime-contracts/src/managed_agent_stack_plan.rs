@@ -2746,22 +2746,22 @@ mod tests {
         assert_eq!(first.control_key_expression().len(), 91);
         assert!(first.submit_key_expression().len() <= MAX_MANAGED_AGENT_KEY_EXPRESSION_BYTES);
         assert!(first.control_key_expression().len() <= MAX_MANAGED_AGENT_KEY_EXPRESSION_BYTES);
-        assert_eq!(
+        assert!(matches!(
             ManagedAgentPortPlanV1::try_new_target_scoped(
                 RuntimeHostId::from_bytes([0; 16]),
                 service_id,
                 ingress(),
             ),
             Err(ManagedAgentStackPlanError::InvalidBinding)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             ManagedAgentPortPlanV1::try_new_target_scoped(
                 target,
                 ManagedServiceId::from_bytes([0; 16]),
                 ingress(),
             ),
             Err(ManagedAgentStackPlanError::InvalidBinding)
-        );
+        ));
     }
 
     #[test]
