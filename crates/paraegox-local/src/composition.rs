@@ -2704,9 +2704,7 @@ fn prepare_public_developer_node_v2(
     manifest: &identity::DeveloperNodeIdentityManifestV1,
     ready: &RuntimeDeveloperLocalReadyV1,
 ) -> Result<PreparedPublicDeveloperNodeV2, LocalProcessError> {
-    if config.schema() != DeveloperNodeConfigSchemaV1::RemoteControlV2
-        || manifest.schema() != DeveloperNodeConfigSchemaV1::RemoteControlV2
-    {
+    if !public_node_remote_observation_schema_pair(config.schema(), manifest.schema()) {
         return Err(LocalProcessError::NodeBootstrap);
     }
     let observation_token = manifest
@@ -2796,6 +2794,22 @@ fn prepare_public_developer_node_v2(
         observation_bootstrap_path,
         observation_socket_path,
     })
+}
+
+fn public_node_remote_observation_schema_pair(
+    config: DeveloperNodeConfigSchemaV1,
+    manifest: DeveloperNodeConfigSchemaV1,
+) -> bool {
+    matches!(
+        (config, manifest),
+        (
+            DeveloperNodeConfigSchemaV1::RemoteControlV2,
+            DeveloperNodeConfigSchemaV1::RemoteControlV2
+        ) | (
+            DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3,
+            DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+        )
+    )
 }
 
 fn reconstruct_runtime_reference_channel_v2(
@@ -3978,6 +3992,33 @@ mod tests {
         write_node_ready(&mut output).expect("node readiness marker");
         assert_eq!(output.bytes, b"paraegox: node ready\n");
         assert_eq!(output.flushes, 1);
+    }
+
+    #[test]
+    fn public_node_remote_observation_schema_pair_accepts_only_matching_v2_or_v3() {
+        let schemas = [
+            DeveloperNodeConfigSchemaV1::HostLocalV1,
+            DeveloperNodeConfigSchemaV1::RemoteControlV2,
+            DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3,
+        ];
+        for config in schemas {
+            for manifest in schemas {
+                let expected = matches!(
+                    (config, manifest),
+                    (
+                        DeveloperNodeConfigSchemaV1::RemoteControlV2,
+                        DeveloperNodeConfigSchemaV1::RemoteControlV2
+                    ) | (
+                        DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3,
+                        DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3
+                    )
+                );
+                assert_eq!(
+                    public_node_remote_observation_schema_pair(config, manifest),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
