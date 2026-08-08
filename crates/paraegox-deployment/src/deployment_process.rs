@@ -117,11 +117,15 @@ pub fn run_deploymentd_process() -> Result<(), DeploymentdProcessError> {
 
 #[cfg(unix)]
 pub use platform::{
+    DeveloperDeploymentAgentBootstrapReadyV1,
+    DeveloperDeploymentAgentBootstrapStartFieldsV1,
+    DeveloperDeploymentAgentBootstrapStartInputV1,
+    DeveloperDeploymentAgentBootstrapStartOutcomeV1,
     DeveloperDeploymentEnrollmentFactsFieldsV1, DeveloperDeploymentEnrollmentFactsV1,
     DeveloperDeploymentErrorV1, DeveloperDeploymentOwnerV1, DeveloperDeploymentReadyV1,
     DeveloperDeploymentStartFieldsV1, DeveloperDeploymentStartInputV1,
     DeveloperDeploymentStartModeV1, DeveloperDeploymentStartOutcomeV1,
-    start_developer_deployment_v1,
+    start_developer_deployment_agent_bootstrap_v1, start_developer_deployment_v1,
 };
 
 #[cfg(unix)]
@@ -183,12 +187,17 @@ mod platform {
         MAX_INSTALLED_RUNTIME_MANIFEST_BYTES, VerifiedRuntimeManifestIngressV1,
     };
     use paraegox_runtime_contracts::managed_agent_stack_plan::{
-        ManagedAgentIngressLimitsV1, ManagedAgentPortPlanV1, ManagedAgentProviderRefV1,
-        ManagedAgentProviderSelectionV1, ManagedAgentSecretRefV1, ManagedAgentSemanticLimitsV1,
-        ManagedAgentServicePlanV1, ManagedAgentStackTargetModeV1,
+        ManagedAgentIngressLimitsV1, ManagedAgentPortPlanV1, ManagedAgentProviderProfileV1,
+        ManagedAgentProviderRefV1, ManagedAgentProviderSelectionV1, ManagedAgentSecretRefV1,
+        ManagedAgentSemanticLimitsV1, ManagedAgentServicePlanV1, ManagedAgentStackTargetModeV1,
+        ManagedAgentStackTerminalOutcomeV1,
+    };
+    use paraegox_runtime_contracts::managed_fabric_plan::{
+        ManagedFabricApplyTerminalOutcomeV1, ManagedFabricListenEndpointV1,
     };
     use paraegox_runtime_contracts::managed_service::{
-        ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
+        ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleBudgetsV1,
+        ManagedServiceSpecV1,
     };
     use paraegox_runtime_contracts::managed_serving_bootstrap::{
         RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestV1,
@@ -264,27 +273,31 @@ mod platform {
         DistributedAgentStackRolloutStatusV1, DistributedAgentStackStoreError,
     };
     use crate::managed_agent_stack_apply::{
-        ManagedAgentStackApplyJournalV1, ManagedAgentStackTerminalCommitV1,
+        ManagedAgentStackApplyJournalV1, ManagedAgentStackApplyPhaseV1,
+        ManagedAgentStackRemoteAgentControlActivateInputV1, ManagedAgentStackTerminalCommitV1,
     };
     use crate::managed_agent_stack_producer::{
         FreshManagedAgentStackApplyV1, ManagedAgentStackActivationV1,
     };
     use crate::managed_fabric_apply::{
         ManagedFabricApplyControllerError, ManagedFabricApplyJournalV1,
+        ManagedFabricApplyPhaseV1, ManagedFabricRemoteAgentControlActivateInputV1,
     };
     use crate::managed_fabric_producer::{
-        ManagedFabricControllerIdentityV1, ManagedFabricControllerProvisioningV1,
-        ManagedFabricRemoteControllerProvisioningV1, ManagedFabricRuntimeChannelPinV1,
-        ManagedFabricServiceAccountsV1, ManagedFabricTenureAuthorityPinV1,
-        VerifiedManagedFabricProducerContextV1,
+        FreshManagedFabricApplyV1, ManagedFabricControllerIdentityV1,
+        ManagedFabricControllerProvisioningV1, ManagedFabricRemoteControllerProvisioningV1,
+        ManagedFabricRuntimeChannelPinV1, ManagedFabricServiceAccountsV1,
+        ManagedFabricTenureAuthorityPinV1, VerifiedManagedFabricProducerContextV1,
     };
     use crate::managed_fabric_store::{
         ManagedAgentStackDurableStoreV1, ManagedFabricSuccessorStoreV1,
     };
     use crate::managed_serving_client::{
-        FreshManagedServingBootstrapV1, ManagedServingBootstrapPhaseV1,
-        ManagedServingDescribeIngressV1, ManagedServingDescribeReconcilePhaseV1,
-        ManagedServingDescribeVerifierV1, RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+        FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1,
+        ManagedServingBootstrapPhaseV1, ManagedServingDescribeIngressV1,
+        ManagedServingDescribeReconcilePhaseV1, ManagedServingDescribeVerifierV1,
+        RuntimeAgentControlDurablePhaseV1, RuntimeAgentControlMtlsExchangeSuccessV1,
+        RuntimeAgentControlTransportErrorV1, RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
         RuntimeManagedServingDescribeTransportErrorV1, RuntimeManagedServingMtlsExchangeSuccessV1,
         RuntimeManagedServingTransportErrorV1, VerifiedManagedServingPinV1,
     };
@@ -386,6 +399,7 @@ mod platform {
         b"paraegox.deployment.developer-enrollment.plan.sha256.v1";
     const DEVELOPER_DEPLOYMENT_MANAGED_READY_DOMAIN: &[u8] =
         b"paraegox.deployment.developer-managed-ready.sha256.v1";
+    const DEVELOPER_AGENT_BOOTSTRAP_LIFECYCLE_NANOS: u64 = 3_000_000_000;
 
     /// Typed projection of one already SHA-pinned, decoded, signature-verified
     /// and cross-pinned PXEA. Deployment never receives the PXEA file bytes.
@@ -608,6 +622,74 @@ mod platform {
         }
     }
 
+    /// Complete one-shot developer request for the T0 deployment owner plus
+    /// the exact managed Fabric, Agent and bootstrap descriptor progression.
+    /// The base request remains the sole owner of credentials, directories,
+    /// connector configuration and verified enrollment facts.
+    pub struct DeveloperDeploymentAgentBootstrapStartInputV1 {
+        base: DeveloperDeploymentStartInputV1,
+        provider: ManagedAgentProviderSelectionV1,
+        fabric_service_id: ManagedServiceId,
+        agent_service_id: ManagedServiceId,
+        fabric_listen_endpoint: ManagedFabricListenEndpointV1,
+    }
+
+    /// Named, reviewable inputs for one developer Agent-bootstrap start.
+    pub struct DeveloperDeploymentAgentBootstrapStartFieldsV1 {
+        pub base: DeveloperDeploymentStartInputV1,
+        pub provider: ManagedAgentProviderSelectionV1,
+        pub fabric_service_id: ManagedServiceId,
+        pub agent_service_id: ManagedServiceId,
+        pub fabric_listen_endpoint: ManagedFabricListenEndpointV1,
+    }
+
+    impl fmt::Debug for DeveloperDeploymentAgentBootstrapStartInputV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("DeveloperDeploymentAgentBootstrapStartInputV1")
+                .field("base", &self.base)
+                .field("provider", &self.provider)
+                .field("fabric_service_id", &self.fabric_service_id)
+                .field("agent_service_id", &self.agent_service_id)
+                .field("fabric_listen_endpoint", &self.fabric_listen_endpoint)
+                .finish()
+        }
+    }
+
+    impl DeveloperDeploymentAgentBootstrapStartInputV1 {
+        pub fn try_new(
+            fields: DeveloperDeploymentAgentBootstrapStartFieldsV1,
+        ) -> Result<Self, DeveloperDeploymentErrorV1> {
+            let DeveloperDeploymentAgentBootstrapStartFieldsV1 {
+                base,
+                provider,
+                fabric_service_id,
+                agent_service_id,
+                fabric_listen_endpoint,
+            } = fields;
+            let exact_fixture = ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+                provider.provider_ref(),
+                provider.config_digest(),
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+            if fabric_service_id.as_bytes().iter().all(|byte| *byte == 0)
+                || agent_service_id.as_bytes().iter().all(|byte| *byte == 0)
+                || fabric_service_id == agent_service_id
+                || provider.profile() != ManagedAgentProviderProfileV1::DeterministicFixture
+                || provider != exact_fixture
+            {
+                return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
+            }
+            Ok(Self {
+                base,
+                provider,
+                fabric_service_id,
+                agent_service_id,
+                fabric_listen_endpoint,
+            })
+        }
+    }
+
     /// The real deployment owner graph. A `Ready` outcome is emitted only
     /// after terminal PXFR and a fresh ManagedReady Describe response are both
     /// durably committed.
@@ -741,6 +823,93 @@ mod platform {
         ReconcileRequired(DeveloperDeploymentOwnerV1),
     }
 
+    /// Non-secret proof that the T0 ManagedReady predecessor and all three T1
+    /// Agent-control slots are durably terminal and were revalidated together.
+    /// The descriptor digest is bootstrap discovery evidence only: it grants
+    /// no conversation session, access capability, request authority or Echo.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct DeveloperDeploymentAgentBootstrapReadyV1 {
+        target: paraegox_kernel::identity::RuntimeHostId,
+        runtime_store_instance_id: [u8; 32],
+        snapshot_sequence: u64,
+        runtime_host_epoch: u64,
+        managed_ready_digest: Digest32,
+        fabric_receipt_digest: Digest32,
+        agent_stack_receipt_digest: Digest32,
+        conversation_port_descriptor_receipt_digest: Digest32,
+        fabric_generation: ManagedServiceGeneration,
+        agent_generation: ManagedServiceGeneration,
+    }
+
+    impl DeveloperDeploymentAgentBootstrapReadyV1 {
+        #[must_use]
+        pub const fn target(&self) -> paraegox_kernel::identity::RuntimeHostId {
+            self.target
+        }
+
+        #[must_use]
+        pub const fn runtime_store_instance_id(&self) -> [u8; 32] {
+            self.runtime_store_instance_id
+        }
+
+        #[must_use]
+        pub const fn snapshot_sequence(&self) -> u64 {
+            self.snapshot_sequence
+        }
+
+        #[must_use]
+        pub const fn runtime_host_epoch(&self) -> u64 {
+            self.runtime_host_epoch
+        }
+
+        #[must_use]
+        pub const fn managed_ready_digest(&self) -> Digest32 {
+            self.managed_ready_digest
+        }
+
+        /// Digest of the independently signed inner PXFT receipt.
+        #[must_use]
+        pub const fn fabric_receipt_digest(&self) -> Digest32 {
+            self.fabric_receipt_digest
+        }
+
+        /// Digest of the independently signed inner PXST receipt.
+        #[must_use]
+        pub const fn agent_stack_receipt_digest(&self) -> Digest32 {
+            self.agent_stack_receipt_digest
+        }
+
+        /// Digest of the whole bootstrap-only descriptor PXAH receipt. This
+        /// value is not a session, an access capability or an Echo authority.
+        #[must_use]
+        pub const fn conversation_port_descriptor_receipt_digest(&self) -> Digest32 {
+            self.conversation_port_descriptor_receipt_digest
+        }
+
+        #[must_use]
+        pub const fn fabric_generation(&self) -> ManagedServiceGeneration {
+            self.fabric_generation
+        }
+
+        #[must_use]
+        pub const fn agent_generation(&self) -> ManagedServiceGeneration {
+            self.agent_generation
+        }
+    }
+
+    /// T1 preserves the complete running owner on both success and explicit
+    /// reconciliation outcomes. Only `Ready` may publish Agent-bootstrap
+    /// readiness.
+    #[derive(Debug)]
+    #[must_use]
+    pub enum DeveloperDeploymentAgentBootstrapStartOutcomeV1 {
+        Ready {
+            owner: DeveloperDeploymentOwnerV1,
+            ready: DeveloperDeploymentAgentBootstrapReadyV1,
+        },
+        ReconcileRequired(DeveloperDeploymentOwnerV1),
+    }
+
     enum DeveloperDeploymentPipelineOutcomeV1 {
         Ready {
             store: Box<ManagedFabricSuccessorStoreV1>,
@@ -866,6 +1035,60 @@ mod platform {
         }
     }
 
+    /// Starts the existing T0 owner once, then advances the exact remote
+    /// Fabric, Agent-stack and bootstrap-only descriptor slots without retry.
+    /// Any durable `Uncertain` fence is returned to its caller unchanged as an
+    /// explicit reconciliation requirement.
+    pub async fn start_developer_deployment_agent_bootstrap_v1(
+        input: DeveloperDeploymentAgentBootstrapStartInputV1,
+    ) -> Result<DeveloperDeploymentAgentBootstrapStartOutcomeV1, DeveloperDeploymentErrorV1> {
+        let DeveloperDeploymentAgentBootstrapStartInputV1 {
+            base,
+            provider,
+            fabric_service_id,
+            agent_service_id,
+            fabric_listen_endpoint,
+        } = input;
+        let controller_signer = SigningKey::from_bytes(&base.controller_seed);
+        let controller_public_key = controller_signer.verifying_key().to_bytes();
+        let enrollment = base.enrollment.clone();
+        let (mut owner, managed_ready) = match start_developer_deployment_v1(base).await? {
+            DeveloperDeploymentStartOutcomeV1::Ready { owner, ready } => (owner, ready),
+            DeveloperDeploymentStartOutcomeV1::ReconcileRequired(owner) => {
+                return Ok(
+                    DeveloperDeploymentAgentBootstrapStartOutcomeV1::ReconcileRequired(owner),
+                );
+            }
+        };
+        let advanced = advance_developer_deployment_agent_bootstrap_v1(
+            DeveloperDeploymentAgentBootstrapAdvanceInputV1 {
+                owner: &mut owner,
+                controller_signer: &controller_signer,
+                controller_public_key,
+                enrollment: &enrollment,
+                managed_ready,
+                provider,
+                fabric_service_id,
+                agent_service_id,
+                fabric_listen_endpoint,
+            },
+        )
+        .await;
+        match advanced {
+            Ok(Some(ready)) => Ok(DeveloperDeploymentAgentBootstrapStartOutcomeV1::Ready {
+                owner,
+                ready,
+            }),
+            Ok(None) => Ok(
+                DeveloperDeploymentAgentBootstrapStartOutcomeV1::ReconcileRequired(owner),
+            ),
+            Err(error) => {
+                let _ = owner.shutdown_and_join().await;
+                Err(error)
+            }
+        }
+    }
+
     struct DeveloperDeploymentPipelineInputV1<'a> {
         mode: DeveloperDeploymentStartModeV1,
         controller_store_directory: &'a Path,
@@ -907,30 +1130,11 @@ mod platform {
         ) {
             return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
         }
-        let controller = ManagedFabricControllerIdentityV1::try_new(
-            enrollment.runtime_carrier.controller_principal(),
-            DeploymentWriterRef::from_bytes(*enrollment.writer.as_bytes()),
-        )
-        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
-        let authority = ManagedFabricTenureAuthorityPinV1::try_new(
-            enrollment.authority_principal,
-            authority_facts.peer().uid(),
-            authority_facts.peer().gid(),
-            enrollment.authority_ref,
-            enrollment.authority_key_ref,
-            authority_facts.authority_verification_key(),
-        )
-        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
-        let describe = ManagedServingDescribeVerifierV1::try_new(
-            enrollment.runtime_transport_profile.target(),
-            enrollment.runtime_carrier.clone(),
+        let provisioning = developer_remote_provisioning(
+            enrollment,
             controller_signer.verifying_key().to_bytes(),
-            enrollment.runtime_response_public_key,
-            enrollment.verified_manifest.manifest_digest(),
-        )
-        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
-        let provisioning =
-            ManagedFabricRemoteControllerProvisioningV1::new(controller, authority, describe);
+            authority_facts,
+        )?;
         let owner_identity = ControllerOwnerIdentityFingerprint::from_stored(
             authority_facts.owner_identity_fingerprint(),
         );
@@ -2053,6 +2257,38 @@ mod platform {
         .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)
     }
 
+    fn developer_remote_provisioning(
+        enrollment: &DeveloperDeploymentEnrollmentFactsV1,
+        controller_public_key: [u8; 32],
+        authority_facts: &crate::developer_local_tenure_authority::DeveloperLocalTenureAuthorityFactsV1,
+    ) -> Result<ManagedFabricRemoteControllerProvisioningV1, DeveloperDeploymentErrorV1> {
+        let controller = ManagedFabricControllerIdentityV1::try_new(
+            enrollment.runtime_carrier.controller_principal(),
+            DeploymentWriterRef::from_bytes(*enrollment.writer.as_bytes()),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        let authority = ManagedFabricTenureAuthorityPinV1::try_new(
+            enrollment.authority_principal,
+            authority_facts.peer().uid(),
+            authority_facts.peer().gid(),
+            enrollment.authority_ref,
+            enrollment.authority_key_ref,
+            authority_facts.authority_verification_key(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        let describe = ManagedServingDescribeVerifierV1::try_new(
+            enrollment.runtime_transport_profile.target(),
+            enrollment.runtime_carrier.clone(),
+            controller_public_key,
+            enrollment.runtime_response_public_key,
+            enrollment.verified_manifest.manifest_digest(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidEnrollmentFacts)?;
+        Ok(ManagedFabricRemoteControllerProvisioningV1::new(
+            controller, authority, describe,
+        ))
+    }
+
     #[derive(Clone, Copy)]
     struct DeveloperTenurePinsV1 {
         source_scope: SourceScopeRef,
@@ -3006,6 +3242,652 @@ mod platform {
             snapshot_sequence: facts.snapshot_sequence(),
             runtime_host_epoch: facts.runtime_host_epoch(),
             managed_ready_digest: digest.finish(),
+        })
+    }
+
+    struct DeveloperDeploymentAgentBootstrapAdvanceInputV1<'a> {
+        owner: &'a mut DeveloperDeploymentOwnerV1,
+        controller_signer: &'a SigningKey,
+        controller_public_key: [u8; 32],
+        enrollment: &'a DeveloperDeploymentEnrollmentFactsV1,
+        managed_ready: DeveloperDeploymentReadyV1,
+        provider: ManagedAgentProviderSelectionV1,
+        fabric_service_id: ManagedServiceId,
+        agent_service_id: ManagedServiceId,
+        fabric_listen_endpoint: ManagedFabricListenEndpointV1,
+    }
+
+    async fn advance_developer_deployment_agent_bootstrap_v1(
+        input: DeveloperDeploymentAgentBootstrapAdvanceInputV1<'_>,
+    ) -> Result<Option<DeveloperDeploymentAgentBootstrapReadyV1>, DeveloperDeploymentErrorV1> {
+        let DeveloperDeploymentAgentBootstrapAdvanceInputV1 {
+            owner,
+            controller_signer,
+            controller_public_key,
+            enrollment,
+            managed_ready,
+            provider,
+            fabric_service_id,
+            agent_service_id,
+            fabric_listen_endpoint,
+        } = input;
+        let authority_facts = owner
+            .authority
+            .as_ref()
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+            .facts();
+        validate_authority_cross_pins(enrollment, controller_signer, authority_facts)?;
+        let provisioning =
+            developer_remote_provisioning(enrollment, controller_public_key, authority_facts)?;
+        if owner.controller_store.is_some() {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        let store = owner
+            .successor_store
+            .as_mut()
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let client = owner
+            .runtime_client
+            .as_mut()
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        if !client.matches_restricted_target(
+            enrollment.runtime_transport_profile.target(),
+            enrollment.runtime_transport_profile.route(),
+            enrollment.runtime_carrier.runtime_principal(),
+            enrollment.runtime_carrier.binding_digest(),
+        ) {
+            return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
+        }
+        let ingress = remote_describe_ingress_from_successor(store, &provisioning)?;
+        let base_journal = ManagedFabricApplyJournalV1::new(store.state().clone());
+        let current_managed_ready = base_journal
+            .current_remote_managed_ready_facts(controller_signer, &provisioning, &ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let revalidated_managed_ready =
+            developer_deployment_ready(&base_journal, &current_managed_ready)?;
+        if revalidated_managed_ready != managed_ready
+            || managed_ready.target() != enrollment.runtime_transport_profile.target()
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+
+        let fabric_service = ManagedServiceSpecV1::new(
+            fabric_service_id,
+            developer_agent_bootstrap_lifecycle_budgets()?,
+        );
+        if !advance_developer_fabric_agent_control(
+            DeveloperFabricAgentControlAdvanceInputV1 {
+                store,
+                client,
+                controller_signer,
+                provisioning: &provisioning,
+                ingress: &ingress,
+                enrollment,
+                service: fabric_service,
+                endpoint: fabric_listen_endpoint,
+            },
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+
+        let expected_fabric = store
+            .state()
+            .desired()
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+            .execution()
+            .clone();
+        let agent_plan = developer_agent_bootstrap_service_plan(
+            enrollment.runtime_transport_profile.target(),
+            agent_service_id,
+            provider,
+        )?;
+        let activation = ManagedAgentStackActivationV1::try_new(expected_fabric, agent_plan)
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        if !advance_developer_agent_stack_agent_control(
+            DeveloperAgentStackControlAdvanceInputV1 {
+                store,
+                client,
+                controller_signer,
+                provisioning: &provisioning,
+                ingress: &ingress,
+                enrollment,
+                activation: &activation,
+            },
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        if !advance_developer_conversation_port_descriptor(
+            DeveloperConversationPortDescriptorAdvanceInputV1 {
+                store,
+                client,
+                controller_signer,
+                provisioning: &provisioning,
+                ingress: &ingress,
+                enrollment,
+            },
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        developer_agent_bootstrap_ready(
+            store,
+            controller_signer,
+            &provisioning,
+            &ingress,
+            managed_ready,
+        )
+        .map(Some)
+    }
+
+    fn developer_agent_bootstrap_lifecycle_budgets()
+    -> Result<ManagedServiceLifecycleBudgetsV1, DeveloperDeploymentErrorV1> {
+        let bound = BoundedDuration::from_nanos(DEVELOPER_AGENT_BOOTSTRAP_LIFECYCLE_NANOS);
+        ManagedServiceLifecycleBudgetsV1::try_new(bound, bound, bound, bound, bound)
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)
+    }
+
+    fn developer_agent_bootstrap_service_plan(
+        target: paraegox_kernel::identity::RuntimeHostId,
+        service_id: ManagedServiceId,
+        provider: ManagedAgentProviderSelectionV1,
+    ) -> Result<ManagedAgentServicePlanV1, DeveloperDeploymentErrorV1> {
+        let ingress =
+            ManagedAgentIngressLimitsV1::try_new(8, 512 * 1024, 64 * 1024, 64 * 1024, 2_000_000_000)
+                .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        let port = ManagedAgentPortPlanV1::try_new_target_scoped(target, service_id, ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        ManagedAgentServicePlanV1::try_new(
+            ManagedServiceSpecV1::new(
+                service_id,
+                developer_agent_bootstrap_lifecycle_budgets()?,
+            ),
+            ManagedAgentSemanticLimitsV1::try_new(8, 16, 16, 32)
+                .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?,
+            port,
+            provider,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)
+    }
+
+    fn fresh_developer_managed_fabric_apply()
+    -> Result<FreshManagedFabricApplyV1, DeveloperDeploymentErrorV1> {
+        FreshManagedFabricApplyV1::try_new(
+            nonzero_system_entropy::<16>()?,
+            nonzero_system_entropy::<16>()?,
+            nonzero_system_entropy::<32>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)
+    }
+
+    fn fresh_developer_managed_agent_stack_apply()
+    -> Result<FreshManagedAgentStackApplyV1, DeveloperDeploymentErrorV1> {
+        FreshManagedAgentStackApplyV1::try_new(
+            nonzero_system_entropy::<16>()?,
+            nonzero_system_entropy::<16>()?,
+            nonzero_system_entropy::<32>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)
+    }
+
+    fn fresh_developer_runtime_agent_control()
+    -> Result<FreshRuntimeAgentControlV1, DeveloperDeploymentErrorV1> {
+        FreshRuntimeAgentControlV1::try_new(
+            nonzero_system_entropy::<16>()?,
+            nonzero_system_entropy::<32>()?,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)
+    }
+
+    struct DeveloperFabricAgentControlAdvanceInputV1<'a> {
+        store: &'a mut ManagedFabricSuccessorStoreV1,
+        client: &'a mut RestrictedRuntimeControlClientV1,
+        controller_signer: &'a SigningKey,
+        provisioning: &'a ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &'a ManagedServingDescribeIngressV1,
+        enrollment: &'a DeveloperDeploymentEnrollmentFactsV1,
+        service: ManagedServiceSpecV1,
+        endpoint: ManagedFabricListenEndpointV1,
+    }
+
+    async fn advance_developer_fabric_agent_control(
+        input: DeveloperFabricAgentControlAdvanceInputV1<'_>,
+    ) -> Result<bool, DeveloperDeploymentErrorV1> {
+        let DeveloperFabricAgentControlAdvanceInputV1 {
+            store,
+            client,
+            controller_signer,
+            provisioning,
+            ingress,
+            enrollment,
+            service,
+            endpoint,
+        } = input;
+        let mut journal = ManagedFabricApplyJournalV1::new(store.state().clone());
+        if let Some(terminal) = journal
+            .remote_agent_control_terminal(controller_signer, provisioning, ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+        {
+            if terminal.inner().facts().outcome()
+                != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+            {
+                return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+            }
+            return Ok(true);
+        }
+        let phase = journal.state().phase();
+        let outer_phase = journal.state().fabric_agent_control().phase();
+        if phase == ManagedFabricApplyPhaseV1::Uncertain
+            || outer_phase == RuntimeAgentControlDurablePhaseV1::Uncertain
+        {
+            return Ok(false);
+        }
+        if phase == ManagedFabricApplyPhaseV1::ReceiptDurable
+            || outer_phase == RuntimeAgentControlDurablePhaseV1::ReceiptDurable
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        let prepared_restart = phase == ManagedFabricApplyPhaseV1::RequestDurableNotSent
+            || outer_phase == RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent;
+        let prepared = journal
+            .prepare_remote_agent_control_activate_with(
+                ManagedFabricRemoteAgentControlActivateInputV1 {
+                    controller_signer,
+                    provisioning,
+                    previous: ingress,
+                    service,
+                    endpoint,
+                    inner_fresh: fresh_developer_managed_fabric_apply()?,
+                    outer_fresh: fresh_developer_runtime_agent_control()?,
+                },
+                |next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                },
+            )
+            .map_err(|_| {
+                if prepared_restart {
+                    DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery
+                } else {
+                    DeveloperDeploymentErrorV1::ManagedServingFailed
+                }
+            })?;
+        let action = journal
+            .claim_remote_agent_control_send_with(
+                prepared,
+                controller_signer,
+                provisioning,
+                ingress,
+                |next| {
+                    store
+                        .commit_state(next)
+                        .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+                },
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let outcome = action
+            .exchange_remote_once(|wire| async {
+                let preflight = client
+                    .preflight(wire.into_vec())
+                    .await
+                    .map_err(|_| RuntimeAgentControlTransportErrorV1::NotSent)?;
+                let response = preflight
+                    .send_once()
+                    .await
+                    .map_err(|_| RuntimeAgentControlTransportErrorV1::Uncertain)?;
+                RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
+                    enrollment.runtime_carrier.runtime_principal(),
+                    enrollment.runtime_carrier.binding_digest(),
+                    response,
+                )
+                .map_err(|_| RuntimeAgentControlTransportErrorV1::Rejected)
+            })
+            .await;
+        let (action, response) = outcome.into_parts();
+        let Ok(transport) = response else {
+            return Ok(false);
+        };
+        let terminal = match journal.consume_remote_agent_control_pxah_with(
+            action,
+            transport,
+            controller_signer,
+            provisioning,
+            ingress,
+            |next| {
+                store
+                    .commit_state(next)
+                    .map_err(|_| ManagedFabricApplyControllerError::DurabilityRejected)
+            },
+        ) {
+            Ok(terminal) => terminal,
+            Err(_) => return Ok(false),
+        };
+        if terminal.inner().facts().outcome()
+            != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        Ok(true)
+    }
+
+    struct DeveloperAgentStackControlAdvanceInputV1<'a> {
+        store: &'a mut ManagedFabricSuccessorStoreV1,
+        client: &'a mut RestrictedRuntimeControlClientV1,
+        controller_signer: &'a SigningKey,
+        provisioning: &'a ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &'a ManagedServingDescribeIngressV1,
+        enrollment: &'a DeveloperDeploymentEnrollmentFactsV1,
+        activation: &'a ManagedAgentStackActivationV1,
+    }
+
+    async fn advance_developer_agent_stack_agent_control(
+        input: DeveloperAgentStackControlAdvanceInputV1<'_>,
+    ) -> Result<bool, DeveloperDeploymentErrorV1> {
+        let DeveloperAgentStackControlAdvanceInputV1 {
+            store,
+            client,
+            controller_signer,
+            provisioning,
+            ingress,
+            enrollment,
+            activation,
+        } = input;
+        let mut journal = ManagedAgentStackApplyJournalV1::new(store.state().clone());
+        if let Some(terminal) = journal
+            .remote_agent_control_terminal(controller_signer, provisioning, ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+        {
+            let facts = terminal.inner().facts();
+            if facts.request_mode() != ManagedAgentStackTargetModeV1::FabricAndAgent
+                || facts.state().outcome() != ManagedAgentStackTerminalOutcomeV1::ActiveReady
+            {
+                return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+            }
+            return Ok(true);
+        }
+        let inner_phase = journal
+            .state()
+            .agent_stack_state()
+            .map(|state| state.phase());
+        let outer_phase = journal.state().agent_stack_agent_control().phase();
+        if inner_phase == Some(ManagedAgentStackApplyPhaseV1::Uncertain)
+            || outer_phase == RuntimeAgentControlDurablePhaseV1::Uncertain
+        {
+            return Ok(false);
+        }
+        if inner_phase == Some(ManagedAgentStackApplyPhaseV1::ReceiptDurable)
+            || outer_phase == RuntimeAgentControlDurablePhaseV1::ReceiptDurable
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        let prepared_restart = inner_phase
+            == Some(ManagedAgentStackApplyPhaseV1::RequestDurableNotSent)
+            || outer_phase == RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent;
+        let prepared = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(store)
+                .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+            journal
+                .prepare_remote_agent_control_activate_with(
+                    ManagedAgentStackRemoteAgentControlActivateInputV1 {
+                        controller_signer,
+                        provisioning,
+                        previous: ingress,
+                        activation,
+                        inner_fresh: fresh_developer_managed_agent_stack_apply()?,
+                        outer_fresh: fresh_developer_runtime_agent_control()?,
+                    },
+                    |next| durable.commit(next),
+                )
+                .map_err(|_| {
+                    if prepared_restart {
+                        DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery
+                    } else {
+                        DeveloperDeploymentErrorV1::ManagedServingFailed
+                    }
+                })?
+        };
+        let action = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(store)
+                .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+            journal
+                .claim_remote_agent_control_send_with(
+                    prepared,
+                    controller_signer,
+                    provisioning,
+                    ingress,
+                    |next| durable.commit(next),
+                )
+                .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+        };
+        let outcome = action
+            .exchange_remote_once(|wire| async {
+                let preflight = client
+                    .preflight(wire.into_vec())
+                    .await
+                    .map_err(|_| RuntimeAgentControlTransportErrorV1::NotSent)?;
+                let response = preflight
+                    .send_once()
+                    .await
+                    .map_err(|_| RuntimeAgentControlTransportErrorV1::Uncertain)?;
+                RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
+                    enrollment.runtime_carrier.runtime_principal(),
+                    enrollment.runtime_carrier.binding_digest(),
+                    response,
+                )
+                .map_err(|_| RuntimeAgentControlTransportErrorV1::Rejected)
+            })
+            .await;
+        let (action, response) = outcome.into_parts();
+        let Ok(transport) = response else {
+            return Ok(false);
+        };
+        let terminal = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(store)
+                .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+            match journal.consume_remote_agent_control_pxah_with(
+                action,
+                transport,
+                controller_signer,
+                provisioning,
+                ingress,
+                |next| durable.commit(next),
+            ) {
+                Ok(terminal) => terminal,
+                Err(_) => return Ok(false),
+            }
+        };
+        let facts = terminal.inner().facts();
+        if facts.request_mode() != ManagedAgentStackTargetModeV1::FabricAndAgent
+            || facts.state().outcome() != ManagedAgentStackTerminalOutcomeV1::ActiveReady
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        Ok(true)
+    }
+
+    struct DeveloperConversationPortDescriptorAdvanceInputV1<'a> {
+        store: &'a mut ManagedFabricSuccessorStoreV1,
+        client: &'a mut RestrictedRuntimeControlClientV1,
+        controller_signer: &'a SigningKey,
+        provisioning: &'a ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &'a ManagedServingDescribeIngressV1,
+        enrollment: &'a DeveloperDeploymentEnrollmentFactsV1,
+    }
+
+    async fn advance_developer_conversation_port_descriptor(
+        input: DeveloperConversationPortDescriptorAdvanceInputV1<'_>,
+    ) -> Result<bool, DeveloperDeploymentErrorV1> {
+        let DeveloperConversationPortDescriptorAdvanceInputV1 {
+            store,
+            client,
+            controller_signer,
+            provisioning,
+            ingress,
+            enrollment,
+        } = input;
+        let mut journal = ManagedAgentStackApplyJournalV1::new(store.state().clone());
+        if let Some(terminal) = journal
+            .conversation_port_descriptor_terminal(controller_signer, provisioning, ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+        {
+            if terminal.descriptor().is_none() {
+                return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+            }
+            return Ok(true);
+        }
+        let phase = journal.state().conversation_port_descriptor().phase();
+        if phase == RuntimeAgentControlDurablePhaseV1::Uncertain {
+            return Ok(false);
+        }
+        if phase == RuntimeAgentControlDurablePhaseV1::ReceiptDurable {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        let prepared_restart = phase == RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent;
+        let intended_client = enrollment.runtime_carrier.controller_principal();
+        let prepared = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(store)
+                .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+            journal
+                .prepare_conversation_port_descriptor_with(
+                    controller_signer,
+                    provisioning,
+                    ingress,
+                    intended_client,
+                    fresh_developer_runtime_agent_control()?,
+                    |next| durable.commit(next),
+                )
+                .map_err(|_| {
+                    if prepared_restart {
+                        DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery
+                    } else {
+                        DeveloperDeploymentErrorV1::ManagedServingFailed
+                    }
+                })?
+        };
+        let action = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(store)
+                .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+            journal
+                .claim_conversation_port_descriptor_with(
+                    prepared,
+                    controller_signer,
+                    provisioning,
+                    ingress,
+                    |next| durable.commit(next),
+                )
+                .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+        };
+        let outcome = action
+            .exchange_remote_once(|wire| async {
+                let preflight = client
+                    .preflight(wire.into_vec())
+                    .await
+                    .map_err(|_| RuntimeAgentControlTransportErrorV1::NotSent)?;
+                let response = preflight
+                    .send_once()
+                    .await
+                    .map_err(|_| RuntimeAgentControlTransportErrorV1::Uncertain)?;
+                RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
+                    enrollment.runtime_carrier.runtime_principal(),
+                    enrollment.runtime_carrier.binding_digest(),
+                    response,
+                )
+                .map_err(|_| RuntimeAgentControlTransportErrorV1::Rejected)
+            })
+            .await;
+        let (action, response) = outcome.into_parts();
+        let Ok(transport) = response else {
+            return Ok(false);
+        };
+        let terminal = {
+            let mut durable = ManagedAgentStackDurableStoreV1::try_new(store)
+                .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+            match journal.consume_conversation_port_descriptor_pxah_with(
+                action,
+                transport,
+                controller_signer,
+                provisioning,
+                ingress,
+                |next| durable.commit(next),
+            ) {
+                Ok(terminal) => terminal,
+                Err(_) => return Ok(false),
+            }
+        };
+        if terminal.descriptor().is_none() {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        Ok(true)
+    }
+
+    fn developer_agent_bootstrap_ready(
+        store: &ManagedFabricSuccessorStoreV1,
+        controller_signer: &SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+        expected_managed_ready: DeveloperDeploymentReadyV1,
+    ) -> Result<DeveloperDeploymentAgentBootstrapReadyV1, DeveloperDeploymentErrorV1> {
+        let fabric_journal = ManagedFabricApplyJournalV1::new(store.state().clone());
+        let current_managed_ready = fabric_journal
+            .current_remote_managed_ready_facts(controller_signer, provisioning, ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let managed_ready = developer_deployment_ready(&fabric_journal, &current_managed_ready)?;
+        if managed_ready != expected_managed_ready {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        let fabric = fabric_journal
+            .remote_agent_control_terminal(controller_signer, provisioning, ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let agent_journal = ManagedAgentStackApplyJournalV1::new(store.state().clone());
+        let agent = agent_journal
+            .remote_agent_control_terminal(controller_signer, provisioning, ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let descriptor = agent_journal
+            .conversation_port_descriptor_terminal(controller_signer, provisioning, ingress)
+            .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let fabric_facts = fabric.inner().facts();
+        let agent_facts = agent.inner().facts();
+        if !fabric.replayed_from_journal()
+            || !agent.replayed_from_journal()
+            || !descriptor.replayed_from_journal()
+            || fabric_facts.outcome() != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+            || agent_facts.request_mode() != ManagedAgentStackTargetModeV1::FabricAndAgent
+            || agent_facts.state().outcome() != ManagedAgentStackTerminalOutcomeV1::ActiveReady
+            || descriptor.descriptor().is_none()
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        let fabric_generation = fabric_facts
+            .generation()
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        let agent_generation = agent_facts
+            .state()
+            .agent_generation()
+            .ok_or(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?;
+        if descriptor.receipt().fabric_generation() != Some(fabric_generation)
+            || descriptor.receipt().agent_generation() != Some(agent_generation)
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
+        Ok(DeveloperDeploymentAgentBootstrapReadyV1 {
+            target: managed_ready.target(),
+            runtime_store_instance_id: managed_ready.runtime_store_instance_id(),
+            snapshot_sequence: managed_ready.snapshot_sequence(),
+            runtime_host_epoch: managed_ready.runtime_host_epoch(),
+            managed_ready_digest: managed_ready.managed_ready_digest(),
+            fabric_receipt_digest: fabric.inner().receipt_digest(),
+            agent_stack_receipt_digest: agent.inner().receipt_digest(),
+            conversation_port_descriptor_receipt_digest: descriptor.receipt().receipt_digest(),
+            fabric_generation,
+            agent_generation,
         })
     }
 

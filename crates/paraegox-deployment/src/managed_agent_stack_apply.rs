@@ -5,9 +5,11 @@
 //! cannot reinterpret or rewrite the already committed Fabric activation.
 
 use core::fmt;
+use core::future::Future;
 
 use ed25519_dalek::Signature;
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
+use paraegox_kernel::identity::PrincipalRef;
 use paraegox_runtime_contracts::managed_agent_stack_plan::{
     ManagedAgentStackApplyRequestV1, ManagedAgentStackPlanError, ManagedAgentStackTargetModeV1,
     ManagedAgentStackTerminalHeadV1, ManagedAgentStackTerminalOutcomeV1,
@@ -17,6 +19,9 @@ use paraegox_runtime_contracts::managed_fabric_plan::{
     ManagedFabricApplyTerminalOutcomeV1, ManagedFabricTargetModeV1,
 };
 use paraegox_runtime_contracts::managed_service::ManagedServiceGeneration;
+use paraegox_runtime_contracts::managed_serving_bootstrap::{
+    RuntimeAgentControlKindV1, RuntimeAgentControlReceiptV1, RuntimeAgentControlRequestV1,
+};
 use paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1;
 
 use crate::managed_agent_stack_producer::{
@@ -29,7 +34,13 @@ use crate::managed_fabric_apply::{
     ManagedFabricApplyControllerError, ManagedFabricApplyPhaseV1, ManagedFabricControllerStateV1,
 };
 use crate::managed_fabric_producer::{
-    ManagedFabricControllerProvisioningV1, VerifiedManagedFabricProducerContextV1,
+    ManagedFabricControllerProvisioningV1, ManagedFabricRemoteControllerProvisioningV1,
+    VerifiedManagedFabricProducerContextV1,
+};
+use crate::managed_serving_client::{
+    FreshRuntimeAgentControlV1, ManagedServingControllerError, ManagedServingDescribeIngressV1,
+    RuntimeAgentControlDurablePhaseV1, RuntimeAgentControlMtlsExchangeSuccessV1,
+    RuntimeAgentControlTransportErrorV1,
 };
 
 const STATE_MAGIC: &[u8; 4] = b"PXAJ";
@@ -472,6 +483,211 @@ pub(crate) struct PreparedManagedAgentStackApplyV1 {
     request_digest: Digest32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedManagedAgentStackAgentControlApplyV1 {
+    outer_sequence: u64,
+    cutover_marker_digest: Digest32,
+    inner_request_digest: Digest32,
+    outer_request_digest: Digest32,
+}
+
+/// Explicit inputs for one remote Agent-stack Agent-control prepare.
+pub(crate) struct ManagedAgentStackRemoteAgentControlActivateInputV1<'a> {
+    pub(crate) controller_signer: &'a ed25519_dalek::SigningKey,
+    pub(crate) provisioning: &'a ManagedFabricRemoteControllerProvisioningV1,
+    pub(crate) previous: &'a ManagedServingDescribeIngressV1,
+    pub(crate) activation: &'a ManagedAgentStackActivationV1,
+    pub(crate) inner_fresh: FreshManagedAgentStackApplyV1,
+    pub(crate) outer_fresh: FreshRuntimeAgentControlV1,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ManagedAgentStackAgentControlSendActionV1 {
+    outer_sequence: u64,
+    cutover_marker_digest: Digest32,
+    request: RuntimeAgentControlRequestV1,
+    channel: ReferenceChannelBindingV1,
+    remote_send_available: bool,
+}
+
+impl ManagedAgentStackAgentControlSendActionV1 {
+    #[must_use]
+    const fn request(&self) -> &RuntimeAgentControlRequestV1 {
+        &self.request
+    }
+
+    #[must_use]
+    fn canonical_request_bytes(&self) -> &[u8] {
+        self.request.canonical_wire()
+    }
+
+    /// Spends this Agent-stack PXAG across exactly one transport call.
+    pub(crate) async fn exchange_remote_once<Exchange, ExchangeFuture>(
+        self,
+        exchange: Exchange,
+    ) -> ManagedAgentStackAgentControlRemoteExchangeOutcomeV1
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<
+                RuntimeAgentControlMtlsExchangeSuccessV1,
+                RuntimeAgentControlTransportErrorV1,
+            >,
+        >,
+    {
+        let mut action = self;
+        let response = if action.remote_send_available {
+            action.remote_send_available = false;
+            exchange(action.request.canonical_wire().into())
+                .await
+                .map_err(ManagedServingControllerError::from)
+        } else {
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        };
+        ManagedAgentStackAgentControlRemoteExchangeOutcomeV1 { action, response }
+    }
+}
+
+/// Result of spending one Agent-stack PXAG transport authority.
+#[derive(Debug)]
+pub(crate) struct ManagedAgentStackAgentControlRemoteExchangeOutcomeV1 {
+    action: ManagedAgentStackAgentControlSendActionV1,
+    response: Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+}
+
+impl ManagedAgentStackAgentControlRemoteExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedAgentStackAgentControlSendActionV1,
+        Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+    ) {
+        (self.action, self.response)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedAgentStackAgentControlTerminalCommitV1 {
+    outer_sequence: u64,
+    inner: ManagedAgentStackTerminalReceiptV1,
+    outer: RuntimeAgentControlReceiptV1,
+    replayed_from_journal: bool,
+}
+
+impl ManagedAgentStackAgentControlTerminalCommitV1 {
+    #[must_use]
+    pub(crate) const fn inner(&self) -> &ManagedAgentStackTerminalReceiptV1 {
+        &self.inner
+    }
+
+    #[must_use]
+    pub(crate) const fn outer(&self) -> &RuntimeAgentControlReceiptV1 {
+        &self.outer
+    }
+
+    #[must_use]
+    pub(crate) const fn replayed_from_journal(&self) -> bool {
+        self.replayed_from_journal
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedConversationPortDescriptorV1 {
+    outer_sequence: u64,
+    cutover_marker_digest: Digest32,
+    request_digest: Digest32,
+    expected_pxst_digest: Digest32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ConversationPortDescriptorSendActionV1 {
+    outer_sequence: u64,
+    cutover_marker_digest: Digest32,
+    request: RuntimeAgentControlRequestV1,
+    remote_send_available: bool,
+}
+
+impl ConversationPortDescriptorSendActionV1 {
+    #[must_use]
+    const fn request(&self) -> &RuntimeAgentControlRequestV1 {
+        &self.request
+    }
+
+    #[must_use]
+    fn canonical_request_bytes(&self) -> &[u8] {
+        self.request.canonical_wire()
+    }
+
+    /// Spends this bootstrap-only Describe PXAG across exactly one transport
+    /// call. A failed call leaves the durable slot `Uncertain` and spent.
+    pub(crate) async fn exchange_remote_once<Exchange, ExchangeFuture>(
+        self,
+        exchange: Exchange,
+    ) -> ConversationPortDescriptorRemoteExchangeOutcomeV1
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<
+                RuntimeAgentControlMtlsExchangeSuccessV1,
+                RuntimeAgentControlTransportErrorV1,
+            >,
+        >,
+    {
+        let mut action = self;
+        let response = if action.remote_send_available {
+            action.remote_send_available = false;
+            exchange(action.request.canonical_wire().into())
+                .await
+                .map_err(ManagedServingControllerError::from)
+        } else {
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        };
+        ConversationPortDescriptorRemoteExchangeOutcomeV1 { action, response }
+    }
+}
+
+/// Result of spending one descriptor PXAG transport authority.
+#[derive(Debug)]
+pub(crate) struct ConversationPortDescriptorRemoteExchangeOutcomeV1 {
+    action: ConversationPortDescriptorSendActionV1,
+    response: Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+}
+
+impl ConversationPortDescriptorRemoteExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ConversationPortDescriptorSendActionV1,
+        Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+    ) {
+        (self.action, self.response)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConversationPortDescriptorTerminalCommitV1 {
+    outer_sequence: u64,
+    receipt: RuntimeAgentControlReceiptV1,
+    replayed_from_journal: bool,
+}
+
+impl ConversationPortDescriptorTerminalCommitV1 {
+    #[must_use]
+    pub(crate) fn descriptor(&self) -> Option<&[u8]> {
+        self.receipt.conversation_port_descriptor()
+    }
+
+    #[must_use]
+    pub(crate) const fn receipt(&self) -> &RuntimeAgentControlReceiptV1 {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub(crate) const fn replayed_from_journal(&self) -> bool {
+        self.replayed_from_journal
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ManagedAgentStackSendActionV1 {
     outer_sequence: u64,
@@ -543,6 +759,580 @@ impl ManagedAgentStackApplyJournalV1 {
     #[must_use]
     pub(crate) const fn state(&self) -> &ManagedFabricControllerStateV1 {
         &self.state
+    }
+
+    pub(crate) fn prepare_remote_agent_control_activate_with<Commit>(
+        &mut self,
+        input: ManagedAgentStackRemoteAgentControlActivateInputV1<'_>,
+        commit: Commit,
+    ) -> Result<PreparedManagedAgentStackAgentControlApplyV1, ManagedAgentStackApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedAgentStackApplyControllerError>,
+    {
+        let ManagedAgentStackRemoteAgentControlActivateInputV1 {
+            controller_signer,
+            provisioning,
+            previous,
+            activation,
+            inner_fresh,
+            outer_fresh,
+        } = input;
+        let (context, ready) = self.state.verified_current_remote_agent_context(
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
+        let (predecessor_desired, predecessor_request, predecessor_receipt) =
+            active_predecessor(&self.state)?;
+        if let Some(stack) = self.state.agent_stack_state() {
+            if stack.phase() != ManagedAgentStackApplyPhaseV1::RequestDurableNotSent
+                || self.state.agent_stack_agent_control().phase()
+                    != RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
+                || stack.archived_active().is_some()
+            {
+                return Err(match stack.phase() {
+                    ManagedAgentStackApplyPhaseV1::Uncertain => {
+                        ManagedAgentStackApplyControllerError::OpaqueReplayForbidden
+                    }
+                    ManagedAgentStackApplyPhaseV1::ReceiptDurable => {
+                        ManagedAgentStackApplyControllerError::AlreadyTerminal
+                    }
+                    ManagedAgentStackApplyPhaseV1::RequestDurableNotSent => {
+                        ManagedAgentStackApplyControllerError::InvalidPhase
+                    }
+                });
+            }
+            let expected = ManagedAgentStackDesiredPlanV1::try_activate(
+                &context,
+                self.state.cutover_marker_digest(),
+                predecessor_desired.revision(),
+                predecessor_desired.execution(),
+                predecessor_request.target_slice_digest(),
+                activation,
+            )?;
+            if stack.desired() != &expected {
+                return Err(ManagedAgentStackApplyControllerError::DesiredConflict);
+            }
+            return self.prepared_remote_agent_control(controller_signer, provisioning, previous);
+        }
+        if predecessor_receipt.facts().outcome() != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+        {
+            return Err(ManagedAgentStackApplyControllerError::FabricNotActive);
+        }
+        let desired = ManagedAgentStackDesiredPlanV1::try_activate(
+            &context,
+            self.state.cutover_marker_digest(),
+            predecessor_desired.revision(),
+            predecessor_desired.execution(),
+            predecessor_request.target_slice_digest(),
+            activation,
+        )?;
+        let inner = produce_managed_agent_stack_request_v1(
+            &context,
+            &desired,
+            inner_fresh,
+            controller_signer,
+        )?;
+        let outer = provisioning
+            .describe()
+            .try_build_managed_agent_stack_agent_control(
+                &ready,
+                &inner,
+                outer_fresh,
+                controller_signer,
+            )?;
+        let stack = ManagedAgentStackControllerStateV1::try_prepared(desired, inner)?;
+        let slot = self.state.agent_stack_agent_control().try_prepare(outer)?;
+        let next = self.state.try_with_agent_stack_and_control(stack, slot)?;
+        commit(&next)?;
+        self.state = next;
+        self.prepared_remote_agent_control(controller_signer, provisioning, previous)
+    }
+
+    pub(crate) fn prepared_remote_agent_control(
+        &self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+    ) -> Result<PreparedManagedAgentStackAgentControlApplyV1, ManagedAgentStackApplyControllerError>
+    {
+        let (context, ready) = self.state.verified_current_remote_agent_context(
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
+        let stack = self
+            .state
+            .agent_stack_state()
+            .ok_or(ManagedAgentStackApplyControllerError::InvalidPhase)?;
+        if stack.phase() != ManagedAgentStackApplyPhaseV1::RequestDurableNotSent
+            || self.state.agent_stack_agent_control().phase()
+                != RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
+        {
+            return Err(match stack.phase() {
+                ManagedAgentStackApplyPhaseV1::Uncertain => {
+                    ManagedAgentStackApplyControllerError::OpaqueReplayForbidden
+                }
+                ManagedAgentStackApplyPhaseV1::ReceiptDurable => {
+                    ManagedAgentStackApplyControllerError::AlreadyTerminal
+                }
+                ManagedAgentStackApplyPhaseV1::RequestDurableNotSent => {
+                    ManagedAgentStackApplyControllerError::InvalidPhase
+                }
+            });
+        }
+        validate_stack_request(&context, stack)?;
+        let outer = self
+            .state
+            .agent_stack_agent_control()
+            .request()
+            .ok_or(ManagedAgentStackApplyControllerError::AgentControlMismatch)?;
+        if outer.managed_agent_stack_apply_request() != Some(stack.request()) {
+            return Err(ManagedAgentStackApplyControllerError::AgentControlMismatch);
+        }
+        Ok(PreparedManagedAgentStackAgentControlApplyV1 {
+            outer_sequence: self.state.sequence(),
+            cutover_marker_digest: self.state.cutover_marker_digest(),
+            inner_request_digest: stack.request().envelope_request_digest(),
+            outer_request_digest: outer.request_digest(),
+        })
+    }
+
+    pub(crate) fn claim_remote_agent_control_send_with<Commit>(
+        &mut self,
+        prepared: PreparedManagedAgentStackAgentControlApplyV1,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+        commit: Commit,
+    ) -> Result<ManagedAgentStackAgentControlSendActionV1, ManagedAgentStackApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedAgentStackApplyControllerError>,
+    {
+        let expected =
+            self.prepared_remote_agent_control(controller_signer, provisioning, previous)?;
+        if prepared != expected {
+            return Err(ManagedAgentStackApplyControllerError::PreparedTokenMismatch);
+        }
+        let (context, _) = self.state.verified_current_remote_agent_context(
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        let stack = self
+            .state
+            .agent_stack_state()
+            .ok_or(ManagedAgentStackApplyControllerError::InvalidPhase)?;
+        let request = self
+            .state
+            .agent_stack_agent_control()
+            .request()
+            .cloned()
+            .ok_or(ManagedAgentStackApplyControllerError::AgentControlMismatch)?;
+        let next_stack = stack.try_claim()?;
+        let next_slot = self.state.agent_stack_agent_control().try_claim()?;
+        let next = self
+            .state
+            .try_with_agent_stack_and_control(next_stack, next_slot)?;
+        commit(&next)?;
+        self.state = next;
+        Ok(ManagedAgentStackAgentControlSendActionV1 {
+            outer_sequence: self.state.sequence(),
+            cutover_marker_digest: self.state.cutover_marker_digest(),
+            request,
+            channel: context.channel(),
+            remote_send_available: true,
+        })
+    }
+
+    pub(crate) fn consume_remote_agent_control_pxah_with<Commit>(
+        &mut self,
+        action: ManagedAgentStackAgentControlSendActionV1,
+        transport: RuntimeAgentControlMtlsExchangeSuccessV1,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+        commit: Commit,
+    ) -> Result<ManagedAgentStackAgentControlTerminalCommitV1, ManagedAgentStackApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedAgentStackApplyControllerError>,
+    {
+        let (context, ready) = self.state.verified_current_remote_agent_context(
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
+        let (_, _, predecessor_receipt) = active_predecessor(&self.state)?;
+        let predecessor_generation = predecessor_receipt
+            .facts()
+            .generation()
+            .ok_or(ManagedAgentStackApplyControllerError::FabricNotActive)?;
+        let stack = self
+            .state
+            .agent_stack_state()
+            .ok_or(ManagedAgentStackApplyControllerError::InvalidPhase)?;
+        if stack.phase() != ManagedAgentStackApplyPhaseV1::Uncertain
+            || self.state.agent_stack_agent_control().phase()
+                != RuntimeAgentControlDurablePhaseV1::Uncertain
+            || action.outer_sequence != self.state.sequence()
+            || action.cutover_marker_digest != self.state.cutover_marker_digest()
+            || self.state.agent_stack_agent_control().request() != Some(&action.request)
+            || action.channel != context.channel()
+            || action.remote_send_available
+        {
+            return Err(ManagedAgentStackApplyControllerError::SendActionMismatch);
+        }
+        let outer = provisioning
+            .describe()
+            .try_accept_runtime_agent_apply_receipt(
+                &ready,
+                &action.request,
+                context.channel(),
+                &transport,
+            )?;
+        let inner = outer
+            .managed_agent_stack_receipt()
+            .cloned()
+            .ok_or(ManagedAgentStackApplyControllerError::AgentControlMismatch)?;
+        verify_terminal(&inner, stack.request(), &context, predecessor_generation)?;
+        let next_stack = stack.try_terminal(inner.clone())?;
+        let next_slot = self
+            .state
+            .agent_stack_agent_control()
+            .try_terminal(outer.clone())?;
+        let next = self
+            .state
+            .try_with_agent_stack_and_control(next_stack, next_slot)?;
+        commit(&next)?;
+        self.state = next;
+        Ok(ManagedAgentStackAgentControlTerminalCommitV1 {
+            outer_sequence: self.state.sequence(),
+            inner,
+            outer,
+            replayed_from_journal: false,
+        })
+    }
+
+    pub(crate) fn remote_agent_control_terminal(
+        &self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+    ) -> Result<
+        Option<ManagedAgentStackAgentControlTerminalCommitV1>,
+        ManagedAgentStackApplyControllerError,
+    > {
+        if self.state.agent_stack_agent_control().phase()
+            != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
+        {
+            return Ok(None);
+        }
+        let (context, ready) = self.state.verified_current_remote_agent_context(
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
+        let stack = self
+            .state
+            .agent_stack_state()
+            .ok_or(ManagedAgentStackApplyControllerError::InvalidState)?;
+        Ok(Some(ManagedAgentStackAgentControlTerminalCommitV1 {
+            outer_sequence: self.state.sequence(),
+            inner: stack
+                .receipt()
+                .cloned()
+                .ok_or(ManagedAgentStackApplyControllerError::InvalidState)?,
+            outer: self
+                .state
+                .agent_stack_agent_control()
+                .receipt()
+                .cloned()
+                .ok_or(ManagedAgentStackApplyControllerError::InvalidState)?,
+            replayed_from_journal: true,
+        }))
+    }
+
+    pub(crate) fn prepare_conversation_port_descriptor_with<Commit>(
+        &mut self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+        intended_client: PrincipalRef,
+        fresh: FreshRuntimeAgentControlV1,
+        commit: Commit,
+    ) -> Result<PreparedConversationPortDescriptorV1, ManagedAgentStackApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedAgentStackApplyControllerError>,
+    {
+        let (context, ready) = self.state.verified_current_remote_agent_context(
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
+        let (_, _, predecessor_receipt) = active_predecessor(&self.state)?;
+        let predecessor_generation = predecessor_receipt
+            .facts()
+            .generation()
+            .ok_or(ManagedAgentStackApplyControllerError::FabricNotActive)?;
+        let stack = self
+            .state
+            .agent_stack_state()
+            .ok_or(ManagedAgentStackApplyControllerError::AgentNotActive)?;
+        let stack_receipt = stack
+            .receipt()
+            .ok_or(ManagedAgentStackApplyControllerError::AgentNotActive)?;
+        verify_terminal(
+            stack_receipt,
+            stack.request(),
+            &context,
+            predecessor_generation,
+        )?;
+        if stack.archived_active().is_some()
+            || stack_receipt.facts().state().outcome()
+                != ManagedAgentStackTerminalOutcomeV1::ActiveReady
+            || stack_receipt.facts().state().agent_generation().is_none()
+        {
+            return Err(ManagedAgentStackApplyControllerError::AgentNotActive);
+        }
+        match self.state.conversation_port_descriptor().phase() {
+            RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent => {
+                let request = self
+                    .state
+                    .conversation_port_descriptor()
+                    .request()
+                    .ok_or(ManagedAgentStackApplyControllerError::InvalidState)?;
+                if request.intended_client() != intended_client {
+                    return Err(ManagedAgentStackApplyControllerError::DesiredConflict);
+                }
+                return self.prepared_conversation_port_descriptor(
+                    controller_signer,
+                    provisioning,
+                    previous,
+                );
+            }
+            RuntimeAgentControlDurablePhaseV1::Uncertain => {
+                return Err(ManagedAgentStackApplyControllerError::OpaqueReplayForbidden);
+            }
+            RuntimeAgentControlDurablePhaseV1::ReceiptDurable => {
+                return Err(ManagedAgentStackApplyControllerError::AlreadyTerminal);
+            }
+            RuntimeAgentControlDurablePhaseV1::Idle => {}
+        }
+        let request = provisioning
+            .describe()
+            .try_build_conversation_port_agent_control(
+                &ready,
+                stack_receipt.receipt_digest(),
+                intended_client,
+                fresh,
+                controller_signer,
+            )?;
+        let descriptor = self
+            .state
+            .conversation_port_descriptor()
+            .try_prepare(request)?;
+        let next = self.state.try_with_descriptor_control(descriptor)?;
+        commit(&next)?;
+        self.state = next;
+        self.prepared_conversation_port_descriptor(controller_signer, provisioning, previous)
+    }
+
+    pub(crate) fn prepared_conversation_port_descriptor(
+        &self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+    ) -> Result<PreparedConversationPortDescriptorV1, ManagedAgentStackApplyControllerError> {
+        if self.state.conversation_port_descriptor().phase()
+            != RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
+        {
+            return Err(match self.state.conversation_port_descriptor().phase() {
+                RuntimeAgentControlDurablePhaseV1::Uncertain => {
+                    ManagedAgentStackApplyControllerError::OpaqueReplayForbidden
+                }
+                RuntimeAgentControlDurablePhaseV1::ReceiptDurable => {
+                    ManagedAgentStackApplyControllerError::AlreadyTerminal
+                }
+                _ => ManagedAgentStackApplyControllerError::InvalidPhase,
+            });
+        }
+        let (context, ready) = self.state.verified_current_remote_agent_context(
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
+        let stack_receipt = self
+            .state
+            .agent_stack_state()
+            .and_then(ManagedAgentStackControllerStateV1::receipt)
+            .ok_or(ManagedAgentStackApplyControllerError::AgentNotActive)?;
+        let request = self
+            .state
+            .conversation_port_descriptor()
+            .request()
+            .ok_or(ManagedAgentStackApplyControllerError::InvalidState)?;
+        if request.kind() != RuntimeAgentControlKindV1::DescribeConversationPort
+            || request.expected_active_pxst_digest() != stack_receipt.receipt_digest()
+        {
+            return Err(ManagedAgentStackApplyControllerError::AgentControlMismatch);
+        }
+        Ok(PreparedConversationPortDescriptorV1 {
+            outer_sequence: self.state.sequence(),
+            cutover_marker_digest: self.state.cutover_marker_digest(),
+            request_digest: request.request_digest(),
+            expected_pxst_digest: stack_receipt.receipt_digest(),
+        })
+    }
+
+    pub(crate) fn claim_conversation_port_descriptor_with<Commit>(
+        &mut self,
+        prepared: PreparedConversationPortDescriptorV1,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+        commit: Commit,
+    ) -> Result<ConversationPortDescriptorSendActionV1, ManagedAgentStackApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedAgentStackApplyControllerError>,
+    {
+        let expected =
+            self.prepared_conversation_port_descriptor(controller_signer, provisioning, previous)?;
+        if prepared != expected {
+            return Err(ManagedAgentStackApplyControllerError::PreparedTokenMismatch);
+        }
+        let request = self
+            .state
+            .conversation_port_descriptor()
+            .request()
+            .cloned()
+            .ok_or(ManagedAgentStackApplyControllerError::InvalidState)?;
+        let descriptor = self.state.conversation_port_descriptor().try_claim()?;
+        let next = self.state.try_with_descriptor_control(descriptor)?;
+        commit(&next)?;
+        self.state = next;
+        Ok(ConversationPortDescriptorSendActionV1 {
+            outer_sequence: self.state.sequence(),
+            cutover_marker_digest: self.state.cutover_marker_digest(),
+            request,
+            remote_send_available: true,
+        })
+    }
+
+    pub(crate) fn consume_conversation_port_descriptor_pxah_with<Commit>(
+        &mut self,
+        action: ConversationPortDescriptorSendActionV1,
+        transport: RuntimeAgentControlMtlsExchangeSuccessV1,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+        commit: Commit,
+    ) -> Result<ConversationPortDescriptorTerminalCommitV1, ManagedAgentStackApplyControllerError>
+    where
+        Commit: FnOnce(
+            &ManagedFabricControllerStateV1,
+        ) -> Result<(), ManagedAgentStackApplyControllerError>,
+    {
+        let (context, ready) = self.state.verified_current_remote_agent_context(
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
+        if self.state.conversation_port_descriptor().phase()
+            != RuntimeAgentControlDurablePhaseV1::Uncertain
+            || action.outer_sequence != self.state.sequence()
+            || action.cutover_marker_digest != self.state.cutover_marker_digest()
+            || self.state.conversation_port_descriptor().request() != Some(&action.request)
+            || action.remote_send_available
+        {
+            return Err(ManagedAgentStackApplyControllerError::SendActionMismatch);
+        }
+        let receipt = provisioning
+            .describe()
+            .try_accept_runtime_agent_descriptor_receipt(&ready, &action.request, &transport)?;
+        let fabric_generation = self
+            .state
+            .receipt()
+            .and_then(|value| value.facts().generation());
+        let agent_generation = self
+            .state
+            .agent_stack_state()
+            .and_then(ManagedAgentStackControllerStateV1::receipt)
+            .and_then(|value| value.facts().state().agent_generation());
+        if receipt.conversation_port_descriptor().is_none()
+            || receipt.fabric_generation() != fabric_generation
+            || receipt.agent_generation() != agent_generation
+        {
+            return Err(ManagedAgentStackApplyControllerError::AgentControlMismatch);
+        }
+        let descriptor = self
+            .state
+            .conversation_port_descriptor()
+            .try_terminal(receipt.clone())?;
+        let next = self.state.try_with_descriptor_control(descriptor)?;
+        commit(&next)?;
+        self.state = next;
+        Ok(ConversationPortDescriptorTerminalCommitV1 {
+            outer_sequence: self.state.sequence(),
+            receipt,
+            replayed_from_journal: false,
+        })
+    }
+
+    pub(crate) fn conversation_port_descriptor_terminal(
+        &self,
+        controller_signer: &ed25519_dalek::SigningKey,
+        provisioning: &ManagedFabricRemoteControllerProvisioningV1,
+        previous: &ManagedServingDescribeIngressV1,
+    ) -> Result<
+        Option<ConversationPortDescriptorTerminalCommitV1>,
+        ManagedAgentStackApplyControllerError,
+    > {
+        if self.state.conversation_port_descriptor().phase()
+            != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
+        {
+            return Ok(None);
+        }
+        let (context, ready) = self.state.verified_current_remote_agent_context(
+            controller_signer,
+            provisioning,
+            previous,
+        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
+        Ok(Some(ConversationPortDescriptorTerminalCommitV1 {
+            outer_sequence: self.state.sequence(),
+            receipt: self
+                .state
+                .conversation_port_descriptor()
+                .receipt()
+                .cloned()
+                .ok_or(ManagedAgentStackApplyControllerError::InvalidState)?,
+            replayed_from_journal: true,
+        }))
     }
 
     pub(crate) fn prepared(
@@ -1023,6 +1813,7 @@ pub(crate) enum ManagedAgentStackApplyControllerError {
     Contract,
     Producer(ManagedAgentStackProducerError),
     Fabric(ManagedFabricApplyControllerError),
+    Serving(ManagedServingControllerError),
     Digest(DigestBuildError),
     InvalidPhase,
     InvalidState,
@@ -1037,6 +1828,7 @@ pub(crate) enum ManagedAgentStackApplyControllerError {
     PreparedTokenMismatch,
     SendActionMismatch,
     OpaqueReplayForbidden,
+    AgentControlMismatch,
     ReceiptMismatch,
     AlreadyTerminal,
 }
@@ -1059,6 +1851,12 @@ impl From<ManagedFabricApplyControllerError> for ManagedAgentStackApplyControlle
     }
 }
 
+impl From<ManagedServingControllerError> for ManagedAgentStackApplyControllerError {
+    fn from(value: ManagedServingControllerError) -> Self {
+        Self::Serving(value)
+    }
+}
+
 impl From<DigestBuildError> for ManagedAgentStackApplyControllerError {
     fn from(value: DigestBuildError) -> Self {
         Self::Digest(value)
@@ -1074,11 +1872,12 @@ impl fmt::Display for ManagedAgentStackApplyControllerError {
 impl std::error::Error for ManagedAgentStackApplyControllerError {}
 
 #[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
+pub(crate) mod tests {
+    use std::cell::{Cell, RefCell};
 
     use ed25519_dalek::{Signer, SigningKey};
     use paraegox_kernel::digest::Digest32;
+    use paraegox_kernel::identity::PrincipalRef;
     use paraegox_kernel::time::BoundedDuration;
     use paraegox_runtime_contracts::apply::ExpectedActive;
     use paraegox_runtime_contracts::assignment::BindingId;
@@ -1100,16 +1899,25 @@ mod tests {
         ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleBudgetsV1,
         ManagedServiceSpecV1,
     };
+    use paraegox_runtime_contracts::managed_serving_bootstrap::{
+        RuntimeAgentControlReceiptDraftV1, RuntimeAgentControlResponseAuthClaimV1,
+    };
     use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
     use super::{
         FreshManagedAgentStackApplyV1, ManagedAgentStackActivationV1,
         ManagedAgentStackApplyControllerError, ManagedAgentStackApplyJournalV1,
-        ManagedAgentStackApplyPhaseV1,
+        ManagedAgentStackApplyPhaseV1, ManagedAgentStackRemoteAgentControlActivateInputV1,
     };
     use crate::managed_agent_stack_producer::ManagedAgentStackProducerError;
+    #[cfg(unix)]
+    use crate::managed_fabric_apply::ManagedFabricApplyControllerError;
     use crate::managed_fabric_apply::{
         ManagedFabricApplyJournalV1, ManagedFabricControllerStateV1, tests as fabric_tests,
+    };
+    use crate::managed_serving_client::{
+        FreshRuntimeAgentControlV1, ManagedServingControllerError,
+        RuntimeAgentControlMtlsExchangeSuccessV1, RuntimeAgentControlTransportErrorV1,
     };
 
     fn lifecycle_budgets(values: [u64; 5]) -> ManagedServiceLifecycleBudgetsV1 {
@@ -1277,6 +2085,43 @@ mod tests {
         draft.finalize(&signature.to_bytes()).expect("signed PXST")
     }
 
+    #[cfg(unix)]
+    fn signed_descriptor_receipt(
+        request: &paraegox_runtime_contracts::managed_serving_bootstrap::RuntimeAgentControlRequestV1,
+        remote: &crate::managed_fabric_producer::ManagedFabricRemoteControllerProvisioningV1,
+        runtime: &SigningKey,
+        fabric_generation: ManagedServiceGeneration,
+        agent_generation: ManagedServiceGeneration,
+    ) -> paraegox_runtime_contracts::managed_serving_bootstrap::RuntimeAgentControlReceiptV1 {
+        let authenticated = request
+            .verify_controller_request(remote.describe().carrier(), |_, _, _, _, _| true)
+            .expect("authenticated descriptor PXAG fixture");
+        let auth = RuntimeAgentControlResponseAuthClaimV1::try_new(
+            remote.describe().carrier(),
+            ApplyAuthKeyRef::from_bytes([0x38; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("descriptor algorithm"),
+            1,
+        )
+        .expect("descriptor Runtime auth claim");
+        let draft = RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
+            authenticated,
+            b"PXAP\0\x01opaque",
+            fabric_generation,
+            agent_generation,
+            auth,
+        )
+        .expect("descriptor PXAH draft");
+        let signature = runtime.sign(
+            draft
+                .signing_transcript()
+                .expect("descriptor PXAH transcript")
+                .as_bytes(),
+        );
+        draft
+            .finalize(&signature.to_bytes())
+            .expect("signed descriptor PXAH")
+    }
+
     fn empty_stack_receipt(
         request: &paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentStackApplyRequestV1,
         runtime: &SigningKey,
@@ -1329,6 +2174,430 @@ mod tests {
         draft
             .finalize(&signature.to_bytes())
             .expect("signed empty PXST")
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn prepared_remote_agent_stack_state(
+        fabric: &ManagedFabricControllerStateV1,
+        controller: &SigningKey,
+        remote: &crate::managed_fabric_producer::ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &crate::managed_serving_client::ManagedServingDescribeIngressV1,
+    ) -> super::ManagedAgentStackControllerStateV1 {
+        let requested = activation(
+            fabric,
+            deterministic_provider(),
+            lifecycle_budgets([7, 11, 13, 17, 19]),
+        );
+        let mut journal = ManagedAgentStackApplyJournalV1::new(fabric.clone());
+        journal
+            .prepare_remote_agent_control_activate_with(
+                ManagedAgentStackRemoteAgentControlActivateInputV1 {
+                    controller_signer: controller,
+                    provisioning: remote,
+                    previous: ingress,
+                    activation: &requested,
+                    inner_fresh: fresh(0xd7),
+                    outer_fresh: FreshRuntimeAgentControlV1::try_new([0xd7; 16], [0xda; 32])
+                        .expect("fresh sibling Agent PXAG"),
+                },
+                |_| Ok(()),
+            )
+            .expect("prepare sibling Agent state");
+        journal
+            .state()
+            .agent_stack_state()
+            .expect("prepared sibling Agent state")
+            .clone()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_agent_and_descriptor_pxag_actions_are_spent_once_and_restart_verified() {
+        let controller = fabric_tests::controller_signer();
+        let runtime = fabric_tests::runtime_signer();
+        let (fabric, remote, ingress) =
+            fabric_tests::remote_fabric_agent_control_terminal_journal().await;
+        let requested = activation(
+            fabric.state(),
+            deterministic_provider(),
+            lifecycle_budgets([7, 11, 13, 17, 19]),
+        );
+        let mut journal = ManagedAgentStackApplyJournalV1::new(fabric.state().clone());
+        let before_prepare = journal.state().sequence();
+        let prepare_commit = RefCell::new(None);
+        let prepared = journal
+            .prepare_remote_agent_control_activate_with(
+                ManagedAgentStackRemoteAgentControlActivateInputV1 {
+                    controller_signer: &controller,
+                    provisioning: &remote,
+                    previous: &ingress,
+                    activation: &requested,
+                    inner_fresh: fresh(0xb1),
+                    outer_fresh: FreshRuntimeAgentControlV1::try_new([0xb1; 16], [0xb4; 32])
+                        .expect("fresh outer Agent PXAG"),
+                },
+                |next| {
+                    *prepare_commit.borrow_mut() = Some(next.clone());
+                    Ok(())
+                },
+            )
+            .expect("inner PXAR v7 and outer PXAG durable together");
+        let durable_prepare = prepare_commit
+            .into_inner()
+            .expect("one Agent prepare commit image");
+        assert_eq!(durable_prepare.sequence(), before_prepare + 1);
+        assert_eq!(
+            durable_prepare
+                .agent_stack_state()
+                .expect("inner Agent state")
+                .phase(),
+            ManagedAgentStackApplyPhaseV1::RequestDurableNotSent
+        );
+        assert_eq!(
+            durable_prepare.agent_stack_agent_control().phase(),
+            crate::managed_serving_client::RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
+        );
+
+        let action = journal
+            .claim_remote_agent_control_send_with(prepared, &controller, &remote, &ingress, |_| {
+                Ok(())
+            })
+            .expect("inner and outer Agent Uncertain fences durable");
+        assert!(matches!(
+            journal.prepared_remote_agent_control(&controller, &remote, &ingress),
+            Err(ManagedAgentStackApplyControllerError::OpaqueReplayForbidden)
+        ));
+        let inner = active_stack_receipt(
+            action
+                .request()
+                .managed_agent_stack_apply_request()
+                .expect("inner PXAR v7"),
+            &runtime,
+            ApplyAuthKeyRef::from_bytes([0x38; 16]),
+        );
+        let authenticated = action
+            .request()
+            .verify_controller_request(remote.describe().carrier(), |_, _, _, _, _| true)
+            .expect("authenticated Agent PXAG fixture");
+        let auth = RuntimeAgentControlResponseAuthClaimV1::try_new(
+            remote.describe().carrier(),
+            ApplyAuthKeyRef::from_bytes([0x38; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("outer Agent algorithm"),
+            1,
+        )
+        .expect("outer Agent auth claim");
+        let draft = RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
+            authenticated,
+            inner,
+            fabric_tests::channel(),
+            auth,
+        )
+        .expect("Agent PXAH draft");
+        let signature = runtime.sign(
+            draft
+                .signing_transcript()
+                .expect("Agent PXAH transcript")
+                .as_bytes(),
+        );
+        let outer = draft
+            .finalize(&signature.to_bytes())
+            .expect("signed Agent PXAH");
+        let transport = RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
+            remote.describe().carrier().runtime_principal(),
+            remote.describe().carrier().binding_digest(),
+            outer.canonical_wire().into(),
+        )
+        .expect("authenticated Agent PXAH transport");
+        let unspent = super::ManagedAgentStackAgentControlSendActionV1 {
+            outer_sequence: action.outer_sequence,
+            cutover_marker_digest: action.cutover_marker_digest,
+            request: action.request.clone(),
+            channel: action.channel,
+            remote_send_available: true,
+        };
+        assert!(matches!(
+            journal.consume_remote_agent_control_pxah_with(
+                unspent,
+                transport.clone(),
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            ),
+            Err(ManagedAgentStackApplyControllerError::SendActionMismatch)
+        ));
+
+        let agent_calls = Cell::new(0_u8);
+        let first = action
+            .exchange_remote_once(|_| {
+                agent_calls.set(agent_calls.get() + 1);
+                let transport = transport.clone();
+                async move { Ok(transport) }
+            })
+            .await;
+        let (spent, response) = first.into_parts();
+        let transport = response.expect("first Agent transport response");
+        let second = spent
+            .exchange_remote_once(|_| {
+                agent_calls.set(agent_calls.get() + 1);
+                async {
+                    Err::<RuntimeAgentControlMtlsExchangeSuccessV1, _>(
+                        RuntimeAgentControlTransportErrorV1::Rejected,
+                    )
+                }
+            })
+            .await;
+        let (spent, second_response) = second.into_parts();
+        assert_eq!(agent_calls.get(), 1);
+        assert_eq!(
+            second_response,
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        );
+        let terminal = journal
+            .consume_remote_agent_control_pxah_with(
+                spent,
+                transport,
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("inner PXST and outer Agent PXAH durable together");
+        assert!(!terminal.replayed_from_journal());
+        let replay = journal
+            .remote_agent_control_terminal(&controller, &remote, &ingress)
+            .expect("Agent terminal signatures reverify")
+            .expect("Agent terminal exists");
+        assert!(replay.replayed_from_journal());
+        assert_eq!(replay.inner(), terminal.inner());
+        assert_eq!(replay.outer(), terminal.outer());
+
+        let (_, ready) = journal
+            .state()
+            .verified_current_remote_agent_context(&controller, &remote, &ingress)
+            .expect("descriptor tamper context");
+        let active_pxst_digest = journal
+            .state()
+            .agent_stack_state()
+            .and_then(super::ManagedAgentStackControllerStateV1::receipt)
+            .map(|receipt| receipt.receipt_digest())
+            .expect("active PXST digest");
+        let active_fabric_generation = journal
+            .state()
+            .receipt()
+            .and_then(|receipt| receipt.facts().generation())
+            .expect("active Fabric generation");
+        let active_agent_generation = journal
+            .state()
+            .agent_stack_state()
+            .and_then(super::ManagedAgentStackControllerStateV1::receipt)
+            .and_then(|receipt| receipt.facts().state().agent_generation())
+            .expect("active Agent generation");
+        let assert_descriptor_reopen_rejects =
+            |state: &ManagedFabricControllerStateV1, reason: &str| {
+                let encoded = state.encode().expect("checksum-resigned descriptor state");
+                assert_eq!(
+                    ManagedFabricControllerStateV1::decode_remote(
+                        &encoded,
+                        &controller,
+                        &remote,
+                        &ingress,
+                    )
+                    .expect_err("cross-state descriptor evidence must fail closed"),
+                    ManagedFabricApplyControllerError::AgentControlMismatch,
+                    "{reason}"
+                );
+            };
+
+        let mut wrong_root = *active_pxst_digest.as_bytes();
+        wrong_root[0] ^= 1;
+        let wrong_root_request = remote
+            .describe()
+            .try_build_conversation_port_agent_control(
+                &ready,
+                Digest32::from_bytes(wrong_root),
+                PrincipalRef::from_bytes([0xc1; 16]),
+                FreshRuntimeAgentControlV1::try_new([0xc4; 16], [0xc5; 32])
+                    .expect("fresh wrong-root descriptor PXAG"),
+                &controller,
+            )
+            .expect("validly signed wrong-root descriptor PXAG");
+        let wrong_root_slot = journal
+            .state()
+            .conversation_port_descriptor()
+            .try_prepare(wrong_root_request)
+            .expect("prepared wrong-root descriptor slot");
+        let wrong_root_state = journal
+            .state()
+            .try_with_descriptor_control(wrong_root_slot)
+            .expect("persist wrong-root descriptor fixture");
+        assert_descriptor_reopen_rejects(
+            &wrong_root_state,
+            "descriptor PXAG root must equal the active PXST receipt digest",
+        );
+
+        let wrong_generation_request = remote
+            .describe()
+            .try_build_conversation_port_agent_control(
+                &ready,
+                active_pxst_digest,
+                PrincipalRef::from_bytes([0xc1; 16]),
+                FreshRuntimeAgentControlV1::try_new([0xc6; 16], [0xc7; 32])
+                    .expect("fresh wrong-generation descriptor PXAG"),
+                &controller,
+            )
+            .expect("valid descriptor PXAG");
+        let prepared_slot = journal
+            .state()
+            .conversation_port_descriptor()
+            .try_prepare(wrong_generation_request)
+            .expect("prepared descriptor slot");
+        let prepared_state = journal
+            .state()
+            .try_with_descriptor_control(prepared_slot)
+            .expect("persist prepared descriptor fixture");
+        let claimed_slot = prepared_state
+            .conversation_port_descriptor()
+            .try_claim()
+            .expect("claim descriptor slot");
+        let uncertain_state = prepared_state
+            .try_with_descriptor_control(claimed_slot)
+            .expect("persist uncertain descriptor fixture");
+        let request = uncertain_state
+            .conversation_port_descriptor()
+            .request()
+            .expect("durable descriptor request");
+        let wrong_generation_receipt = signed_descriptor_receipt(
+            request,
+            &remote,
+            &runtime,
+            active_fabric_generation
+                .try_successor()
+                .expect("wrong Fabric generation"),
+            active_agent_generation,
+        );
+        let terminal_slot = uncertain_state
+            .conversation_port_descriptor()
+            .try_terminal(wrong_generation_receipt)
+            .expect("terminal descriptor slot");
+        let wrong_generation_state = uncertain_state
+            .try_with_descriptor_control(terminal_slot)
+            .expect("persist wrong-generation descriptor fixture");
+        assert_descriptor_reopen_rejects(
+            &wrong_generation_state,
+            "descriptor PXAH generations must equal the current Fabric and Agent generations",
+        );
+
+        let descriptor_prepared = journal
+            .prepare_conversation_port_descriptor_with(
+                &controller,
+                &remote,
+                &ingress,
+                PrincipalRef::from_bytes([0xc1; 16]),
+                FreshRuntimeAgentControlV1::try_new([0xc2; 16], [0xc3; 32])
+                    .expect("fresh descriptor PXAG"),
+                |_| Ok(()),
+            )
+            .expect("bootstrap-only descriptor PXAG durable");
+        let descriptor_action = journal
+            .claim_conversation_port_descriptor_with(
+                descriptor_prepared,
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("descriptor Uncertain fence durable");
+        assert!(matches!(
+            journal.prepared_conversation_port_descriptor(&controller, &remote, &ingress),
+            Err(ManagedAgentStackApplyControllerError::OpaqueReplayForbidden)
+        ));
+        let fabric_generation = journal
+            .state()
+            .receipt()
+            .and_then(|receipt| receipt.facts().generation())
+            .expect("active Fabric generation");
+        let agent_generation = journal
+            .state()
+            .agent_stack_state()
+            .and_then(super::ManagedAgentStackControllerStateV1::receipt)
+            .and_then(|receipt| receipt.facts().state().agent_generation())
+            .expect("active Agent generation");
+        let receipt = signed_descriptor_receipt(
+            descriptor_action.request(),
+            &remote,
+            &runtime,
+            fabric_generation,
+            agent_generation,
+        );
+        let transport = RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
+            remote.describe().carrier().runtime_principal(),
+            remote.describe().carrier().binding_digest(),
+            receipt.canonical_wire().into(),
+        )
+        .expect("authenticated descriptor transport");
+        let unspent = super::ConversationPortDescriptorSendActionV1 {
+            outer_sequence: descriptor_action.outer_sequence,
+            cutover_marker_digest: descriptor_action.cutover_marker_digest,
+            request: descriptor_action.request.clone(),
+            remote_send_available: true,
+        };
+        assert!(matches!(
+            journal.consume_conversation_port_descriptor_pxah_with(
+                unspent,
+                transport.clone(),
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            ),
+            Err(ManagedAgentStackApplyControllerError::SendActionMismatch)
+        ));
+
+        let descriptor_calls = Cell::new(0_u8);
+        let first = descriptor_action
+            .exchange_remote_once(|_| {
+                descriptor_calls.set(descriptor_calls.get() + 1);
+                let transport = transport.clone();
+                async move { Ok(transport) }
+            })
+            .await;
+        let (spent, response) = first.into_parts();
+        let transport = response.expect("first descriptor transport response");
+        let second = spent
+            .exchange_remote_once(|_| {
+                descriptor_calls.set(descriptor_calls.get() + 1);
+                async {
+                    Err::<RuntimeAgentControlMtlsExchangeSuccessV1, _>(
+                        RuntimeAgentControlTransportErrorV1::Rejected,
+                    )
+                }
+            })
+            .await;
+        let (spent, second_response) = second.into_parts();
+        assert_eq!(descriptor_calls.get(), 1);
+        assert_eq!(
+            second_response,
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        );
+        let descriptor = journal
+            .consume_conversation_port_descriptor_pxah_with(
+                spent,
+                transport,
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("descriptor PXAH durable");
+        assert_eq!(descriptor.descriptor(), Some(&b"PXAP\0\x01opaque"[..]));
+        assert!(!descriptor.replayed_from_journal());
+        let replay = journal
+            .conversation_port_descriptor_terminal(&controller, &remote, &ingress)
+            .expect("descriptor receipt revalidates")
+            .expect("descriptor terminal exists");
+        assert!(replay.replayed_from_journal());
+        assert_eq!(replay.receipt(), descriptor.receipt());
     }
 
     #[test]

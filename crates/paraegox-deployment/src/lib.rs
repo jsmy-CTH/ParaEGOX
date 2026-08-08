@@ -83,11 +83,15 @@ mod tenure_protocol;
 pub use deployment_process::{DeploymentdProcessError, run_deploymentd_process};
 #[cfg(unix)]
 pub use deployment_process::{
+    DeveloperDeploymentAgentBootstrapReadyV1,
+    DeveloperDeploymentAgentBootstrapStartFieldsV1,
+    DeveloperDeploymentAgentBootstrapStartInputV1,
+    DeveloperDeploymentAgentBootstrapStartOutcomeV1,
     DeveloperDeploymentEnrollmentFactsFieldsV1, DeveloperDeploymentEnrollmentFactsV1,
     DeveloperDeploymentErrorV1, DeveloperDeploymentOwnerV1, DeveloperDeploymentReadyV1,
     DeveloperDeploymentStartFieldsV1, DeveloperDeploymentStartInputV1,
     DeveloperDeploymentStartModeV1, DeveloperDeploymentStartOutcomeV1,
-    start_developer_deployment_v1,
+    start_developer_deployment_agent_bootstrap_v1, start_developer_deployment_v1,
 };
 #[cfg(unix)]
 pub use developer_fixture_agent_stack::{
