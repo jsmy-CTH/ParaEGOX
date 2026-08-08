@@ -95,7 +95,63 @@ jobs:
 
           mkdir -p artifact
           install -m 0755 target/debug/paraegox artifact/paraegox
-          uv pip install --target artifact/python --no-compile .
+          runtime_requirements="$RUNNER_TEMP/paraegox-runtime-requirements.txt"
+          uv export \
+            --frozen \
+            --no-dev \
+            --no-emit-project \
+            --format requirements.txt \
+            --output-file "$runtime_requirements"
+          uv pip install \
+            --target artifact/python \
+            --no-compile \
+            --no-deps \
+            --require-hashes \
+            --requirements "$runtime_requirements"
+          uv pip install \
+            --target artifact/python \
+            --no-compile \
+            --no-deps \
+            .
+          RUNTIME_REQUIREMENTS="$runtime_requirements" \
+            ARTIFACT_PYTHON="$PWD/artifact/python" \
+            uv run --frozen python - <<'PY'
+          import os
+          import re
+          from importlib.metadata import distributions
+          from pathlib import Path
+
+          from packaging.requirements import Requirement
+
+
+          def canonical_name(value: str) -> str:
+              return re.sub(r"[-_.]+", "-", value).lower()
+
+
+          expected: dict[str, str] = {}
+          requirements = Path(os.environ["RUNTIME_REQUIREMENTS"])
+          for raw_line in requirements.read_text(encoding="utf-8").splitlines():
+              if not raw_line or raw_line[0].isspace() or raw_line.startswith("#"):
+                  continue
+              requirement = Requirement(raw_line.removesuffix("\\").rstrip())
+              if requirement.marker is not None and not requirement.marker.evaluate():
+                  continue
+              pins = [item.version for item in requirement.specifier if item.operator == "=="]
+              if len(pins) != 1:
+                  raise SystemExit(f"runtime dependency is not exactly pinned: {requirement}")
+              expected[canonical_name(requirement.name)] = pins[0]
+
+          actual = {
+              canonical_name(distribution.metadata["Name"]): distribution.version
+              for distribution in distributions(path=[os.environ["ARTIFACT_PYTHON"]])
+              if canonical_name(distribution.metadata["Name"]) != "paraegox-sdk"
+          }
+          if actual != expected:
+              raise SystemExit(
+                  f"bundled runtime dependencies differ from uv.lock: "
+                  f"expected={expected!r} actual={actual!r}"
+              )
+          PY
           if [ -d artifact/python/bin ]; then
             for generated_script in artifact/python/bin/*; do
               [ -e "$generated_script" ] || continue
