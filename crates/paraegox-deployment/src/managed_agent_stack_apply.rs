@@ -678,11 +678,8 @@ impl ManagedAgentStackApplyJournalV1 {
             provisioning,
             previous,
         )?;
-        self.state.revalidate_runtime_agent_control_slots(
-            provisioning,
-            &ready,
-            &context,
-        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
         let (predecessor_desired, predecessor_request, predecessor_receipt) =
             active_predecessor(&self.state)?;
         if let Some(stack) = self.state.agent_stack_state() {
@@ -714,14 +711,9 @@ impl ManagedAgentStackApplyJournalV1 {
             if stack.desired() != &expected {
                 return Err(ManagedAgentStackApplyControllerError::DesiredConflict);
             }
-            return self.prepared_remote_agent_control(
-                controller_signer,
-                provisioning,
-                previous,
-            );
+            return self.prepared_remote_agent_control(controller_signer, provisioning, previous);
         }
-        if predecessor_receipt.facts().outcome()
-            != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+        if predecessor_receipt.facts().outcome() != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
         {
             return Err(ManagedAgentStackApplyControllerError::FabricNotActive);
         }
@@ -748,10 +740,7 @@ impl ManagedAgentStackApplyJournalV1 {
                 controller_signer,
             )?;
         let stack = ManagedAgentStackControllerStateV1::try_prepared(desired, inner)?;
-        let slot = self
-            .state
-            .agent_stack_agent_control()
-            .try_prepare(outer)?;
+        let slot = self.state.agent_stack_agent_control().try_prepare(outer)?;
         let next = self.state.try_with_agent_stack_and_control(stack, slot)?;
         commit(&next)?;
         self.state = next;
@@ -770,11 +759,8 @@ impl ManagedAgentStackApplyJournalV1 {
             provisioning,
             previous,
         )?;
-        self.state.revalidate_runtime_agent_control_slots(
-            provisioning,
-            &ready,
-            &context,
-        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
         let stack = self
             .state
             .agent_stack_state()
@@ -825,11 +811,8 @@ impl ManagedAgentStackApplyJournalV1 {
             &ManagedFabricControllerStateV1,
         ) -> Result<(), ManagedAgentStackApplyControllerError>,
     {
-        let expected = self.prepared_remote_agent_control(
-            controller_signer,
-            provisioning,
-            previous,
-        )?;
+        let expected =
+            self.prepared_remote_agent_control(controller_signer, provisioning, previous)?;
         if prepared != expected {
             return Err(ManagedAgentStackApplyControllerError::PreparedTokenMismatch);
         }
@@ -882,11 +865,8 @@ impl ManagedAgentStackApplyJournalV1 {
             provisioning,
             previous,
         )?;
-        self.state.revalidate_runtime_agent_control_slots(
-            provisioning,
-            &ready,
-            &context,
-        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
         let (_, _, predecessor_receipt) = active_predecessor(&self.state)?;
         let predecessor_generation = predecessor_receipt
             .facts()
@@ -918,12 +898,7 @@ impl ManagedAgentStackApplyJournalV1 {
             .managed_agent_stack_receipt()
             .cloned()
             .ok_or(ManagedAgentStackApplyControllerError::AgentControlMismatch)?;
-        verify_terminal(
-            &inner,
-            stack.request(),
-            &context,
-            predecessor_generation,
-        )?;
+        verify_terminal(&inner, stack.request(), &context, predecessor_generation)?;
         let next_stack = stack.try_terminal(inner.clone())?;
         let next_slot = self
             .state
@@ -961,11 +936,8 @@ impl ManagedAgentStackApplyJournalV1 {
             provisioning,
             previous,
         )?;
-        self.state.revalidate_runtime_agent_control_slots(
-            provisioning,
-            &ready,
-            &context,
-        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
         let stack = self
             .state
             .agent_stack_state()
@@ -1005,11 +977,8 @@ impl ManagedAgentStackApplyJournalV1 {
             provisioning,
             previous,
         )?;
-        self.state.revalidate_runtime_agent_control_slots(
-            provisioning,
-            &ready,
-            &context,
-        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
         let (_, _, predecessor_receipt) = active_predecessor(&self.state)?;
         let predecessor_generation = predecessor_receipt
             .facts()
@@ -1102,11 +1071,8 @@ impl ManagedAgentStackApplyJournalV1 {
             provisioning,
             previous,
         )?;
-        self.state.revalidate_runtime_agent_control_slots(
-            provisioning,
-            &ready,
-            &context,
-        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
         let stack_receipt = self
             .state
             .agent_stack_state()
@@ -1143,11 +1109,8 @@ impl ManagedAgentStackApplyJournalV1 {
             &ManagedFabricControllerStateV1,
         ) -> Result<(), ManagedAgentStackApplyControllerError>,
     {
-        let expected = self.prepared_conversation_port_descriptor(
-            controller_signer,
-            provisioning,
-            previous,
-        )?;
+        let expected =
+            self.prepared_conversation_port_descriptor(controller_signer, provisioning, previous)?;
         if prepared != expected {
             return Err(ManagedAgentStackApplyControllerError::PreparedTokenMismatch);
         }
@@ -1187,11 +1150,8 @@ impl ManagedAgentStackApplyJournalV1 {
             provisioning,
             previous,
         )?;
-        self.state.revalidate_runtime_agent_control_slots(
-            provisioning,
-            &ready,
-            &context,
-        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
         if self.state.conversation_port_descriptor().phase()
             != RuntimeAgentControlDurablePhaseV1::Uncertain
             || action.outer_sequence != self.state.sequence()
@@ -1202,11 +1162,7 @@ impl ManagedAgentStackApplyJournalV1 {
         }
         let receipt = provisioning
             .describe()
-            .try_accept_runtime_agent_descriptor_receipt(
-                &ready,
-                &action.request,
-                &transport,
-            )?;
+            .try_accept_runtime_agent_descriptor_receipt(&ready, &action.request, &transport)?;
         let fabric_generation = self
             .state
             .receipt()
@@ -1255,11 +1211,8 @@ impl ManagedAgentStackApplyJournalV1 {
             provisioning,
             previous,
         )?;
-        self.state.revalidate_runtime_agent_control_slots(
-            provisioning,
-            &ready,
-            &context,
-        )?;
+        self.state
+            .revalidate_runtime_agent_control_slots(provisioning, &ready, &context)?;
         Ok(Some(ConversationPortDescriptorTerminalCommitV1 {
             outer_sequence: self.state.sequence(),
             receipt: self

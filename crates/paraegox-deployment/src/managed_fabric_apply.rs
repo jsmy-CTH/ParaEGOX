@@ -23,8 +23,8 @@ use paraegox_runtime_contracts::managed_fabric_plan::{
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::ManagedModelAgentStackTargetModeV1;
 use paraegox_runtime_contracts::managed_service::ManagedServiceSpecV1;
 use paraegox_runtime_contracts::managed_serving_bootstrap::{
-    ManagedServingBootstrapRequestV1, RuntimeAgentControlKindV1,
-    RuntimeAgentControlReceiptV1, RuntimeAgentControlRequestV1, RuntimeControlCarrierRequestV1,
+    ManagedServingBootstrapRequestV1, RuntimeAgentControlKindV1, RuntimeAgentControlReceiptV1,
+    RuntimeAgentControlRequestV1, RuntimeControlCarrierRequestV1,
 };
 use paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1;
 
@@ -42,13 +42,11 @@ use crate::managed_model_agent_stack_apply::{
     ManagedModelAgentStackControllerStateV1, ManagedModelAgentStackDecodeContextV1,
 };
 use crate::managed_serving_client::{
-    FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1,
-    ManagedServingBootstrapPhaseV1, ManagedServingBootstrapStateV1, ManagedServingControllerError,
-    ManagedServingDescribeIngressV1,
+    FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1, ManagedServingBootstrapPhaseV1,
+    ManagedServingBootstrapStateV1, ManagedServingControllerError, ManagedServingDescribeIngressV1,
     ManagedServingDescribeReconcileDecodeV1, ManagedServingDescribeReconcilePhaseV1,
     RuntimeAgentControlDurablePhaseV1, RuntimeAgentControlDurableSlotV1,
-    RuntimeAgentControlMtlsExchangeSuccessV1,
-    RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+    RuntimeAgentControlMtlsExchangeSuccessV1, RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
     RuntimeManagedServingDescribeTransportErrorV1, RuntimeManagedServingMtlsExchangeSuccessV1,
     RuntimeManagedServingTransportErrorV1, VerifiedManagedServingPinV1,
     VerifiedManagedServingReadyV1, VerifiedRuntimeManagedServingResponseV1,
@@ -274,9 +272,7 @@ impl ManagedFabricControllerStateV1 {
     }
 
     #[must_use]
-    pub(crate) const fn conversation_port_descriptor(
-        &self,
-    ) -> &RuntimeAgentControlDurableSlotV1 {
+    pub(crate) const fn conversation_port_descriptor(&self) -> &RuntimeAgentControlDurableSlotV1 {
         &self.conversation_port_descriptor
     }
 
@@ -1060,10 +1056,8 @@ impl ManagedFabricControllerStateV1 {
 
     fn runtime_agent_control_slots_idle(&self) -> bool {
         self.fabric_agent_control.phase() == RuntimeAgentControlDurablePhaseV1::Idle
-            && self.agent_stack_agent_control.phase()
-                == RuntimeAgentControlDurablePhaseV1::Idle
-            && self.conversation_port_descriptor.phase()
-                == RuntimeAgentControlDurablePhaseV1::Idle
+            && self.agent_stack_agent_control.phase() == RuntimeAgentControlDurablePhaseV1::Idle
+            && self.conversation_port_descriptor.phase() == RuntimeAgentControlDurablePhaseV1::Idle
     }
 
     fn try_with_remote_fabric_prepared(
@@ -1089,10 +1083,8 @@ impl ManagedFabricControllerStateV1 {
             || self.receipt.is_some()
             || self.fabric_agent_control.phase()
                 != RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
-            || self.agent_stack_agent_control.phase()
-                != RuntimeAgentControlDurablePhaseV1::Idle
-            || self.conversation_port_descriptor.phase()
-                != RuntimeAgentControlDurablePhaseV1::Idle
+            || self.agent_stack_agent_control.phase() != RuntimeAgentControlDurablePhaseV1::Idle
+            || self.conversation_port_descriptor.phase() != RuntimeAgentControlDurablePhaseV1::Idle
         {
             return Err(ManagedFabricApplyControllerError::OpaqueReplayForbidden);
         }
@@ -1111,8 +1103,7 @@ impl ManagedFabricControllerStateV1 {
         if self.phase != ManagedFabricApplyPhaseV1::Uncertain
             || self.request.is_none()
             || self.receipt.is_some()
-            || self.fabric_agent_control.phase()
-                != RuntimeAgentControlDurablePhaseV1::Uncertain
+            || self.fabric_agent_control.phase() != RuntimeAgentControlDurablePhaseV1::Uncertain
             || outer.kind() != RuntimeAgentControlKindV1::ApplyManagedFabric
             || outer.managed_fabric_receipt() != Some(&inner)
         {
@@ -1243,11 +1234,9 @@ impl ManagedFabricControllerStateV1 {
         agent_stack: ManagedAgentStackControllerStateV1,
         outer: RuntimeAgentControlDurableSlotV1,
     ) -> Result<Self, ManagedFabricApplyControllerError> {
-        if self.fabric_agent_control.phase()
-            != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
+        if self.fabric_agent_control.phase() != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
             || self.model_stack.is_some()
-            || self.conversation_port_descriptor.phase()
-                != RuntimeAgentControlDurablePhaseV1::Idle
+            || self.conversation_port_descriptor.phase() != RuntimeAgentControlDurablePhaseV1::Idle
             || !agent_control_slot_matches_stack(&outer, &agent_stack)
         {
             return Err(ManagedFabricApplyControllerError::AgentControlMismatch);
@@ -1278,8 +1267,7 @@ impl ManagedFabricControllerStateV1 {
         &self,
         descriptor: RuntimeAgentControlDurableSlotV1,
     ) -> Result<Self, ManagedFabricApplyControllerError> {
-        if self.fabric_agent_control.phase()
-            != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
+        if self.fabric_agent_control.phase() != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
             || self.agent_stack_agent_control.phase()
                 != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
             || self.model_stack.is_some()
@@ -1478,10 +1466,11 @@ fn agent_control_slot_matches_stack(
         return false;
     }
     match slot.phase() {
-        RuntimeAgentControlDurablePhaseV1::ReceiptDurable => slot
-            .receipt()
-            .and_then(RuntimeAgentControlReceiptV1::managed_agent_stack_receipt)
-            == stack.receipt(),
+        RuntimeAgentControlDurablePhaseV1::ReceiptDurable => {
+            slot.receipt()
+                .and_then(RuntimeAgentControlReceiptV1::managed_agent_stack_receipt)
+                == stack.receipt()
+        }
         RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
         | RuntimeAgentControlDurablePhaseV1::Uncertain => {
             slot.receipt().is_none() && stack.receipt().is_none()
@@ -1550,8 +1539,7 @@ fn validate_runtime_agent_control_slots(
     }
 
     if state.agent_stack_agent_control.phase() != RuntimeAgentControlDurablePhaseV1::Idle {
-        if state.fabric_agent_control.phase()
-            != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
+        if state.fabric_agent_control.phase() != RuntimeAgentControlDurablePhaseV1::ReceiptDurable
             || state.receipt.as_ref().is_none_or(|receipt| {
                 receipt.facts().outcome() != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
                     || receipt.facts().generation().is_none()
@@ -1638,7 +1626,10 @@ fn validate_runtime_agent_control_slots(
             )?;
             if descriptor_receipt.conversation_port_descriptor().is_none()
                 || descriptor_receipt.fabric_generation()
-                    != state.receipt.as_ref().and_then(|receipt| receipt.facts().generation())
+                    != state
+                        .receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.facts().generation())
                 || descriptor_receipt.agent_generation()
                     != stack_receipt.facts().state().agent_generation()
             {
@@ -2646,11 +2637,7 @@ impl ManagedFabricApplyJournalV1 {
             if &requested != desired {
                 return Err(ManagedFabricApplyControllerError::DesiredConflict);
             }
-            return self.prepared_remote_agent_control(
-                controller_signer,
-                provisioning,
-                previous,
-            );
+            return self.prepared_remote_agent_control(controller_signer, provisioning, previous);
         }
         if self.state.phase != ManagedFabricApplyPhaseV1::CutoverReady
             || !self.state.runtime_agent_control_slots_idle()
@@ -2777,11 +2764,8 @@ impl ManagedFabricApplyJournalV1 {
             &ManagedFabricControllerStateV1,
         ) -> Result<(), ManagedFabricApplyControllerError>,
     {
-        let expected = self.prepared_remote_agent_control(
-            controller_signer,
-            provisioning,
-            previous,
-        )?;
+        let expected =
+            self.prepared_remote_agent_control(controller_signer, provisioning, previous)?;
         if prepared != expected {
             return Err(ManagedFabricApplyControllerError::PreparedTokenMismatch);
         }
@@ -3590,11 +3574,13 @@ pub(crate) mod tests {
     };
 
     use super::{
-        AGENT_STACK_STATE_VERSION, LEGACY_STATE_VERSION, MODEL_STACK_STATE_VERSION,
-        MANAGED_READY_STATE_VERSION, ManagedFabricApplyControllerError,
+        AGENT_STACK_STATE_FIXED_BYTES, AGENT_STACK_STATE_VERSION, LEGACY_STATE_FIXED_BYTES,
+        LEGACY_STATE_VERSION, MANAGED_READY_STATE_FIXED_BYTES, MANAGED_READY_STATE_VERSION,
+        MODEL_STACK_STATE_FIXED_BYTES, MODEL_STACK_STATE_VERSION, ManagedFabricApplyControllerError,
         ManagedFabricApplyJournalV1, ManagedFabricApplyPhaseV1, ManagedFabricControllerStateV1,
-        ManagedServingDescribeSendActionV1, REMOTE_CARRIER_STATE_VERSION, STATE_CHECKSUM_BYTES,
-        STATE_VERSION, state_checksum,
+        ManagedServingDescribeSendActionV1, REMOTE_CARRIER_STATE_FIXED_BYTES,
+        REMOTE_CARRIER_STATE_VERSION, STATE_CHECKSUM_BYTES, STATE_FIXED_BYTES, STATE_VERSION,
+        state_checksum,
     };
     use crate::managed_fabric_producer::{
         FreshManagedFabricApplyV1, ManagedFabricControllerIdentityV1,

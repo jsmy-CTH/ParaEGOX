@@ -23,11 +23,10 @@ use paraegox_runtime_contracts::managed_fabric_plan::{
 use paraegox_runtime_contracts::managed_serving_bootstrap::{
     ManagedServingBootstrapError, ManagedServingBootstrapFactsV1,
     ManagedServingBootstrapRequestDraftV1, ManagedServingBootstrapRequestIdV1,
-    ManagedServingBootstrapRequestV1, ManagedServingBootstrapResponseV1,
-    RuntimeAgentControlKindV1, RuntimeAgentControlReceiptV1,
-    RuntimeAgentControlRequestDraftV1, RuntimeAgentControlRequestFieldsV1,
-    RuntimeAgentControlRequestIdV1, RuntimeAgentControlRequestV1,
-    RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestDraftV1,
+    ManagedServingBootstrapRequestV1, ManagedServingBootstrapResponseV1, RuntimeAgentControlKindV1,
+    RuntimeAgentControlReceiptV1, RuntimeAgentControlRequestDraftV1,
+    RuntimeAgentControlRequestFieldsV1, RuntimeAgentControlRequestIdV1,
+    RuntimeAgentControlRequestV1, RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestDraftV1,
     RuntimeControlCarrierRequestV1, RuntimeControlDescribeReadyPhaseV1,
     RuntimeControlDescribeReadyResponseV1,
 };
@@ -116,9 +115,7 @@ impl RuntimeAgentControlDurablePhaseV1 {
         }
     }
 
-    pub(crate) const fn try_from_wire(
-        value: u8,
-    ) -> Result<Self, ManagedServingControllerError> {
+    pub(crate) const fn try_from_wire(value: u8) -> Result<Self, ManagedServingControllerError> {
         match value {
             0 => Ok(Self::Idle),
             1 => Ok(Self::RequestDurableNotSent),
@@ -166,7 +163,10 @@ impl RuntimeAgentControlDurableSlotV1 {
                 if request_wire.is_empty() || !receipt_wire.is_empty() {
                     return Err(ManagedServingControllerError::InvalidAgentControlState);
                 }
-                (Some(RuntimeAgentControlRequestV1::decode(request_wire)?), None)
+                (
+                    Some(RuntimeAgentControlRequestV1::decode(request_wire)?),
+                    None,
+                )
             }
             RuntimeAgentControlDurablePhaseV1::ReceiptDurable => {
                 if request_wire.is_empty() || receipt_wire.is_empty() {
@@ -391,10 +391,8 @@ impl ManagedServingDescribeVerifierV1 {
         controller_signer: &SigningKey,
     ) -> Result<RuntimeAgentControlRequestV1, ManagedServingControllerError> {
         let fields = self.runtime_agent_control_fields(ready, fresh, controller_signer)?;
-        let draft = RuntimeAgentControlRequestDraftV1::try_apply_managed_fabric(
-            fields,
-            inner.clone(),
-        )?;
+        let draft =
+            RuntimeAgentControlRequestDraftV1::try_apply_managed_fabric(fields, inner.clone())?;
         let signature = controller_signer.sign(draft.signing_transcript()?.as_bytes());
         let request = draft.finalize(&signature.to_bytes())?;
         self.revalidate_runtime_agent_control_request(
@@ -475,8 +473,7 @@ impl ManagedServingDescribeVerifierV1 {
             || request.target() != self.target
             || request.expected_runtime_store_instance_id()
                 != ready.serving_facts().runtime_store_instance_id()
-            || request.expected_runtime_host_epoch()
-                != ready.serving_facts().runtime_host_epoch()
+            || request.expected_runtime_host_epoch() != ready.serving_facts().runtime_host_epoch()
             || claim.principal() != self.carrier.controller_principal()
             || claim.key() != self.carrier.controller_request_key()
             || claim.algorithm().value() != ED25519_ALGORITHM
@@ -521,12 +518,7 @@ impl ManagedServingDescribeVerifierV1 {
         self.revalidate_runtime_agent_control_request(ready, request.kind(), request)?;
         self.validate_runtime_agent_control_transport(transport)?;
         let receipt = RuntimeAgentControlReceiptV1::decode(&transport.response_wire)?;
-        self.revalidate_runtime_agent_apply_receipt(
-            ready,
-            request,
-            current_channel,
-            &receipt,
-        )?;
+        self.revalidate_runtime_agent_apply_receipt(ready, request, current_channel, &receipt)?;
         Ok(receipt)
     }
 
@@ -630,9 +622,7 @@ impl ManagedServingDescribeVerifierV1 {
             request_id: RuntimeAgentControlRequestIdV1::try_from_bytes(fresh.request_id)?,
             carrier: self.carrier.clone(),
             target: self.target,
-            expected_runtime_store_instance_id: ready
-                .serving_facts()
-                .runtime_store_instance_id(),
+            expected_runtime_store_instance_id: ready.serving_facts().runtime_store_instance_id(),
             expected_runtime_host_epoch: ready.serving_facts().runtime_host_epoch(),
             auth_claim: ApplyRequestAuthClaim::try_new(
                 self.carrier.controller_principal(),
