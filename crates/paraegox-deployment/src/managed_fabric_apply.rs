@@ -3576,11 +3576,11 @@ pub(crate) mod tests {
     use super::{
         AGENT_STACK_STATE_FIXED_BYTES, AGENT_STACK_STATE_VERSION, LEGACY_STATE_FIXED_BYTES,
         LEGACY_STATE_VERSION, MANAGED_READY_STATE_FIXED_BYTES, MANAGED_READY_STATE_VERSION,
-        MODEL_STACK_STATE_FIXED_BYTES, MODEL_STACK_STATE_VERSION, ManagedFabricApplyControllerError,
-        ManagedFabricApplyJournalV1, ManagedFabricApplyPhaseV1, ManagedFabricControllerStateV1,
-        ManagedServingDescribeSendActionV1, REMOTE_CARRIER_STATE_FIXED_BYTES,
-        REMOTE_CARRIER_STATE_VERSION, STATE_CHECKSUM_BYTES, STATE_FIXED_BYTES, STATE_VERSION,
-        state_checksum,
+        MODEL_STACK_STATE_FIXED_BYTES, MODEL_STACK_STATE_VERSION,
+        ManagedFabricApplyControllerError, ManagedFabricApplyJournalV1, ManagedFabricApplyPhaseV1,
+        ManagedFabricControllerStateV1, ManagedServingDescribeSendActionV1,
+        REMOTE_CARRIER_STATE_FIXED_BYTES, REMOTE_CARRIER_STATE_VERSION, STATE_CHECKSUM_BYTES,
+        STATE_FIXED_BYTES, STATE_VERSION, state_checksum,
     };
     use crate::managed_fabric_producer::{
         FreshManagedFabricApplyV1, ManagedFabricControllerIdentityV1,
