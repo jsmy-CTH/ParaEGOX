@@ -2791,13 +2791,18 @@ mod platform {
                     )
                     .map_err(|_| DeveloperDeploymentErrorV1::ManagedServingFailed)?
             };
+            let carrier_fresh = FreshManagedServingBootstrapV1::try_new(
+                prepared.request_id(),
+                nonzero_system_entropy::<32>()?,
+            )
+            .map_err(|_| DeveloperDeploymentErrorV1::RuntimeExchangeFailed)?;
             let action = journal
                 .claim_remote_serving_bootstrap_with(
                     prepared,
                     signer,
                     provisioning,
                     ingress,
-                    fresh_remote_runtime_request()?,
+                    carrier_fresh,
                     |next| {
                         store
                             .commit_state(next)

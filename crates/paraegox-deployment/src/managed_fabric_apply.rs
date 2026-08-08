@@ -1121,6 +1121,14 @@ pub(crate) struct PreparedManagedServingBootstrapV1 {
     state_sequence: u64,
     cutover_marker_digest: Digest32,
     request_digest: Digest32,
+    request_id: [u8; 16],
+}
+
+impl PreparedManagedServingBootstrapV1 {
+    #[must_use]
+    pub(crate) const fn request_id(&self) -> [u8; 16] {
+        self.request_id
+    }
 }
 
 /// Proof that one exact post-PXFB Describe PXCC is durable and unsent.
@@ -1450,6 +1458,7 @@ impl ManagedFabricApplyJournalV1 {
             state_sequence: self.state.sequence,
             cutover_marker_digest: self.state.cutover_marker_digest,
             request_digest: request.request_digest(),
+            request_id: *request.request_id().as_bytes(),
         })
     }
 
@@ -3632,6 +3641,7 @@ pub(crate) mod tests {
                 |_| Ok(()),
             )
             .expect("inner PXFB durable");
+        assert_eq!(prepared.request_id(), [0x92; 16]);
         let action = journal
             .claim_remote_serving_bootstrap_with(
                 prepared,

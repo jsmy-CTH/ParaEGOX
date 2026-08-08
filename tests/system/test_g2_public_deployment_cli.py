@@ -95,9 +95,9 @@ def _ed25519_public_key(seed: bytes) -> bytes:
     )
 
 
-def _non_loopback_ipv4() -> str:
+def _non_loopback_ipv4(ip_command: str) -> str:
     completed = subprocess.run(
-        ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+        [ip_command, "-o", "-4", "addr", "show", "scope", "global"],
         check=True,
         capture_output=True,
         text=True,
@@ -281,7 +281,10 @@ def _logs(process: RunningProcess) -> tuple[bytes, bytes]:
 def _inventory(root: Path) -> list[tuple[str, int, int, int, int, int]]:
     observed = []
     for path in sorted(root.rglob("*")):
-        metadata = path.lstat()
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
         observed.append(
             (
                 str(path.relative_to(root)),
@@ -454,6 +457,8 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
     source_binary = Path(binary_value).resolve(strict=True)
     setpriv = shutil.which("setpriv")
     assert setpriv is not None
+    ip_command = shutil.which("ip")
+    assert ip_command is not None
     account = pwd.getpwnam("nobody")
     uid, gid = account.pw_uid, account.pw_gid
     assert uid != 0 and gid != 0
@@ -469,6 +474,12 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
             "deployment": 0o700,
             "authority": 0o700,
             "authority-socket": 0o2750,
+            "deployment-wrong-sha": 0o700,
+            "authority-wrong-sha": 0o700,
+            "authority-wrong-sha-socket": 0o2750,
+            "deployment-node-down": 0o700,
+            "authority-node-down": 0o700,
+            "authority-node-down-socket": 0o2750,
             "input": 0o700,
             "secrets": 0o700,
             "deployment-credentials": 0o700,
@@ -490,7 +501,7 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
         authority_public_key = _ed25519_public_key(authority_seed_bytes)
         assert controller_public_key != authority_public_key
 
-        address = _non_loopback_ipv4()
+        address = _non_loopback_ipv4(ip_command)
         runtime_port = _free_port(address, set())
         node_port = _free_port(address, {runtime_port})
         ca_key, ca_certificate = _make_ca()
@@ -579,6 +590,7 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
         deployment: RunningProcess | None = None
         deployment_restart: RunningProcess | None = None
         wrong_pin: RunningProcess | None = None
+        node_down: RunningProcess | None = None
         try:
             _wait_for_marker(node, NODE_READY)
             artifact_source = root / "node" / "node" / "enrollment-v1.pxea"
@@ -586,6 +598,47 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
             artifact = root / "input" / "enrollment-v1.pxea"
             _write_owned(artifact, artifact_source.read_bytes(), 0o400, uid, gid)
             artifact_sha256 = hashlib.sha256(artifact.read_bytes()).digest()
+            wrong_digest = bytes([artifact_sha256[0] ^ 1]) + artifact_sha256[1:]
+            wrong_config = root / "cfg" / "deployment-wrong-sha.toml"
+            _write_owned(
+                wrong_config,
+                _deployment_document(
+                    state_root=root / "deployment-wrong-sha",
+                    artifact=artifact,
+                    artifact_sha256=wrong_digest,
+                    controller_seed=controller_seed,
+                    authority_seed=authority_seed,
+                    authority_state=root / "authority-wrong-sha",
+                    authority_socket=root
+                    / "authority-wrong-sha-socket"
+                    / "authority.sock",
+                    credentials=deployment_credentials,
+                ).encode(),
+                0o600,
+                uid,
+                gid,
+            )
+            wrong_pin = _spawn(
+                [
+                    *command_prefix,
+                    str(binary),
+                    "deployment",
+                    "--config",
+                    str(wrong_config),
+                ],
+                name="deployment-wrong-sha",
+                root=root,
+                environment=environment,
+            )
+            assert _wait_for_exit(wrong_pin, timeout=30) != 0
+            wrong_stdout, _ = _logs(wrong_pin)
+            assert DEPLOYMENT_READY not in wrong_stdout
+            assert not any((root / "deployment-wrong-sha").iterdir())
+            assert not any((root / "authority-wrong-sha").iterdir())
+            assert not (root / "authority-wrong-sha-socket" / "authority.sock").exists()
+            wrong_pin.close_logs()
+            wrong_pin = None
+
             deployment_config = root / "cfg" / "deployment.toml"
             deployment_text = _deployment_document(
                 state_root=root / "deployment",
@@ -641,46 +694,47 @@ def test_public_deployment_fresh_restart_and_sha_pin_fail_closed() -> None:
             deployment_restart.close_logs()
             deployment_restart = None
 
-            wrong_digest = bytes([artifact_sha256[0] ^ 1]) + artifact_sha256[1:]
-            wrong_config = root / "cfg" / "deployment-wrong-sha.toml"
+            assert node.process.poll() is None
+            node.process.send_signal(signal.SIGTERM)
+            assert _wait_for_exit(node) == 0, _logs(node)
+
+            node_down_config = root / "cfg" / "deployment-node-down.toml"
+            node_down_socket = root / "authority-node-down-socket" / "authority.sock"
             _write_owned(
-                wrong_config,
+                node_down_config,
                 _deployment_document(
-                    state_root=root / "deployment",
+                    state_root=root / "deployment-node-down",
                     artifact=artifact,
-                    artifact_sha256=wrong_digest,
+                    artifact_sha256=artifact_sha256,
                     controller_seed=controller_seed,
                     authority_seed=authority_seed,
-                    authority_state=root / "authority",
-                    authority_socket=root / "authority-socket" / "authority.sock",
+                    authority_state=root / "authority-node-down",
+                    authority_socket=node_down_socket,
                     credentials=deployment_credentials,
                 ).encode(),
                 0o600,
                 uid,
                 gid,
             )
-            wrong_pin = _spawn(
+            node_down = _spawn(
                 [
                     *command_prefix,
                     str(binary),
                     "deployment",
                     "--config",
-                    str(wrong_config),
+                    str(node_down_config),
                 ],
-                name="deployment-wrong-sha",
+                name="deployment-node-down",
                 root=root,
                 environment=environment,
             )
-            assert _wait_for_exit(wrong_pin, timeout=30) != 0
-            wrong_stdout, _ = _logs(wrong_pin)
-            assert DEPLOYMENT_READY not in wrong_stdout
-            wrong_pin.close_logs()
-            wrong_pin = None
-
-            assert node.process.poll() is None
-            node.process.send_signal(signal.SIGTERM)
-            assert _wait_for_exit(node) == 0, _logs(node)
+            assert _wait_for_exit(node_down, timeout=90) != 0
+            node_down_stdout, _ = _logs(node_down)
+            assert DEPLOYMENT_READY not in node_down_stdout
+            assert not node_down_socket.exists()
+            node_down.close_logs()
+            node_down = None
         finally:
-            for process in (wrong_pin, deployment_restart, deployment, node):
+            for process in (node_down, wrong_pin, deployment_restart, deployment, node):
                 if process is not None:
                     _stop_process(process)
