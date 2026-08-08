@@ -435,11 +435,13 @@ mod tests {
         assert!(text.contains("single DeploymentController"));
         assert!(text.contains("Config schema v1 prints its\noriginal readiness marker only"));
         assert!(text.contains("reports ManagedReady"));
-        assert!(text.contains("Schema v2 additionally consumes its\nenrollment-pinned Agent-provider"));
+        assert!(
+            text.contains("Schema v2 additionally consumes its\nenrollment-pinned Agent-provider")
+        );
         assert!(text.contains("config-owned Fabric/Agent\nservice identities"));
         assert!(text.contains("distinct Agent-bootstrap readiness marker"));
         assert!(text.contains("complete durable\nbootstrap facade reports Ready"));
-        assert!(text.contains("not evidence of a two-host system proof"));
+        assert!(text.contains("not evidence of a\ntwo-host system proof"));
         assert!(text.contains("remote Agent conversation, remote TUI"));
         assert!(text.contains("remote TUI"));
         assert!(text.contains("reconnect policy"));

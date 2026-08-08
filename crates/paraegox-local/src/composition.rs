@@ -20,11 +20,10 @@ use nix::unistd::{Gid, Pid, Uid};
 use paraegox_agent_contracts::{AgentConversationDeckRunId, AgentConversationSessionId};
 use paraegox_agent_service::AgentConversationModelServiceProviderV1;
 use paraegox_deployment::{
-    DeveloperDeploymentAgentBootstrapStartFieldsV1,
-    DeveloperDeploymentAgentBootstrapStartInputV1,
-    DeveloperDeploymentAgentBootstrapStartOutcomeV1,
-    DeveloperDeploymentEnrollmentFactsFieldsV1, DeveloperDeploymentEnrollmentFactsV1,
-    DeveloperDeploymentOwnerV1, DeveloperDeploymentStartFieldsV1, DeveloperDeploymentStartInputV1,
+    DeveloperDeploymentAgentBootstrapStartFieldsV1, DeveloperDeploymentAgentBootstrapStartInputV1,
+    DeveloperDeploymentAgentBootstrapStartOutcomeV1, DeveloperDeploymentEnrollmentFactsFieldsV1,
+    DeveloperDeploymentEnrollmentFactsV1, DeveloperDeploymentOwnerV1,
+    DeveloperDeploymentStartFieldsV1, DeveloperDeploymentStartInputV1,
     DeveloperDeploymentStartModeV1, DeveloperDeploymentStartOutcomeV1,
     DeveloperFixtureAgentStackInputV1, DeveloperFixtureControllerCredentialsV1,
     DeveloperFixtureDerivedIdentityV1, DeveloperFixtureDistributedAgentStackInputV1,
@@ -262,12 +261,8 @@ async fn run_deployment_with_signals(
                 authority_verification_key,
             )
             .map_err(|_| LocalProcessError::DeploymentPreparation)?;
-            let input = prepare_developer_deployment_start_input(
-                &config,
-                peer,
-                parts,
-                &enrollment,
-            )?;
+            let input =
+                prepare_developer_deployment_start_input(&config, peer, parts, &enrollment)?;
             run_enrollment_deployment_with_signals(input, interrupt, terminate).await
         }
         DeveloperDeploymentConfigSchemaV1::ManagedAgentBootstrapV2 => {
@@ -328,8 +323,8 @@ fn prepare_developer_deployment_start_input(
         enrollment.runtime_manifest_digest(),
     )
     .map_err(|_| LocalProcessError::DeploymentPreparation)?;
-    let prepared_layout = layout::prepare_deployment(config)
-        .map_err(|_| LocalProcessError::DeploymentPreparation)?;
+    let prepared_layout =
+        layout::prepare_deployment(config).map_err(|_| LocalProcessError::DeploymentPreparation)?;
     let mode = deployment_start_mode(&prepared_layout, config.authority_state_directory())?;
 
     let runtime_transport_profile = enrollment.runtime_transport_profile();
@@ -4057,8 +4052,7 @@ mod tests {
             2,
             "production has exactly one Agent-bootstrap Ready call plus its function definition"
         );
-        let local_ready_struct_literal =
-            concat!("DeveloperDeploymentAgentBootstrapReadyV1", " {");
+        let local_ready_struct_literal = concat!("DeveloperDeploymentAgentBootstrapReadyV1", " {");
         let local_ready_constructor = concat!("DeveloperDeploymentAgentBootstrapReadyV1", "::");
         assert!(!source.contains(local_ready_struct_literal));
         assert!(!source.contains(local_ready_constructor));
