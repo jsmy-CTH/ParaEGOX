@@ -149,12 +149,13 @@ validation, but it is not a development checkout whose source can flow back into
   server-mutated `Cargo.lock`.
 - Any exception to this one-way boundary requires explicit user authorization before the transfer.
 
-## Validate locally
+## Validate on admitted execution hosts
 
 The repository has a pinned Rust workspace for admitted core slices and Python 3.11/`uv`
 governance tooling. The commands below validate those current surfaces; they are not evidence that
 a production RuntimeHost exists, and they are not a claim about the eventual ROS2, Jetson,
-hardware, or production runtime support matrix.
+hardware, or production runtime support matrix. They are the complete repository-wide gates, not a
+command list authorizing every host to execute every tool.
 
 ```bash
 cargo fmt --all --check
@@ -169,11 +170,35 @@ uv run --frozen python scripts/check_governance.py
 uv run --frozen pytest
 ```
 
+### Current Mac source-authority regression
+
+The current Mac source-authority workflow prohibits direct or indirect execution of Cargo, rustc,
+rustfmt, or any other Rust build tool. The same rule applies when pytest, a script, task runner,
+build helper, or child process would launch the tool. Therefore do not run bare
+`uv run --frozen pytest` on this Mac. The complete `scripts/check_governance.py` is prohibited too:
+its required workspace check invokes `cargo metadata --locked`, so removing, filtering, mocking, or
+bypassing that phase cannot produce valid governance evidence. The permitted non-Rust Mac checks
+are:
+
+```bash
+uv lock --check
+uv run --frozen ruff check .
+uv run --frozen pytest --deselect=tests/system/test_s6_python_reference_worker.py::test_rust_process_domain_owns_real_python_worker_fault_matrix
+```
+
+The complete governance checker and the deselected case remain required and run on Ubuntu/CI with
+the pinned Rust toolchain in this workflow. All Rust commands in the repository-wide list also
+remain required on their admitted Ubuntu/CI host. A Mac result may report the permitted checks that
+actually ran, but must report the complete governance checker as not run; it must never claim a
+governance pass from a Cargo-free subset. This host-specific orchestration split is not a waiver, a
+global skip, or a reduction of required validation.
+
 Cargo is the authority for Rust dependencies, builds and tests, while `uv`, Python
 `pyproject.toml` and `uv.lock` remain
 the authority for Python governance tooling, SDKs and workloads. Neither tool may maintain a second
-lock or dependency truth for the other ecosystem. `cargo metadata --locked` failure is a hard
-governance failure; do not skip Rust checks when Cargo or the pinned toolchain is unavailable.
+lock or dependency truth for the other ecosystem. `cargo metadata --locked` failure remains a hard
+governance failure on the admitted Ubuntu/CI checker host. On the current Mac, report the complete
+checker as not run under the host policy rather than skipping its Cargo phase or claiming it passed.
 
 Hardware, external-service, or manually authorized checks remain separate and must not be reported
 as passing based on local mocks.

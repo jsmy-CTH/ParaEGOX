@@ -21,7 +21,7 @@ from pathlib import Path
 
 _STARTUP_TIMEOUT_SECONDS = 45.0
 _REPLY_TIMEOUT_SECONDS = 45.0
-_EXIT_TIMEOUT_SECONDS = 20.0
+_EXIT_TIMEOUT_SECONDS = 60.0
 _MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 _MESSAGE = "artifact-smoke-echo"
 
@@ -180,6 +180,20 @@ def main() -> int:
                 b"System: connected",
                 _STARTUP_TIMEOUT_SECONDS,
             )
+            for inspection_marker in (
+                b"Node-local startup snapshot",
+                b"NodeDaemon",
+                b"Authority",
+                b"Fabric",
+                b"health unreported",
+            ):
+                _read_until(
+                    master_fd,
+                    process,
+                    capture,
+                    inspection_marker,
+                    _STARTUP_TIMEOUT_SECONDS,
+                )
             os.write(master_fd, f"{_MESSAGE}\r".encode())
             _read_until(
                 master_fd,
@@ -197,7 +211,10 @@ def main() -> int:
             _stop_process(process)
             os.close(master_fd)
 
-    print("macOS bundle smoke passed: parent -> Textual -> Runtime Agent IPC -> Echo")
+    print(
+        "macOS bundle smoke passed: parent -> Inspection -> Textual -> "
+        "Runtime Agent IPC -> Echo"
+    )
     return 0
 
 

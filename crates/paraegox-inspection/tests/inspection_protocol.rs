@@ -11,13 +11,19 @@ use paraegox_inspection::{
     InspectionSourceAvailabilityV1, InspectionSourceCoordinateV1, InspectionSourceOwnerV1,
     InspectionSourceSlotV1, LocalInspectionOverallV1, LocalInspectionProjectionInputV1,
     LocalInspectionProjectionInputV2, LocalInspectionServiceV1, LocalInspectionServiceV2,
-    NodeInspectionSourceSlotV2, OwnerInspectionFactFieldsV1, OwnerInspectionFactV1,
+    NodeInspectionFactFieldsV2, NodeInspectionFactV2, NodeInspectionSourceSlotV2,
+    OwnerInspectionFactFieldsV1, OwnerInspectionFactV1,
 };
 use paraegox_kernel::digest::{Digest32, Digest32Builder};
 
 const PROJECTION_ID: [u8; 16] = [0xa1; 16];
 const OTHER_PROJECTION_ID: [u8; 16] = [0xa2; 16];
 const CLOCK_BYTES: [u8; 16] = [0xc1; 16];
+const CROSS_LANGUAGE_PROJECTION_ID: [u8; 16] = [0x21; 16];
+const CROSS_LANGUAGE_CLOCK_BYTES: [u8; 16] = [0x31; 16];
+const CROSS_LANGUAGE_REQUEST_ID: [u8; 16] = [
+    0x6e, 0xeb, 0x8f, 0xa5, 0x0a, 0xd6, 0x17, 0x7b, 0x24, 0xd9, 0x4c, 0x51, 0x12, 0xf5, 0x04, 0x83,
+];
 const REQUEST_HEADER_BYTES: usize = 96;
 const REQUEST_DIGEST_OFFSET: usize = 64;
 const RESPONSE_HEADER_BYTES: usize = 144;
@@ -103,6 +109,66 @@ fn service_with_snapshot_v2(revision: u64) -> LocalInspectionServiceV2 {
         .expect("v2 projection input");
     for _ in 0..revision {
         service.project(150, &input).expect("v2 projection");
+    }
+    service
+}
+
+fn cross_language_clock() -> InspectionObservationClockRefV1 {
+    InspectionObservationClockRefV1::try_from_bytes(CROSS_LANGUAGE_CLOCK_BYTES)
+        .expect("cross-language clock")
+}
+
+fn cross_language_missing_slot(
+    owner: InspectionSourceOwnerV1,
+    subject_byte: u8,
+) -> InspectionSourceSlotV1 {
+    InspectionSourceSlotV1::try_new(owner, [subject_byte; 16], None)
+        .expect("cross-language missing slot")
+}
+
+fn cross_language_input_v2() -> LocalInspectionProjectionInputV2 {
+    let base = LocalInspectionProjectionInputV1::try_new(
+        cross_language_clock(),
+        [
+            cross_language_missing_slot(InspectionSourceOwnerV1::Authority, 0x41),
+            cross_language_missing_slot(InspectionSourceOwnerV1::DeploymentController, 0x42),
+            cross_language_missing_slot(InspectionSourceOwnerV1::RuntimeHost, 0x43),
+            cross_language_missing_slot(InspectionSourceOwnerV1::FabricService, 0x44),
+            cross_language_missing_slot(InspectionSourceOwnerV1::AgentService, 0x45),
+        ],
+    )
+    .expect("cross-language base input");
+    let node_fact = NodeInspectionFactV2::try_new(NodeInspectionFactFieldsV2 {
+        node_ref: [0x61; 16],
+        node_incarnation_ref: [0x62; 16],
+        registration_epoch: 31,
+        status_sequence: 41,
+        observation_clock_ref: cross_language_clock(),
+        observed_at_nanos: 100,
+        valid_until_nanos: 200,
+        availability: InspectionSourceAvailabilityV1::Observed,
+        liveness: InspectionLivenessV1::Live,
+        readiness: InspectionReadinessV1::Ready,
+        health: InspectionHealthV1::Healthy,
+        feature_support: InspectionFeatureSupportV1::AllRequiredSupported,
+        reason: InspectionReasonV1::None,
+        node_status_digest: Digest32::from_bytes([0x63; 32]),
+    })
+    .expect("cross-language NodeDaemon fact");
+    let node = NodeInspectionSourceSlotV2::try_new([0x61; 16], [0x62; 16], Some(node_fact))
+        .expect("cross-language NodeDaemon slot");
+    LocalInspectionProjectionInputV2::try_new(base, node).expect("cross-language v2 input")
+}
+
+fn cross_language_service_v2() -> LocalInspectionServiceV2 {
+    let mut service =
+        LocalInspectionServiceV2::try_new(CROSS_LANGUAGE_PROJECTION_ID, cross_language_clock())
+            .expect("cross-language service");
+    let input = cross_language_input_v2();
+    for _ in 0..7 {
+        service
+            .project(150, &input)
+            .expect("cross-language projection");
     }
     service
 }
@@ -605,5 +671,79 @@ fn v2_protocol_is_strictly_versioned_and_returns_the_composite_cache() {
     assert_eq!(
         client_response.outcome(),
         InspectionResponseOutcomeV2::Snapshot
+    );
+}
+
+#[test]
+fn v2_latest_snapshot_and_not_found_match_cross_language_goldens() {
+    let latest =
+        InspectionRequestV2::try_latest(CROSS_LANGUAGE_REQUEST_ID, CROSS_LANGUAGE_PROJECTION_ID)
+            .expect("cross-language latest");
+    let service = cross_language_service_v2();
+    let snapshot_response = service
+        .answer_read_only_v2(&latest)
+        .expect("cross-language snapshot response");
+    let blank =
+        LocalInspectionServiceV2::try_new(CROSS_LANGUAGE_PROJECTION_ID, cross_language_clock())
+            .expect("blank cross-language service");
+    let not_found_response = blank
+        .answer_read_only_v2(&latest)
+        .expect("cross-language not-found response");
+    let fixtures = [
+        (
+            "LATEST_REQUEST_V2",
+            include_str!("fixtures/inspection_latest_request_v2.hex").trim(),
+            latest.canonical_wire(),
+        ),
+        (
+            "SNAPSHOT_RESPONSE_V2",
+            include_str!("fixtures/inspection_snapshot_response_v2.hex").trim(),
+            snapshot_response.canonical_wire(),
+        ),
+        (
+            "NOT_FOUND_RESPONSE_V2",
+            include_str!("fixtures/inspection_not_found_response_v2.hex").trim(),
+            not_found_response.canonical_wire(),
+        ),
+    ];
+    if fixtures
+        .iter()
+        .any(|(_, expected, _)| *expected == "PENDING")
+    {
+        let values = fixtures
+            .iter()
+            .map(|(name, _, bytes)| format!("{name}={}", encode_hex(bytes)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!("PXI_PROTOCOL_V2_GOLDENS\n{values}");
+    }
+    for (_, expected, actual) in fixtures {
+        assert_eq!(actual, decode_hex(expected));
+    }
+
+    assert_eq!(
+        InspectionRequestV2::decode(latest.canonical_wire()).expect("strict latest decode"),
+        latest
+    );
+    let decoded_snapshot = InspectionResponseV2::decode(snapshot_response.canonical_wire())
+        .expect("strict snapshot response decode");
+    decoded_snapshot
+        .validate_for(&latest)
+        .expect("exact snapshot correlation");
+    assert_eq!(
+        decoded_snapshot
+            .snapshot_value()
+            .expect("snapshot payload")
+            .canonical_wire(),
+        decode_hex(include_str!("fixtures/local_inspection_snapshot_v2.hex"))
+    );
+    let decoded_not_found = InspectionResponseV2::decode(not_found_response.canonical_wire())
+        .expect("strict not-found response decode");
+    decoded_not_found
+        .validate_for(&latest)
+        .expect("exact not-found correlation");
+    assert_eq!(
+        decoded_not_found.outcome(),
+        InspectionResponseOutcomeV2::NotFound
     );
 }

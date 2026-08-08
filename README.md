@@ -4,7 +4,11 @@ ParaEGOX is a distributed Agent OS for robotics and embodied agents, currently b
 
 ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). The original baseline remains available on the `archive/phanthymotus-baseline` branch, with its license attribution preserved.
 
-> Status: the current worktree contains the first DeveloperLocal backend and Textual chat composition; fresh integrated validation of the presentation migration is pending. ParaEGOX is adopting a Rust-first core with polyglot managed workloads; no stable release is currently available.
+> Status: the current worktree contains the first DeveloperLocal backend, Textual chat composition,
+> and typed one-shot Inspection startup view. The r21 integration run reached a real Echo terminal,
+> but its joined exit exceeded the workflow's 20-second limit, so presentation closeout remains
+> pending an r22 rerun with a 60-second exit budget. ParaEGOX is adopting a Rust-first core with
+> polyglot managed workloads; no stable release is currently available.
 
 ## Runnable DeveloperLocal slice
 
@@ -56,33 +60,35 @@ unset DEEPSEEK_API_KEY
 Build the native binary on the designated server or GitHub CI and download the complete bundle to
 the Mac. Do not run Cargo on the Mac for this workflow.
 
-Remote validation of source snapshot r18 passed `cargo fmt --all --check`, warning-free workspace
-all-targets compilation, all 19 `paraegox-model-adapters` tests, and all 87 DeveloperLocal tests
-under a non-root identity. Ruff and the governance checker also passed; 391 governance, contract,
-and Agent-worker tests passed on the Mac without invoking Rust. The r19 source then produced a
-checksum-verified native x86_64 Mac executable and completed one offline Echo round trip through the
-preceding Rust Ratatui frontend. That is historical backend and old-frontend evidence; it does not
-validate the current Python client, Textual child, launcher change, or new packaging dependency.
-Fresh focused and integrated evidence must be recorded before calling this presentation migration
-validated. A credentialed external DeepSeek smoke is also still pending, so the configured DeepSeek
-path must not yet be described as externally validated or production ready. For an offline substrate
-check, use the same config schema with
+Source snapshot r21 passed the build server's locked workspace check, all 36 Inspection tests, all
+89 DeveloperLocal tests under a non-root identity, and all 364 Deployment tests under a non-root
+identity. Its native Intel macOS CI run built the binary, passed the Python checks, and completed a
+real Textual-to-Runtime Echo terminal. The workflow still failed because joined process exit exceeded
+its 20-second limit. Formatting findings and four Clippy findings from the r21 gates have been fixed
+in the Mac source authority, but those fixes are not claimed as passed until r22 reruns the remote
+format/Clippy gates and the same macOS smoke with a 60-second exit budget. A credentialed external
+DeepSeek smoke is also still pending, so the configured DeepSeek path must not yet be described as
+externally validated or production ready. For an offline substrate check, use the same config schema with
 `model.provider = "deterministic-echo-v1"` and omit model/SecretRef; `echo: <message>` proves only the
 DeveloperLocal owner chain. The standalone Rust `paraegox-tui fixture-v1` executable is retained
 temporarily as a retirement reference only: `paraegox-local` no longer depends on or launches it,
-and it is not an alternative public `paraegox chat` entry.
+and it is not an alternative public `paraegox chat` entry. It is scheduled for deletion only after
+the next replacement-validation gate passes; it is not claimed deleted today.
 
 The current A2 slice is non-streaming, permits one Model call in flight, and sends only the current
 turn's prompt; conversation-history recall, Memory, Tools, planning, and multi-agent orchestration
 remain later Agent Core work. The parent supplies the internal Textual child only owner-private
 bootstrap-file paths: one for Agent conversation and, when available, one for read-only local
 Inspection. The Python `AgentConversationClient` consumes only the Runtime Agent path and never opens
-raw Zenoh or sees provider/model credentials. The current Textual slice accepts the Inspection path
-but explicitly reports that its snapshot is not loaded, so it does not yet provide or claim the old
-Status view. The parent removes both `OPENAI_API_KEY` and `DEEPSEEK_API_KEY` from the child environment,
-and argv carries no raw identity, Node management capability, Zenoh route, capability token, or
-Secret. This typed boundary is not a revived all-in-one ConsoleBridge and is not federated
-Inspection/Ops.
+raw Zenoh or sees provider/model credentials. A separate strict typed client validates the owner-private
+PXIB v2 bootstrap and performs exactly one no-retry PXIQ Latest exchange before the Textual App starts;
+it strictly correlates the PXIP response and decodes the complete PXIS v2 snapshot. Any bootstrap,
+transport, correlation, or snapshot failure prevents the UI from starting. A successful read is shown
+as three read-only startup-status lines; there is no watch, retry, cache, background refresh, action,
+continuous monitoring, Ops, or federated view. The parent removes both `OPENAI_API_KEY` and
+`DEEPSEEK_API_KEY` from the child environment, and argv carries no raw identity, Node management
+capability, Zenoh route, capability token, or Secret. This typed boundary is not a revived all-in-one
+ConsoleBridge.
 
 The Node contract, Unix same-tenure durable NodeDaemon state, and read-only management protocol are
 now consumed by `paraegox-local`, rather than existing only as a standalone mechanism. The launcher

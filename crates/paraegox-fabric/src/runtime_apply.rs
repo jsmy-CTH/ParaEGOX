@@ -48,6 +48,13 @@ const RESTRICTED_REPLY_CAPACITY: usize = 1;
 const RESTRICTED_ZENOH_FRAMING_ALLOWANCE_BYTES: usize = 64 * 1024;
 const REMOTE_REJECTION_BODY: &[u8] = b"restricted runtime apply rejected";
 
+struct RestrictedRuntimeApplyPeerExpectation {
+    expected_target: RuntimeHostId,
+    expected_peer_principal: PrincipalRef,
+    expected_carrier_binding_digest: Digest32,
+    timeout: Duration,
+}
+
 /// Controller-owned, connector-only configuration for one Runtime endpoint.
 #[derive(Clone, Eq, PartialEq)]
 pub struct RestrictedRuntimeApplyClientConfigV1 {
@@ -85,10 +92,12 @@ impl RestrictedRuntimeApplyClientConfigV1 {
             profile.route(),
             root_ca_certificate_file,
             connector_identity,
-            profile.target(),
-            profile.runtime_principal(),
-            carrier.binding_digest(),
-            Duration::from_nanos(profile.operation_timeout_nanos()),
+            RestrictedRuntimeApplyPeerExpectation {
+                expected_target: profile.target(),
+                expected_peer_principal: profile.runtime_principal(),
+                expected_carrier_binding_digest: carrier.binding_digest(),
+                timeout: Duration::from_nanos(profile.operation_timeout_nanos()),
+            },
         )
     }
 
@@ -103,11 +112,14 @@ impl RestrictedRuntimeApplyClientConfigV1 {
         route: impl Into<String>,
         root_ca_certificate_file: PathBuf,
         connector_identity: ResolvedRemoteMtlsIdentityFiles,
-        expected_target: RuntimeHostId,
-        expected_runtime_principal: PrincipalRef,
-        expected_carrier_binding_digest: Digest32,
-        operation_timeout: Duration,
+        peer_expectation: RestrictedRuntimeApplyPeerExpectation,
     ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        let RestrictedRuntimeApplyPeerExpectation {
+            expected_target,
+            expected_peer_principal: expected_runtime_principal,
+            expected_carrier_binding_digest,
+            timeout: operation_timeout,
+        } = peer_expectation;
         let operation_timeout = validate_timeout(operation_timeout)?;
         validate_target(expected_target)?;
         validate_principal(expected_runtime_principal)?;
@@ -198,10 +210,12 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
             profile.route(),
             root_ca_certificate_file,
             listener_identity,
-            profile.target(),
-            profile.controller_principal(),
-            carrier.binding_digest(),
-            Duration::from_nanos(profile.operation_timeout_nanos()),
+            RestrictedRuntimeApplyPeerExpectation {
+                expected_target: profile.target(),
+                expected_peer_principal: profile.controller_principal(),
+                expected_carrier_binding_digest: carrier.binding_digest(),
+                timeout: Duration::from_nanos(profile.operation_timeout_nanos()),
+            },
         )
     }
 
@@ -215,11 +229,14 @@ impl RestrictedRuntimeApplyEndpointConfigV1 {
         route: impl Into<String>,
         root_ca_certificate_file: PathBuf,
         listener_identity: ResolvedRemoteMtlsIdentityFiles,
-        expected_target: RuntimeHostId,
-        expected_controller_principal: PrincipalRef,
-        expected_carrier_binding_digest: Digest32,
-        handler_timeout: Duration,
+        peer_expectation: RestrictedRuntimeApplyPeerExpectation,
     ) -> Result<Self, RestrictedRuntimeApplyConfigErrorV1> {
+        let RestrictedRuntimeApplyPeerExpectation {
+            expected_target,
+            expected_peer_principal: expected_controller_principal,
+            expected_carrier_binding_digest,
+            timeout: handler_timeout,
+        } = peer_expectation;
         let handler_timeout = validate_timeout(handler_timeout)?;
         validate_target(expected_target)?;
         validate_principal(expected_controller_principal)?;
@@ -1264,9 +1281,10 @@ mod tests {
     use super::{
         OneQueryAttempt, RestrictedRuntimeApplyClientConfigV1, RestrictedRuntimeApplyConfigErrorV1,
         RestrictedRuntimeApplyEndpointConfigV1, RestrictedRuntimeApplyErrorV1,
-        RestrictedRuntimeApplyInboundV1, RestrictedRuntimeApplyRespondErrorV1, checked_deadline,
-        deadline_result, preserve_query_outcome, reduce_client_shutdown_failures,
-        reduce_endpoint_shutdown_failures, reduce_queryable_declaration_failure,
+        RestrictedRuntimeApplyInboundV1, RestrictedRuntimeApplyPeerExpectation,
+        RestrictedRuntimeApplyRespondErrorV1, checked_deadline, deadline_result,
+        preserve_query_outcome, reduce_client_shutdown_failures, reduce_endpoint_shutdown_failures,
+        reduce_queryable_declaration_failure,
         restricted_runtime_apply_peer_certificate_common_name_v1, validate_request_frame,
         validate_response_frame,
     };
@@ -1391,10 +1409,12 @@ mod tests {
             "paraegox/runtime-a/apply",
             PathBuf::from("/run/paraegox/root-ca.pem"),
             identity("controller"),
-            target(0x51),
-            principal(0x52),
-            digest(0x53),
-            Duration::from_secs(5),
+            RestrictedRuntimeApplyPeerExpectation {
+                expected_target: target(0x51),
+                expected_peer_principal: principal(0x52),
+                expected_carrier_binding_digest: digest(0x53),
+                timeout: Duration::from_secs(5),
+            },
         )
         .unwrap()
         .build_zenoh_config()
@@ -1442,10 +1462,12 @@ mod tests {
             "paraegox/runtime-a/apply",
             PathBuf::from("/run/paraegox/root-ca.pem"),
             identity("runtime"),
-            target(0x51),
-            principal(0x43),
-            digest(0x53),
-            Duration::from_secs(5),
+            RestrictedRuntimeApplyPeerExpectation {
+                expected_target: target(0x51),
+                expected_peer_principal: principal(0x43),
+                expected_carrier_binding_digest: digest(0x53),
+                timeout: Duration::from_secs(5),
+            },
         )
         .unwrap()
         .build_zenoh_config()
@@ -1554,10 +1576,12 @@ mod tests {
             "paraegox/runtime-a/apply",
             PathBuf::from("/run/paraegox/root-ca.pem"),
             identity("controller"),
-            target(0x51),
-            principal(0x52),
-            digest(0x53),
-            Duration::from_secs(5),
+            RestrictedRuntimeApplyPeerExpectation {
+                expected_target: target(0x51),
+                expected_peer_principal: principal(0x52),
+                expected_carrier_binding_digest: digest(0x53),
+                timeout: Duration::from_secs(5),
+            },
         )
         .unwrap()
         .build_zenoh_config()
@@ -1626,10 +1650,12 @@ mod tests {
                 "paraegox/*/apply",
                 PathBuf::from("/run/paraegox/root-ca.pem"),
                 identity("controller"),
-                target(0x51),
-                principal(0x52),
-                digest(0x53),
-                Duration::from_secs(1),
+                RestrictedRuntimeApplyPeerExpectation {
+                    expected_target: target(0x51),
+                    expected_peer_principal: principal(0x52),
+                    expected_carrier_binding_digest: digest(0x53),
+                    timeout: Duration::from_secs(1),
+                },
             ),
             Err(RestrictedRuntimeApplyConfigErrorV1::InvalidRoute)
         );
@@ -1639,10 +1665,12 @@ mod tests {
                 "paraegox/runtime-a/\napply",
                 PathBuf::from("/run/paraegox/root-ca.pem"),
                 identity("controller"),
-                target(0x51),
-                principal(0x52),
-                digest(0x53),
-                Duration::from_secs(1),
+                RestrictedRuntimeApplyPeerExpectation {
+                    expected_target: target(0x51),
+                    expected_peer_principal: principal(0x52),
+                    expected_carrier_binding_digest: digest(0x53),
+                    timeout: Duration::from_secs(1),
+                },
             ),
             Err(RestrictedRuntimeApplyConfigErrorV1::InvalidRoute)
         );
@@ -1652,10 +1680,12 @@ mod tests {
                 "paraegox/runtime-a/apply",
                 PathBuf::from("/run/paraegox/root-ca.pem"),
                 identity("controller"),
-                target(0x51),
-                principal(0x52),
-                digest(0x53),
-                Duration::ZERO,
+                RestrictedRuntimeApplyPeerExpectation {
+                    expected_target: target(0x51),
+                    expected_peer_principal: principal(0x52),
+                    expected_carrier_binding_digest: digest(0x53),
+                    timeout: Duration::ZERO,
+                },
             ),
             Err(RestrictedRuntimeApplyConfigErrorV1::ZeroTimeout)
         );
@@ -1665,10 +1695,12 @@ mod tests {
                 "paraegox/runtime-a/apply",
                 PathBuf::from("/run/paraegox/root-ca.pem"),
                 identity("controller"),
-                target(0),
-                principal(0x52),
-                digest(0x53),
-                Duration::from_secs(1),
+                RestrictedRuntimeApplyPeerExpectation {
+                    expected_target: target(0),
+                    expected_peer_principal: principal(0x52),
+                    expected_carrier_binding_digest: digest(0x53),
+                    timeout: Duration::from_secs(1),
+                },
             ),
             Err(RestrictedRuntimeApplyConfigErrorV1::ZeroTarget)
         );
@@ -1678,10 +1710,12 @@ mod tests {
                 "paraegox/runtime-a/apply",
                 PathBuf::from("/run/paraegox/root-ca.pem"),
                 identity("controller"),
-                target(0x51),
-                principal(0),
-                digest(0x53),
-                Duration::from_secs(1),
+                RestrictedRuntimeApplyPeerExpectation {
+                    expected_target: target(0x51),
+                    expected_peer_principal: principal(0),
+                    expected_carrier_binding_digest: digest(0x53),
+                    timeout: Duration::from_secs(1),
+                },
             ),
             Err(RestrictedRuntimeApplyConfigErrorV1::ZeroPeerPrincipal)
         );
@@ -1691,10 +1725,12 @@ mod tests {
                 "paraegox/runtime-a/apply",
                 PathBuf::from("/run/paraegox/root-ca.pem"),
                 identity("controller"),
-                target(0x51),
-                principal(0x52),
-                digest(0),
-                Duration::from_secs(1),
+                RestrictedRuntimeApplyPeerExpectation {
+                    expected_target: target(0x51),
+                    expected_peer_principal: principal(0x52),
+                    expected_carrier_binding_digest: digest(0),
+                    timeout: Duration::from_secs(1),
+                },
             ),
             Err(RestrictedRuntimeApplyConfigErrorV1::ZeroCarrierBindingDigest)
         );

@@ -1,8 +1,9 @@
 """Minimal Textual console for the typed ParaEGOX conversation client.
 
-This presentation owner receives one Runtime-issued private bootstrap file. It
-does not open Zenoh, select a model, read an API key, or own conversation
-identity and retry policy.
+This presentation owner receives one Runtime-issued private Agent bootstrap and
+may read one separate immutable Inspection startup snapshot before the App
+starts. It does not open Zenoh, select a model, read an API key, or own
+conversation identity, projection, or retry policy.
 """
 
 from __future__ import annotations
@@ -26,6 +27,16 @@ from paraegox_sdk.agent_worker.protocol import (
     TerminalOutcome,
 )
 from paraegox_sdk.console_client import (
+    DeveloperLocalInspectionClientError,
+    DeveloperLocalInspectionClientV2,
+    InspectionFreshnessV1,
+    InspectionHealthV1,
+    InspectionLivenessV1,
+    InspectionReadinessV1,
+    LocalInspectionOverallV1,
+    LocalInspectionRecordV1,
+    LocalInspectionSnapshotV2,
+    NodeInspectionRecordV2,
     RuntimeAgentConversationCancelResultV1,
     RuntimeAgentConversationClientV1,
 )
@@ -77,8 +88,14 @@ class ParaEGOXConsoleApp(App[None]):
         text-style: bold;
     }
 
-    #connection-status, #inspection-status {
+    #connection-status {
         height: 1;
+        padding: 0 2;
+        color: #9fb8c0;
+    }
+
+    #inspection-status {
+        height: 3;
         padding: 0 2;
         color: #9fb8c0;
     }
@@ -112,11 +129,11 @@ class ParaEGOXConsoleApp(App[None]):
         self,
         client: _ConversationClient,
         *,
-        inspection_bootstrap_file: Path | None = None,
+        inspection_snapshot: LocalInspectionSnapshotV2 | None = None,
     ) -> None:
         super().__init__()
         self._client = client
-        self._inspection_bootstrap_file = inspection_bootstrap_file
+        self._inspection_snapshot = inspection_snapshot
         self._connected = False
         self._pending = False
         self._cancel_requested = False
@@ -144,10 +161,11 @@ class ParaEGOXConsoleApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Static("ParaEGOX Agent Chat", id="title")
         yield Static("Connection: connecting · Request: idle", id="connection-status")
-        if self._inspection_bootstrap_file is None:
-            inspection_status = "Inspection: no bootstrap provided; snapshot not loaded"
-        else:
-            inspection_status = "Inspection: snapshot not loaded in this Textual slice"
+        inspection_status = (
+            "Inspection: no startup snapshot"
+            if self._inspection_snapshot is None
+            else "\n".join(_inspection_status_lines(self._inspection_snapshot))
+        )
         yield Static(inspection_status, id="inspection-status")
         yield RichLog(
             id="chat-log",
@@ -378,9 +396,108 @@ class ParaEGOXConsoleApp(App[None]):
             pass
 
 
+def _inspection_status_lines(snapshot: LocalInspectionSnapshotV2) -> tuple[str, str, str]:
+    node = snapshot.node
+    coordinate = (
+        ""
+        if node.registration_epoch is None or node.status_sequence is None
+        else (
+            f" · registration e{node.registration_epoch}"
+            f" · status s{node.status_sequence}"
+        )
+    )
+    records = snapshot.base_snapshot.records
+    return (
+        (
+            f"Node-local startup snapshot {_overall_label(snapshot.overall)} "
+            f"r{snapshot.projection_revision} | NodeDaemon {_projected_node_label(node)}"
+            f"{coordinate}"
+        ),
+        (
+            f"Authority {_projected_source_label(records[0])} | "
+            f"Deployment {_projected_source_label(records[1])} | "
+            f"Runtime {_projected_source_label(records[2])}"
+        ),
+        (
+            f"Fabric {_projected_source_label(records[3])} | "
+            f"Agent {_projected_source_label(records[4])} | "
+            f"{_five_owner_health_label(records)}"
+        ),
+    )
+
+
+def _overall_label(overall: LocalInspectionOverallV1) -> str:
+    return {
+        LocalInspectionOverallV1.READY: "READY",
+        LocalInspectionOverallV1.DEGRADED: "DEGRADED",
+        LocalInspectionOverallV1.UNAVAILABLE: "UNAVAILABLE",
+        LocalInspectionOverallV1.UNKNOWN: "UNKNOWN",
+    }[overall]
+
+
+def _projected_source_label(record: LocalInspectionRecordV1) -> str:
+    if record.freshness is InspectionFreshnessV1.STALE:
+        return "stale"
+    if record.freshness is InspectionFreshnessV1.PARTITIONED:
+        return "partitioned"
+    if record.freshness is InspectionFreshnessV1.MISSING:
+        return "missing"
+    return _current_state_label(record.readiness, record.liveness)
+
+
+def _projected_node_label(record: NodeInspectionRecordV2) -> str:
+    if record.freshness is InspectionFreshnessV1.STALE:
+        return "stale"
+    if record.freshness is InspectionFreshnessV1.PARTITIONED:
+        return "partitioned"
+    if record.freshness is InspectionFreshnessV1.MISSING:
+        return "missing"
+    return _current_state_label(record.readiness, record.liveness)
+
+
+def _current_state_label(
+    readiness: InspectionReadinessV1,
+    liveness: InspectionLivenessV1,
+) -> str:
+    if readiness is InspectionReadinessV1.READY and liveness is InspectionLivenessV1.LIVE:
+        return "ready"
+    if readiness is InspectionReadinessV1.READY and liveness is InspectionLivenessV1.UNKNOWN:
+        return "recorded-ready"
+    return {
+        InspectionReadinessV1.NOT_READY: "not-ready",
+        InspectionReadinessV1.DEGRADED: "degraded",
+        InspectionReadinessV1.BLOCKED: "blocked",
+        InspectionReadinessV1.UNKNOWN: "unknown",
+        InspectionReadinessV1.READY: "invalid-ready",
+    }[readiness]
+
+
+def _five_owner_health_label(
+    records: tuple[
+        LocalInspectionRecordV1,
+        LocalInspectionRecordV1,
+        LocalInspectionRecordV1,
+        LocalInspectionRecordV1,
+        LocalInspectionRecordV1,
+    ],
+) -> str:
+    if all(record.health is InspectionHealthV1.UNKNOWN for record in records):
+        return "health unreported"
+    healthy = sum(record.health is InspectionHealthV1.HEALTHY for record in records)
+    degraded = sum(record.health is InspectionHealthV1.DEGRADED for record in records)
+    faulted = sum(record.health is InspectionHealthV1.FAULTED for record in records)
+    return f"health {healthy} healthy/{degraded} degraded/{faulted} faulted"
+
+
 def _display_safe_error(error: Exception) -> str:
     message = str(error).strip()
     return message or "the typed conversation operation failed"
+
+
+def _display_safe_inspection_error(error: Exception) -> str:
+    if isinstance(error, DeveloperLocalInspectionClientError):
+        return str(error)
+    return "the typed Inspection startup read failed"
 
 
 class _StorePathOnce(argparse.Action):
@@ -420,7 +537,7 @@ def _parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespa
         "--inspection-bootstrap-file",
         type=_absolute_path,
         action=_StorePathOnce,
-        help="accepted for launcher compatibility; this first slice does not load it",
+        help="optional absolute owner-private Inspection v2 bootstrap path",
     )
     parsed = parser.parse_args(arguments)
     if (
@@ -429,6 +546,14 @@ def _parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespa
     ):
         parser.error("Runtime and Inspection bootstrap paths must differ")
     return parsed
+
+
+def _load_inspection_snapshot_once(path: Path) -> LocalInspectionSnapshotV2:
+    inspection_client = DeveloperLocalInspectionClientV2.from_private_bootstrap_file(path)
+    try:
+        return asyncio.run(inspection_client.latest())
+    finally:
+        inspection_client.close()
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -442,9 +567,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
             f"paraegox-console: unable to load Runtime bootstrap — {_display_safe_error(error)}"
         ) from None
 
+    inspection_snapshot = None
+    if parsed.inspection_bootstrap_file is not None:
+        try:
+            inspection_snapshot = _load_inspection_snapshot_once(
+                parsed.inspection_bootstrap_file
+            )
+        except Exception as error:
+            client.close()
+            raise SystemExit(
+                "paraegox-console: unable to load Inspection startup snapshot — "
+                f"{_display_safe_inspection_error(error)}"
+            ) from None
+
     app = ParaEGOXConsoleApp(
         client,
-        inspection_bootstrap_file=parsed.inspection_bootstrap_file,
+        inspection_snapshot=inspection_snapshot,
     )
     try:
         app.run()

@@ -114,11 +114,11 @@ use crate::inspection::{
     DeveloperLocalDeploymentOutcomeV1, DeveloperLocalInspectionSourcesV2,
     start_developer_local_inspection_v2,
 };
-use crate::{identity, layout};
 #[cfg(not(test))]
 use crate::{
     NODE_BOOTSTRAP_FILE_OPTION, NODE_DAEMON_CHILD_MODE, NODE_OBSERVATION_BOOTSTRAP_FILE_OPTION,
 };
+use crate::{identity, layout};
 
 const CONSOLE_COMMAND: &str = "paraegox-console";
 const RUNTIME_BOOTSTRAP_FILE_OPTION: &str = "--runtime-bootstrap-file";
@@ -2394,15 +2394,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use paraegox_agent_contracts::{
-        AgentConversationRequestId, AgentConversationRequestV1,
-        AgentConversationTerminalResultV1, AgentConversationTurnId,
+        AgentConversationRequestId, AgentConversationRequestV1, AgentConversationTerminalResultV1,
+        AgentConversationTurnId,
     };
     use paraegox_inspection::developer_local::{
         DeveloperLocalInspectionBootstrapV2, encode_authenticated_request_v2,
     };
     use paraegox_inspection::protocol::{
-        InspectionClientV2, InspectionEndpointErrorV2, InspectionEndpointV2,
-        InspectionRequestV2, InspectionResponseOutcomeV2, MAX_INSPECTION_RESPONSE_V2_BYTES,
+        InspectionClientV2, InspectionEndpointErrorV2, InspectionEndpointV2, InspectionRequestV2,
+        InspectionResponseOutcomeV2, MAX_INSPECTION_RESPONSE_V2_BYTES,
     };
     use paraegox_inspection::{
         InspectionFreshnessV1, InspectionHealthV1, InspectionLivenessV1, InspectionReadinessV1,
@@ -2422,7 +2422,6 @@ mod tests {
         ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
     };
 
-    const RUNNER_TIMEOUT: Duration = Duration::from_secs(30);
     const TEST_LOOPBACK_ADAPTER_ID_V1: ModelAdapterIdV1 =
         match ModelAdapterIdV1::try_from_bytes(*b"px-test-loopback") {
             Ok(adapter_id) => adapter_id,
@@ -2462,9 +2461,11 @@ mod tests {
             ]
         );
         for secret_name in ["OPENAI_API_KEY", "DEEPSEEK_API_KEY"] {
-            assert!(command.get_envs().any(|(name, value)| {
-                name == OsStr::new(secret_name) && value.is_none()
-            }));
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| { name == OsStr::new(secret_name) && value.is_none() })
+            );
         }
     }
 
@@ -3021,11 +3022,8 @@ mod tests {
         ) -> Result<Box<[u8]>, InspectionEndpointErrorV2> {
             let request = InspectionRequestV2::decode(canonical_request)
                 .map_err(|_| InspectionEndpointErrorV2::MalformedRequest)?;
-            let wire = encode_authenticated_request_v2(
-                self.bootstrap.generation_token(),
-                &request,
-            )
-            .map_err(|_| InspectionEndpointErrorV2::MalformedRequest)?;
+            let wire = encode_authenticated_request_v2(self.bootstrap.generation_token(), &request)
+                .map_err(|_| InspectionEndpointErrorV2::MalformedRequest)?;
             let mut stream = StdUnixStream::connect(self.bootstrap.socket_path())
                 .map_err(|_| InspectionEndpointErrorV2::Unavailable)?;
             let operation_timeout = Some(self.bootstrap.operation_timeout());
@@ -3254,10 +3252,9 @@ mod tests {
         };
         let inspection_bootstrap_path = env::var_os(INSPECTION_PROBE_BOOTSTRAP_ENVIRONMENT)
             .expect("Inspection probe bootstrap environment");
-        let inspection = read_test_inspection_status_v2(std::path::Path::new(
-            &inspection_bootstrap_path,
-        ))
-        .expect("typed read-only Inspection exchange");
+        let inspection =
+            read_test_inspection_status_v2(std::path::Path::new(&inspection_bootstrap_path))
+                .expect("typed read-only Inspection exchange");
         assert_eq!(inspection.overall(), LocalInspectionOverallV1::Unknown);
         assert_eq!(inspection.projection_revision(), 1);
         let node = inspection.node();

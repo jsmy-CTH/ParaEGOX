@@ -10,6 +10,7 @@ import struct
 import tempfile
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,18 @@ _SESSION_ID = bytes([0x11]) * 16
 _DEADLINE_NANOS = 5_000_000_000
 _OPERATION_TIMEOUT_NANOS = 2_000_000_000
 _COMMAND_CAPACITY = 8
+_INSPECTION_PROJECTION_ID = bytes([0x21]) * 16
+_INSPECTION_CLOCK_REF = bytes([0x31]) * 16
+_INSPECTION_TOKEN = bytes([0x5B]) * 32
+_INSPECTION_REQUEST_SEED = bytes([0x6C]) * 16
+_INSPECTION_TIMEOUT_NANOS = 2_000_000_000
+_RUST_INSPECTION_FIXTURES = (
+    Path(__file__).parents[2] / "crates/paraegox-inspection/tests/fixtures"
+)
+
+
+def _inspection_fixture(name: str) -> bytes:
+    return bytes.fromhex((_RUST_INSPECTION_FIXTURES / name).read_text(encoding="ascii"))
 
 
 def _rust_canonical_digest(domain: bytes, fields: tuple[bytes, ...]) -> bytes:
@@ -118,8 +131,26 @@ def _rust_bootstrap_wire(socket_path: Path) -> bytes:
     )
 
 
+def _inspection_bootstrap_wire(socket_path: Path) -> bytes:
+    bootstrap = console_client._InspectionBootstrapV2(
+        socket_path=os.fsencode(socket_path),
+        projection_id=_INSPECTION_PROJECTION_ID,
+        generation_token=bytearray(_INSPECTION_TOKEN),
+        server_uid=os.geteuid(),
+        server_gid=os.getegid(),
+        operation_timeout_nanos=_INSPECTION_TIMEOUT_NANOS,
+        request_seed=bytearray(_INSPECTION_REQUEST_SEED),
+    )
+    return console_client._encode_inspection_bootstrap_v2(bootstrap)
+
+
 def _write_bootstrap(path: Path, socket_path: Path, *, wire: bytes | None = None) -> None:
     path.write_bytes(_rust_bootstrap_wire(socket_path) if wire is None else wire)
+    path.chmod(0o600)
+
+
+def _write_inspection_bootstrap(path: Path, socket_path: Path) -> None:
+    path.write_bytes(_inspection_bootstrap_wire(socket_path))
     path.chmod(0o600)
 
 
@@ -312,6 +343,60 @@ async def _with_fake_server(
         try:
             await scenario(bootstrap_path, socket_path, errors)
         finally:
+            server.close()
+            await server.wait_closed()
+            if tasks:
+                await asyncio.gather(*tuple(tasks), return_exceptions=True)
+        assert not errors
+
+
+async def _with_fake_inspection_server(
+    response_wire: bytes,
+    scenario: Callable[
+        [console_client.DeveloperLocalInspectionClientV2, list[bytes]], Awaitable[None]
+    ],
+) -> None:
+    with _private_directory() as directory:
+        socket_path = directory / "inspection.sock"
+        bootstrap_path = directory / "inspection.pxib"
+        requests: list[bytes] = []
+        errors: list[BaseException] = []
+        tasks: set[asyncio.Task[None]] = set()
+
+        def start_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            async def invoke() -> None:
+                try:
+                    authenticated_request = await reader.readexactly(128)
+                    assert await reader.read(1) == b""
+                    assert authenticated_request[:32] == _INSPECTION_TOKEN
+                    request = authenticated_request[32:]
+                    requests.append(request)
+                    assert request == _inspection_fixture("inspection_latest_request_v2.hex")
+                    writer.write(len(response_wire).to_bytes(4, "big") + response_wire)
+                    await writer.drain()
+                    if writer.can_write_eof():
+                        writer.write_eof()
+                except BaseException as cause:
+                    errors.append(cause)
+                finally:
+                    writer.close()
+                    with contextlib_suppress(Exception):
+                        await writer.wait_closed()
+
+            task = asyncio.create_task(invoke())
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+        server = await asyncio.start_unix_server(start_handler, path=socket_path)
+        socket_path.chmod(0o600)
+        _write_inspection_bootstrap(bootstrap_path, socket_path)
+        client = console_client.DeveloperLocalInspectionClientV2.from_private_bootstrap_file(
+            bootstrap_path
+        )
+        try:
+            await scenario(client, requests)
+        finally:
+            client.close()
             server.close()
             await server.wait_closed()
             if tasks:
@@ -676,3 +761,228 @@ def test_operation_timeout_does_not_wait_for_hung_writer_cleanup(
         client.close()
 
     asyncio.run(run())
+
+
+def test_inspection_v2_decodes_all_rust_generated_fixtures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_bootstrap = console_client._InspectionBootstrapV2(
+        socket_path=b"/tmp/inspection.sock",
+        projection_id=_INSPECTION_PROJECTION_ID,
+        generation_token=bytearray(_INSPECTION_TOKEN),
+        server_uid=501,
+        server_gid=20,
+        operation_timeout_nanos=_INSPECTION_TIMEOUT_NANOS,
+        request_seed=bytearray(_INSPECTION_REQUEST_SEED),
+    )
+    bootstrap_wire = _inspection_fixture("developer_local_inspection_bootstrap_v2.hex")
+    assert console_client._encode_inspection_bootstrap_v2(expected_bootstrap) == bootstrap_wire
+    monkeypatch.setattr(console_client.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(console_client.os, "getegid", lambda: 20)
+    bootstrap = console_client._decode_inspection_bootstrap_v2(bootstrap_wire)
+    assert bootstrap.socket_path == b"/tmp/inspection.sock"
+    assert bootstrap.projection_id == _INSPECTION_PROJECTION_ID
+
+    request_id = console_client._inspection_request_id_v2(bootstrap, 1)
+    request = console_client._encode_inspection_latest_request_v2(
+        request_id,
+        _INSPECTION_PROJECTION_ID,
+    )
+    request_wire = _inspection_fixture("inspection_latest_request_v2.hex")
+    assert request.canonical_wire == request_wire
+    assert (
+        bytes(bootstrap.generation_token) + request.canonical_wire
+        == _inspection_fixture("developer_local_inspection_authenticated_request_v2.hex")
+    )
+
+    snapshot_wire = _inspection_fixture("local_inspection_snapshot_v2.hex")
+    snapshot = console_client._decode_local_inspection_snapshot_v2(snapshot_wire)
+    assert snapshot.canonical_wire == snapshot_wire
+    assert snapshot.projection_revision == 7
+    assert snapshot.overall is console_client.LocalInspectionOverallV1.UNKNOWN
+    assert tuple(record.owner for record in snapshot.base_snapshot.records) == tuple(
+        console_client.InspectionSourceOwnerV1
+    )
+    assert all(
+        record.freshness is console_client.InspectionFreshnessV1.MISSING
+        for record in snapshot.base_snapshot.records
+    )
+    assert snapshot.node.registration_epoch == 31
+    assert snapshot.node.status_sequence == 41
+    response_snapshot = console_client._decode_inspection_response_v2(
+        _inspection_fixture("inspection_snapshot_response_v2.hex"),
+        request,
+    )
+    assert response_snapshot == snapshot
+    assert (
+        console_client._decode_inspection_response_v2(
+            _inspection_fixture("inspection_not_found_response_v2.hex"),
+            request,
+        )
+        is None
+    )
+    with pytest.raises(FrozenInstanceError):
+        setattr(snapshot, "overall", console_client.LocalInspectionOverallV1.READY)
+    console_client.DeveloperLocalInspectionClientV2(bootstrap).close()
+
+
+def test_inspection_v2_rejects_digest_owner_order_and_aggregate_corruption() -> None:
+    request_wire = _inspection_fixture("inspection_latest_request_v2.hex")
+    request = console_client._InspectionRequestV2(
+        request_id=request_wire[16:32],
+        projection_id=request_wire[32:48],
+        request_digest=request_wire[64:96],
+        canonical_wire=request_wire,
+    )
+    response = bytearray(_inspection_fixture("inspection_snapshot_response_v2.hex"))
+    response[-1] ^= 1
+    with pytest.raises(console_client.DeveloperLocalInspectionClientError) as digest:
+        console_client._decode_inspection_response_v2(bytes(response), request)
+    assert (
+        digest.value.code
+        is console_client.DeveloperLocalInspectionClientErrorCode.DIGEST_MISMATCH
+    )
+
+    correlation = bytearray(_inspection_fixture("inspection_snapshot_response_v2.hex"))
+    correlation[24] ^= 1
+    correlation[112:144] = _rust_canonical_digest(
+        b"paraegox.inspection.protocol-response.v2",
+        (bytes(correlation[:112]), bytes(correlation[144:])),
+    )
+    with pytest.raises(console_client.DeveloperLocalInspectionClientError) as mismatch:
+        console_client._decode_inspection_response_v2(bytes(correlation), request)
+    assert (
+        mismatch.value.code
+        is console_client.DeveloperLocalInspectionClientErrorCode.CORRELATION_MISMATCH
+    )
+
+    reserved = bytearray(_inspection_fixture("local_inspection_snapshot_v2.hex"))
+    reserved[71] = 1
+    reserved[80:112] = _rust_canonical_digest(
+        b"paraegox.inspection.local-snapshot.v2",
+        (bytes(reserved[:80]), bytes(reserved[112:])),
+    )
+    with pytest.raises(console_client.DeveloperLocalInspectionClientError) as noncanonical:
+        console_client._decode_local_inspection_snapshot_v2(bytes(reserved))
+    assert (
+        noncanonical.value.code
+        is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
+    )
+
+    aggregate = bytearray(_inspection_fixture("local_inspection_snapshot_v2.hex"))
+    aggregate[70] = 1
+    aggregate[80:112] = _rust_canonical_digest(
+        b"paraegox.inspection.local-snapshot.v2",
+        (bytes(aggregate[:80]), bytes(aggregate[112:])),
+    )
+    with pytest.raises(console_client.DeveloperLocalInspectionClientError) as invalid_aggregate:
+        console_client._decode_local_inspection_snapshot_v2(bytes(aggregate))
+    assert (
+        invalid_aggregate.value.code
+        is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
+    )
+
+    owner_order = bytearray(_inspection_fixture("local_inspection_snapshot_v2.hex"))
+    base_start = 112
+    owner_order[base_start + 112] = 2
+    owner_order[base_start + 80 : base_start + 112] = _rust_canonical_digest(
+        b"paraegox.inspection.local-snapshot.v1",
+        (
+            bytes(owner_order[base_start : base_start + 80]),
+            bytes(owner_order[base_start + 112 : base_start + 592]),
+        ),
+    )
+    owner_order[80:112] = _rust_canonical_digest(
+        b"paraegox.inspection.local-snapshot.v2",
+        (bytes(owner_order[:80]), bytes(owner_order[112:])),
+    )
+    with pytest.raises(console_client.DeveloperLocalInspectionClientError) as invalid_order:
+        console_client._decode_local_inspection_snapshot_v2(bytes(owner_order))
+    assert (
+        invalid_order.value.code
+        is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
+    )
+
+    node_coordinate = bytearray(_inspection_fixture("local_inspection_snapshot_v2.hex"))
+    node_start = 112 + 592
+    node_coordinate[node_start + 40 : node_start + 48] = bytes(8)
+    node_coordinate[80:112] = _rust_canonical_digest(
+        b"paraegox.inspection.local-snapshot.v2",
+        (bytes(node_coordinate[:80]), bytes(node_coordinate[112:])),
+    )
+    with pytest.raises(console_client.DeveloperLocalInspectionClientError) as invalid_node:
+        console_client._decode_local_inspection_snapshot_v2(bytes(node_coordinate))
+    assert (
+        invalid_node.value.code
+        is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
+    )
+
+
+def test_inspection_v2_real_uds_reads_latest_exactly_once_and_closes() -> None:
+    async def scenario(
+        client: console_client.DeveloperLocalInspectionClientV2,
+        requests: list[bytes],
+    ) -> None:
+        snapshot = await client.latest()
+        assert snapshot.projection_revision == 7
+        assert snapshot.node.registration_epoch == 31
+        assert len(requests) == 1
+        assert requests[0][:4] == b"PXIQ"
+        assert requests[0][4:6] == (2).to_bytes(2, "big")
+        assert requests[0][12] == 1
+        assert not any(requests[0][48:64])
+
+        with pytest.raises(console_client.DeveloperLocalInspectionClientError) as reused:
+            await client.latest()
+        assert (
+            reused.value.code
+            is console_client.DeveloperLocalInspectionClientErrorCode.ALREADY_USED
+        )
+        client.close()
+        client.close()
+        assert not any(client._bootstrap.generation_token)
+        assert not any(client._bootstrap.request_seed)
+
+    asyncio.run(
+        _with_fake_inspection_server(
+            _inspection_fixture("inspection_snapshot_response_v2.hex"),
+            scenario,
+        )
+    )
+
+
+def test_inspection_v2_not_found_and_closed_client_fail_closed() -> None:
+    async def not_found_scenario(
+        client: console_client.DeveloperLocalInspectionClientV2,
+        requests: list[bytes],
+    ) -> None:
+        with pytest.raises(console_client.DeveloperLocalInspectionClientError) as unavailable:
+            await client.latest()
+        assert (
+            unavailable.value.code
+            is console_client.DeveloperLocalInspectionClientErrorCode.SNAPSHOT_UNAVAILABLE
+        )
+        assert len(requests) == 1
+
+    asyncio.run(
+        _with_fake_inspection_server(
+            _inspection_fixture("inspection_not_found_response_v2.hex"),
+            not_found_scenario,
+        )
+    )
+
+    bootstrap = console_client._InspectionBootstrapV2(
+        socket_path=b"/private/inspection.sock",
+        projection_id=_INSPECTION_PROJECTION_ID,
+        generation_token=bytearray(_INSPECTION_TOKEN),
+        server_uid=os.geteuid(),
+        server_gid=os.getegid(),
+        operation_timeout_nanos=_INSPECTION_TIMEOUT_NANOS,
+        request_seed=bytearray(_INSPECTION_REQUEST_SEED),
+    )
+    closed = console_client.DeveloperLocalInspectionClientV2(bootstrap)
+    closed.close()
+    closed.close()
+    with pytest.raises(console_client.DeveloperLocalInspectionClientError) as error:
+        asyncio.run(closed.latest())
+    assert error.value.code is console_client.DeveloperLocalInspectionClientErrorCode.CLOSED

@@ -8,6 +8,8 @@ import pytest
 from textual.pilot import Pilot
 from textual.widgets import Input, RichLog, Static
 
+import paraegox_sdk.console_client as console_client
+import paraegox_sdk.console_tui as console_tui
 from paraegox_sdk.agent_worker.control import AgentConversationCancelOutcomeV1
 from paraegox_sdk.agent_worker.protocol import (
     MAX_AGENT_CONVERSATION_INPUT_BYTES,
@@ -91,6 +93,58 @@ class FakeConversationClient:
         self.close_calls += 1
 
 
+def _inspection_snapshot() -> console_client.LocalInspectionSnapshotV2:
+    records = tuple(
+        console_client.LocalInspectionRecordV1(
+            owner=owner,
+            freshness=console_client.InspectionFreshnessV1.MISSING,
+            subject_ref=bytes([0x40 + int(owner)]) * 16,
+            coordinate=None,
+            observed_at_nanos=None,
+            valid_until_nanos=None,
+            liveness=console_client.InspectionLivenessV1.UNKNOWN,
+            readiness=console_client.InspectionReadinessV1.UNKNOWN,
+            health=console_client.InspectionHealthV1.UNKNOWN,
+            feature_support=console_client.InspectionFeatureSupportV1.UNKNOWN,
+            reason=console_client.InspectionReasonV1.SOURCE_MISSING,
+            owner_fact_digest=None,
+        )
+        for owner in console_client.InspectionSourceOwnerV1
+    )
+    base = console_client.LocalInspectionSnapshotV1(
+        projection_id=bytes([0x21]) * 16,
+        observation_clock_ref=bytes([0x31]) * 16,
+        projection_revision=7,
+        projected_at_nanos=150,
+        overall=console_client.LocalInspectionOverallV1.UNKNOWN,
+        records=(records[0], records[1], records[2], records[3], records[4]),
+        projection_digest=bytes([0x51]) * 32,
+        canonical_wire=bytes(592),
+    )
+    node = console_client.NodeInspectionRecordV2(
+        freshness=console_client.InspectionFreshnessV1.FRESH,
+        node_ref=bytes([0x61]) * 16,
+        node_incarnation_ref=bytes([0x62]) * 16,
+        registration_epoch=31,
+        status_sequence=41,
+        observed_at_nanos=100,
+        valid_until_nanos=200,
+        liveness=console_client.InspectionLivenessV1.LIVE,
+        readiness=console_client.InspectionReadinessV1.READY,
+        health=console_client.InspectionHealthV1.HEALTHY,
+        feature_support=console_client.InspectionFeatureSupportV1.ALL_REQUIRED_SUPPORTED,
+        reason=console_client.InspectionReasonV1.NONE,
+        node_status_digest=bytes([0x63]) * 32,
+    )
+    return console_client.LocalInspectionSnapshotV2(
+        base_snapshot=base,
+        node=node,
+        overall=console_client.LocalInspectionOverallV1.UNKNOWN,
+        projection_digest=bytes([0x71]) * 32,
+        canonical_wire=bytes(832),
+    )
+
+
 async def _wait_until(
     pilot: Pilot[None],
     predicate: Callable[[], bool],
@@ -117,14 +171,21 @@ def test_console_connects_and_submits_one_successful_turn() -> None:
         client = FakeConversationClient(output="A typed reply")
         app = ParaEGOXConsoleApp(
             client,
-            inspection_bootstrap_file=Path("/private/inspection.pxib"),
+            inspection_snapshot=_inspection_snapshot(),
         )
         async with app.run_test(size=(100, 30)) as pilot:
             await _wait_until(pilot, lambda: app.connected)
             status = app.query_one("#connection-status", Static)
             inspection = app.query_one("#inspection-status", Static)
             assert str(status.content) == "Connection: connected · Request: idle"
-            assert "snapshot not loaded" in str(inspection.content)
+            assert str(inspection.content).splitlines() == [
+                (
+                    "Node-local startup snapshot UNKNOWN r7 | NodeDaemon ready · "
+                    "registration e31 · status s41"
+                ),
+                "Authority missing | Deployment missing | Runtime missing",
+                "Fabric missing | Agent missing | health unreported",
+            ]
 
             await _enter(app, pilot, "hello")
             await _wait_until(pilot, lambda: "Agent: A typed reply" in app.transcript)
@@ -302,3 +363,70 @@ def test_console_cli_accepts_only_explicit_absolute_bootstrap_paths(tmp_path: Pa
         with pytest.raises(SystemExit) as captured:
             _parse_arguments(arguments)
         assert captured.value.code == 2
+
+
+def test_startup_inspection_loader_reads_once_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = _inspection_snapshot()
+
+    class FakeInspectionClient:
+        def __init__(self) -> None:
+            self.latest_calls = 0
+            self.close_calls = 0
+
+        async def latest(self) -> console_client.LocalInspectionSnapshotV2:
+            self.latest_calls += 1
+            return snapshot
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    client = FakeInspectionClient()
+    monkeypatch.setattr(
+        console_tui.DeveloperLocalInspectionClientV2,
+        "from_private_bootstrap_file",
+        lambda _path: client,
+    )
+    loaded = console_tui._load_inspection_snapshot_once(tmp_path / "inspection.pxib")
+    assert loaded is snapshot
+    assert client.latest_calls == 1
+    assert client.close_calls == 1
+
+
+def test_inspection_startup_failure_closes_agent_client_before_ui(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent_client = FakeConversationClient()
+
+    class RuntimeClientFactory:
+        @staticmethod
+        def from_private_bootstrap_file(_path: Path) -> FakeConversationClient:
+            return agent_client
+
+    def fail_inspection(_path: Path) -> console_client.LocalInspectionSnapshotV2:
+        raise console_client.DeveloperLocalInspectionClientError(
+            console_client.DeveloperLocalInspectionClientErrorCode.SNAPSHOT_UNAVAILABLE,
+            "DeveloperLocal Inspection v2 startup snapshot is unavailable",
+        )
+
+    monkeypatch.setattr(
+        console_tui,
+        "RuntimeAgentConversationClientV1",
+        RuntimeClientFactory,
+    )
+    monkeypatch.setattr(console_tui, "_load_inspection_snapshot_once", fail_inspection)
+    with pytest.raises(SystemExit) as captured:
+        console_tui.main(
+            [
+                "--runtime-bootstrap-file",
+                str(tmp_path / "runtime.pxab"),
+                "--inspection-bootstrap-file",
+                str(tmp_path / "inspection.pxib"),
+            ]
+        )
+    assert agent_client.close_calls == 1
+    assert "startup snapshot is unavailable" in str(captured.value)
+    assert str(tmp_path) not in str(captured.value)

@@ -4,7 +4,10 @@ ParaEGOX 是一个面向机器人与具身智能体的分布式 Agent OS，目�
 
 ParaEGOX 基于 [PhanthyMotus](https://github.com/4paradigm/phanthymotus) 构建。原始基线保留在 `archive/phanthymotus-baseline` 分支，并保留其许可证归属。
 
-> 当前状态：当前工作树已有首个 DeveloperLocal 后端与 Textual 对话组合；这次展示层迁移仍待 fresh 集成验证。生产核心机制优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
+> 当前状态：当前工作树已有首个 DeveloperLocal 后端、Textual 对话组合和 typed 单次
+> Inspection 启动视图。r21 集成运行已到达真实 Echo terminal，但 joined exit 超过
+> workflow 的 20 秒限制，因此展示层 closeout 仍待 r22 以 60 秒退出预算复验。生产核心
+> 机制优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
 
 ## 当前可运行切片
 
@@ -53,26 +56,30 @@ unset DEEPSEEK_API_KEY
 原生 binary 必须在指定服务器或 GitHub CI 构建，Mac 只下载完整 bundle；当前工作流禁止在 Mac 运行
 Cargo。
 
-远端 source snapshot r18 已通过 `cargo fmt --all --check`、无 warning 的 workspace all-targets
-编译、`paraegox-model-adapters` 19/19 测试，以及非 root 身份下的 DeveloperLocal 87/87 测试；Ruff 与
-governance checker 通过，Mac 上不调用 Rust 的 governance、contract 和 Agent-worker 测试为 391/391。
-r19 随后由原生 Intel Mac CI 构建并校验 x86_64 executable，并通过当时的 Rust Ratatui frontend 完成
-一次真实离线 Echo 往返。这是历史后端和旧展示层证据，不能验证当前 Python client、Textual child、
-launcher 修改或新 packaging 依赖；必须取得 fresh focused 与集成证据后才能把本次展示层迁移称为已验证。
-真实 credentialed DeepSeek smoke 也仍未完成，因此还不能把配置中的 DeepSeek 路径描述成外部验证通过
-或 production ready。离线验证系统基座时，使用同一个配置 schema，将 `model.provider` 改为
+源码快照 r21 已通过编译服务器的 locked workspace check、Inspection 36/36 测试、
+非 root 身份下 DeveloperLocal 89/89 测试以及 Deployment 364/364 测试。它的原生 Intel
+macOS CI 已构建 binary、通过 Python checks，并完成真实 Textual→Runtime Echo terminal；
+但 joined process exit 超过 20 秒，因此 workflow 仍以失败结束。r21 门禁发现的格式问题和
+4 项 Clippy 问题已在 Mac 源码 authority 修复，但在 r22 重跑远端 fmt/Clippy 和同一
+macOS smoke（退出预算 60 秒）之前，不冒充宣称这些修复已通过。真实 credentialed DeepSeek
+smoke 也仍未完成，因此还不能把配置中的 DeepSeek 路径描述成外部验证通过或 production
+ready。离线验证系统基座时，使用同一个配置 schema，将 `model.provider` 改为
 `deterministic-echo-v1` 并省略 model/SecretRef；`echo: <你的消息>` 只证明 DeveloperLocal owner 链。
 独立 Rust `paraegox-tui fixture-v1` executable 只作为待退役参考暂存：`paraegox-local` 已不再依赖或
-启动它，它也不是第二个公开 `paraegox chat` 入口。
+启动它，它也不是第二个公开 `paraegox chat` 入口。只有下一个 replacement validation gate
+通过后才删除它；当前不冒充宣称已删除。
 
 当前 A2 仍是最小文本链：不流式、同时只允许一个 Model 调用、每轮只把当前输入发给模型；会话历史
 回灌、Memory、Tools、规划和多 Agent 编排仍属于后续 Agent Core。父进程只把 owner-private bootstrap
 文件路径交给内部 Textual child：一个用于 Agent 对话，存在时另一个用于只读本地 Inspection。Python
 `AgentConversationClient` 只消费 Runtime Agent 路径，不打开 raw Zenoh，也看不到 provider/model 凭据。
-当前 Textual slice 虽接收 Inspection 路径，但明确显示 snapshot 尚未加载，所以还没有也不声称旧 Status
-view。argv 不携带 raw identity、Node management capability、Zenoh route、capability token 或 Secret，
-parent 会从 child 环境同时移除 `OPENAI_API_KEY` 和 `DEEPSEEK_API_KEY`。这套 typed boundary 不是复活
-全能 ConsoleBridge，也不等于 federated Inspection/Ops。Node 合同、Unix 同一 registration tenure 的
+另一个 strict typed client 会验证 owner-private PXIB v2 bootstrap，并在 Textual App 启动前只执行
+一次无重试 PXIQ Latest 交换，严格关联 PXIP response 并解码完整 PXIS v2 snapshot。任何
+bootstrap、transport、correlation 或 snapshot 错误都会阻止 UI 启动。成功时只显示三行只读
+startup status；没有 watch、retry、cache、background refresh、action、持续监控、Ops 或
+federated view。argv 不携带 raw identity、Node management capability、Zenoh route、capability token
+或 Secret，parent 会从 child 环境同时移除 `OPENAI_API_KEY` 和 `DEEPSEEK_API_KEY`。这套
+typed boundary 不是复活全能 ConsoleBridge。Node 合同、Unix 同一 registration tenure 的
 NodeDaemon 持久状态和只读管理协议现在已经由 `paraegox-local` 真实消费，而不再只是独立机制。
 launcher 会创建或安全重开精确的本地 Node tenure，提交一份初始 feature-only status，启动真实、
 独立的 reference child，并只在本地 management channel、target、tenure 与 status fence 全部通过后

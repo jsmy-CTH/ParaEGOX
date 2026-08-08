@@ -452,6 +452,17 @@ pub struct RuntimeObservationRequestV1 {
     canonical_wire: Box<[u8]>,
 }
 
+struct RuntimeObservationRequestWireFields<'a> {
+    intended_status_sequence: u64,
+    freshness_budget_nanos: u64,
+    runtime_host_id: RuntimeHostId,
+    authority_digest: Digest32,
+    challenge_issued_at_unix_nanos: u64,
+    challenge_expires_at_unix_nanos: u64,
+    query_request: &'a ReferenceQueryRequestV1,
+    query_response: &'a ReferenceQueryResponseV1,
+}
+
 impl RuntimeObservationRequestV1 {
     pub fn try_new(
         input: RuntimeObservationRequestInputV1,
@@ -487,16 +498,16 @@ impl RuntimeObservationRequestV1 {
         {
             return Err(RuntimeObservationError::InvalidRequest);
         }
-        let canonical_wire = encode_request(
-            intended_status_sequence.get(),
-            freshness_budget_nanos.get(),
+        let canonical_wire = encode_request(RuntimeObservationRequestWireFields {
+            intended_status_sequence: intended_status_sequence.get(),
+            freshness_budget_nanos: freshness_budget_nanos.get(),
             runtime_host_id,
             authority_digest,
-            challenge_issued_at_unix_nanos.get(),
-            challenge_expires_at_unix_nanos.get(),
-            &query_request,
-            &query_response,
-        )?;
+            challenge_issued_at_unix_nanos: challenge_issued_at_unix_nanos.get(),
+            challenge_expires_at_unix_nanos: challenge_expires_at_unix_nanos.get(),
+            query_request: &query_request,
+            query_response: &query_response,
+        })?;
         let request_digest = Digest32::from_bytes(copy_array(
             &canonical_wire,
             OBSERVATION_REQUEST_DIGEST_OFFSET,
@@ -625,11 +636,7 @@ impl RuntimeObservationRequestV1 {
             return Err(RuntimeObservationError::ChallengeExpired);
         }
         let age = now - issued_at;
-        let remaining_budget = self
-            .freshness_budget_nanos
-            .get()
-            .checked_sub(age)
-            .unwrap_or(0);
+        let remaining_budget = self.freshness_budget_nanos.get().saturating_sub(age);
         let remaining_window = expires_at - now;
         let remaining = core::cmp::min(remaining_budget, remaining_window);
         if remaining == 0 {
@@ -1112,15 +1119,18 @@ fn decode_bootstrap(wire: &[u8]) -> Result<RuntimeObservationBootstrapV1, Runtim
 }
 
 fn encode_request(
-    intended_status_sequence: u64,
-    freshness_budget_nanos: u64,
-    runtime_host_id: RuntimeHostId,
-    authority_digest: Digest32,
-    challenge_issued_at_unix_nanos: u64,
-    challenge_expires_at_unix_nanos: u64,
-    query_request: &ReferenceQueryRequestV1,
-    query_response: &ReferenceQueryResponseV1,
+    fields: RuntimeObservationRequestWireFields<'_>,
 ) -> Result<Vec<u8>, RuntimeObservationError> {
+    let RuntimeObservationRequestWireFields {
+        intended_status_sequence,
+        freshness_budget_nanos,
+        runtime_host_id,
+        authority_digest,
+        challenge_issued_at_unix_nanos,
+        challenge_expires_at_unix_nanos,
+        query_request,
+        query_response,
+    } = fields;
     let query_request_bytes = query_request.canonical_wire();
     let query_response_bytes = query_response.canonical_wire();
     let total = OBSERVATION_REQUEST_HEADER_BYTES

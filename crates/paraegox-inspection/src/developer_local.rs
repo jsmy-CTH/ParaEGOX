@@ -666,6 +666,34 @@ impl std::error::Error for DeveloperLocalInspectionTransportErrorV1 {
 mod tests {
     use super::*;
 
+    fn encode_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            output.push(HEX[usize::from(byte >> 4)] as char);
+            output.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+        output
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        let value = value.trim();
+        assert_eq!(value.len() % 2, 0, "golden hex length");
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
+    }
+
+    fn nibble(value: u8) -> u8 {
+        match value {
+            b'0'..=b'9' => value - b'0',
+            b'a'..=b'f' => value - b'a' + 10,
+            _ => panic!("invalid golden hex"),
+        }
+    }
+
     fn bootstrap(token: u8) -> DeveloperLocalInspectionBootstrapV1 {
         DeveloperLocalInspectionBootstrapV1::try_new(
             PathBuf::from("/private/tmp/pxl-test/i.sock"),
@@ -690,6 +718,19 @@ mod tests {
             Zeroizing::new([0x43; 16]),
         )
         .expect("v2 bootstrap")
+    }
+
+    fn cross_language_bootstrap_v2() -> DeveloperLocalInspectionBootstrapV2 {
+        DeveloperLocalInspectionBootstrapV2::try_new(
+            PathBuf::from("/tmp/inspection.sock"),
+            [0x21; 16],
+            Zeroizing::new([0x5b; 32]),
+            501,
+            20,
+            Duration::from_secs(2),
+            Zeroizing::new([0x6c; 16]),
+        )
+        .expect("cross-language v2 bootstrap")
     }
 
     #[test]
@@ -788,5 +829,79 @@ mod tests {
             Ok(request)
         );
         assert!(decode_authenticated_request_v1(&authenticated, value.generation_token()).is_err());
+    }
+
+    #[test]
+    fn v2_bootstrap_request_id_and_authenticated_request_match_cross_language_goldens() {
+        let value = cross_language_bootstrap_v2();
+        let request_id = value.request_id(1).expect("cross-language request id");
+        assert_eq!(
+            request_id,
+            [
+                0x6e, 0xeb, 0x8f, 0xa5, 0x0a, 0xd6, 0x17, 0x7b, 0x24, 0xd9, 0x4c, 0x51, 0x12, 0xf5,
+                0x04, 0x83,
+            ]
+        );
+        let request = InspectionRequestV2::try_latest(request_id, value.projection_id())
+            .expect("cross-language PXIQ-v2");
+        let bootstrap_wire = value.encode().expect("cross-language PXIB-v2");
+        let authenticated = encode_authenticated_request_v2(value.generation_token(), &request)
+            .expect("cross-language authenticated request");
+        let fixtures = [
+            (
+                "PXIB_V2",
+                include_str!("../tests/fixtures/developer_local_inspection_bootstrap_v2.hex")
+                    .trim(),
+                bootstrap_wire.as_slice(),
+            ),
+            (
+                "PXIQ_V2",
+                include_str!("../tests/fixtures/inspection_latest_request_v2.hex").trim(),
+                request.canonical_wire(),
+            ),
+            (
+                "AUTHENTICATED_PXIQ_V2",
+                include_str!(
+                    "../tests/fixtures/developer_local_inspection_authenticated_request_v2.hex"
+                )
+                .trim(),
+                authenticated.as_slice(),
+            ),
+        ];
+        if fixtures
+            .iter()
+            .any(|(_, expected, _)| *expected == "PENDING")
+        {
+            let values = fixtures
+                .iter()
+                .map(|(name, _, bytes)| format!("{name}={}", encode_hex(bytes)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!("PXI_DEVELOPER_LOCAL_V2_GOLDENS\n{values}");
+        }
+        for (_, expected, actual) in fixtures {
+            assert_eq!(actual, decode_hex(expected));
+        }
+
+        let decoded_bootstrap = DeveloperLocalInspectionBootstrapV2::decode(&decode_hex(
+            include_str!("../tests/fixtures/developer_local_inspection_bootstrap_v2.hex"),
+        ))
+        .expect("strict PXIB-v2 golden decode");
+        assert_eq!(
+            decoded_bootstrap.socket_path(),
+            Path::new("/tmp/inspection.sock")
+        );
+        assert_eq!(decoded_bootstrap.server_uid(), 501);
+        assert_eq!(decoded_bootstrap.server_gid(), 20);
+        assert_eq!(decoded_bootstrap.request_id(1), Ok(request_id));
+        assert_eq!(
+            decode_authenticated_request_v2(
+                &decode_hex(include_str!(
+                    "../tests/fixtures/developer_local_inspection_authenticated_request_v2.hex"
+                )),
+                value.generation_token(),
+            ),
+            Ok(request)
+        );
     }
 }

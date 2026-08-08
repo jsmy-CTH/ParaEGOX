@@ -14,6 +14,8 @@ use paraegox_kernel::digest::{Digest32, Digest32Builder};
 
 const PROJECTION_ID: [u8; 16] = [0xa1; 16];
 const CLOCK_BYTES: [u8; 16] = [0xc1; 16];
+const CROSS_LANGUAGE_PROJECTION_ID: [u8; 16] = [0x21; 16];
+const CROSS_LANGUAGE_CLOCK_BYTES: [u8; 16] = [0x31; 16];
 const PROJECTED_AT: u64 = 150;
 const SNAPSHOT_HEADER_BYTES: usize = 112;
 const SNAPSHOT_DIGEST_OFFSET: usize = 80;
@@ -188,6 +190,62 @@ fn input_v2(
 
 fn ready_input_v2() -> LocalInspectionProjectionInputV2 {
     input_v2(ready_input(), Some(node_fact(FactState::ready())))
+}
+
+fn cross_language_clock() -> InspectionObservationClockRefV1 {
+    InspectionObservationClockRefV1::try_from_bytes(CROSS_LANGUAGE_CLOCK_BYTES)
+        .expect("cross-language clock")
+}
+
+fn cross_language_input_v2() -> LocalInspectionProjectionInputV2 {
+    let base = LocalInspectionProjectionInputV1::try_new(
+        cross_language_clock(),
+        [
+            InspectionSourceSlotV1::try_new(InspectionSourceOwnerV1::Authority, [0x41; 16], None)
+                .expect("missing Authority slot"),
+            InspectionSourceSlotV1::try_new(
+                InspectionSourceOwnerV1::DeploymentController,
+                [0x42; 16],
+                None,
+            )
+            .expect("missing DeploymentController slot"),
+            InspectionSourceSlotV1::try_new(InspectionSourceOwnerV1::RuntimeHost, [0x43; 16], None)
+                .expect("missing RuntimeHost slot"),
+            InspectionSourceSlotV1::try_new(
+                InspectionSourceOwnerV1::FabricService,
+                [0x44; 16],
+                None,
+            )
+            .expect("missing FabricService slot"),
+            InspectionSourceSlotV1::try_new(
+                InspectionSourceOwnerV1::AgentService,
+                [0x45; 16],
+                None,
+            )
+            .expect("missing AgentService slot"),
+        ],
+    )
+    .expect("cross-language base input");
+    let node_fact = NodeInspectionFactV2::try_new(NodeInspectionFactFieldsV2 {
+        node_ref: [0x61; 16],
+        node_incarnation_ref: [0x62; 16],
+        registration_epoch: 31,
+        status_sequence: 41,
+        observation_clock_ref: cross_language_clock(),
+        observed_at_nanos: 100,
+        valid_until_nanos: 200,
+        availability: InspectionSourceAvailabilityV1::Observed,
+        liveness: InspectionLivenessV1::Live,
+        readiness: InspectionReadinessV1::Ready,
+        health: InspectionHealthV1::Healthy,
+        feature_support: InspectionFeatureSupportV1::AllRequiredSupported,
+        reason: InspectionReasonV1::None,
+        node_status_digest: Digest32::from_bytes([0x63; 32]),
+    })
+    .expect("cross-language NodeDaemon fact");
+    let node = NodeInspectionSourceSlotV2::try_new([0x61; 16], [0x62; 16], Some(node_fact))
+        .expect("cross-language NodeDaemon slot");
+    LocalInspectionProjectionInputV2::try_new(base, node).expect("cross-language v2 input")
 }
 
 fn project(input: &LocalInspectionProjectionInputV1) -> LocalInspectionSnapshotV1 {
@@ -621,6 +679,33 @@ fn v2_preserves_the_exact_v1_snapshot_and_adds_only_the_node_projection() {
         LocalInspectionSnapshotV2::decode(snapshot.canonical_wire()).expect("strict v2 decode");
     assert_eq!(decoded, snapshot);
     assert!(LocalInspectionSnapshotV1::decode(snapshot.canonical_wire()).is_err());
+}
+
+#[test]
+fn v2_cross_language_snapshot_matches_the_rust_canonical_golden() {
+    let snapshot = project_local_inspection_snapshot_v2(
+        CROSS_LANGUAGE_PROJECTION_ID,
+        cross_language_clock(),
+        7,
+        PROJECTED_AT,
+        &cross_language_input_v2(),
+    )
+    .expect("cross-language v2 projection");
+    let expected_hex = include_str!("fixtures/local_inspection_snapshot_v2.hex").trim();
+    if expected_hex == "PENDING" {
+        panic!("PXIS_V2_GOLDEN={}", encode_hex(snapshot.canonical_wire()));
+    }
+    let expected = decode_hex(expected_hex);
+
+    assert_eq!(snapshot.canonical_wire(), expected);
+    assert_eq!(snapshot.projection_revision(), 7);
+    assert_eq!(snapshot.overall(), LocalInspectionOverallV1::Unknown);
+    assert_eq!(snapshot.node().registration_epoch(), Some(31));
+    assert_eq!(snapshot.node().status_sequence(), Some(41));
+    assert_eq!(
+        LocalInspectionSnapshotV2::decode(&expected).expect("strict golden decode"),
+        snapshot
+    );
 }
 
 #[test]

@@ -45,6 +45,15 @@ repository:
 - The Mac repository is the sole writable source authority for the current development workflow.
   Agents edit source only there. The build server is a disposable validation consumer, never a
   second source tree or merge authority.
+- On the current Mac source-authority host, do not invoke Cargo, rustc, rustfmt, or another Rust
+  build tool either directly or indirectly. This prohibition includes pytest cases, scripts, task
+  runners, build helpers, and child processes that would spawn a Rust tool. The Mac Python
+  regression must deselect exactly
+  `tests/system/test_s6_python_reference_worker.py::test_rust_process_domain_owns_real_python_worker_fault_matrix`;
+  that required case runs only on Ubuntu/CI with the pinned Rust toolchain in this workflow. The
+  complete `scripts/check_governance.py` is also prohibited on this Mac because it invokes
+  `cargo metadata --locked`; run the complete checker on Ubuntu/CI and never present a partial or
+  Cargo-bypassed substitute as a governance pass.
 - Prefer transferring source to the build server as Git commits, refs, or patches produced from the
   Mac repository. If Git transport is unavailable and the user explicitly authorizes the fallback,
   send only the required uncompressed files or bounded file chunks from Mac to a remote temporary
@@ -61,7 +70,8 @@ repository:
 
 ## Required validation
 
-Run from the repository root:
+These are repository-wide required gates. Run each from the repository root on its admitted
+execution host; this is not permission to run Rust tools on the current Mac source-authority host:
 
 ```bash
 cargo fmt --all --check
@@ -75,5 +85,19 @@ uv run --frozen ruff check .
 uv run --frozen python scripts/check_governance.py
 uv run --frozen pytest
 ```
+
+On the current Mac source-authority host, the permitted non-Rust validation subset is:
+
+```bash
+uv lock --check
+uv run --frozen ruff check .
+uv run --frozen pytest --deselect=tests/system/test_s6_python_reference_worker.py::test_rust_process_domain_owns_real_python_worker_fault_matrix
+```
+
+Do not run the complete governance checker on this Mac: its Cargo metadata phase is mandatory, so
+there is no valid Mac-only flag, environment override, filtered invocation, or replacement command
+that can establish a governance pass. The complete checker, the deselected system case, and all
+Rust gates remain required on Ubuntu/CI with pinned Rust; this host split does not waive, skip
+globally, or reduce the repository-wide validation contract.
 
 If a command cannot run, report it as blocked; do not claim it passed.
