@@ -201,12 +201,17 @@ pub(crate) fn run(config: DeveloperFixtureConfigV1) -> Result<(), LocalProcessEr
     run_with_runner(config, peer, &mut ChildProcessConversationRunner)
 }
 
-/// Runs the public host-local Node substrate. This deliberately starts only
-/// the split-trust Runtime restricted listener and one feature-only
-/// NodeDaemon; it never activates Authority, Deployment, Fabric, Model, Agent,
-/// Evidence, Inspection, or Textual owners.
+/// Runs the public split-trust Node substrate. Schema v1 keeps the host-local
+/// feature-only NodeDaemon, while schema v2 also starts the restricted Runtime
+/// and Node-control ingress owned by this process. Neither profile activates
+/// Authority, Deployment, Model, Agent, Evidence, Inspection, or Textual
+/// owners.
 pub(crate) fn run_node(config: DeveloperNodeConfigV1) -> Result<(), LocalProcessError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // Zenoh's runtime rejects Tokio's current-thread scheduler. One worker is
+    // sufficient because blocking Node/store work stays behind its existing
+    // process and spawn_blocking boundaries.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .map_err(|_| LocalProcessError::SignalHandling)?;
