@@ -117,10 +117,8 @@ pub fn run_deploymentd_process() -> Result<(), DeploymentdProcessError> {
 
 #[cfg(unix)]
 pub use platform::{
-    DeveloperDeploymentAgentBootstrapReadyV1,
-    DeveloperDeploymentAgentBootstrapStartFieldsV1,
-    DeveloperDeploymentAgentBootstrapStartInputV1,
-    DeveloperDeploymentAgentBootstrapStartOutcomeV1,
+    DeveloperDeploymentAgentBootstrapReadyV1, DeveloperDeploymentAgentBootstrapStartFieldsV1,
+    DeveloperDeploymentAgentBootstrapStartInputV1, DeveloperDeploymentAgentBootstrapStartOutcomeV1,
     DeveloperDeploymentEnrollmentFactsFieldsV1, DeveloperDeploymentEnrollmentFactsV1,
     DeveloperDeploymentErrorV1, DeveloperDeploymentOwnerV1, DeveloperDeploymentReadyV1,
     DeveloperDeploymentStartFieldsV1, DeveloperDeploymentStartInputV1,
@@ -280,8 +278,8 @@ mod platform {
         FreshManagedAgentStackApplyV1, ManagedAgentStackActivationV1,
     };
     use crate::managed_fabric_apply::{
-        ManagedFabricApplyControllerError, ManagedFabricApplyJournalV1,
-        ManagedFabricApplyPhaseV1, ManagedFabricRemoteAgentControlActivateInputV1,
+        ManagedFabricApplyControllerError, ManagedFabricApplyJournalV1, ManagedFabricApplyPhaseV1,
+        ManagedFabricRemoteAgentControlActivateInputV1,
     };
     use crate::managed_fabric_producer::{
         FreshManagedFabricApplyV1, ManagedFabricControllerIdentityV1,
@@ -293,11 +291,11 @@ mod platform {
         ManagedAgentStackDurableStoreV1, ManagedFabricSuccessorStoreV1,
     };
     use crate::managed_serving_client::{
-        FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1,
-        ManagedServingBootstrapPhaseV1, ManagedServingDescribeIngressV1,
-        ManagedServingDescribeReconcilePhaseV1, ManagedServingDescribeVerifierV1,
-        RuntimeAgentControlDurablePhaseV1, RuntimeAgentControlMtlsExchangeSuccessV1,
-        RuntimeAgentControlTransportErrorV1, RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+        FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1, ManagedServingBootstrapPhaseV1,
+        ManagedServingDescribeIngressV1, ManagedServingDescribeReconcilePhaseV1,
+        ManagedServingDescribeVerifierV1, RuntimeAgentControlDurablePhaseV1,
+        RuntimeAgentControlMtlsExchangeSuccessV1, RuntimeAgentControlTransportErrorV1,
+        RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
         RuntimeManagedServingDescribeTransportErrorV1, RuntimeManagedServingMtlsExchangeSuccessV1,
         RuntimeManagedServingTransportErrorV1, VerifiedManagedServingPinV1,
     };
@@ -667,19 +665,11 @@ mod platform {
                 agent_service_id,
                 fabric_listen_endpoint,
             } = fields;
-            let exact_fixture = ManagedAgentProviderSelectionV1::try_deterministic_fixture(
-                provider.provider_ref(),
-                provider.config_digest(),
-            )
-            .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
-            if fabric_service_id.as_bytes().iter().all(|byte| *byte == 0)
-                || agent_service_id.as_bytes().iter().all(|byte| *byte == 0)
-                || fabric_service_id == agent_service_id
-                || provider.profile() != ManagedAgentProviderProfileV1::DeterministicFixture
-                || provider != exact_fixture
-            {
-                return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
-            }
+            validate_developer_agent_bootstrap_desired(
+                provider,
+                fabric_service_id,
+                agent_service_id,
+            )?;
             Ok(Self {
                 base,
                 provider,
@@ -688,6 +678,27 @@ mod platform {
                 fabric_listen_endpoint,
             })
         }
+    }
+
+    fn validate_developer_agent_bootstrap_desired(
+        provider: ManagedAgentProviderSelectionV1,
+        fabric_service_id: ManagedServiceId,
+        agent_service_id: ManagedServiceId,
+    ) -> Result<(), DeveloperDeploymentErrorV1> {
+        let exact_fixture = ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+            provider.provider_ref(),
+            provider.config_digest(),
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        if fabric_service_id.as_bytes().iter().all(|byte| *byte == 0)
+            || agent_service_id.as_bytes().iter().all(|byte| *byte == 0)
+            || fabric_service_id == agent_service_id
+            || provider.profile() != ManagedAgentProviderProfileV1::DeterministicFixture
+            || provider != exact_fixture
+        {
+            return Err(DeveloperDeploymentErrorV1::InvalidConfiguration);
+        }
+        Ok(())
     }
 
     /// The real deployment owner graph. A `Ready` outcome is emitted only
@@ -904,7 +915,7 @@ mod platform {
     #[must_use]
     pub enum DeveloperDeploymentAgentBootstrapStartOutcomeV1 {
         Ready {
-            owner: DeveloperDeploymentOwnerV1,
+            owner: Box<DeveloperDeploymentOwnerV1>,
             ready: DeveloperDeploymentAgentBootstrapReadyV1,
         },
         ReconcileRequired(DeveloperDeploymentOwnerV1),
@@ -1076,12 +1087,12 @@ mod platform {
         .await;
         match advanced {
             Ok(Some(ready)) => Ok(DeveloperDeploymentAgentBootstrapStartOutcomeV1::Ready {
-                owner,
+                owner: Box::new(owner),
                 ready,
             }),
-            Ok(None) => Ok(
-                DeveloperDeploymentAgentBootstrapStartOutcomeV1::ReconcileRequired(owner),
-            ),
+            Ok(None) => {
+                Ok(DeveloperDeploymentAgentBootstrapStartOutcomeV1::ReconcileRequired(owner))
+            }
             Err(error) => {
                 let _ = owner.shutdown_and_join().await;
                 Err(error)
@@ -3315,18 +3326,16 @@ mod platform {
             fabric_service_id,
             developer_agent_bootstrap_lifecycle_budgets()?,
         );
-        if !advance_developer_fabric_agent_control(
-            DeveloperFabricAgentControlAdvanceInputV1 {
-                store,
-                client,
-                controller_signer,
-                provisioning: &provisioning,
-                ingress: &ingress,
-                enrollment,
-                service: fabric_service,
-                endpoint: fabric_listen_endpoint,
-            },
-        )
+        if !advance_developer_fabric_agent_control(DeveloperFabricAgentControlAdvanceInputV1 {
+            store,
+            client,
+            controller_signer,
+            provisioning: &provisioning,
+            ingress: &ingress,
+            enrollment,
+            service: fabric_service,
+            endpoint: fabric_listen_endpoint,
+        })
         .await?
         {
             return Ok(None);
@@ -3343,19 +3352,19 @@ mod platform {
             agent_service_id,
             provider,
         )?;
-        let activation = ManagedAgentStackActivationV1::try_new(expected_fabric, agent_plan)
-            .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
-        if !advance_developer_agent_stack_agent_control(
-            DeveloperAgentStackControlAdvanceInputV1 {
-                store,
-                client,
-                controller_signer,
-                provisioning: &provisioning,
-                ingress: &ingress,
-                enrollment,
-                activation: &activation,
-            },
-        )
+        let activation =
+            ManagedAgentStackActivationV1::try_new(expected_fabric, agent_plan.clone())
+                .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        if !advance_developer_agent_stack_agent_control(DeveloperAgentStackControlAdvanceInputV1 {
+            store,
+            client,
+            controller_signer,
+            provisioning: &provisioning,
+            ingress: &ingress,
+            enrollment,
+            activation: &activation,
+            expected_agent: &agent_plan,
+        })
         .await?
         {
             return Ok(None);
@@ -3396,16 +3405,18 @@ mod platform {
         service_id: ManagedServiceId,
         provider: ManagedAgentProviderSelectionV1,
     ) -> Result<ManagedAgentServicePlanV1, DeveloperDeploymentErrorV1> {
-        let ingress =
-            ManagedAgentIngressLimitsV1::try_new(8, 512 * 1024, 64 * 1024, 64 * 1024, 2_000_000_000)
-                .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
+        let ingress = ManagedAgentIngressLimitsV1::try_new(
+            8,
+            512 * 1024,
+            64 * 1024,
+            64 * 1024,
+            2_000_000_000,
+        )
+        .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
         let port = ManagedAgentPortPlanV1::try_new_target_scoped(target, service_id, ingress)
             .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?;
         ManagedAgentServicePlanV1::try_new(
-            ManagedServiceSpecV1::new(
-                service_id,
-                developer_agent_bootstrap_lifecycle_budgets()?,
-            ),
+            ManagedServiceSpecV1::new(service_id, developer_agent_bootstrap_lifecycle_budgets()?),
             ManagedAgentSemanticLimitsV1::try_new(8, 16, 16, 32)
                 .map_err(|_| DeveloperDeploymentErrorV1::InvalidConfiguration)?,
             port,
@@ -3468,6 +3479,19 @@ mod platform {
             endpoint,
         } = input;
         let mut journal = ManagedFabricApplyJournalV1::new(store.state().clone());
+        let phase = journal.state().phase();
+        let outer_phase = journal.state().fabric_agent_control().phase();
+        if phase == ManagedFabricApplyPhaseV1::Uncertain
+            || outer_phase == RuntimeAgentControlDurablePhaseV1::Uncertain
+        {
+            return Ok(false);
+        }
+        if let Some(desired) = journal.state().desired()
+            && (desired.execution().service() != Some(service)
+                || desired.execution().listen_endpoint() != Some(&endpoint))
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
         if let Some(terminal) = journal
             .remote_agent_control_terminal(controller_signer, provisioning, ingress)
             .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
@@ -3478,13 +3502,6 @@ mod platform {
                 return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
             }
             return Ok(true);
-        }
-        let phase = journal.state().phase();
-        let outer_phase = journal.state().fabric_agent_control().phase();
-        if phase == ManagedFabricApplyPhaseV1::Uncertain
-            || outer_phase == RuntimeAgentControlDurablePhaseV1::Uncertain
-        {
-            return Ok(false);
         }
         if phase == ManagedFabricApplyPhaseV1::ReceiptDurable
             || outer_phase == RuntimeAgentControlDurablePhaseV1::ReceiptDurable
@@ -3567,9 +3584,7 @@ mod platform {
             Ok(terminal) => terminal,
             Err(_) => return Ok(false),
         };
-        if terminal.inner().facts().outcome()
-            != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
-        {
+        if terminal.inner().facts().outcome() != ManagedFabricApplyTerminalOutcomeV1::ActiveReady {
             return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
         }
         Ok(true)
@@ -3583,6 +3598,7 @@ mod platform {
         ingress: &'a ManagedServingDescribeIngressV1,
         enrollment: &'a DeveloperDeploymentEnrollmentFactsV1,
         activation: &'a ManagedAgentStackActivationV1,
+        expected_agent: &'a ManagedAgentServicePlanV1,
     }
 
     async fn advance_developer_agent_stack_agent_control(
@@ -3596,8 +3612,24 @@ mod platform {
             ingress,
             enrollment,
             activation,
+            expected_agent,
         } = input;
         let mut journal = ManagedAgentStackApplyJournalV1::new(store.state().clone());
+        let inner_phase = journal
+            .state()
+            .agent_stack_state()
+            .map(|state| state.phase());
+        let outer_phase = journal.state().agent_stack_agent_control().phase();
+        if inner_phase == Some(ManagedAgentStackApplyPhaseV1::Uncertain)
+            || outer_phase == RuntimeAgentControlDurablePhaseV1::Uncertain
+        {
+            return Ok(false);
+        }
+        if let Some(stack) = journal.state().agent_stack_state()
+            && stack.desired().execution().agent() != Some(expected_agent)
+        {
+            return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
+        }
         if let Some(terminal) = journal
             .remote_agent_control_terminal(controller_signer, provisioning, ingress)
             .map_err(|_| DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery)?
@@ -3609,16 +3641,6 @@ mod platform {
                 return Err(DeveloperDeploymentErrorV1::RestartRequiresExplicitRecovery);
             }
             return Ok(true);
-        }
-        let inner_phase = journal
-            .state()
-            .agent_stack_state()
-            .map(|state| state.phase());
-        let outer_phase = journal.state().agent_stack_agent_control().phase();
-        if inner_phase == Some(ManagedAgentStackApplyPhaseV1::Uncertain)
-            || outer_phase == RuntimeAgentControlDurablePhaseV1::Uncertain
-        {
-            return Ok(false);
         }
         if inner_phase == Some(ManagedAgentStackApplyPhaseV1::ReceiptDurable)
             || outer_phase == RuntimeAgentControlDurablePhaseV1::ReceiptDurable
@@ -10209,6 +10231,10 @@ mod platform {
             DistributedFabricTrustDomainRefV1, RestrictedRuntimeApplyTransportProfileFieldsV1,
             RestrictedRuntimeApplyTransportProfileV1,
         };
+        use paraegox_runtime_contracts::managed_agent_stack_plan::{
+            ManagedAgentProviderRefV1, ManagedAgentProviderSelectionV1, ManagedAgentSecretRefV1,
+        };
+        use paraegox_runtime_contracts::managed_service::ManagedServiceId;
         use paraegox_runtime_contracts::provenance::SourceScopeRef;
         use paraegox_runtime_contracts::reference_control::ValidatedReferenceLifecycleBudgetsV1;
         use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
@@ -10224,10 +10250,12 @@ mod platform {
             ProcessCommand, ProcessErrorKind, TENURE_ENTROPY_BYTES, TenureRequestProfile,
             acquire_developer_tenure_once, build_empty_commit_receipt, build_reference_candidate,
             build_reference_empty_candidate, commit_reference_empty_in_store,
+            developer_agent_bootstrap_service_plan,
             distributed_owner_terminal_runtime_observation_is_admissible,
             fresh_apply_request_from_entropy, fresh_tenure_request_from_entropy, parse_arguments,
             parse_nonzero_hex, read_pinned_file, recover_tenure_request,
             select_durable_tenure_request, validate_committed_empty_state,
+            validate_developer_agent_bootstrap_desired, DeveloperDeploymentErrorV1,
         };
         use crate::controller_initializer::{
             ControllerInitializationInput, initialize_controller_store_developer_local,
@@ -10255,6 +10283,88 @@ mod platform {
         };
 
         static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+        fn agent_bootstrap_fixture_provider() -> ManagedAgentProviderSelectionV1 {
+            ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+                ManagedAgentProviderRefV1::try_from_bytes([0x71; 16])
+                    .expect("fixture provider ref"),
+                Digest32::from_bytes([0x72; 32]),
+            )
+            .expect("deterministic fixture provider")
+        }
+
+        #[test]
+        fn developer_agent_bootstrap_rejects_nonfixture_and_invalid_service_ids() {
+            let provider = agent_bootstrap_fixture_provider();
+            let fabric = ManagedServiceId::from_bytes([0x73; 16]);
+            let agent = ManagedServiceId::from_bytes([0x74; 16]);
+            assert_eq!(
+                validate_developer_agent_bootstrap_desired(provider, fabric, agent),
+                Ok(())
+            );
+            assert_eq!(
+                validate_developer_agent_bootstrap_desired(
+                    provider,
+                    ManagedServiceId::from_bytes([0; 16]),
+                    agent,
+                ),
+                Err(DeveloperDeploymentErrorV1::InvalidConfiguration)
+            );
+            assert_eq!(
+                validate_developer_agent_bootstrap_desired(provider, fabric, fabric),
+                Err(DeveloperDeploymentErrorV1::InvalidConfiguration)
+            );
+            let provisioned = ManagedAgentProviderSelectionV1::try_provisioned(
+                ManagedAgentProviderRefV1::try_from_bytes([0x75; 16])
+                    .expect("provisioned provider ref"),
+                Digest32::from_bytes([0x76; 32]),
+                ManagedAgentSecretRefV1::try_from_bytes([0x77; 16])
+                    .expect("provisioned secret ref"),
+            )
+            .expect("provisioned provider");
+            assert_eq!(
+                validate_developer_agent_bootstrap_desired(provisioned, fabric, agent),
+                Err(DeveloperDeploymentErrorV1::InvalidConfiguration)
+            );
+        }
+
+        #[test]
+        fn developer_agent_bootstrap_plan_is_fixed_and_target_scoped() {
+            let provider = agent_bootstrap_fixture_provider();
+            let service_id = ManagedServiceId::from_bytes([0x78; 16]);
+            let first = developer_agent_bootstrap_service_plan(
+                RuntimeHostId::from_bytes([0x79; 16]),
+                service_id,
+                provider,
+            )
+            .expect("first target-scoped plan");
+            let same = developer_agent_bootstrap_service_plan(
+                RuntimeHostId::from_bytes([0x79; 16]),
+                service_id,
+                provider,
+            )
+            .expect("same target-scoped plan");
+            let other_target = developer_agent_bootstrap_service_plan(
+                RuntimeHostId::from_bytes([0x7a; 16]),
+                service_id,
+                provider,
+            )
+            .expect("other target-scoped plan");
+            assert_eq!(first, same);
+            assert_ne!(first.port(), other_target.port());
+            assert_eq!(first.provider(), provider);
+            assert_eq!(first.service().service_id(), service_id);
+            assert_eq!(first.semantic_limits().max_sessions(), 8);
+            assert_eq!(first.semantic_limits().max_turns_per_session(), 16);
+            assert_eq!(first.semantic_limits().max_requests_per_session(), 16);
+            assert_eq!(first.semantic_limits().max_event_batch(), 32);
+            let ingress = first.port().ingress_limits();
+            assert_eq!(ingress.max_items(), 8);
+            assert_eq!(ingress.max_bytes(), 512 * 1024);
+            assert_eq!(ingress.max_frame_bytes(), 64 * 1024);
+            assert_eq!(ingress.max_response_body_bytes(), 64 * 1024);
+            assert_eq!(ingress.handler_timeout_nanos(), 2_000_000_000);
+        }
 
         fn hex(byte: u8, length: usize) -> OsString {
             OsString::from(format!("{byte:02x}").repeat(length))
