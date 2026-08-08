@@ -920,7 +920,7 @@ mod platform {
     pub enum DeveloperDeploymentAgentBootstrapStartOutcomeV1 {
         Ready {
             owner: Box<DeveloperDeploymentOwnerV1>,
-            ready: DeveloperDeploymentAgentBootstrapReadyV1,
+            ready: Box<DeveloperDeploymentAgentBootstrapReadyV1>,
         },
         ReconcileRequired(Box<DeveloperDeploymentOwnerV1>),
     }
@@ -1094,13 +1094,11 @@ mod platform {
         match advanced {
             Ok(Some(ready)) => Ok(DeveloperDeploymentAgentBootstrapStartOutcomeV1::Ready {
                 owner: Box::new(owner),
-                ready,
+                ready: Box::new(ready),
             }),
-            Ok(None) => {
-                Ok(DeveloperDeploymentAgentBootstrapStartOutcomeV1::ReconcileRequired(Box::new(
-                    owner,
-                )))
-            }
+            Ok(None) => Ok(
+                DeveloperDeploymentAgentBootstrapStartOutcomeV1::ReconcileRequired(Box::new(owner)),
+            ),
             Err(error) => {
                 let _ = owner.shutdown_and_join().await;
                 Err(error)
