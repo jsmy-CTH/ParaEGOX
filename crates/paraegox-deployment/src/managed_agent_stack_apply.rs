@@ -2189,10 +2189,10 @@ mod tests {
                 Ok(())
             })
             .expect("inner and outer Agent Uncertain fences durable");
-        assert_eq!(
+        assert!(matches!(
             journal.prepared_remote_agent_control(&controller, &remote, &ingress),
             Err(ManagedAgentStackApplyControllerError::OpaqueReplayForbidden)
-        );
+        ));
         let inner = active_stack_receipt(
             action
                 .request()
@@ -2241,7 +2241,7 @@ mod tests {
             channel: action.channel,
             remote_send_available: true,
         };
-        assert_eq!(
+        assert!(matches!(
             journal.consume_remote_agent_control_pxah_with(
                 unspent,
                 transport.clone(),
@@ -2251,7 +2251,7 @@ mod tests {
                 |_| Ok(()),
             ),
             Err(ManagedAgentStackApplyControllerError::SendActionMismatch)
-        );
+        ));
 
         let agent_calls = Cell::new(0_u8);
         let first = action
@@ -2318,10 +2318,10 @@ mod tests {
                 |_| Ok(()),
             )
             .expect("descriptor Uncertain fence durable");
-        assert_eq!(
+        assert!(matches!(
             journal.prepared_conversation_port_descriptor(&controller, &remote, &ingress),
             Err(ManagedAgentStackApplyControllerError::OpaqueReplayForbidden)
-        );
+        ));
         let fabric_generation = journal
             .state()
             .receipt()
@@ -2373,7 +2373,7 @@ mod tests {
             request: descriptor_action.request.clone(),
             remote_send_available: true,
         };
-        assert_eq!(
+        assert!(matches!(
             journal.consume_conversation_port_descriptor_pxah_with(
                 unspent,
                 transport.clone(),
@@ -2383,7 +2383,7 @@ mod tests {
                 |_| Ok(()),
             ),
             Err(ManagedAgentStackApplyControllerError::SendActionMismatch)
-        );
+        ));
 
         let descriptor_calls = Cell::new(0_u8);
         let first = descriptor_action
