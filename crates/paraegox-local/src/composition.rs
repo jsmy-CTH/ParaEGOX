@@ -172,6 +172,7 @@ const DEVELOPER_NODE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const DEVELOPER_NODE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEVELOPER_DEPLOYMENT_OWNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEVELOPER_DEPLOYMENT_CONNECTOR_TIMEOUT: Duration = Duration::from_secs(5);
+const DEVELOPER_DEPLOYMENT_EXECUTOR_STACK_BYTES: usize = 16 * 1024 * 1024;
 const DEVELOPER_DEPLOYMENT_AUTHORITY_OWNER_DOMAIN: &[u8] =
     b"paraegox.local.developer-deployment-authority-owner.sha256.v1";
 const DEVELOPER_NODE_CONTROL_ED25519_ALGORITHM: u16 = 1;
@@ -221,6 +222,19 @@ pub(crate) fn run(config: DeveloperFixtureConfigV1) -> Result<(), LocalProcessEr
 pub(crate) fn run_deployment(config: DeveloperDeploymentConfigV1) -> Result<(), LocalProcessError> {
     let peer = DeveloperLocalPeerIdentityV1::current()
         .map_err(|_| LocalProcessError::UnsafeExecutionIdentity)?;
+    thread::Builder::new()
+        .name("paraegox-deployment".to_owned())
+        .stack_size(DEVELOPER_DEPLOYMENT_EXECUTOR_STACK_BYTES)
+        .spawn(move || run_deployment_on_executor(config, peer))
+        .map_err(|_| LocalProcessError::DeploymentStartup)?
+        .join()
+        .map_err(|_| LocalProcessError::DeploymentStartup)?
+}
+
+fn run_deployment_on_executor(
+    config: DeveloperDeploymentConfigV1,
+    peer: DeveloperLocalPeerIdentityV1,
+) -> Result<(), LocalProcessError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
