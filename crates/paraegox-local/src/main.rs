@@ -365,7 +365,7 @@ mod tests {
         assert!(text.contains("schema v1 retains the G1 host-local feature-only profile"));
         assert!(text.contains("schema v2\nstarts the G2 host-side Runtime-control listener"));
         assert!(text.contains("authenticated Node-control\ningress/observation bridge"));
-        assert!(text.contains("never Controller or Authority\nprivate keys"));
+        assert!(text.contains("never Controller or Authority private\nkeys"));
         assert!(text.contains("does not run Controller, Authority"));
         assert!(text.contains("There is not yet a public Mac Controller connector"));
         assert!(text.contains("two-host cutover proof"));
