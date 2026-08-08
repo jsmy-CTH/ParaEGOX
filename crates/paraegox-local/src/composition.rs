@@ -2494,7 +2494,13 @@ fn prepare_public_developer_node(
         bootstrap.initial_feature_report(),
     )
     .map_err(|_| LocalProcessError::NodeBootstrap)?;
-    let current = owner.current_status().cloned();
+    let current = if retain_runtime_observation {
+        owner
+            .current_status_or_expire_runtime_observations(MAX_NODE_STATUS_FRESHNESS_NANOS)
+            .map_err(|_| LocalProcessError::NodeBootstrap)?
+    } else {
+        owner.current_status().cloned()
+    };
     let status = match (retain_runtime_observation, current) {
         (true, Some(status)) => status,
         (true, None) | (false, None) => owner

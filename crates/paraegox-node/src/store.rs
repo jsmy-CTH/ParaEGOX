@@ -251,6 +251,28 @@ impl DurableNodeDaemonV1 {
         self.daemon.current_status()
     }
 
+    /// Returns the current immutable status, durably replacing an expired
+    /// Runtime-observation-backed publication with a node-only publication.
+    ///
+    /// The replacement retains every RuntimeHost monotonic fence but hides
+    /// the expired discovery records. A subsequent authenticated observation
+    /// must make a RuntimeHost visible again. This lets the same Node tenure
+    /// restart after its last observation lease expires without serving that
+    /// stale lease as fresh discovery data.
+    pub fn current_status_or_expire_runtime_observations(
+        &mut self,
+        node_only_freshness_budget_nanos: u64,
+    ) -> Result<Option<NodeStatusV1>, NodeDaemonStoreError> {
+        if self.last_runtime_observation.is_none() {
+            return Ok(self.daemon.current_status().cloned());
+        }
+        let now_unix_nanos = current_unix_time_nanos()?;
+        self.current_status_or_expire_runtime_observations_at(
+            node_only_freshness_budget_nanos,
+            now_unix_nanos,
+        )
+    }
+
     /// Durably advances one already owner-verified RuntimeHost observation.
     ///
     /// The endpoint remains discovery data.  No request is sent or admitted.
@@ -436,6 +458,34 @@ impl DurableNodeDaemonV1 {
         Err(NodeDaemonStoreError::Contract(
             NodeContractError::StatusSequenceConflict,
         ))
+    }
+
+    fn current_status_or_expire_runtime_observations_at(
+        &mut self,
+        node_only_freshness_budget_nanos: u64,
+        now_unix_nanos: u64,
+    ) -> Result<Option<NodeStatusV1>, NodeDaemonStoreError> {
+        self.ensure_usable()?;
+        let current = self.daemon.current_status().cloned();
+        if self.last_runtime_observation.is_none()
+            || !self.observation_backed_status_is_expired_at(now_unix_nanos)
+        {
+            return Ok(current);
+        }
+
+        // PXNS carries one aggregate freshness deadline. Once that deadline
+        // expires, retaining any member of the old visible set would
+        // accidentally renew it. Hide the complete set, retain the reducer's
+        // RuntimeHost fences, and publish the next node-only status atomically.
+        let mut candidate = self.daemon.clone();
+        let visible_runtime_hosts: Vec<RuntimeHostId> =
+            candidate.visible_runtime_hosts.iter().copied().collect();
+        for runtime_host_id in visible_runtime_hosts {
+            candidate.forget_runtime_host(runtime_host_id);
+        }
+        let status = candidate.publish_status(node_only_freshness_budget_nanos)?;
+        self.commit_candidate_with_replay(candidate, None, BTreeMap::new())?;
+        Ok(Some(status))
     }
 
     fn transaction<T>(
@@ -1578,6 +1628,49 @@ mod tests {
         assert_eq!(
             replay.outcome,
             DurableRuntimeObservationCommitOutcome::ExactReplay
+        );
+    }
+
+    #[test]
+    fn expired_observation_restart_publishes_node_only_status_and_retains_runtime_fence() {
+        let root = TestRoot::new();
+        let request_digest = digest(98);
+        let mut store = open(&root);
+        let observed = store
+            .commit_fresh_authenticated_runtime_observation_at(
+                1,
+                runtime(2, 4, 2),
+                200,
+                request_digest,
+                100,
+            )
+            .expect("publish authenticated observation");
+
+        assert_eq!(
+            store
+                .current_status_or_expire_runtime_observations_at(1_000, 199)
+                .expect("unexpired status")
+                .expect("current status"),
+            observed.status
+        );
+        let node_only = store
+            .current_status_or_expire_runtime_observations_at(1_000, 200)
+            .expect("expire observation")
+            .expect("replacement status");
+        assert_eq!(node_only.status_sequence(), 2);
+        assert!(node_only.runtime_hosts().is_empty());
+        assert_eq!(node_only.valid_until_unix_nanos(), None);
+        assert_eq!(store.last_runtime_observation, None);
+        assert!(store.runtime_observation_valid_until.is_empty());
+        drop(store);
+
+        let mut recovered = open(&root);
+        assert_eq!(recovered.current_status(), Some(&node_only));
+        assert_eq!(
+            recovered
+                .observe_runtime_host(runtime(1, 99, 2))
+                .expect_err("expired visibility must not erase the Runtime epoch fence"),
+            NodeDaemonStoreError::Contract(crate::NodeContractError::StaleRuntimeHostEpoch)
         );
     }
 
