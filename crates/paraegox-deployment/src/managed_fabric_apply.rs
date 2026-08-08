@@ -3593,6 +3593,8 @@ pub(crate) mod tests {
         TenureProofAlgorithm, TenureProofAuthority, WriterTenureClaim, WriterTenureProof,
         WriterTenureSigningTranscript,
     };
+    #[cfg(unix)]
+    use paraegox_runtime_contracts::assignment::BindingId;
     use paraegox_runtime_contracts::distributed_agent_stack_plan::{
         RestrictedRuntimeApplyCarrierBindingFieldsV1, RestrictedRuntimeApplyCarrierBindingV1,
     };
@@ -3601,11 +3603,21 @@ pub(crate) mod tests {
         InstalledRuntimeArtifactObservationV1, RuntimeCompiledInstallationFactsV1,
         VerifiedRuntimeInstallationV1, generate_build_descriptor, generate_manifest,
     };
+    #[cfg(unix)]
+    use paraegox_runtime_contracts::managed_agent_stack_plan::{
+        ManagedAgentIngressLimitsV1, ManagedAgentPortPlanV1, ManagedAgentProviderRefV1,
+        ManagedAgentProviderSelectionV1, ManagedAgentSemanticLimitsV1, ManagedAgentServicePlanV1,
+    };
     use paraegox_runtime_contracts::managed_fabric_plan::{
         ManagedFabricApplyTerminalEvidenceV1, ManagedFabricApplyTerminalHeadV1,
         ManagedFabricApplyTerminalLifecycleEffectV1, ManagedFabricApplyTerminalOutcomeV1,
         ManagedFabricApplyTerminalReceiptAuthClaimV1, ManagedFabricApplyTerminalReceiptDraftV1,
         ManagedFabricApplyTerminalStateV1, ManagedFabricListenEndpointV1,
+    };
+    #[cfg(unix)]
+    use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+        ManagedModelAdapterBindingV1, ManagedModelAdapterVersionV1, ManagedModelCapabilityIdV1,
+        ManagedModelServicePlanV1,
     };
     use paraegox_runtime_contracts::managed_service::{
         ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleBudgetsV1,
@@ -3665,6 +3677,13 @@ pub(crate) mod tests {
         ManagedFabricRemoteControllerProvisioningV1, ManagedFabricRuntimeChannelPinV1,
         ManagedFabricServiceAccountsV1, ManagedFabricTenureAuthorityPinV1,
         VerifiedManagedFabricProducerContextV1,
+    };
+    #[cfg(unix)]
+    use crate::managed_model_agent_stack_apply::ManagedModelAgentStackControllerStateV1;
+    #[cfg(unix)]
+    use crate::managed_model_agent_stack_producer::{
+        FreshManagedModelAgentStackApplyV1, ManagedModelAgentStackActivationV1,
+        ManagedModelAgentStackDesiredPlanV1, produce_managed_model_agent_stack_request_v1,
     };
     use crate::managed_serving_client::{
         FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1, ManagedServingBootstrapStateV1,
@@ -4225,20 +4244,16 @@ pub(crate) mod tests {
             .expect("Describe response")
     }
 
-    pub(crate) async fn remote_managed_ready_journal() -> (
+    async fn remote_managed_ready_journal_from_state(
+        state: ManagedFabricControllerStateV1,
+    ) -> (
         ManagedFabricApplyJournalV1,
         ManagedFabricRemoteControllerProvisioningV1,
         ManagedServingDescribeIngressV1,
     ) {
         let controller = controller_signer();
         let (remote, ingress) = remote_provisioning_and_ingress();
-        let mut journal = ManagedFabricApplyJournalV1::new(
-            ManagedFabricControllerStateV1::try_from_cutover(
-                Digest32::from_bytes([0xd0; 32]),
-                ready_snapshot(),
-            )
-            .expect("remote fixture cutover"),
-        );
+        let mut journal = ManagedFabricApplyJournalV1::new(state);
         let prepared = journal
             .prepare_remote_managed_ready_describe_with(
                 &controller,
@@ -4279,6 +4294,40 @@ pub(crate) mod tests {
         (journal, remote, ingress)
     }
 
+    pub(crate) async fn remote_managed_ready_journal() -> (
+        ManagedFabricApplyJournalV1,
+        ManagedFabricRemoteControllerProvisioningV1,
+        ManagedServingDescribeIngressV1,
+    ) {
+        remote_managed_ready_journal_from_state(
+            ManagedFabricControllerStateV1::try_from_cutover(
+                Digest32::from_bytes([0xd0; 32]),
+                ready_snapshot(),
+            )
+            .expect("remote fixture cutover"),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn remote_connector_managed_ready_journal() -> (
+        ManagedFabricApplyJournalV1,
+        ManagedFabricRemoteControllerProvisioningV1,
+        ManagedServingDescribeIngressV1,
+    ) {
+        let predecessor = crate::controller_journal::tests::remote_connector_terminal_snapshot_from(
+            ready_snapshot(),
+        );
+        remote_managed_ready_journal_from_state(
+            ManagedFabricControllerStateV1::try_from_remote_connector_cutover(
+                Digest32::from_bytes([0xd0; 32]),
+                predecessor,
+            )
+            .expect("remote connector fixture cutover"),
+        )
+        .await
+    }
+
     fn signed_runtime_fabric_receipt(
         request: &paraegox_runtime_contracts::managed_serving_bootstrap::
             RuntimeAgentControlRequestV1,
@@ -4317,13 +4366,14 @@ pub(crate) mod tests {
             .expect("signed PXAH Fabric receipt")
     }
 
+    #[cfg(unix)]
     pub(crate) async fn remote_fabric_agent_control_terminal_journal() -> (
         ManagedFabricApplyJournalV1,
         ManagedFabricRemoteControllerProvisioningV1,
         ManagedServingDescribeIngressV1,
     ) {
         let controller = controller_signer();
-        let (mut journal, remote, ingress) = remote_managed_ready_journal().await;
+        let (mut journal, remote, ingress) = remote_connector_managed_ready_journal().await;
         let prepared = journal
             .prepare_remote_agent_control_activate_with(
                 ManagedFabricRemoteAgentControlActivateInputV1 {
@@ -4388,6 +4438,115 @@ pub(crate) mod tests {
             [marker.wrapping_add(2); 32],
         )
         .expect("fresh request identities")
+    }
+
+    #[cfg(unix)]
+    fn sibling_provider(marker: u8) -> ManagedAgentProviderSelectionV1 {
+        ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+            ManagedAgentProviderRefV1::try_from_bytes([marker; 16]).expect("provider ref"),
+            Digest32::from_bytes([marker.wrapping_add(1); 32]),
+        )
+        .expect("provider selection")
+    }
+
+    #[cfg(unix)]
+    fn sibling_budgets(values: [u64; 5]) -> ManagedServiceLifecycleBudgetsV1 {
+        ManagedServiceLifecycleBudgetsV1::try_new(
+            BoundedDuration::from_nanos(values[0]),
+            BoundedDuration::from_nanos(values[1]),
+            BoundedDuration::from_nanos(values[2]),
+            BoundedDuration::from_nanos(values[3]),
+            BoundedDuration::from_nanos(values[4]),
+        )
+        .expect("sibling lifecycle budgets")
+    }
+
+    #[cfg(unix)]
+    fn sibling_agent_plan() -> ManagedAgentServicePlanV1 {
+        let ingress = ManagedAgentIngressLimitsV1::try_new(
+            64,
+            512 * 1024,
+            128 * 1024,
+            128 * 1024,
+            5_000_000_000,
+        )
+        .expect("sibling Agent ingress");
+        let port = ManagedAgentPortPlanV1::try_new(
+            BindingId::from_bytes([0x81; 16]),
+            BindingId::from_bytes([0x82; 16]),
+            "paraegox/agent/v1/submit",
+            "paraegox/agent/v1/control",
+            ingress,
+        )
+        .expect("sibling Agent port");
+        ManagedAgentServicePlanV1::try_new(
+            ManagedServiceSpecV1::new(
+                ManagedServiceId::from_bytes([0x88; 16]),
+                sibling_budgets([7, 11, 13, 17, 19]),
+            ),
+            ManagedAgentSemanticLimitsV1::try_new(16, 64, 64, 64).expect("sibling Agent limits"),
+            port,
+            sibling_provider(0x83),
+        )
+        .expect("sibling Agent plan")
+    }
+
+    #[cfg(unix)]
+    fn sibling_model_plan() -> ManagedModelServicePlanV1 {
+        ManagedModelServicePlanV1::try_new(
+            ManagedServiceSpecV1::new(
+                ManagedServiceId::from_bytes([0x89; 16]),
+                sibling_budgets([23, 29, 31, 37, 41]),
+            ),
+            8,
+            sibling_provider(0x83),
+            ManagedModelAdapterBindingV1::try_new(
+                [0x90; 16],
+                ManagedModelAdapterVersionV1::try_new(7).expect("adapter version"),
+                ManagedModelCapabilityIdV1::bounded_text_v1(),
+            )
+            .expect("sibling Model adapter"),
+        )
+        .expect("sibling Model plan")
+    }
+
+    #[cfg(unix)]
+    fn prepared_remote_model_stack_state(
+        fabric: &ManagedFabricControllerStateV1,
+        controller: &SigningKey,
+        remote: &ManagedFabricRemoteControllerProvisioningV1,
+        ingress: &ManagedServingDescribeIngressV1,
+    ) -> ManagedModelAgentStackControllerStateV1 {
+        let (context, _) = fabric
+            .verified_current_remote_agent_context(controller, remote, ingress)
+            .expect("remote Model sibling context");
+        let predecessor_desired = fabric.desired().expect("active Fabric desired");
+        let predecessor_request = fabric.request().expect("active Fabric request");
+        let activation = ManagedModelAgentStackActivationV1::try_new(
+            predecessor_desired.execution().clone(),
+            sibling_agent_plan(),
+            sibling_model_plan(),
+        )
+        .expect("sibling Model activation");
+        let desired = ManagedModelAgentStackDesiredPlanV1::try_activate(
+            &context,
+            fabric.cutover_marker_digest(),
+            predecessor_desired.revision(),
+            predecessor_desired.execution(),
+            predecessor_request.target_slice_digest(),
+            &activation,
+        )
+        .expect("sibling Model desired");
+        let request = produce_managed_model_agent_stack_request_v1(
+            &context,
+            &desired,
+            FreshManagedModelAgentStackApplyV1::try_new([0xe7; 16], [0xe8; 16], [0xe9; 32])
+                .expect("fresh sibling Model identities"),
+            controller,
+        )
+        .expect("sibling Model request");
+        ManagedModelAgentStackControllerStateV1::try_prepared(desired, request)
+            .expect("prepared sibling Model state")
     }
 
     pub(crate) fn active_receipt(
@@ -4674,6 +4833,64 @@ pub(crate) mod tests {
                 "migration-on-write must emit only PXFJ v7"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pxfj_v7_remote_outer_rejects_checksum_resigned_idle_sibling_states() {
+        let controller = controller_signer();
+        let (journal, remote, ingress) = remote_fabric_agent_control_terminal_journal().await;
+        assert_eq!(
+            journal.state().fabric_agent_control().phase(),
+            RuntimeAgentControlDurablePhaseV1::ReceiptDurable
+        );
+        assert_eq!(
+            journal.state().agent_stack_agent_control().phase(),
+            RuntimeAgentControlDurablePhaseV1::Idle
+        );
+
+        let assert_strict_reopen_rejects =
+            |state: &ManagedFabricControllerStateV1, sibling: &str| {
+                let encoded = state.encode().expect("checksum-resigned PXFJ v7");
+                let body_end = encoded.len() - STATE_CHECKSUM_BYTES;
+                let expected = state_checksum(&encoded[..body_end]).expect("PXFJ checksum");
+                assert_eq!(expected.as_bytes(), &encoded[body_end..]);
+                assert_eq!(
+                    ManagedFabricControllerStateV1::decode_remote(
+                        &encoded,
+                        &controller,
+                        &remote,
+                        &ingress,
+                    )
+                    .expect_err("outer Fabric with an Idle-owned sibling must fail closed"),
+                    ManagedFabricApplyControllerError::AgentControlMismatch,
+                    "{sibling} must be owned by its matching outer slot"
+                );
+            };
+
+        let mut agent_tampered = journal.state().clone();
+        agent_tampered.agent_stack = Some(
+            crate::managed_agent_stack_apply::tests::prepared_remote_agent_stack_state(
+                journal.state(),
+                &controller,
+                &remote,
+                &ingress,
+            ),
+        );
+        assert_eq!(
+            agent_tampered.agent_stack_agent_control().phase(),
+            RuntimeAgentControlDurablePhaseV1::Idle
+        );
+        assert_strict_reopen_rejects(&agent_tampered, "Agent sibling");
+
+        let mut model_tampered = journal.state().clone();
+        model_tampered.model_stack = Some(prepared_remote_model_stack_state(
+            journal.state(),
+            &controller,
+            &remote,
+            &ingress,
+        ));
+        assert_strict_reopen_rejects(&model_tampered, "Model sibling");
     }
 
     #[tokio::test(flavor = "current_thread")]
