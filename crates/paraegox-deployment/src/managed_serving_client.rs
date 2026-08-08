@@ -2534,6 +2534,15 @@ pub(crate) enum RuntimeManagedServingDescribeTransportErrorV1 {
     Rejected,
 }
 
+/// Classification returned by exactly one restricted Runtime Agent-control
+/// exchange. No variant grants replay authority for the spent PXAG.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeAgentControlTransportErrorV1 {
+    NotSent,
+    Uncertain,
+    Rejected,
+}
+
 /// Fail-closed Controller errors for PXFB/PXFR durable ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedServingControllerError {
@@ -2578,6 +2587,8 @@ pub(crate) enum ManagedServingControllerError {
     AgentControlReceiptMismatch,
     AgentControlUnauthenticatedTransport,
     AgentControlTransportPinMismatch,
+    AgentControlTransport(RuntimeAgentControlTransportErrorV1),
+    AgentControlTransportAuthoritySpent,
     ReferenceQueryRequiresLegacyReady,
     ReferenceQueryRequestMismatch,
     ReferenceQueryUnauthenticatedTransport,
@@ -2628,6 +2639,12 @@ impl From<RuntimeManagedServingDescribeTransportErrorV1> for ManagedServingContr
     }
 }
 
+impl From<RuntimeAgentControlTransportErrorV1> for ManagedServingControllerError {
+    fn from(value: RuntimeAgentControlTransportErrorV1) -> Self {
+        Self::AgentControlTransport(value)
+    }
+}
+
 impl fmt::Display for ManagedServingControllerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "managed serving Controller failed: {self:?}")
@@ -2652,7 +2669,7 @@ mod tests {
     use paraegox_runtime_contracts::managed_serving_bootstrap::{
         ManagedServingBootstrapError, ManagedServingBootstrapFactsV1,
         ManagedServingBootstrapRequestIdV1, ManagedServingBootstrapResponseAuthClaimV1,
-        RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestDraftV1,
+        RuntimeAgentControlKindV1, RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestDraftV1,
         RuntimeControlCarrierRequestV1, RuntimeControlDescribeReadyFactsV1,
         RuntimeControlDescribeReadyPhaseV1, RuntimeControlDescribeReadyResponseDraftV1,
     };
@@ -2671,10 +2688,12 @@ mod tests {
     };
 
     use super::{
-        FreshManagedServingBootstrapV1, ManagedServingBootstrapPhaseV1,
-        ManagedServingBootstrapStateV1, ManagedServingControllerError,
-        ManagedServingDescribeIngressV1, ManagedServingDescribeVerifierV1,
-        RuntimeReferenceQueryMtlsExchangeSuccessV1, RuntimeReferenceQueryTransportErrorV1,
+        FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1,
+        ManagedServingBootstrapPhaseV1, ManagedServingBootstrapStateV1,
+        ManagedServingControllerError, ManagedServingDescribeIngressV1,
+        ManagedServingDescribeVerifierV1, RuntimeAgentControlDurablePhaseV1,
+        RuntimeAgentControlDurableSlotV1, RuntimeReferenceQueryMtlsExchangeSuccessV1,
+        RuntimeReferenceQueryTransportErrorV1, VerifiedManagedServingReadyV1,
         ingress_reference_serving_identity,
     };
     use crate::runtime_control_client::PreparedRuntimeQueryRequest;
@@ -2701,6 +2720,72 @@ mod tests {
         assert_eq!(
             ManagedServingBootstrapStateV1::initial().require_remote_prepare_ready(),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn exact_pxag_slot_reopens_uncertain_without_replay_authority() {
+        let (projection, controller, runtime, carrier, verifier) = fixture();
+        let describe = describe_request(&carrier, &controller, 0x91);
+        let response = describe_response(ResponseInput {
+            request: &describe,
+            projection: projection.clone(),
+            channel: channel(projection.target(), 0x92),
+            store: STORE,
+            epoch: 3,
+            snapshot: 5,
+            phase: RuntimeControlDescribeReadyPhaseV1::ManagedReady,
+            runtime: &runtime,
+        });
+        let ready = VerifiedManagedServingReadyV1 {
+            ingress: ManagedServingDescribeIngressV1::try_accept(
+                &verifier,
+                None,
+                describe,
+                &response,
+            )
+            .expect("ManagedReady ingress"),
+        };
+        let request = verifier
+            .try_build_conversation_port_agent_control(
+                &ready,
+                Digest32::from_bytes([0x93; 32]),
+                PrincipalRef::from_bytes([0x94; 16]),
+                FreshRuntimeAgentControlV1::try_new([0x95; 16], [0x96; 32])
+                    .expect("fresh PXAG"),
+                &controller,
+            )
+            .expect("signed descriptor PXAG");
+        assert_eq!(
+            request.kind(),
+            RuntimeAgentControlKindV1::DescribeConversationPort
+        );
+
+        let idle = RuntimeAgentControlDurableSlotV1::idle();
+        assert_eq!(
+            RuntimeAgentControlDurableSlotV1::decode(
+                RuntimeAgentControlDurablePhaseV1::Idle,
+                request.canonical_wire(),
+                &[],
+            ),
+            Err(ManagedServingControllerError::InvalidAgentControlState)
+        );
+        let prepared = idle.try_prepare(request).expect("PXAG request durable");
+        let uncertain = prepared.try_claim().expect("PXAG send fence durable");
+        assert_eq!(
+            uncertain.try_claim(),
+            Err(ManagedServingControllerError::AgentControlReplayForbidden)
+        );
+        let reopened = RuntimeAgentControlDurableSlotV1::decode(
+            RuntimeAgentControlDurablePhaseV1::Uncertain,
+            uncertain.request_wire(),
+            &[],
+        )
+        .expect("exact Uncertain PXAG reopens without an action");
+        assert_eq!(reopened, uncertain);
+        assert_eq!(
+            reopened.try_claim(),
+            Err(ManagedServingControllerError::AgentControlReplayForbidden)
         );
     }
 

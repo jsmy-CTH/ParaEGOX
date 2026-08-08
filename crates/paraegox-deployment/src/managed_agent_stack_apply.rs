@@ -5,6 +5,7 @@
 //! cannot reinterpret or rewrite the already committed Fabric activation.
 
 use core::fmt;
+use core::future::Future;
 
 use ed25519_dalek::Signature;
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
@@ -39,6 +40,7 @@ use crate::managed_fabric_producer::{
 use crate::managed_serving_client::{
     FreshRuntimeAgentControlV1, ManagedServingControllerError, ManagedServingDescribeIngressV1,
     RuntimeAgentControlDurablePhaseV1, RuntimeAgentControlMtlsExchangeSuccessV1,
+    RuntimeAgentControlTransportErrorV1,
 };
 
 const STATE_MAGIC: &[u8; 4] = b"PXAJ";
@@ -505,17 +507,62 @@ pub(crate) struct ManagedAgentStackAgentControlSendActionV1 {
     cutover_marker_digest: Digest32,
     request: RuntimeAgentControlRequestV1,
     channel: ReferenceChannelBindingV1,
+    remote_send_available: bool,
 }
 
 impl ManagedAgentStackAgentControlSendActionV1 {
     #[must_use]
-    pub(crate) const fn request(&self) -> &RuntimeAgentControlRequestV1 {
+    const fn request(&self) -> &RuntimeAgentControlRequestV1 {
         &self.request
     }
 
     #[must_use]
-    pub(crate) fn canonical_request_bytes(&self) -> &[u8] {
+    fn canonical_request_bytes(&self) -> &[u8] {
         self.request.canonical_wire()
+    }
+
+    /// Spends this Agent-stack PXAG across exactly one transport call.
+    pub(crate) async fn exchange_remote_once<Exchange, ExchangeFuture>(
+        self,
+        exchange: Exchange,
+    ) -> ManagedAgentStackAgentControlRemoteExchangeOutcomeV1
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<
+                RuntimeAgentControlMtlsExchangeSuccessV1,
+                RuntimeAgentControlTransportErrorV1,
+            >,
+        >,
+    {
+        let mut action = self;
+        let response = if action.remote_send_available {
+            action.remote_send_available = false;
+            exchange(action.request.canonical_wire().into())
+                .await
+                .map_err(ManagedServingControllerError::from)
+        } else {
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        };
+        ManagedAgentStackAgentControlRemoteExchangeOutcomeV1 { action, response }
+    }
+}
+
+/// Result of spending one Agent-stack PXAG transport authority.
+#[derive(Debug)]
+pub(crate) struct ManagedAgentStackAgentControlRemoteExchangeOutcomeV1 {
+    action: ManagedAgentStackAgentControlSendActionV1,
+    response: Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+}
+
+impl ManagedAgentStackAgentControlRemoteExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedAgentStackAgentControlSendActionV1,
+        Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+    ) {
+        (self.action, self.response)
     }
 }
 
@@ -557,17 +604,63 @@ pub(crate) struct ConversationPortDescriptorSendActionV1 {
     outer_sequence: u64,
     cutover_marker_digest: Digest32,
     request: RuntimeAgentControlRequestV1,
+    remote_send_available: bool,
 }
 
 impl ConversationPortDescriptorSendActionV1 {
     #[must_use]
-    pub(crate) const fn request(&self) -> &RuntimeAgentControlRequestV1 {
+    const fn request(&self) -> &RuntimeAgentControlRequestV1 {
         &self.request
     }
 
     #[must_use]
-    pub(crate) fn canonical_request_bytes(&self) -> &[u8] {
+    fn canonical_request_bytes(&self) -> &[u8] {
         self.request.canonical_wire()
+    }
+
+    /// Spends this bootstrap-only Describe PXAG across exactly one transport
+    /// call. A failed call leaves the durable slot `Uncertain` and spent.
+    pub(crate) async fn exchange_remote_once<Exchange, ExchangeFuture>(
+        self,
+        exchange: Exchange,
+    ) -> ConversationPortDescriptorRemoteExchangeOutcomeV1
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<
+                RuntimeAgentControlMtlsExchangeSuccessV1,
+                RuntimeAgentControlTransportErrorV1,
+            >,
+        >,
+    {
+        let mut action = self;
+        let response = if action.remote_send_available {
+            action.remote_send_available = false;
+            exchange(action.request.canonical_wire().into())
+                .await
+                .map_err(ManagedServingControllerError::from)
+        } else {
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        };
+        ConversationPortDescriptorRemoteExchangeOutcomeV1 { action, response }
+    }
+}
+
+/// Result of spending one descriptor PXAG transport authority.
+#[derive(Debug)]
+pub(crate) struct ConversationPortDescriptorRemoteExchangeOutcomeV1 {
+    action: ConversationPortDescriptorSendActionV1,
+    response: Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+}
+
+impl ConversationPortDescriptorRemoteExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ConversationPortDescriptorSendActionV1,
+        Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+    ) {
+        (self.action, self.response)
     }
 }
 
@@ -856,6 +949,7 @@ impl ManagedAgentStackApplyJournalV1 {
             cutover_marker_digest: self.state.cutover_marker_digest(),
             request,
             channel: context.channel(),
+            remote_send_available: true,
         })
     }
 
@@ -896,6 +990,7 @@ impl ManagedAgentStackApplyJournalV1 {
             || action.cutover_marker_digest != self.state.cutover_marker_digest()
             || self.state.agent_stack_agent_control().request() != Some(&action.request)
             || action.channel != context.channel()
+            || action.remote_send_available
         {
             return Err(ManagedAgentStackApplyControllerError::SendActionMismatch);
         }
@@ -1141,6 +1236,7 @@ impl ManagedAgentStackApplyJournalV1 {
             outer_sequence: self.state.sequence(),
             cutover_marker_digest: self.state.cutover_marker_digest(),
             request,
+            remote_send_available: true,
         })
     }
 
@@ -1170,6 +1266,7 @@ impl ManagedAgentStackApplyJournalV1 {
             || action.outer_sequence != self.state.sequence()
             || action.cutover_marker_digest != self.state.cutover_marker_digest()
             || self.state.conversation_port_descriptor().request() != Some(&action.request)
+            || action.remote_send_available
         {
             return Err(ManagedAgentStackApplyControllerError::SendActionMismatch);
         }
@@ -1776,10 +1873,11 @@ impl std::error::Error for ManagedAgentStackApplyControllerError {}
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use ed25519_dalek::{Signer, SigningKey};
     use paraegox_kernel::digest::Digest32;
+    use paraegox_kernel::identity::PrincipalRef;
     use paraegox_kernel::time::BoundedDuration;
     use paraegox_runtime_contracts::apply::ExpectedActive;
     use paraegox_runtime_contracts::assignment::BindingId;
@@ -1801,16 +1899,23 @@ mod tests {
         ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleBudgetsV1,
         ManagedServiceSpecV1,
     };
+    use paraegox_runtime_contracts::managed_serving_bootstrap::{
+        RuntimeAgentControlReceiptDraftV1, RuntimeAgentControlResponseAuthClaimV1,
+    };
     use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
     use super::{
         FreshManagedAgentStackApplyV1, ManagedAgentStackActivationV1,
         ManagedAgentStackApplyControllerError, ManagedAgentStackApplyJournalV1,
-        ManagedAgentStackApplyPhaseV1,
+        ManagedAgentStackApplyPhaseV1, ManagedAgentStackRemoteAgentControlActivateInputV1,
     };
     use crate::managed_agent_stack_producer::ManagedAgentStackProducerError;
     use crate::managed_fabric_apply::{
         ManagedFabricApplyJournalV1, ManagedFabricControllerStateV1, tests as fabric_tests,
+    };
+    use crate::managed_serving_client::{
+        FreshRuntimeAgentControlV1, ManagedServingControllerError,
+        RuntimeAgentControlMtlsExchangeSuccessV1, RuntimeAgentControlTransportErrorV1,
     };
 
     fn lifecycle_budgets(values: [u64; 5]) -> ManagedServiceLifecycleBudgetsV1 {
@@ -2030,6 +2135,305 @@ mod tests {
         draft
             .finalize(&signature.to_bytes())
             .expect("signed empty PXST")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_agent_and_descriptor_pxag_actions_are_spent_once_and_restart_verified() {
+        let controller = fabric_tests::controller_signer();
+        let runtime = fabric_tests::runtime_signer();
+        let (fabric, remote, ingress) =
+            fabric_tests::remote_fabric_agent_control_terminal_journal().await;
+        let requested = activation(
+            fabric.state(),
+            deterministic_provider(),
+            lifecycle_budgets([7, 11, 13, 17, 19]),
+        );
+        let mut journal = ManagedAgentStackApplyJournalV1::new(fabric.state().clone());
+        let before_prepare = journal.state().sequence();
+        let prepare_commit = RefCell::new(None);
+        let prepared = journal
+            .prepare_remote_agent_control_activate_with(
+                ManagedAgentStackRemoteAgentControlActivateInputV1 {
+                    controller_signer: &controller,
+                    provisioning: &remote,
+                    previous: &ingress,
+                    activation: &requested,
+                    inner_fresh: fresh(0xb1),
+                    outer_fresh: FreshRuntimeAgentControlV1::try_new([0xb1; 16], [0xb4; 32])
+                        .expect("fresh outer Agent PXAG"),
+                },
+                |next| {
+                    *prepare_commit.borrow_mut() = Some(next.clone());
+                    Ok(())
+                },
+            )
+            .expect("inner PXAR v7 and outer PXAG durable together");
+        let durable_prepare = prepare_commit
+            .into_inner()
+            .expect("one Agent prepare commit image");
+        assert_eq!(durable_prepare.sequence(), before_prepare + 1);
+        assert_eq!(
+            durable_prepare
+                .agent_stack_state()
+                .expect("inner Agent state")
+                .phase(),
+            ManagedAgentStackApplyPhaseV1::RequestDurableNotSent
+        );
+        assert_eq!(
+            durable_prepare.agent_stack_agent_control().phase(),
+            crate::managed_serving_client::RuntimeAgentControlDurablePhaseV1::
+                RequestDurableNotSent
+        );
+
+        let action = journal
+            .claim_remote_agent_control_send_with(
+                prepared,
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("inner and outer Agent Uncertain fences durable");
+        assert_eq!(
+            journal.prepared_remote_agent_control(&controller, &remote, &ingress),
+            Err(ManagedAgentStackApplyControllerError::OpaqueReplayForbidden)
+        );
+        let inner = active_stack_receipt(
+            action
+                .request()
+                .managed_agent_stack_apply_request()
+                .expect("inner PXAR v7"),
+            &runtime,
+            ApplyAuthKeyRef::from_bytes([0x38; 16]),
+        );
+        let authenticated = action
+            .request()
+            .verify_controller_request(remote.describe().carrier(), |_, _, _, _, _| true)
+            .expect("authenticated Agent PXAG fixture");
+        let auth = RuntimeAgentControlResponseAuthClaimV1::try_new(
+            remote.describe().carrier(),
+            ApplyAuthKeyRef::from_bytes([0x38; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("outer Agent algorithm"),
+            1,
+        )
+        .expect("outer Agent auth claim");
+        let draft = RuntimeAgentControlReceiptDraftV1::try_managed_agent_stack_apply(
+            authenticated,
+            inner,
+            fabric_tests::channel(),
+            auth,
+        )
+        .expect("Agent PXAH draft");
+        let signature = runtime.sign(
+            draft
+                .signing_transcript()
+                .expect("Agent PXAH transcript")
+                .as_bytes(),
+        );
+        let outer = draft
+            .finalize(&signature.to_bytes())
+            .expect("signed Agent PXAH");
+        let transport = RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
+            remote.describe().carrier().runtime_principal(),
+            remote.describe().carrier().binding_digest(),
+            outer.canonical_wire().into(),
+        )
+        .expect("authenticated Agent PXAH transport");
+        let unspent = super::ManagedAgentStackAgentControlSendActionV1 {
+            outer_sequence: action.outer_sequence,
+            cutover_marker_digest: action.cutover_marker_digest,
+            request: action.request.clone(),
+            channel: action.channel,
+            remote_send_available: true,
+        };
+        assert_eq!(
+            journal.consume_remote_agent_control_pxah_with(
+                unspent,
+                transport.clone(),
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            ),
+            Err(ManagedAgentStackApplyControllerError::SendActionMismatch)
+        );
+
+        let agent_calls = Cell::new(0_u8);
+        let first = action
+            .exchange_remote_once(|_| {
+                agent_calls.set(agent_calls.get() + 1);
+                let transport = transport.clone();
+                async move { Ok(transport) }
+            })
+            .await;
+        let (spent, response) = first.into_parts();
+        let transport = response.expect("first Agent transport response");
+        let second = spent
+            .exchange_remote_once(|_| {
+                agent_calls.set(agent_calls.get() + 1);
+                async {
+                    Err::<RuntimeAgentControlMtlsExchangeSuccessV1, _>(
+                        RuntimeAgentControlTransportErrorV1::Rejected,
+                    )
+                }
+            })
+            .await;
+        let (spent, second_response) = second.into_parts();
+        assert_eq!(agent_calls.get(), 1);
+        assert_eq!(
+            second_response,
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        );
+        let terminal = journal
+            .consume_remote_agent_control_pxah_with(
+                spent,
+                transport,
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("inner PXST and outer Agent PXAH durable together");
+        assert!(!terminal.replayed_from_journal());
+        let replay = journal
+            .remote_agent_control_terminal(&controller, &remote, &ingress)
+            .expect("Agent terminal signatures reverify")
+            .expect("Agent terminal exists");
+        assert!(replay.replayed_from_journal());
+        assert_eq!(replay.inner(), terminal.inner());
+        assert_eq!(replay.outer(), terminal.outer());
+
+        let descriptor_prepared = journal
+            .prepare_conversation_port_descriptor_with(
+                &controller,
+                &remote,
+                &ingress,
+                PrincipalRef::from_bytes([0xc1; 16]),
+                FreshRuntimeAgentControlV1::try_new([0xc2; 16], [0xc3; 32])
+                    .expect("fresh descriptor PXAG"),
+                |_| Ok(()),
+            )
+            .expect("bootstrap-only descriptor PXAG durable");
+        let descriptor_action = journal
+            .claim_conversation_port_descriptor_with(
+                descriptor_prepared,
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("descriptor Uncertain fence durable");
+        assert_eq!(
+            journal.prepared_conversation_port_descriptor(&controller, &remote, &ingress),
+            Err(ManagedAgentStackApplyControllerError::OpaqueReplayForbidden)
+        );
+        let fabric_generation = journal
+            .state()
+            .receipt()
+            .and_then(|receipt| receipt.facts().generation())
+            .expect("active Fabric generation");
+        let agent_generation = journal
+            .state()
+            .agent_stack_state()
+            .and_then(super::ManagedAgentStackControllerStateV1::receipt)
+            .and_then(|receipt| receipt.facts().state().agent_generation())
+            .expect("active Agent generation");
+        let authenticated = descriptor_action
+            .request()
+            .verify_controller_request(remote.describe().carrier(), |_, _, _, _, _| true)
+            .expect("authenticated descriptor PXAG fixture");
+        let auth = RuntimeAgentControlResponseAuthClaimV1::try_new(
+            remote.describe().carrier(),
+            ApplyAuthKeyRef::from_bytes([0x38; 16]),
+            ApplyAuthAlgorithm::try_new(1).expect("descriptor algorithm"),
+            1,
+        )
+        .expect("descriptor Runtime auth claim");
+        let draft = RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
+            authenticated,
+            b"PXAP\0\x01opaque",
+            fabric_generation,
+            agent_generation,
+            auth,
+        )
+        .expect("descriptor PXAH draft");
+        let signature = runtime.sign(
+            draft
+                .signing_transcript()
+                .expect("descriptor PXAH transcript")
+                .as_bytes(),
+        );
+        let receipt = draft
+            .finalize(&signature.to_bytes())
+            .expect("signed descriptor PXAH");
+        let transport = RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
+            remote.describe().carrier().runtime_principal(),
+            remote.describe().carrier().binding_digest(),
+            receipt.canonical_wire().into(),
+        )
+        .expect("authenticated descriptor transport");
+        let unspent = super::ConversationPortDescriptorSendActionV1 {
+            outer_sequence: descriptor_action.outer_sequence,
+            cutover_marker_digest: descriptor_action.cutover_marker_digest,
+            request: descriptor_action.request.clone(),
+            remote_send_available: true,
+        };
+        assert_eq!(
+            journal.consume_conversation_port_descriptor_pxah_with(
+                unspent,
+                transport.clone(),
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            ),
+            Err(ManagedAgentStackApplyControllerError::SendActionMismatch)
+        );
+
+        let descriptor_calls = Cell::new(0_u8);
+        let first = descriptor_action
+            .exchange_remote_once(|_| {
+                descriptor_calls.set(descriptor_calls.get() + 1);
+                let transport = transport.clone();
+                async move { Ok(transport) }
+            })
+            .await;
+        let (spent, response) = first.into_parts();
+        let transport = response.expect("first descriptor transport response");
+        let second = spent
+            .exchange_remote_once(|_| {
+                descriptor_calls.set(descriptor_calls.get() + 1);
+                async {
+                    Err::<RuntimeAgentControlMtlsExchangeSuccessV1, _>(
+                        RuntimeAgentControlTransportErrorV1::Rejected,
+                    )
+                }
+            })
+            .await;
+        let (spent, second_response) = second.into_parts();
+        assert_eq!(descriptor_calls.get(), 1);
+        assert_eq!(
+            second_response,
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        );
+        let descriptor = journal
+            .consume_conversation_port_descriptor_pxah_with(
+                spent,
+                transport,
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("descriptor PXAH durable");
+        assert_eq!(descriptor.descriptor(), Some(&b"PXAP\0\x01opaque"[..]));
+        assert!(!descriptor.replayed_from_journal());
+        let replay = journal
+            .conversation_port_descriptor_terminal(&controller, &remote, &ingress)
+            .expect("descriptor receipt revalidates")
+            .expect("descriptor terminal exists");
+        assert!(replay.replayed_from_journal());
+        assert_eq!(replay.receipt(), descriptor.receipt());
     }
 
     #[test]

@@ -46,7 +46,8 @@ use crate::managed_serving_client::{
     ManagedServingBootstrapStateV1, ManagedServingControllerError, ManagedServingDescribeIngressV1,
     ManagedServingDescribeReconcileDecodeV1, ManagedServingDescribeReconcilePhaseV1,
     RuntimeAgentControlDurablePhaseV1, RuntimeAgentControlDurableSlotV1,
-    RuntimeAgentControlMtlsExchangeSuccessV1, RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
+    RuntimeAgentControlMtlsExchangeSuccessV1, RuntimeAgentControlTransportErrorV1,
+    RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
     RuntimeManagedServingDescribeTransportErrorV1, RuntimeManagedServingMtlsExchangeSuccessV1,
     RuntimeManagedServingTransportErrorV1, VerifiedManagedServingPinV1,
     VerifiedManagedServingReadyV1, VerifiedRuntimeManagedServingResponseV1,
@@ -1543,8 +1544,7 @@ fn validate_runtime_agent_control_slots(
     // the only compatibility path for v2-v6 and legacy direct-carrier state.
     if state.model_stack.is_some()
         || (state.agent_stack.is_some()
-            && state.agent_stack_agent_control.phase()
-                == RuntimeAgentControlDurablePhaseV1::Idle)
+            && state.agent_stack_agent_control.phase() == RuntimeAgentControlDurablePhaseV1::Idle)
     {
         return Err(ManagedFabricApplyControllerError::AgentControlMismatch);
     }
@@ -1689,17 +1689,63 @@ pub(crate) struct ManagedFabricAgentControlSendActionV1 {
     cutover_marker_digest: Digest32,
     request: RuntimeAgentControlRequestV1,
     channel: ReferenceChannelBindingV1,
+    remote_send_available: bool,
 }
 
 impl ManagedFabricAgentControlSendActionV1 {
     #[must_use]
-    pub(crate) const fn request(&self) -> &RuntimeAgentControlRequestV1 {
+    const fn request(&self) -> &RuntimeAgentControlRequestV1 {
         &self.request
     }
 
     #[must_use]
-    pub(crate) fn canonical_request_bytes(&self) -> &[u8] {
+    fn canonical_request_bytes(&self) -> &[u8] {
         self.request.canonical_wire()
+    }
+
+    /// Spends this action across exactly one `FnOnce` transport boundary. The
+    /// returned action is permanently spent even when transport fails.
+    pub(crate) async fn exchange_remote_once<Exchange, ExchangeFuture>(
+        self,
+        exchange: Exchange,
+    ) -> ManagedFabricAgentControlRemoteExchangeOutcomeV1
+    where
+        Exchange: FnOnce(Box<[u8]>) -> ExchangeFuture,
+        ExchangeFuture: Future<
+            Output = Result<
+                RuntimeAgentControlMtlsExchangeSuccessV1,
+                RuntimeAgentControlTransportErrorV1,
+            >,
+        >,
+    {
+        let mut action = self;
+        let response = if action.remote_send_available {
+            action.remote_send_available = false;
+            exchange(action.request.canonical_wire().into())
+                .await
+                .map_err(ManagedServingControllerError::from)
+        } else {
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        };
+        ManagedFabricAgentControlRemoteExchangeOutcomeV1 { action, response }
+    }
+}
+
+/// Result of spending one Fabric PXAG transport authority.
+#[derive(Debug)]
+pub(crate) struct ManagedFabricAgentControlRemoteExchangeOutcomeV1 {
+    action: ManagedFabricAgentControlSendActionV1,
+    response: Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+}
+
+impl ManagedFabricAgentControlRemoteExchangeOutcomeV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedFabricAgentControlSendActionV1,
+        Result<RuntimeAgentControlMtlsExchangeSuccessV1, ManagedServingControllerError>,
+    ) {
+        (self.action, self.response)
     }
 }
 
@@ -2822,6 +2868,7 @@ impl ManagedFabricApplyJournalV1 {
             cutover_marker_digest: self.state.cutover_marker_digest,
             request,
             channel: context.channel(),
+            remote_send_available: true,
         })
     }
 
@@ -2847,6 +2894,7 @@ impl ManagedFabricApplyJournalV1 {
             || action.state_sequence != self.state.sequence
             || action.cutover_marker_digest != self.state.cutover_marker_digest
             || self.state.fabric_agent_control.request() != Some(&action.request)
+            || action.remote_send_available
         {
             return Err(ManagedFabricApplyControllerError::SendActionMismatch);
         }
@@ -3532,7 +3580,7 @@ impl std::error::Error for ManagedFabricApplyControllerError {}
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use ed25519_dalek::{Signer, SigningKey};
     use paraegox_kernel::digest::Digest32;
@@ -3566,7 +3614,8 @@ pub(crate) mod tests {
     use paraegox_runtime_contracts::managed_serving_bootstrap::{
         ManagedServingBootstrapFactsV1, ManagedServingBootstrapRequestDraftV1,
         ManagedServingBootstrapRequestIdV1, ManagedServingBootstrapResponseAuthClaimV1,
-        ManagedServingBootstrapResponseDraftV1, RuntimeControlDescribeReadyFactsV1,
+        ManagedServingBootstrapResponseDraftV1, RuntimeAgentControlReceiptDraftV1,
+        RuntimeAgentControlResponseAuthClaimV1, RuntimeControlDescribeReadyFactsV1,
         RuntimeControlDescribeReadyPhaseV1, RuntimeControlDescribeReadyResponseDraftV1,
         RuntimeControlDescribeReadyResponseV1,
     };
@@ -3605,7 +3654,8 @@ pub(crate) mod tests {
         LEGACY_STATE_VERSION, MANAGED_READY_STATE_FIXED_BYTES, MANAGED_READY_STATE_VERSION,
         MODEL_STACK_STATE_FIXED_BYTES, MODEL_STACK_STATE_VERSION,
         ManagedFabricApplyControllerError, ManagedFabricApplyJournalV1, ManagedFabricApplyPhaseV1,
-        ManagedFabricControllerStateV1, ManagedServingDescribeSendActionV1,
+        ManagedFabricControllerStateV1, ManagedFabricRemoteAgentControlActivateInputV1,
+        ManagedServingDescribeSendActionV1,
         REMOTE_CARRIER_STATE_FIXED_BYTES, REMOTE_CARRIER_STATE_VERSION, STATE_CHECKSUM_BYTES,
         STATE_FIXED_BYTES, STATE_VERSION, state_checksum,
     };
@@ -3617,10 +3667,12 @@ pub(crate) mod tests {
         VerifiedManagedFabricProducerContextV1,
     };
     use crate::managed_serving_client::{
-        FreshManagedServingBootstrapV1, ManagedServingBootstrapStateV1,
-        ManagedServingControllerError, ManagedServingDescribeIngressV1,
+        FreshManagedServingBootstrapV1, FreshRuntimeAgentControlV1,
+        ManagedServingBootstrapStateV1, ManagedServingControllerError,
+        ManagedServingDescribeIngressV1,
         ManagedServingDescribeReconcileDecodeV1, ManagedServingDescribeReconcilePhaseV1,
         ManagedServingDescribeVerifierV1, RuntimeAgentControlDurablePhaseV1,
+        RuntimeAgentControlMtlsExchangeSuccessV1, RuntimeAgentControlTransportErrorV1,
         RuntimeManagedServingDescribeMtlsExchangeSuccessV1,
         RuntimeManagedServingDescribeTransportErrorV1, RuntimeManagedServingMtlsExchangeSuccessV1,
         RuntimeManagedServingTransportErrorV1,
@@ -4016,7 +4068,7 @@ pub(crate) mod tests {
         ManagedFabricControllerProvisioningV1::new(controller, authority, runtime)
     }
 
-    fn remote_provisioning_and_ingress() -> (
+    pub(crate) fn remote_provisioning_and_ingress() -> (
         ManagedFabricRemoteControllerProvisioningV1,
         ManagedServingDescribeIngressV1,
     ) {
@@ -4127,7 +4179,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn post_bootstrap_describe_response(
+    pub(crate) fn post_bootstrap_describe_response(
         request: &paraegox_runtime_contracts::managed_serving_bootstrap::RuntimeControlCarrierRequestV1,
         phase: RuntimeControlDescribeReadyPhaseV1,
         snapshot_sequence: u64,
@@ -4172,6 +4224,154 @@ pub(crate) mod tests {
         draft
             .finalize(&signature.to_bytes())
             .expect("Describe response")
+    }
+
+    pub(crate) async fn remote_managed_ready_journal() -> (
+        ManagedFabricApplyJournalV1,
+        ManagedFabricRemoteControllerProvisioningV1,
+        ManagedServingDescribeIngressV1,
+    ) {
+        let controller = controller_signer();
+        let (remote, ingress) = remote_provisioning_and_ingress();
+        let mut journal = ManagedFabricApplyJournalV1::new(
+            ManagedFabricControllerStateV1::try_from_cutover(
+                Digest32::from_bytes([0xd0; 32]),
+                ready_snapshot(),
+            )
+            .expect("remote fixture cutover"),
+        );
+        let prepared = journal
+            .prepare_remote_managed_ready_describe_with(
+                &controller,
+                &remote,
+                &ingress,
+                FreshManagedServingBootstrapV1::try_new([0xd1; 16], [0xd2; 32])
+                    .expect("fresh ManagedReady Describe"),
+                |_| Ok(()),
+            )
+            .expect("ManagedReady Describe durable");
+        let action = journal
+            .claim_remote_managed_ready_describe_with(prepared, &remote, &ingress, |_| Ok(()))
+            .expect("ManagedReady Describe send claimed");
+        let response = post_bootstrap_describe_response(
+            action.request(),
+            RuntimeControlDescribeReadyPhaseV1::ManagedReady,
+            2,
+        );
+        let transport = RuntimeManagedServingDescribeMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            response.canonical_wire().into(),
+        )
+        .expect("authenticated ManagedReady transport");
+        let outcome = action
+            .exchange_remote_once(|_| async move { Ok(transport) })
+            .await;
+        let (action, response) = outcome.into_parts();
+        journal
+            .consume_remote_managed_ready_describe_response_with(
+                action,
+                response.expect("one ManagedReady response"),
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("ManagedReady response durable");
+        (journal, remote, ingress)
+    }
+
+    fn signed_runtime_fabric_receipt(
+        request: &paraegox_runtime_contracts::managed_serving_bootstrap::
+            RuntimeAgentControlRequestV1,
+        remote: &ManagedFabricRemoteControllerProvisioningV1,
+    ) -> paraegox_runtime_contracts::managed_serving_bootstrap::RuntimeAgentControlReceiptV1 {
+        let authenticated = request
+            .verify_controller_request(remote.describe().carrier(), |_, _, _, _, _| true)
+            .expect("authenticated PXAG fixture");
+        let inner = active_receipt(
+            request
+                .managed_fabric_apply_request()
+                .expect("inner PXAR v6"),
+        );
+        let auth = RuntimeAgentControlResponseAuthClaimV1::try_new(
+            remote.describe().carrier(),
+            RUNTIME_KEY_REF,
+            ApplyAuthAlgorithm::try_new(1).expect("outer Runtime algorithm"),
+            1,
+        )
+        .expect("outer Runtime auth claim");
+        let draft = RuntimeAgentControlReceiptDraftV1::try_managed_fabric_apply(
+            authenticated,
+            inner,
+            channel(),
+            auth,
+        )
+        .expect("PXAH Fabric draft");
+        let signature = runtime_signer().sign(
+            draft
+                .signing_transcript()
+                .expect("PXAH Fabric transcript")
+                .as_bytes(),
+        );
+        draft
+            .finalize(&signature.to_bytes())
+            .expect("signed PXAH Fabric receipt")
+    }
+
+    pub(crate) async fn remote_fabric_agent_control_terminal_journal() -> (
+        ManagedFabricApplyJournalV1,
+        ManagedFabricRemoteControllerProvisioningV1,
+        ManagedServingDescribeIngressV1,
+    ) {
+        let controller = controller_signer();
+        let (mut journal, remote, ingress) = remote_managed_ready_journal().await;
+        let prepared = journal
+            .prepare_remote_agent_control_activate_with(
+                ManagedFabricRemoteAgentControlActivateInputV1 {
+                    controller_signer: &controller,
+                    provisioning: &remote,
+                    previous: &ingress,
+                    service: service(),
+                    endpoint: ManagedFabricListenEndpointV1::try_new("tcp/127.0.0.1:7447")
+                        .expect("remote Fabric endpoint"),
+                    inner_fresh: fresh(0xe1),
+                    outer_fresh: FreshRuntimeAgentControlV1::try_new([0xe1; 16], [0xe4; 32])
+                        .expect("fresh outer Fabric PXAG"),
+                },
+                |_| Ok(()),
+            )
+            .expect("remote Fabric prepare");
+        let action = journal
+            .claim_remote_agent_control_send_with(
+                prepared,
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("remote Fabric claim");
+        let outer = signed_runtime_fabric_receipt(action.request(), &remote);
+        let transport = RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            outer.canonical_wire().into(),
+        )
+        .expect("remote Fabric PXAH transport");
+        let outcome = action
+            .exchange_remote_once(|_| async move { Ok(transport) })
+            .await;
+        let (action, transport) = outcome.into_parts();
+        journal
+            .consume_remote_agent_control_pxah_with(
+                action,
+                transport.expect("one remote Fabric PXAH"),
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            )
+            .expect("remote Fabric terminal");
+        (journal, remote, ingress)
     }
 
     pub(crate) fn service() -> ManagedServiceSpecV1 {
@@ -4479,6 +4679,167 @@ pub(crate) mod tests {
                 "migration-on-write must emit only PXFJ v7"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_fabric_pxag_is_one_shot_and_commits_inner_outer_atomically() {
+        let controller = controller_signer();
+        let (mut journal, remote, ingress) = remote_managed_ready_journal().await;
+        let before_prepare = journal.state().sequence();
+        let prepare_commit = RefCell::new(None);
+        let prepared = journal
+            .prepare_remote_agent_control_activate_with(
+                ManagedFabricRemoteAgentControlActivateInputV1 {
+                    controller_signer: &controller,
+                    provisioning: &remote,
+                    previous: &ingress,
+                    service: service(),
+                    endpoint: ManagedFabricListenEndpointV1::try_new("tcp/127.0.0.1:7447")
+                        .expect("remote Fabric endpoint"),
+                    inner_fresh: fresh(0xd3),
+                    outer_fresh: FreshRuntimeAgentControlV1::try_new([0xd3; 16], [0xd6; 32])
+                        .expect("fresh outer Fabric PXAG"),
+                },
+                |next| {
+                    *prepare_commit.borrow_mut() = Some(next.clone());
+                    Ok(())
+                },
+            )
+            .expect("inner PXAR and outer PXAG durable together");
+        let durable_prepare = prepare_commit
+            .into_inner()
+            .expect("one prepared commit image");
+        assert_eq!(durable_prepare.sequence(), before_prepare + 1);
+        assert_eq!(
+            durable_prepare.phase(),
+            ManagedFabricApplyPhaseV1::RequestDurableNotSent
+        );
+        assert_eq!(
+            durable_prepare.fabric_agent_control().phase(),
+            RuntimeAgentControlDurablePhaseV1::RequestDurableNotSent
+        );
+        assert_eq!(
+            durable_prepare
+                .fabric_agent_control()
+                .request()
+                .and_then(|request| request.managed_fabric_apply_request()),
+            durable_prepare.request()
+        );
+
+        let uncertain_commit = RefCell::new(None);
+        let action = journal
+            .claim_remote_agent_control_send_with(
+                prepared,
+                &controller,
+                &remote,
+                &ingress,
+                |next| {
+                    *uncertain_commit.borrow_mut() = Some(next.clone());
+                    Ok(())
+                },
+            )
+            .expect("both Uncertain fences durable before action");
+        let durable_uncertain = uncertain_commit
+            .into_inner()
+            .expect("one Uncertain commit image");
+        assert_eq!(durable_uncertain.sequence(), durable_prepare.sequence() + 1);
+        assert_eq!(durable_uncertain.phase(), ManagedFabricApplyPhaseV1::Uncertain);
+        assert_eq!(
+            durable_uncertain.fabric_agent_control().phase(),
+            RuntimeAgentControlDurablePhaseV1::Uncertain
+        );
+        assert_eq!(
+            journal.prepared_remote_agent_control(&controller, &remote, &ingress),
+            Err(ManagedFabricApplyControllerError::OpaqueReplayForbidden)
+        );
+
+        let outer_receipt = signed_runtime_fabric_receipt(action.request(), &remote);
+        let transport = RuntimeAgentControlMtlsExchangeSuccessV1::try_new(
+            RUNTIME_PRINCIPAL,
+            remote.describe().carrier().binding_digest(),
+            outer_receipt.canonical_wire().into(),
+        )
+        .expect("authenticated PXAH transport");
+        let unspent = super::ManagedFabricAgentControlSendActionV1 {
+            state_sequence: action.state_sequence,
+            cutover_marker_digest: action.cutover_marker_digest,
+            request: action.request.clone(),
+            channel: action.channel,
+            remote_send_available: true,
+        };
+        assert_eq!(
+            journal.consume_remote_agent_control_pxah_with(
+                unspent,
+                transport.clone(),
+                &controller,
+                &remote,
+                &ingress,
+                |_| Ok(()),
+            ),
+            Err(ManagedFabricApplyControllerError::SendActionMismatch)
+        );
+
+        let calls = Cell::new(0_u8);
+        let expected_wire = action.canonical_request_bytes().to_vec();
+        let first = action
+            .exchange_remote_once(|wire| {
+                calls.set(calls.get() + 1);
+                assert_eq!(wire.as_ref(), expected_wire.as_slice());
+                let transport = transport.clone();
+                async move { Ok(transport) }
+            })
+            .await;
+        let (spent, first_response) = first.into_parts();
+        let admitted_transport = first_response.expect("first transport result");
+        let second = spent
+            .exchange_remote_once(|_| {
+                calls.set(calls.get() + 1);
+                async {
+                    Err::<RuntimeAgentControlMtlsExchangeSuccessV1, _>(
+                        RuntimeAgentControlTransportErrorV1::Rejected,
+                    )
+                }
+            })
+            .await;
+        let (spent, second_response) = second.into_parts();
+        assert_eq!(calls.get(), 1, "spent action must not invoke transport twice");
+        assert_eq!(
+            second_response,
+            Err(ManagedServingControllerError::AgentControlTransportAuthoritySpent)
+        );
+
+        let terminal_commit = RefCell::new(None);
+        let terminal = journal
+            .consume_remote_agent_control_pxah_with(
+                spent,
+                admitted_transport,
+                &controller,
+                &remote,
+                &ingress,
+                |next| {
+                    *terminal_commit.borrow_mut() = Some(next.clone());
+                    Ok(())
+                },
+            )
+            .expect("inner PXFT and outer PXAH durable together");
+        assert!(!terminal.replayed_from_journal());
+        assert_eq!(terminal.outer(), &outer_receipt);
+        let durable_terminal = terminal_commit
+            .into_inner()
+            .expect("one terminal commit image");
+        assert_eq!(durable_terminal.sequence(), durable_uncertain.sequence() + 1);
+        assert_eq!(durable_terminal.phase(), ManagedFabricApplyPhaseV1::ReceiptDurable);
+        assert_eq!(
+            durable_terminal.fabric_agent_control().phase(),
+            RuntimeAgentControlDurablePhaseV1::ReceiptDurable
+        );
+        let replay = journal
+            .remote_agent_control_terminal(&controller, &remote, &ingress)
+            .expect("durable outer and inner signatures reverify")
+            .expect("terminal exists");
+        assert!(replay.replayed_from_journal());
+        assert_eq!(replay.inner(), terminal.inner());
+        assert_eq!(replay.outer(), terminal.outer());
     }
 
     #[test]
